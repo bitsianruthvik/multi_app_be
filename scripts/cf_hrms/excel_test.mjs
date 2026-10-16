@@ -319,7 +319,7 @@ try {
   section('[3] Every entity: unchanged = SAME; a changed cell = CHANGE; a new row = ADD');
   const deptCode = async (id) => (await one('SELECT code FROM hrms_departments WHERE id = ?', [id])).code;
   const CASES = {
-    departments: { query: `?q=${TAG}`, at: ['Name', `${TAG} SUB`], change: ['Name', `${TAG} SUB renamed`], add: async () => ({ Name: `${TAG} Added department`, Label: 'Section', Under: await deptCode(D.root), Shared: 'No' }), issued: true, read: 'Name' },
+    departments: { query: `?q=${TAG}`, at: ['Name', `${TAG} SUB`], change: ['Name', `${TAG} SUB renamed`], add: async () => ({ Name: `${TAG} Added department`, Kind: 'Section', Under: await deptCode(D.root), Shared: 'No' }), issued: true, read: 'Name' },
     locations: { query: `?q=${TAG}`, at: ['Name', `${TAG} Unit`], change: ['City', 'Nagpur'], add: () => ({ Name: `${TAG} Added location`, City: 'Indore', Pincode: '452001' }), issued: true, read: 'City' },
     roles: { query: `?q=${TAG}`, at: ['Title', `${TAG} Operator`], change: ['Purpose', 'Runs the machine and keeps it clean.'], add: () => ({ Title: `${TAG} Added role`, Purpose: 'A new job.', Status: 'ACTIVE' }), issued: true, read: 'Purpose' },
     positions: { query: `?department=${D.root}`, at: ['Code', `${TAG}-VAC2`], change: ['Shift', `${S2.code} — ${S2.name}`], add: () => ({ Role: `${TAG}R`, Department: `${TAG}SUB`, Shift: S1.code, 'Reports to': `${TAG}-HEAD`, Status: 'ACTIVE' }), issued: true, read: 'Shift' },
@@ -471,15 +471,15 @@ try {
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'ROOT'), 'Under', `${TAG}SUB`)), /inside itself/), 'a department put under its own sub-department: "would put the department inside itself"');
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => { b.set(dAt(b, 'ROOT'), 'Under', `${TAG}OTHER`); b.set(dAt(b, 'OTHER'), 'Under', `${TAG}ROOT`); }), /inside itself/, { rows: 2 }), 'a cycle made by two rows of the file');
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Under', `${TAG}OTHER`)), /cannot be under itself/), 'a department under itself');
-    ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Label', 'Machine / area')), /Label: “Machine \/ area” is not in the “Labels” list/), 'a label that is not in the company’s list');
+    ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Kind', 'Machine / area')), /Kind: “Machine \/ area” is not in the “Labels” list/), 'a label that is not in the company’s list');
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Serves', `${TAG}ROOT`)), /only a shared department serves others/), 'Serves on a department that is not shared');
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => { b.set(dAt(b, 'OTHER'), 'Shared', 'Yes'); b.set(dAt(b, 'OTHER'), 'Serves', `${TAG}ROOT, NOPE-1`); }), /“NOPE-1” is not the code of a department/), 'Serves naming a code that is no department');
-    const twoNew = await edited(deptFile.contentBase64, (b) => { b.append({ Name: `${TAG} Parent new`, Label: 'Section' }); b.append({ Name: `${TAG} Child new`, Label: 'Section', Under: `${TAG} Parent new` }); });
+    const twoNew = await edited(deptFile.contentBase64, (b) => { b.append({ Name: `${TAG} Parent new`, Kind: 'Section' }); b.append({ Name: `${TAG} Child new`, Kind: 'Section', Under: `${TAG} Parent new` }); });
     const pTwo = await preview(O, 'departments', twoNew);
     ok(pTwo.json.summary.add === 1 && pTwo.json.summary.problems === 1 && /Under: “.*Parent new” is not in the “Departments” list/.test(problemsOf(pTwo)),
       'a new department under another NEW department of the same file: refused plainly (a new row has no code to be pointed at) — the first is an ADD, the second a problem', problemsOf(pTwo));
     ok(await rowProblem('departments', await edited(deptFile.contentBase64, (b) => b.set(dAt(b, 'OTHER'), 'Name', 'x'.repeat(201))), /Name is 201 characters long; it can be up to 200/), 'text longer than the column holds: said, with both numbers');
-    const spaces = await preview(O, 'departments', await edited(deptFile.contentBase64, (b) => { b.set(dAt(b, 'OTHER'), 'Name', `  ${TAG} OTHER   `); b.set(dAt(b, 'OTHER'), 'Label', ' department '); b.set(dAt(b, 'OTHER'), 'Shared', 'no'); }));
+    const spaces = await preview(O, 'departments', await edited(deptFile.contentBase64, (b) => { b.set(dAt(b, 'OTHER'), 'Name', `  ${TAG} OTHER   `); b.set(dAt(b, 'OTHER'), 'Kind', ' department '); b.set(dAt(b, 'OTHER'), 'Shared', 'no'); }));
     ok(spaces.json.summary.same === deptFile.rows && spaces.json.summary.problems === 0, 'trailing spaces, and a list value in other capitals, are the same value: SAME', JSON.stringify(spaces.json.summary));
 
     const empFile = await download(O, 'employees', `?department=${D.root}`);
@@ -676,8 +676,8 @@ try {
       'a row outside it is a problem: moving a position out, changing a position that is outside (somebody else’s file), adding one outside', `${problemsOf(moveOut)} | ${problemsOf(newOutside)}`.slice(0, 300));
     const deptMine = await download(scoped, 'departments');
     const dTop = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.set(b.find('Code', `${TAG}ROOT`), 'Name', `${TAG} ROOT x`)));
-    const dNewTop = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.append({ Name: `${TAG} At the top`, Label: 'Section' })));
-    const dNewIn = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.append({ Name: `${TAG} Inside`, Label: 'Section', Under: `${TAG}SUB` })));
+    const dNewTop = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.append({ Name: `${TAG} At the top`, Kind: 'Section' })));
+    const dNewIn = await preview(scoped, 'departments', await edited(deptMine.contentBase64, (b) => b.append({ Name: `${TAG} Inside`, Kind: 'Section', Under: `${TAG}SUB` })));
     ok(/This is your own department/.test(problemsOf(dTop)) && /choose a department inside your own/.test(problemsOf(dNewTop)) && dNewIn.json.summary.add === 1 && dNewIn.json.summary.problems === 0 && deptMine.rows === 3,
       'departments: its own top department cannot be changed, nothing can be added at the top, a department inside can', `${problemsOf(dTop)} | ${problemsOf(dNewTop)}`.slice(0, 300));
     const wholeDownload = await call(scoped, 'GET', '/excel/shifts/workbook');

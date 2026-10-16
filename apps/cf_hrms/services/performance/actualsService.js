@@ -278,7 +278,7 @@ export async function enterActuals(db, c, entries, opts = {}) {
     }
     if (e.met !== undefined) {
       if (!isText) {
-        if (e.met !== null && e.met !== '') throw why('INVALID', `${where(e)}${kpi.name} has a number target: give the number, not met / not met.`);
+        if (e.met !== null && e.met !== '') throw why('INVALID', `${where(e)}${kpi.name} has a number target: give the number, not "Met" or "Not met".`);
       } else if (e.met === null || e.met === '') {
         if (was) throw why('NO_REMOVE', `${where(e)}An answer once entered is corrected, not removed: give the right answer and a reason.`);
         met = null;

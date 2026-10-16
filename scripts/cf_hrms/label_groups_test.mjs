@@ -383,8 +383,14 @@ try {
     const file = await download('departments', `?q=${TAG}`);
     const book = await open(file.contentBase64);
     const heads = [...book.head.keys()];
-    ok(heads.includes('Label') && heads.includes(`${TAG} Units`) && heads.includes(`${TAG} Area`) && heads.indexOf(`${TAG} Units`) === heads.indexOf('Label') + 1,
-      'the departments file: "Label" (Kind) then one column per group, in group order', heads.join(', '));
+    ok(heads.includes(KIND.name) && !heads.includes('Label') && heads.includes(`${TAG} Units`) && heads.includes(`${TAG} Area`) && heads.indexOf(`${TAG} Units`) === heads.indexOf(KIND.name) + 1,
+      `the departments file: "${KIND.name}" (the Kind group's own name) then one column per group, in group order`, heads.join(', '));
+    {
+      // A file with the older header "Label" still reads.
+      const oldFile = await edited(file.contentBase64, (b) => { b.ws.getRow(1).getCell(b.head.get(KIND.name)).value = 'Label ★'; });
+      const old = await preview('departments', oldFile);
+      ok(old.status === 200 && old.json.summary.change === 0 && old.json.summary.problems === 0, 'a file with the old "Label" header reads the same', JSON.stringify(old.json?.summary ?? old.json));
+    }
     const listsSheet = book.wb.getWorksheet('Lists');
     const listValues = []; listsSheet.eachRow((r) => r.eachCell((cell) => listValues.push(String(cell.value))));
     ok(listValues.includes(`${TAG} Units labels`) && listValues.includes('Unit 2') && book.wb.definedNames.model.some((n) => n.name === `List_group_${UNIT.id}`),
@@ -405,7 +411,7 @@ try {
     const wrong = await preview('departments', await edited(file.contentBase64, (b) => b.set(b.find('Name', `${TAG} C`), `${TAG} Area`, 'Unit 2')));
     ok(wrong.json.summary.problems === 1 && /Unit 2/.test(JSON.stringify(wrong.json.rows.find((r) => r.action === 'PROBLEM')?.problems)), 'a label of the wrong group in a group\'s column = a problem', JSON.stringify(wrong.json.rows.find((r) => r.action === 'PROBLEM')));
     const fresh = await download('departments', `?q=${TAG}`);
-    const addRow = await edited(fresh.contentBase64, (b) => { const r = b.ws.rowCount + 1; b.set(r, 'Name', `${TAG} From file`); b.set(r, 'Label', 'Section'); b.set(r, `${TAG} Units`, 'Unit 1'); });
+    const addRow = await edited(fresh.contentBase64, (b) => { const r = b.ws.rowCount + 1; b.set(r, 'Name', `${TAG} From file`); b.set(r, KIND.name, 'Section'); b.set(r, `${TAG} Units`, 'Unit 1'); });
     const added = await applyX('departments', addRow, { add: 1, change: 0 });
     const fromFile = (await get(`/organisation/departments?q=${encodeURIComponent(`${TAG} From file`)}`)).rows[0];
     ok(added.status === 200 && fromFile?.labels.map((l) => l.name).join('|') === 'Section|Unit 1', 'a new row with a group label: the department is created with it', JSON.stringify({ added: added.json, labels: fromFile?.labels }));

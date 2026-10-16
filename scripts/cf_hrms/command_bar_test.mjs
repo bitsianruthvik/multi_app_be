@@ -92,7 +92,7 @@ const POS = {
   '{BFL2}': byRole('Operator - Production (BFL)', 2),                      // was P159-2
   '{MAINT}': byRole('Manager - Maintenance', 1),                           // was P040
   '{PRODMGR}': byRole('Production Manager', 1),                            // was P020
-  '{QCINCH}': byRole('Incharge - Quality (Quality · P208)', 1),            // was P208
+  '{QCINCH}': byRole('Incharge - Quality (Systems & Complaints)', 1),            // was P208
   '{PLAN}': byRole('Deputy Manager - Planning', 1),                        // was P098
 };
 const placed = recs.employees.filter((e) => e.positionId && e.name.split(' ').length >= 2 && Math.max(...e.name.split(' ').map((w) => w.length)) >= 6);

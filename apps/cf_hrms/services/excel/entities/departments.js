@@ -1,12 +1,18 @@
 /**
- * Departments in Excel. Code (issued) · Name★ · Label★ · <one column per label group> · Under · Shared · Serves · Status.
- * "Label" is the Kind group's label (its column kept its name so older files still read); every
+ * Departments in Excel. Code (issued) · Name★ · Kind★ · <one column per label group> · Under · Shared · Serves · Status.
+ * The Kind column is headed with the Kind group's own name (a file with the older header "Label" still reads); every
  * other group has a column of its own, a drop-down of that group's labels (spec §15.3).
  * Writes go through organisationService (the label rules, the cycle rule, the serves rule, the code).
  */
 import { PERM, words, coded, textOf, STATUS, yes, flag, changedKeys, inScope, loops } from './_shared.js';
 import * as ORG from '../../organisationService.js';
 import { labelState, groupLists, groupColumns, groupCells, otherGroups, groupKey } from './_labels.js';
+
+/** The Kind column is headed with the group's own name, unless that name is another column's header. */
+const kindHeader = (model) => {
+  const name = String(model.kind?.name ?? '').trim();
+  return name && !['code', 'name', 'under', 'shared', 'serves', 'status'].includes(name.toLowerCase()) ? name : 'Label';
+};
 
 const codesOf = (text) => String(text ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -54,8 +60,8 @@ export default {
   columns: (state) => [
     { key: 'code', header: 'Code', kind: 'issued', width: 14, meaning: 'The department’s code.', example: 'D012' },
     { key: 'name', header: 'Name', kind: 'text', required: true, max: 200, width: 34, meaning: 'What the department is called.', example: 'Quality Control' },
-    { key: 'label', header: 'Label', kind: 'list', list: 'labels', required: true, width: 18, meaning: `What kind of department it is (its ${state.model.kind?.name ?? 'Kind'} label).`, example: 'Section' },
-    ...groupColumns(state.model, ['Code', 'Name', 'Label', 'Under', 'Shared', 'Serves', 'Status']),
+    { key: 'label', header: kindHeader(state.model), aliases: ['Label'], kind: 'list', list: 'labels', required: true, width: 18, meaning: `What kind of department it is (its ${state.model.kind?.name ?? 'Kind'} label).`, example: 'Section' },
+    ...groupColumns(state.model, ['Code', 'Name', kindHeader(state.model), 'Label', 'Under', 'Shared', 'Serves', 'Status']),
     { key: 'under', header: 'Under', kind: 'list', list: 'departments', width: 36, meaning: 'The department it sits in. Blank = at the top.', example: 'D004 — Production' },
     { key: 'shared', header: 'Shared', kind: 'yesno', meaning: 'Yes when it works for several departments.', example: 'No' },
     { key: 'serves', header: 'Serves', kind: 'text', max: 500, width: 26, meaning: 'For a shared department: the codes of the departments it works for, separated by commas.', example: 'D004, D007' },

@@ -158,7 +158,9 @@ async function analyse(db, c, def, body, env) {
   const state = await def.load(db, c, fileIds ? { ...env, fileIds } : env);
   const columns = def.columns(state, env);
   const lists = listsOf(state);
-  const missing = columns.filter((col) => editable(col) && !opened.columnAt.has(col.header));
+  // A column is found by its header, or by an older header it once had (`aliases`), so an old file still reads.
+  const columnOf = (col) => [col.header, ...(col.aliases ?? [])].map((h) => opened.columnAt.get(h)).find((n) => n != null);
+  const missing = columns.filter((col) => editable(col) && columnOf(col) == null);
   if (missing.length) { fileProblems.push(`The Data sheet has lost ${missing.length === 1 ? 'a column' : 'columns'}: ${missing.map((m) => m.header).join(', ')}. Download a fresh file and fill that in.`); return answer(); }
 
   // ── the rows that hold anything ───────────────────────────────────────────
@@ -167,7 +169,7 @@ async function analyse(db, c, def, body, env) {
   for (let n = 2; n <= opened.lastRow; n += 1) {
     const r = sheet.getRow(n);
     const idCell = cellOf(r.getCell(1));
-    const filled = columns.some((col) => editable(col) && cellOf(r.getCell(opened.columnAt.get(col.header))).kind !== 'empty');
+    const filled = columns.some((col) => editable(col) && cellOf(r.getCell(columnOf(col))).kind !== 'empty');
     if (idCell.kind === 'empty' && !filled) continue;
     found.push({ n, r, idCell });
     if (found.length > MAX_DATA_ROWS) break;
@@ -200,7 +202,7 @@ async function analyse(db, c, def, body, env) {
     // ── its cells ──
     for (const col of columns) {
       if (!editable(col)) continue;
-      const read = readCell(r.getCell(opened.columnAt.get(col.header)), col, lists);
+      const read = readCell(r.getCell(columnOf(col)), col, lists);
       // A required cell that is empty on the record too is not this file's doing: the row may still be changed elsewhere.
       if (read.problem && read.empty && row.current && (row.current.cells[col.key] == null || row.current.cells[col.key] === '')) { row.values[col.key] = null; continue; }
       if (read.problem) { row.problems.push(read.problem); continue; }

@@ -2,9 +2,9 @@
  * _labels.js — the label groups in the Excel files (TM/CF_HRMS_HIRING_SPEC.md §15.3).
  *
  *   departments   one column per group other than Kind (a drop-down of that
- *                 group's labels; a required group is starred). Kind keeps the
- *                 column it always had, "Label", so a file downloaded before
- *                 groups existed still reads.
+ *                 group's labels; a required group is starred). Kind's column
+ *                 is headed with its own name (departments.js); a file with
+ *                 the older header "Label" still reads.
  *   positions,    one INFO column per group: the label their department carries
  *   employees     (the employee's: their main position's department).
  *

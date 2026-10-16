@@ -16,8 +16,8 @@ One tag = one thing a person may do. The Owner (the company’s `admin` role) ho
 | Documents | Job descriptions, Responsibility profiles | `cf_hrms_documents_view` | `cf_hrms_documents_edit` | `cf_hrms_documents_remove` | – |
 | Time | Shifts, Holidays | `cf_hrms_time_view` | `cf_hrms_time_edit` | `cf_hrms_time_remove` | `cf_hrms_time_upload` |
 | Leave | Leave policies | `cf_hrms_leave_view` | `cf_hrms_leave_edit` | `cf_hrms_leave_remove` | – |
-| Setup | Code formats, Letters, Reporting types | `cf_hrms_setup_view` | `cf_hrms_setup_edit` | `cf_hrms_setup_remove` | – |
-| Performance | Plans, A person’s plan, Periods | `cf_hrms_performance_view` | `cf_hrms_performance_edit` | `cf_hrms_performance_remove` | `cf_hrms_performance_upload` |
+| Setup | Code formats, Letters, Reporting types, Performance settings | `cf_hrms_setup_view` | `cf_hrms_setup_edit` | `cf_hrms_setup_remove` | – |
+| Performance | Plans, A person’s plan, Periods, Actuals, Reviews and check-ins, Actions | `cf_hrms_performance_view` | `cf_hrms_performance_edit` | `cf_hrms_performance_remove` | `cf_hrms_performance_upload` |
 
 | Named right | What it is |
 |---|---|

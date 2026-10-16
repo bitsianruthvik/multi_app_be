@@ -28,10 +28,10 @@ export const AREAS = [
   { key: 'documents', label: 'Documents', screens: ['Job descriptions', 'Responsibility profiles'], rights: ['view', 'edit', 'remove'] },
   { key: 'time', label: 'Time', screens: ['Shifts', 'Holidays'], rights: ['view', 'edit', 'remove', 'upload'] },
   { key: 'leave', label: 'Leave', screens: ['Leave policies'], rights: ['view', 'edit', 'remove'] },
-  { key: 'setup', label: 'Setup', screens: ['Code formats', 'Letters', 'Reporting types'], rights: ['view', 'edit', 'remove'] },
+  { key: 'setup', label: 'Setup', screens: ['Code formats', 'Letters', 'Reporting types', 'Performance settings'], rights: ['view', 'edit', 'remove'] },
   // Spec §18 (2026-10-15). Added after companies were set up: scripts/setup-access.mjs grants it to
   // the ready-made roles of an existing company once (LATE_AREAS below), and nothing else.
-  { key: 'performance', label: 'Performance', screens: ['Plans', 'A person’s plan', 'Periods'], rights: ['view', 'edit', 'remove', 'upload'] },
+  { key: 'performance', label: 'Performance', screens: ['Plans', 'A person’s plan', 'Periods', 'Actuals', 'Reviews and check-ins', 'Actions'], rights: ['view', 'edit', 'remove', 'upload'] },
 ];
 
 export const areaTag = (area, right) => `cf_hrms_${area}_${right}`;
