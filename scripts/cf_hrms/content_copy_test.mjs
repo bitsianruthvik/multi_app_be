@@ -426,6 +426,14 @@ try {
       // a second fork of the same seat with nothing new is refused
       const again = await refused(() => CC.executeCopy(db, c, { ...body, targets: [{ type: 'position', id: pick.position_id }] }));
       ok('forking again with nothing new to add is refused rather than making an empty copy', again?.code === 'NOTHING_TO_FORK' || again?.code === 'SAME_ROLE', again?.message);
+
+      // a title chosen for the new role that a role already has, in other capitals (from content_copy_http_test, 2026-10-16)
+      if (otherSeats.length) {
+        const b4 = await count(db);
+        const clash = await refused(() => CC.executeCopy(db, c, { ...body, targets: [{ type: 'position', id: otherSeats[0].id }], forkTitle: f.newRoleTitle.toUpperCase() }));
+        ok('a fork title that a role already carries (any case) is refused, 409 DUPLICATE_TITLE, naming the clash, and nothing is written',
+          clash?.code === 'DUPLICATE_TITLE' && clash.status === 409 && clash.message.includes(f.newRoleTitle) && JSON.stringify(diff(b4, await count(db))) === '{}', clash?.message);
+      } else skip('a fork title already taken', 'the forked role had no other seat');
     }
   }
 

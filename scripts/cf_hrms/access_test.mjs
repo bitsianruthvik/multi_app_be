@@ -7,6 +7,8 @@
  *      loses, exact tenant- and app-scoped grants, no duplicates, re-runnable;
  *   3. THE MATRIX: each ready-made role × a route of every area and right and
  *      every named right, through the real middleware;
+ *  3b. copying content: the right a copy needs follows its MODE (SEAT, ROLE,
+ *      FORK), refusals write nothing, a write is attributed to its login;
  *   4. a change of rights counts on the very next request, with the same token;
  *   5. scope: a Department head, a scoped login with no employee, a scoped role
  *      that may change departments;
@@ -57,6 +59,8 @@ import { scopeFor } from '../../apps/cf_hrms/services/accessScope.js';
 import * as ACCESS from '../../apps/cf_hrms/services/accessService.js';
 import * as HIRE from '../../apps/cf_hrms/services/hiringService.js';
 import * as PEOPLE from '../../apps/cf_hrms/services/peopleService.js';
+import * as RC from '../../apps/cf_hrms/services/roleContentService.js';
+import * as POS from '../../apps/cf_hrms/services/positionService.js';
 import { isPayPaper, isIdentityPaper } from '../../apps/cf_hrms/lib/redact.js';
 
 const slug = (process.argv.find((a) => a.startsWith('--company=')) || '--company=karni').split('=')[1];
@@ -471,6 +475,77 @@ try {
       for (const [what, method, url, body, anyOf] of MATRIX) if (anyOf && !anyOf.includes(PERM.selfView)) { const r = await call(who, method, url, body); if (r.status !== 403) others.push(`${what} ${r.status}`); }
       ok(place.status === 200 && chart.status === 200 && others.length === 0, 'a real Employee login of the company: its own place and chart answer, everything else is 403 — as before the migration', others.join('; '));
     } else skip('a real Employee login', 'none found');
+  }
+
+  /* ══ 3b. copying content: the right follows the MODE ═════════════════════ */
+  // One route, three rights: what a copy needs depends on its body (SEAT -> positions edit,
+  // ROLE -> roles edit, FORK -> both). The guard alone cannot say it, so it is proven here
+  // through the real middleware. WHAT a copy does is content_copy_test's. (Moved here from
+  // content_copy_http_test.mjs, 2026-10-16, which needed a server of its own.)
+  section('[3b] Copying content: the right follows the mode, through the real middleware');
+  {
+    const CU = {
+      EMPLOYEE: U.EMPLOYEE,
+      viewer: await login('Copy viewer', await customRole('copy viewer', [PERM.roles.view, PERM.positions.view])),
+      seats: await login('Copy seats', await customRole('copy seats', [PERM.positions.view, PERM.positions.edit])),
+      roles: await login('Copy roles', await customRole('copy roles', [PERM.roles.view, PERM.roles.edit])),
+      both: await login('Copy both', await customRole('copy both', [PERM.roles.view, PERM.roles.edit, PERM.positions.view, PERM.positions.edit])),
+      OWNER: U.OWNER,
+    };
+    forgetAccess();
+    const def = await RC.createMasterItem(db, c, 'responsibilities', { name: `${TAG} copy duty`, description: `${TAG} A duty to copy` });
+    const srcRole = await RC.createRole(db, c, { title: `${TAG} copy source`, status: 'ACTIVE' });
+    const tgtRole = await RC.createRole(db, c, { title: `${TAG} copy target`, status: 'ACTIVE' });
+    await RC.addContent(db, c, srcRole.id, 'responsibilities', { responsibilityDefinitionId: def.id });
+    const seat1 = (await POS.createPosition(db, c, { roleId: tgtRole.id, positionTitle: 'Seat 1', status: 'ACTIVE' })).position.id;
+    const seat2 = (await POS.createPosition(db, c, { roleId: tgtRole.id, positionTitle: 'Seat 2', status: 'ACTIVE' })).position.id;
+    const body = (mode, extra = {}) => ({
+      source: { type: 'role', id: srcRole.id }, targets: mode === 'ROLE' ? [{ type: 'role', id: tgtRole.id }] : [{ type: 'position', id: seat1 }], mode, kinds: ['responsibilities'], ...extra,
+    });
+    const counts = async () => JSON.stringify(await q(
+      `SELECT (SELECT COUNT(*) FROM hrms_roles WHERE company_id = ?) AS roles, (SELECT COUNT(*) FROM hrms_positions WHERE company_id = ?) AS positions,
+              (SELECT COUNT(*) FROM hrms_role_responsibility_assignments WHERE company_id = ?) AS duties,
+              (SELECT COUNT(*) FROM hrms_position_content_overrides WHERE company_id = ?) AS overlays`, [COMPANY, COMPANY, COMPANY, COMPANY]));
+    const statuses = async (method, url, payload, keys = Object.keys(CU)) => Object.fromEntries(await Promise.all(keys.map(async (k) => [k, (await call(CU[k], method, url, payload)).status])));
+
+    const read = await statuses('GET', `/role-content-copy/source?type=role&id=${srcRole.id}`);
+    ok(same(Object.entries(read).map(([k, s]) => `${k}:${s}`), ['EMPLOYEE:403', 'viewer:200', 'seats:200', 'roles:200', 'both:200', 'OWNER:200']),
+      'reading a source needs roles view OR positions view: an Employee 403, everyone else 200', JSON.stringify(read));
+
+    const before0 = await counts();
+    const expected = {
+      SEAT: { EMPLOYEE: 403, viewer: 403, seats: 200, roles: 403, both: 200, OWNER: 200 },
+      ROLE: { EMPLOYEE: 403, viewer: 403, seats: 403, roles: 200, both: 200, OWNER: 200 },
+      FORK: { EMPLOYEE: 403, viewer: 403, seats: 403, roles: 403, both: 200, OWNER: 200 },
+    };
+    const previews = {};
+    for (const mode of Object.keys(expected)) previews[mode] = await statuses('POST', '/role-content-copy/preview', body(mode));
+    ok(JSON.stringify(previews) === JSON.stringify(expected), 'preview: SEAT needs positions edit, ROLE roles edit, FORK both; the Owner may do any', JSON.stringify(previews));
+    const unknown = await statuses('POST', '/role-content-copy/preview', { mode: 'TELEPORT' });
+    const empty = await statuses('POST', '/role-content-copy/preview', undefined, ['EMPLOYEE', 'seats']);
+    ok(JSON.stringify(unknown) === JSON.stringify({ EMPLOYEE: 403, viewer: 403, seats: 422, roles: 422, both: 422, OWNER: 422 }) && empty.EMPLOYEE === 403 && empty.seats === 422,
+      'an unknown mode or an empty body: 403 for whoever holds neither edit right (never a peek at the validation), 422 for the rest', JSON.stringify({ unknown, empty }));
+    ok(await counts() === before0, 'no preview wrote anything');
+
+    const wrong = [];
+    for (const [k, mode, extra] of [['EMPLOYEE', 'SEAT'], ['EMPLOYEE', 'ROLE', { confirm: { seats: 2 } }], ['viewer', 'SEAT'], ['roles', 'SEAT'], ['seats', 'ROLE', { confirm: { seats: 2 } }], ['seats', 'FORK'], ['roles', 'FORK']]) {
+      const r = await call(CU[k], 'POST', '/role-content-copy', body(mode, extra));
+      if (r.status !== 403) wrong.push(`${k} ${mode} ${r.status}`);
+    }
+    ok(wrong.length === 0 && await counts() === before0, 'every write with the wrong right for its mode is 403, and none of them wrote a row', wrong.join('; '));
+
+    const seatOk = await call(CU.seats, 'POST', '/role-content-copy', body('SEAT'));
+    const overlayBy = await one('SELECT COUNT(*) AS n, MAX(created_by) AS who FROM hrms_position_content_overrides WHERE company_id = ? AND position_id = ? AND deleted_at IS NULL', [COMPANY, seat1]);
+    ok(seatOk.status === 200 && seatOk.json?.totals?.created === 1 && Number(overlayBy.n) === 1 && Number(overlayBy.who) === CU.seats.id,
+      'positions edit alone copies onto a seat: one overlay row, on that seat, written as that login', JSON.stringify({ totals: seatOk.json?.totals, overlayBy }));
+    const fork = await call(CU.both, 'POST', '/role-content-copy', { ...body('FORK'), targets: [{ type: 'position', id: seat2 }], forkTitle: `${TAG} seat 2 own role` });
+    ok(fork.status === 200 && fork.json?.totals?.newRoles === 1 && (await one('SELECT role_id FROM hrms_positions WHERE id = ?', [seat2])).role_id === fork.json.targets[0].fork.newRoleId,
+      'both rights fork a seat onto a role of its own', JSON.stringify(fork.json?.totals ?? fork.json));
+    // The target role has one seat left (seat 2 took a role of its own).
+    const noConfirm = await call(CU.roles, 'POST', '/role-content-copy', body('ROLE'));
+    const roleOk = await call(CU.roles, 'POST', '/role-content-copy', body('ROLE', { confirm: { seats: 1 } }));
+    ok(noConfirm.status === 422 && noConfirm.json?.code === 'CONFIRM_SEATS' && roleOk.status === 200 && roleOk.json?.totals?.created === 1,
+      'roles edit alone copies onto a role — over HTTP the missing seat count is a 422 CONFIRM_SEATS, the confirmed one a 200', `${noConfirm.status} ${noConfirm.json?.code} ${roleOk.status} ${JSON.stringify(roleOk.json?.totals ?? roleOk.json)}`);
   }
 
   /* ══ 4. the next request ══════════════════════════════════════════════════ */

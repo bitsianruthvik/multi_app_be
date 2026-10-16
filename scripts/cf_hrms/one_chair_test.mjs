@@ -15,7 +15,10 @@
  *   7. the employee's own slice: the day in-charge sees the night crew;
  *   8. close / delete of one chair of a multi-chair card (the team stays with
  *      the card) versus the card's last chair (the team moves up);
- *   9. the retired importers refuse a one-chair tenant.
+ *   9. the retired importers refuse a one-chair tenant;
+ *  10. positions held and moving a person: the old position ends the day
+ *      before, the refusals, a second position, a move on a later date, how
+ *      each one ended (from cleanup_a_test, 2026-10-16).
  *
  *   node scripts/cf_hrms/one_chair_test.mjs [--company=karni] [--verbose]
  *
@@ -25,7 +28,8 @@
  * and the transaction is ROLLED BACK. The last check re-reads the tenant and
  * compares row counts with the start. No tenant row is edited, even inside the
  * transaction, except that one unlinked login is pointed at a fixture employee
- * for the slice checks (rolled back with the rest).
+ * for the slice checks, and section 10 moves real people into real vacant
+ * positions (all rolled back with the rest).
  *
  * Local only — it refuses a non-local DB_HOST. The 220 / 71 / 149 figures are
  * local Karni's; on another company they are skipped, with a line saying so.
@@ -39,6 +43,8 @@ import { myOrgChart } from '../../apps/cf_hrms/services/selfOrgChartService.js';
 import { myPlace } from '../../apps/cf_hrms/services/selfService.js';
 import { departmentStaffing } from '../../apps/cf_hrms/services/jobContentService.js';
 import { createDepartment } from '../../apps/cf_hrms/services/organisationService.js';
+import * as HIRE from '../../apps/cf_hrms/services/hiringService.js';
+import * as HELD from '../../apps/cf_hrms/services/employeePositionsService.js';
 import { computeCards, loadCards } from '../../apps/cf_hrms/services/positionCards.js';
 import { SEAT_TOTALS_SQL } from '../../apps/cf_hrms/services/seatCount.js';
 import { oneChairState, oneChairRefusal, ONE_CHAIR_OVERRIDE } from '../../apps/cf_hrms/scripts/lib/oneChairGuard.mjs';
@@ -70,7 +76,8 @@ const TAG = `ZZ1C${Date.now().toString(36).toUpperCase().slice(-5)}`;
 const on = POS.today();
 
 const TABLES = ['hrms_positions', 'hrms_position_reporting_relationships', 'hrms_work_assignments', 'hrms_employees',
-  'hrms_roles', 'hrms_departments', 'hrms_position_content_overrides', 'hrms_responsibility_definitions', 'hrms_audit_log'];
+  'hrms_roles', 'hrms_departments', 'hrms_position_content_overrides', 'hrms_responsibility_definitions', 'hrms_audit_log',
+  'hrms_employment_events', 'hrms_hirings', 'hrms_employee_exits'];
 const rowCounts = async (db) => {
   const out = {};
   for (const t of TABLES) {
@@ -562,6 +569,152 @@ try {
     const [[emptyCompany]] = await db.query('SELECT c.id FROM companies c LEFT JOIN hrms_positions p ON p.company_id = c.id AND p.deleted_at IS NULL WHERE p.id IS NULL LIMIT 1');
     if (emptyCompany) ok((await oneChairState(db, emptyCompany.id)).isOneChair === false, 'a company with no positions is not refused (a first import into a new tenant)');
   }
+  /* ── 10. positions held, and moving a person (from cleanup_a_test, 2026-10-16) ── */
+  // Real people and real vacant positions of the tenant, inside this run's transaction.
+  section('[10] Positions held, and moving a person');
+  await (async () => {
+  const today = on;
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const dayText = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  const plusDays = (n) => { const d = new Date(`${on}T00:00:00`); d.setDate(d.getDate() + n); return dayText(d); };
+  const day = (v) => (v == null ? null : (v instanceof Date ? dayText(v) : String(v).slice(0, 10)));
+  const refused = (e, status, code) => Boolean(e) && e.status === status && e.code === code;
+  const why = (e) => (e ? `${e.status ?? '?'} ${e.code ?? ''} ${e.message ?? ''} ${JSON.stringify(e.problems ?? '')}` : 'nothing was thrown');
+  const [[otherCo]] = await db.query('SELECT id FROM companies WHERE id <> ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY]);
+  const OTHER = otherCo?.id ?? 0;
+  const there = { companyId: OTHER, userId: null };
+  const [people] = await db.query(
+    `SELECT e.id, e.full_name, e.employee_code, wa.id AS assignment_id, wa.position_id, wa.effective_from, p.position_code
+       FROM hrms_employees e
+       JOIN hrms_work_assignments wa ON wa.company_id = e.company_id AND wa.employee_id = e.id AND wa.deleted_at IS NULL AND wa.status = 'ACTIVE' AND wa.is_primary = 1
+            AND wa.effective_to IS NULL AND wa.effective_from < ?
+       JOIN hrms_positions p ON p.id = wa.position_id AND p.deleted_at IS NULL
+      WHERE e.company_id = ? AND e.deleted_at IS NULL AND e.employment_status = 'ACTIVE'
+        AND (SELECT COUNT(*) FROM hrms_work_assignments x WHERE x.employee_id = e.id AND x.deleted_at IS NULL AND x.status <> 'ENDED') = 1
+        AND NOT EXISTS (SELECT 1 FROM hrms_employee_exits x WHERE x.company_id = e.company_id AND x.employee_id = e.id AND x.deleted_at IS NULL AND x.status = 'OPEN')
+      ORDER BY e.id LIMIT 6`, [today, COMPANY]);
+  const [vacant] = await db.query(
+    `SELECT p.id, p.position_code, p.role_id, p.default_shift_id FROM hrms_positions p
+      WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status = 'ACTIVE' AND (p.effective_to IS NULL OR p.effective_to >= ?)
+        AND NOT EXISTS (SELECT 1 FROM hrms_work_assignments wa WHERE wa.company_id = p.company_id AND wa.position_id = p.id AND wa.deleted_at IS NULL AND wa.status <> 'ENDED')
+        AND NOT EXISTS (SELECT 1 FROM hrms_hirings h WHERE h.company_id = p.company_id AND h.open_position = p.id)
+      ORDER BY p.id LIMIT 6`, [COMPANY, today]);
+  if (people.length < 5 || vacant.length < 5) { skip('positions held and move', `needs 5 employees in one position each and 5 vacant positions; found ${people.length} and ${vacant.length}`); return; }
+  const [E, F, K, X, L] = people;
+  const [B, C, D, H, V] = vacant;
+  const yesterday = plusDays(-1);
+  const wa = async (id) => (await db.query('SELECT status, effective_from, effective_to, is_primary, position_id FROM hrms_work_assignments WHERE id = ?', [id]))[0][0];
+  const occupantOf = async (positionId) => (await POS.getPosition(db, COMPANY, positionId)).position.occupant?.employeeId ?? null;
+
+  // ── the history, before anything moves ──
+  const held0 = await HELD.positionsHeld(db, COMPANY, E.id);
+  const row0 = held0.positions[0];
+  ok(JSON.stringify(Object.keys(held0)) === JSON.stringify(['employee', 'positions', 'current', 'can'])
+    && JSON.stringify(held0.employee) === JSON.stringify({ id: E.id, code: E.employee_code, name: E.full_name, status: 'ACTIVE' })
+    && held0.positions.length === 1 && JSON.stringify(held0.current) === JSON.stringify([E.assignment_id]) && held0.can.move === true && held0.can.addSecond === true,
+  'GET /people/employees/:id/positions -> { employee, positions, current, can }');
+  ok(JSON.stringify(Object.keys(row0)) === JSON.stringify(['assignmentId', 'positionId', 'positionCode', 'positionTitle', 'roleId', 'roleTitle', 'roleCode', 'departmentId', 'departmentName', 'locationName', 'shift', 'from', 'to', 'isMain', 'state', 'ended', 'reason'])
+    && row0.positionId === E.position_id && row0.positionCode === E.position_code && row0.state === 'CURRENT' && row0.ended === null && row0.isMain === true && row0.to === null && row0.from === day(E.effective_from)
+    && row0.roleTitle && (row0.shift === null || typeof row0.shift.summary === 'string'),
+  'a position held: its code, role, department, shift, from, to, and how it ended (null while it is current)', JSON.stringify(row0));
+
+  // ── move ──
+  const moved = await HELD.moveEmployee(db, c, E.id, { positionId: B.id, effectiveFrom: today });
+  const oldRow = await wa(E.assignment_id);
+  const newRow = await wa(moved.moved.assignmentId);
+  ok(JSON.stringify(moved.moved) === JSON.stringify({ assignmentId: moved.moved.assignmentId, positionId: B.id, positionCode: B.position_code, from: today, endedAssignmentId: E.assignment_id, endedOn: yesterday, keptCurrent: false }),
+    'POST …/move -> { moved: { assignmentId, positionId, positionCode, from, endedAssignmentId, endedOn, keptCurrent }, …positions held }', JSON.stringify(moved.moved));
+  ok(oldRow.status === 'ENDED' && day(oldRow.effective_to) === yesterday && newRow.status === 'ACTIVE' && day(newRow.effective_from) === today && newRow.effective_to === null && newRow.is_primary === 1 && newRow.position_id === B.id,
+    'the old position ended the day BEFORE the new one starts; the new one is their main position', `${oldRow.status} to ${day(oldRow.effective_to)} / ${newRow.status} from ${day(newRow.effective_from)}`);
+  ok((await occupantOf(E.position_id)) === null && (await occupantOf(B.id)) === E.id, 'the position they left is vacant; the one they moved to is theirs');
+  ok(moved.positions.length === 2 && moved.positions[0].positionId === B.id && moved.positions[0].state === 'CURRENT' && moved.positions[0].ended === null
+    && moved.positions[1].positionId === E.position_id && moved.positions[1].state === 'ENDED' && moved.positions[1].to === yesterday
+    && JSON.stringify(moved.positions[1].ended) === JSON.stringify({ how: 'MOVED', label: `Moved to ${B.position_code}`, on: yesterday, movedToPositionCode: B.position_code })
+    && JSON.stringify(moved.current) === JSON.stringify([moved.moved.assignmentId]),
+  'positions held, newest first: the new one current, the old one ended — "Moved to <code>"', JSON.stringify(moved.positions.map((p) => [p.positionCode, p.state, p.ended?.label])));
+  const [[event]] = await db.query("SELECT event_type, summary, work_assignment_id FROM hrms_employment_events WHERE company_id = ? AND employee_id = ? ORDER BY id DESC LIMIT 1", [COMPANY, E.id]);
+  const [[auditRow]] = await db.query("SELECT after_json FROM hrms_audit_log WHERE company_id = ? AND entity_type = 'hrms_work_assignments' AND entity_id = ? AND action = 'CREATE'", [COMPANY, moved.moved.assignmentId]);
+  ok(event?.event_type === 'ASSIGNMENT_CHANGE' && event.work_assignment_id === moved.moved.assignmentId && event.summary.includes(E.position_code) && event.summary.includes(B.position_code)
+    && !/assignment|seat/i.test(event.summary) && Boolean(auditRow), 'the move is on their file ("Moved from … to …", no "assignment", no "seat") and in the audit log', event?.summary);
+
+  // ── refusals ──
+  const sentence = (e) => `${e?.message ?? ''} ${JSON.stringify(e?.problems ?? '')}`;
+  const filled = await caught(() => HELD.moveEmployee(db, c, F.id, { positionId: B.id }));
+  ok(refused(filled, 409, 'POSITION_FILLED') && filled.message.includes(E.full_name), 'to a position somebody is in: 409 POSITION_FILLED, naming them', why(filled));
+  await HIRE.startHiring(db, c, C.id);
+  const hiring = await caught(() => HELD.moveEmployee(db, c, F.id, { positionId: C.id }));
+  ok(refused(hiring, 409, 'HIRING_OPEN'), 'to a position a hiring is open for: 409 HIRING_OPEN', why(hiring));
+  const same = await caught(() => HELD.moveEmployee(db, c, F.id, { positionId: F.position_id }));
+  ok(refused(same, 409, 'ALREADY_THERE') && same.message.includes(F.full_name), 'to the position they are already in: 409 ALREADY_THERE', why(same));
+  await db.query("UPDATE hrms_employees SET employment_status = 'EXITED' WHERE id = ?", [X.id]);
+  const left = await caught(() => HELD.moveEmployee(db, c, X.id, { positionId: D.id }));
+  ok(refused(left, 409, 'EMPLOYEE_LEFT') && left.message.includes(X.full_name), 'somebody who has left: 409 EMPLOYEE_LEFT', why(left));
+  ok((await HELD.positionsHeld(db, COMPANY, X.id)).can.move === false && (await HELD.positionsHeld(db, COMPANY, X.id)).can.addSecond === false, '…and their page says so: can.move and can.addSecond are false');
+  await db.query("UPDATE hrms_positions SET status = 'CLOSED' WHERE id = ?", [V.id]);
+  const closed = await caught(() => HELD.moveEmployee(db, c, F.id, { positionId: V.id }));
+  ok(refused(closed, 409, 'POSITION_CLOSED'), 'to a closed position: 409 POSITION_CLOSED', why(closed));
+  const early = await caught(() => HELD.moveEmployee(db, c, F.id, { positionId: D.id, effectiveFrom: day(F.effective_from) }));
+  ok(refused(early, 422, 'INVALID') && /later date/.test(sentence(early)) && !/assignment/i.test(sentence(early)), 'on or before the day they started in the current position: 422, "choose a later date"', why(early));
+  for (const [label, fn, status, code] of [
+    ['no position', () => HELD.moveEmployee(db, c, F.id, {}), 422, 'INVALID'],
+    ['a date that is not a date', () => HELD.moveEmployee(db, c, F.id, { positionId: D.id, effectiveFrom: '12/10/2026' }), 422, 'INVALID'],
+    ['keepCurrent that is not yes or no', () => HELD.moveEmployee(db, c, F.id, { positionId: D.id, keepCurrent: 'maybe' }), 422, 'INVALID'],
+    ['a position that does not exist', () => HELD.moveEmployee(db, c, F.id, { positionId: 999999999 }), 404, 'NOT_FOUND'],
+    ['an employee that does not exist', () => HELD.moveEmployee(db, c, 999999999, { positionId: D.id }), 404, 'NOT_FOUND'],
+    ['positions held of an employee that does not exist', () => HELD.positionsHeld(db, COMPANY, 999999999), 404, 'NOT_FOUND'],
+  ]) ok(refused(await caught(fn), status, code), `${label}: ${status}`);
+  ok((await wa(F.assignment_id)).status === 'ACTIVE' && (await wa(F.assignment_id)).effective_to === null && (await occupantOf(D.id)) === null, 'none of those refusals moved anybody');
+
+  // ── a second position ──
+  const second = await HELD.moveEmployee(db, c, F.id, { positionId: D.id, keepCurrent: true });
+  const secondRow = await wa(second.moved.assignmentId);
+  ok(second.moved.keptCurrent === true && second.moved.endedAssignmentId === null && second.moved.endedOn === null && (await wa(F.assignment_id)).status === 'ACTIVE' && (await wa(F.assignment_id)).is_primary === 1
+    && secondRow.is_primary === 0 && secondRow.status === 'ACTIVE' && second.current.length === 2 && second.positions.filter((p) => p.state === 'CURRENT').length === 2
+    && second.positions.find((p) => p.positionId === D.id).isMain === false && second.positions.find((p) => p.positionId === F.position_id).isMain === true
+    && (await occupantOf(D.id)) === F.id && (await occupantOf(F.position_id)) === F.id,
+  'keepCurrent: true adds a SECOND position — nothing ends, the first stays their main one, both are current');
+  // Moving somebody who holds two: the main one ends unless the request names the other.
+  const fromSecond = await HELD.moveEmployee(db, c, F.id, { positionId: H.id, effectiveFrom: plusDays(1), fromAssignmentId: second.moved.assignmentId });
+  ok(fromSecond.moved.endedAssignmentId === second.moved.assignmentId && day((await wa(second.moved.assignmentId)).effective_to) === today && (await wa(F.assignment_id)).effective_to === null,
+    'somebody with two positions: fromAssignmentId says which one the move is from', JSON.stringify(fromSecond.moved));
+  ok(refused(await caught(() => HELD.moveEmployee(db, c, K.id, { positionId: H.id, fromAssignmentId: F.assignment_id })), 422, 'INVALID'), 'a fromAssignmentId that is not theirs: 422');
+
+  // ── a move on a later date ──
+  const later = plusDays(10);
+  await db.query("UPDATE hrms_positions SET status = 'ACTIVE' WHERE id = ?", [V.id]);
+  const planned = await HELD.moveEmployee(db, c, K.id, { positionId: V.id, effectiveFrom: later });
+  const kOld = await wa(K.assignment_id);
+  ok(planned.moved.endedOn === plusDays(9) && kOld.status === 'ACTIVE' && day(kOld.effective_to) === plusDays(9) && (await occupantOf(K.position_id)) === K.id,
+    'a move dated later: the current position gets its last day (the day before) and they are STILL in it today', `${kOld.status} to ${day(kOld.effective_to)}`);
+  const vNow = (await POS.getPosition(db, COMPANY, V.id)).position;
+  ok(vNow.occupant === null && vNow.joining?.employeeId === K.id && planned.positions[0].state === 'COMING' && planned.positions[0].from === later && planned.positions[1].state === 'CURRENT'
+    && planned.positions[1].to === plusDays(9) && planned.positions[1].ended === null && JSON.stringify(planned.current) === JSON.stringify([K.assignment_id]),
+  'the new position shows them as joining on that date; their history: COMING first, then the CURRENT one with its last day', JSON.stringify(planned.positions.map((p) => [p.positionCode, p.state, p.from, p.to])));
+  const asOfLater = await HELD.positionsHeld(db, COMPANY, K.id, { on: later });
+  ok(asOfLater.positions[0].state === 'CURRENT' && asOfLater.positions[1].state === 'ENDED' && asOfLater.positions[1].ended.how === 'MOVED' && asOfLater.positions[1].ended.label === `Moved to ${V.position_code}`,
+    'read as of that date (?on=): the new one is current and the old one reads "Moved to <code>"');
+  const taken = await caught(() => HELD.moveEmployee(db, c, L.id, { positionId: V.id, effectiveFrom: plusDays(20) }));
+  ok(refused(taken, 409, 'POSITION_FILLED'), 'a position promised to somebody from a later date is not free for another person after it: 409 POSITION_FILLED', why(taken));
+
+  // ── how it ended: left the company ──
+  await db.query("UPDATE hrms_work_assignments SET status = 'ENDED', effective_to = ? WHERE id = ?", [yesterday, L.assignment_id]);
+  await db.query(
+    "INSERT INTO hrms_employee_exits (company_id, employee_id, exit_type, reason_code, notice_date, last_working_day, status, closed_on) VALUES (?, ?, 'RESIGNED', 'OTHER', ?, ?, 'CLOSED', ?)",
+    [COMPANY, L.id, plusDays(-5), yesterday, today]);
+  await db.query("UPDATE hrms_employees SET employment_status = 'EXITED' WHERE id = ?", [L.id]);
+  const gone = await HELD.positionsHeld(db, COMPANY, L.id);
+  ok(JSON.stringify(gone.positions[0].ended) === JSON.stringify({ how: 'LEFT', label: 'Left the company', on: yesterday }) && gone.current.length === 0 && gone.employee.status === 'EXITED',
+    'the last position of somebody who left reads "Left the company"', JSON.stringify(gone.positions[0].ended));
+  await db.query("UPDATE hrms_work_assignments SET status = 'ENDED', effective_to = ? WHERE id = ?", [plusDays(-3), second.moved.assignmentId]);
+  ok((await HELD.positionsHeld(db, COMPANY, F.id)).positions.find((p) => p.assignmentId === second.moved.assignmentId).ended.how === 'ENDED', 'a position that simply ended, with nothing after it, reads "Ended"');
+
+  // ── another company ──
+  ok(refused(await caught(() => HELD.positionsHeld(db, OTHER, E.id)), 404, 'NOT_FOUND') && refused(await caught(() => HELD.moveEmployee(db, there, E.id, { positionId: H.id })), 404, 'NOT_FOUND'),
+    'another company cannot read a person’s positions or move them: 404');
+  const [[foreign]] = await db.query('SELECT p.id FROM hrms_positions p WHERE p.company_id <> ? AND p.deleted_at IS NULL LIMIT 1', [COMPANY]);
+  if (foreign) ok(refused(await caught(() => HELD.moveEmployee(db, c, L.id === E.id ? F.id : E.id, { positionId: foreign.id, keepCurrent: true })), 404, 'NOT_FOUND'), 'nor can this company move somebody into another company’s position: 404');
+  else skip('moving into another company’s position', 'no other company has a position');
+  })();
 } catch (err) {
   crashed = err;
 } finally {

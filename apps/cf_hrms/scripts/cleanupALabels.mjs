@@ -1,7 +1,7 @@
 /**
  * cleanupALabels.mjs — the label migration of apply-cleanup-a.mjs, as two
  * functions with no connection of their own, so the script and the test
- * (scripts/cf_hrms/cleanup_a_test.mjs) run the SAME code:
+ * (scripts/cf_hrms/label_test.mjs, section 10) run the SAME code:
  *
  *   planLabels(departments, labels)        pure: what would change for one company
  *   applyLabels(conn, companyId, plan)     writes it, on the caller's connection

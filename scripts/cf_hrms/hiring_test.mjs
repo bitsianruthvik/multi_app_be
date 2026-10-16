@@ -10,6 +10,10 @@
  *   3. codes: the default rule for a company with none, Karni's first new code,
  *      skipping codes in use, a code a client sends being ignored, a rolled-back
  *      create giving its number back, a rule with a condition;
+ *  3b. the same generator for departments, roles, positions and locations: the
+ *      default rules on first use, tokens, conditions, a tie, card codes, the
+ *      role-code-plus-number rule, a code too long, another company's rules
+ *      (from cleanup_a_test, 2026-10-16);
  *   4. the whole flow on a vacant Karni position: JD, offer letter, again,
  *      accept, appoint — and every refusal on the way;
  *   5. a hiring that is closed uses no employee code and keeps its reference;
@@ -54,7 +58,10 @@ import * as CODES from '../../apps/cf_hrms/services/codeService.js';
 import * as LETTER from '../../apps/cf_hrms/services/letterRenderer.js';
 import { scanParagraphs, replaceRanges, plainText } from '../../apps/cf_hrms/services/docxText.js';
 import { unpack } from '../../apps/cf_hrms/services/documentStorage.js';
-import { dateParts } from '../../apps/cf_hrms/services/codegenProvider.js';
+import { dateParts, initials, cardCodeOf } from '../../apps/cf_hrms/services/codegenProvider.js';
+import { generate } from '../../apps/cf_erp/modules/codegen/index.js';
+import * as ORG from '../../apps/cf_hrms/services/organisationService.js';
+import * as RC from '../../apps/cf_hrms/services/roleContentService.js';
 import { buildOrgChart, getPositionCard } from '../../apps/cf_hrms/services/orgChartService.js';
 import { previewDocument } from '../../apps/cf_hrms/services/documentService.js';
 import { CLOSE_REASON_GROUPS } from '../../apps/cf_hrms/services/hiringRead.js';
@@ -417,6 +424,228 @@ await rolledBack(async (db) => {
   const again = await PEOPLE.createEmployee(db, c, { fullName: `${TAG} Again`, dateOfJoining: on });
   ok(again.employee.employeeCode === firstCode, `and the same code is issued to the next create (${firstCode})`, again.employee.employeeCode);
 });
+
+/* ══ 3b. codes of departments, roles, positions, locations (from cleanup_a_test, 2026-10-16) ══ */
+section('[3b] Codes: departments, roles, positions, locations (spec §11)');
+// A company with no department and no hrms code rule, so "first use" really is the first.
+const [[FRESH]] = await pool.query(
+  `SELECT co.id, co.name FROM companies co
+    WHERE co.id <> ? AND co.deleted_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM hrms_departments d WHERE d.company_id = co.id)
+      AND NOT EXISTS (SELECT 1 FROM cf_code_schemes s WHERE s.company_id = co.id AND s.entity_type LIKE 'hrms\_%' AND s.deleted_at IS NULL)
+    ORDER BY co.id LIMIT 1`, [COMPANY]);
+const atFresh = FRESH ? { companyId: FRESH.id, userId: null } : null;
+ok(initials('Quality Control') === 'QC' && initials('Unit 2') === 'U2' && initials('  shift in-charge ') === 'SIC' && initials('Stores') === 'S' && initials('') === '' && initials(null) === ''
+  && cardCodeOf('P021-3') === 'P021' && cardCodeOf('P021') === 'P021' && cardCodeOf('') === null && cardCodeOf(null) === null, 'initials and the card code read as the guide says');
+
+const split = (code) => { const m = /^(.*?)(\d+)$/.exec(String(code)); return m ? { head: m[1], n: Number(m[2]), width: m[2].length } : null; };
+const nextOf = (code, by = 1) => { const s = split(code); return `${s.head}${String(s.n + by).padStart(s.width, '0')}`; };
+const ruleCount = async (db, companyId, entityType) => Number((await db.query(
+  "SELECT COUNT(*) AS n FROM cf_code_schemes WHERE company_id = ? AND entity_type = ? AND target_field = 'code' AND deleted_at IS NULL", [companyId, entityType]))[0][0].n);
+const counters = async (db, companyId, entityType) => (await db.query(
+  `SELECT q.seq_key, q.next_value FROM cf_code_sequences q JOIN cf_code_schemes s ON s.id = q.scheme_id
+    WHERE q.company_id = ? AND s.entity_type = ? AND s.deleted_at IS NULL ORDER BY q.seq_key`, [companyId, entityType]))[0].map((r) => `${r.seq_key}=${r.next_value}`).join(',');
+
+// ── the default rule on first use, in a company that has never had one ──
+await rolledBack(async (db) => {
+  if (!FRESH) { skip('the default rule on first use', 'no company without departments and hrms code rules'); return; }
+  ok((await ruleCount(db, FRESH.id, 'hrms_department')) + (await ruleCount(db, FRESH.id, 'hrms_role')) + (await ruleCount(db, FRESH.id, 'hrms_position')) + (await ruleCount(db, FRESH.id, 'hrms_location')) === 0,
+    `${FRESH.name} starts with no rule for any of the four`);
+  const d1 = await ORG.createDepartment(db, atFresh, { name: `${TAG} First department` });
+  const d2 = await ORG.createDepartment(db, atFresh, { name: `${TAG} Second department`, parentId: d1.id });
+  const r1 = await RC.createRole(db, atFresh, { title: `${TAG} First role`, status: 'ACTIVE' });
+  const l1 = await ORG.createLocation(db, atFresh, { name: `${TAG} First location` });
+  const p1 = (await POS.createPosition(db, atFresh, { roleId: r1.id, departmentId: d1.id, locationId: l1.id, status: 'ACTIVE' })).position;
+  const p2 = (await POS.createPosition(db, atFresh, { roleId: r1.id, status: 'ACTIVE' })).position;
+  ok(d1.code === 'D001' && d2.code === 'D002' && r1.roleCode === 'R001' && l1.code === 'L01' && p1.positionCode === 'P001' && p2.positionCode === 'P002',
+    'the first of each gets the default rule’s first code: D001, D002 · R001 · L01 · P001, P002', [d1.code, d2.code, r1.roleCode, l1.code, p1.positionCode, p2.positionCode].join(' '));
+  const [made] = await db.query("SELECT entity_type, code, status FROM cf_code_schemes WHERE company_id = ? AND entity_type LIKE 'hrms\\_%' AND deleted_at IS NULL ORDER BY entity_type", [FRESH.id]);
+  ok(JSON.stringify(made.map((m) => `${m.entity_type}:${m.code}:${m.status}`)) === JSON.stringify(['hrms_department:HRMS_DEPARTMENT:active', 'hrms_location:HRMS_LOCATION:active', 'hrms_position:HRMS_POSITION:active', 'hrms_role:HRMS_ROLE:active']),
+    'each default rule was created once, on first use, and only for what was created', JSON.stringify(made.map((m) => m.code)));
+  const sib = (await POS.addSiblingPosition(db, atFresh, p1.id, {})).position;
+  ok(sib.positionCode === 'P003', 'add-sibling under the default rule takes the next code like any new position', sib.positionCode);
+});
+
+await rolledBack(async (db) => {
+  const G = (await db.query('SELECT id, code FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY]))[0][0] ?? null;
+
+  // THE TEST OWNS ITS POSITION RULE. The tenant's own (a plain running number, role code plus number, or
+  // none at all) is switched off for this transaction, so no check below depends on how it codes positions.
+  await db.query("UPDATE cf_code_schemes SET status = 'inactive' WHERE company_id = ? AND entity_type = 'hrms_position' AND deleted_at IS NULL", [COMPANY]);
+  await createScheme(db, COMPANY, c.userId, {
+    code: `${TAG}_BASE`, name: `${TAG} base`, entityType: 'hrms_position', targetField: 'code', seqScope: 'prefix', priority: 0, status: 'active', conditions: [],
+    segments: [{ segmentType: 'literal', literalText: `${TAG}P` }, { segmentType: 'sequence', format: '000' }],
+  });
+
+  // ── a code a client sends is ignored, on create and on update ──
+  const dept = await ORG.createDepartment(db, c, { name: `${TAG} Quality Control`, code: `${TAG}HACK`, type: 'Machine' });
+  const role = await RC.createRole(db, c, { title: `${TAG} Quality Inspector`, roleCode: `${TAG}HACK`, status: 'ACTIVE', defaultDepartmentId: dept.id });
+  const loc = await ORG.createLocation(db, c, { name: `${TAG} Unit 3`, code: `${TAG}HACK`, address: { city: 'Navi Mumbai' } });
+  const pos = (await POS.createPosition(db, c, { roleId: role.id, departmentId: dept.id, locationId: loc.id, positionCode: `${TAG}HACK`, status: 'ACTIVE' })).position;
+  const issued = { dept: dept.code, role: role.roleCode, loc: loc.code, pos: pos.positionCode };
+  ok(Object.values(issued).every((v) => v && !String(v).includes('HACK')), 'create ignores a code the client sends: each record gets the company’s next code', JSON.stringify(issued));
+  const dept2 = await ORG.updateDepartment(db, c, dept.id, { code: `${TAG}CHANGED`, name: `${TAG} Quality Control 2` });
+  const role2 = await RC.updateRole(db, c, role.id, { roleCode: `${TAG}CHANGED`, roleSummary: 'Edited.' });
+  const loc2 = await ORG.updateLocation(db, c, loc.id, { code: `${TAG}CHANGED`, name: `${TAG} Unit 3 renamed` });
+  const pos2 = (await POS.updatePosition(db, c, pos.id, { positionCode: `${TAG}CHANGED`, positionTitle: `${TAG} Retitled` })).position;
+  ok(dept2.code === issued.dept && dept2.name === `${TAG} Quality Control 2` && role2.roleCode === issued.role && loc2.code === issued.loc && loc2.name === `${TAG} Unit 3 renamed`
+    && pos2.positionCode === issued.pos && pos2.positionTitle === `${TAG} Retitled`,
+  'update never changes a code — the other fields of the same request are saved', JSON.stringify({ d: dept2.code, r: role2.roleCode, l: loc2.code, p: pos2.positionCode }));
+  ok((await caught(() => ORG.updateDepartment(db, c, dept.id, { code: 'has spaces and is far too long to be a code at all, really it is' }))) === null, 'a nonsense code on update is not even validated: it is not read');
+
+  // ── a code already in use is stepped over; a deleted record’s code too ──
+  for (const [label, table, column, make, read] of [
+    ['department', 'hrms_departments', 'code', () => ORG.createDepartment(db, c, { name: `${TAG} D ${Math.random()}` }), (x) => x.code],
+    ['role', 'hrms_roles', 'role_code', () => RC.createRole(db, c, { title: `${TAG} R ${Math.random()}`, status: 'ACTIVE' }), (x) => x.roleCode],
+    ['location', 'hrms_locations', 'code', () => ORG.createLocation(db, c, { name: `${TAG} L ${Math.random()}` }), (x) => x.code],
+    ['position', 'hrms_positions', 'position_code', async () => (await POS.createPosition(db, c, { roleId: role.id, status: 'ACTIVE' })).position, (x) => x.positionCode],
+  ]) {
+    const a = read(await make());
+    if (!split(a)) { skip(`${label}: stepping over a used code`, `this company’s ${label} rule does not end in a number (${a})`); continue; }
+    // Somebody else already holds the next two codes: one live, one deleted.
+    const extra = table === 'hrms_departments' || table === 'hrms_locations' ? ['name', `${TAG} taken`] : table === 'hrms_roles' ? ['title', `${TAG} taken ${label}`] : ['role_id', role.id];
+    await db.query(`INSERT INTO ${table} (company_id, ${column}, ${extra[0]}) VALUES (?, ?, ?)`, [COMPANY, nextOf(a, 1).toLowerCase(), extra[1]]);
+    await db.query(`INSERT INTO ${table} (company_id, ${column}, ${extra[0]}, deleted_at) VALUES (?, ?, ?, NOW())`, [COMPANY, nextOf(a, 2), `${extra[1]}${table === 'hrms_positions' ? '' : ' gone'}`]);
+    const b = read(await make());
+    ok(b === nextOf(a, 3), `${label}: the next two codes are taken (one by a live record in other capitals, one by a deleted record) — the generator steps over both`, `${a} -> ${b}`);
+  }
+
+  // ── a create that rolls back gives its number back ──
+  for (const [label, entityType, make, read] of [
+    ['department', 'hrms_department', () => ORG.createDepartment(db, c, { name: `${TAG} RB ${Math.random()}` }), (x) => x.code],
+    ['role', 'hrms_role', () => RC.createRole(db, c, { title: `${TAG} RB ${Math.random()}`, status: 'ACTIVE' }), (x) => x.roleCode],
+    ['location', 'hrms_location', () => ORG.createLocation(db, c, { name: `${TAG} RB ${Math.random()}` }), (x) => x.code],
+    ['position', 'hrms_position', async () => (await POS.createPosition(db, c, { roleId: role.id, status: 'ACTIVE' })).position, (x) => x.positionCode],
+  ]) {
+    const before = await counters(db, COMPANY, entityType);
+    await db.query('SAVEPOINT rb');
+    const lost = read(await make());
+    const during = await counters(db, COMPANY, entityType);
+    await db.query('ROLLBACK TO SAVEPOINT rb');
+    const after = await counters(db, COMPANY, entityType);
+    const again = read(await make());
+    ok(during !== before && after === before && again === lost, `${label}: a create that is rolled back gives its number back — the next one gets the same code`, `${lost} then ${again}; counter ${before} -> ${during} -> ${after}`);
+  }
+  // …and a create refused by a rule takes none.
+  const beforeRefusal = await counters(db, COMPANY, 'hrms_department');
+  await caught(() => ORG.createDepartment(db, c, { name: `${TAG} Refused`, type: `${TAG} no such label` }));
+  await caught(() => ORG.createDepartment(db, c, { name: '', type: 'Machine' }));
+  ok((await counters(db, COMPANY, 'hrms_department')) === beforeRefusal, 'a create refused for its label or its name takes no number');
+
+  // ── the tokens render, and a rule with a condition beats the plain one ──
+  const [[machine]] = await db.query("SELECT id FROM hrms_department_labels WHERE company_id = ? AND deleted_at IS NULL AND name = 'Machine'", [COMPANY]);
+  const rule = (entityType, code, segments, conditions = []) => createScheme(db, COMPANY, c.userId, {
+    code: `${TAG}_${code}`, name: `${TAG} ${code}`, entityType, targetField: 'code', seqScope: 'prefix', priority: 10, status: 'active', conditions, segments,
+  });
+  const lit = (t) => ({ segmentType: 'literal', literalText: t });
+  const tok = (k, extra = {}) => ({ segmentType: 'token', tokenKey: k, ...extra });
+  const seq = (f) => ({ segmentType: 'sequence', format: f });
+
+  if (machine) {
+    await rule('hrms_department', 'DEPT', [tok('label.initial'), lit('-'), tok('name.initials'), lit('-'), tok('parent.code'), lit('-'), seq('0')], [{ tokenKey: 'label', operator: 'eq', value: String(machine.id) }]);
+    const press = await ORG.createDepartment(db, c, { name: 'Offset Press', type: 'Machine', parentId: dept.id });
+    const press2 = await ORG.createDepartment(db, c, { name: 'offset  press two', type: 'machine', parentId: dept.id });
+    const office = await ORG.createDepartment(db, c, { name: `${TAG} Office`, type: 'Department', parentId: dept.id });
+    ok(press.code === `M-OP-${dept.code}-1` && press2.code === `M-OPT-${dept.code}-1` && split(office.code) && !office.code.startsWith('M-'),
+      'a department rule {label.initial}-{name.initials}-{parent.code}-{#} for the label Machine: M-OP-<parent>-1; a Department still gets the plain rule', `${press.code} ${press2.code} ${office.code}`);
+    const top = await caught(() => ORG.createDepartment(db, c, { name: 'Top Machine', type: 'Machine' }));
+    ok(top?.status === 422 && top.code === 'TOKEN_MISSING' && /parent\.code/.test(top.message), 'a rule that needs the department above refuses a department with none (422 TOKEN_MISSING), rather than print a code with a hole in it', why(top));
+    const preview = await generate(db, COMPANY, 'hrms_department', 'code', { entityId: press.id }, { consume: false });
+    ok(preview.text === `M-OP-${dept.code}-2` && preview.schemeCode === `${TAG}_DEPT`, 'the rules screen can preview a SAVED department: its rule and the number that would be next', JSON.stringify(preview));
+  } else skip('department tokens', 'this company has no label called Machine');
+
+  await db.query("UPDATE cf_code_schemes SET status = 'inactive' WHERE company_id = ? AND entity_type IN ('hrms_role', 'hrms_location') AND code NOT LIKE ?", [COMPANY, `${TAG}%`]);
+  await rule('hrms_role', 'ROLE', [tok('title.initials'), lit('/'), tok('department.code', { isRequired: false }), lit('/'), seq('00')]);
+  const qi = await RC.createRole(db, c, { title: 'Quality  Inspector (night)', status: 'ACTIVE', defaultDepartmentId: dept.id });
+  const qi2 = await RC.createRole(db, c, { title: 'quality inspector day', status: 'ACTIVE' });
+  ok(qi.roleCode === `QIN/${dept.code}/01` && qi2.roleCode === 'QID//01', 'a role rule {title.initials}/{department.code}/{##}: QIN/<department>/01; a part that is not required prints nothing when the role has no department', `${qi.roleCode} ${qi2.roleCode}`);
+  await rule('hrms_location', 'LOC', [tok('city.initials', { isRequired: false }), lit('-'), tok('name.initials'), lit('-'), seq('0')]);
+  const u3 = await ORG.createLocation(db, c, { name: 'Unit 3', address: { city: 'Navi Mumbai' } });
+  const u4 = await ORG.createLocation(db, c, { name: 'Head office' });
+  ok(u3.code === 'NM-U3-1' && u4.code === '-HO-1', 'a location rule {city.initials}-{name.initials}-{#}: NM-U3-1; no city in the address prints nothing there', `${u3.code} ${u4.code}`);
+
+  // ── positions: {department.code}-{role.code}-{##}, and add-sibling through the generator ──
+  await rule('hrms_position', 'POS', [tok('department.code'), lit('-'), tok('role.code'), lit('-'), seq('00')], [{ tokenKey: 'role', operator: 'eq', value: String(qi.id) }]);
+  const a1 = (await POS.createPosition(db, c, { roleId: qi.id, departmentId: dept.id, status: 'ACTIVE', ...(G ? { defaultShiftId: G.id } : {}) })).position;
+  const a2 = (await POS.createPosition(db, c, { roleId: qi.id, departmentId: dept.id, status: 'ACTIVE' })).position;
+  const elsewhere = (await POS.createPosition(db, c, { roleId: role.id, departmentId: dept.id, status: 'ACTIVE' })).position;
+  ok(a1.positionCode === `${dept.code}-${qi.roleCode}-01` && a2.positionCode === `${dept.code}-${qi.roleCode}-02` && split(elsewhere.positionCode) && !elsewhere.positionCode.includes(qi.roleCode),
+    'a position rule {department.code}-{role.code}-{##} for one role: <department>-<role>-01, -02; a position of another role still gets the plain rule', `${a1.positionCode} ${a2.positionCode} ${elsewhere.positionCode}`);
+  const a3 = (await POS.addSiblingPosition(db, c, a1.id, {})).position;
+  ok(a3.positionCode === `${dept.code}-${qi.roleCode}-03` && (await db.query('SELECT position_code FROM hrms_positions WHERE id = ?', [a1.id]))[0][0].position_code === a1.positionCode,
+    'add-sibling goes through the generator: the same rule, the next number (-03) — not "<source>-2"; the source keeps its code', a3.positionCode);
+  const underCondition = await rule('hrms_position', 'DEPTPOS', [lit('QC-'), tok('shift.code', { isRequired: false }), tok('location.code', { isRequired: false }), seq('000')], [{ tokenKey: 'department', operator: 'under', value: String(dept.id) }]);
+  const b1 = (await POS.createPosition(db, c, { roleId: role.id, departmentId: dept.id, locationId: u3.id, status: 'ACTIVE', ...(G ? { defaultShiftId: G.id } : {}) })).position;
+  const general = (await db.query("SELECT id, code FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY (UPPER(code) LIKE 'G%') DESC, id LIMIT 1", [COMPANY]))[0][0] ?? null;
+  ok(b1.positionCode === `QC-${G?.code ?? general?.code ?? ''}NM-U3-1001` && underCondition.id > 0, 'a position rule "department is under X" prints the shift and location codes: QC-<shift><location>001', b1.positionCode);
+  // That role in that department now has TWO rules that weigh the same. The generator does not guess.
+  const tie = await caught(() => POS.createPosition(db, c, { roleId: qi.id, departmentId: dept.id, status: 'ACTIVE' }));
+  ok(tie?.status === 409 && tie.code === 'SCHEME_TIE' && tie.message.includes(`${TAG}_POS`) && tie.message.includes(`${TAG}_DEPTPOS`),
+    'two rules that apply equally (one by role, one by department) are a 409 SCHEME_TIE naming both — never decided by row order', why(tie));
+  await db.query('UPDATE cf_code_schemes SET priority = 20 WHERE company_id = ? AND code = ?', [COMPANY, `${TAG}_POS`]);
+  const a4 = (await POS.createPosition(db, c, { roleId: qi.id, departmentId: dept.id, status: 'ACTIVE' })).position;
+  ok(a4.positionCode === `${dept.code}-${qi.roleCode}-04`, 'give one a higher priority and it wins; the refused create took no number (-04 is next)', a4.positionCode);
+
+  // card.code: number the chairs of a card P021-1, P021-2 …
+  const lone = (await POS.createPosition(db, c, { roleId: qi2.id, status: 'ACTIVE' })).position;
+  await rule('hrms_position', 'CARD', [tok('card.code'), lit('-'), seq('0')], [{ tokenKey: 'role', operator: 'eq', value: String(qi2.id) }]);
+  const s1 = (await POS.addSiblingPosition(db, c, lone.id, {})).position;
+  const s2 = (await POS.addSiblingPosition(db, c, s1.id, {})).position;
+  ok(s1.positionCode === `${lone.positionCode}-1` && s2.positionCode === `${lone.positionCode}-2`,
+    'a rule {card.code}-{#}: siblings are numbered after the card’s first position — and a sibling OF a sibling strips the tail first', `${lone.positionCode} -> ${s1.positionCode}, ${s2.positionCode}`);
+  await db.query('INSERT INTO hrms_positions (company_id, position_code, role_id) VALUES (?, ?, ?)', [COMPANY, `${lone.positionCode}-3`, qi2.id]);
+  const s4 = (await POS.addSiblingPosition(db, c, lone.id, {})).position;
+  ok(s4.positionCode === `${lone.positionCode}-4`, '…and steps over a number somebody already holds', s4.positionCode);
+  const noCard = await caught(() => POS.createPosition(db, c, { roleId: qi2.id, status: 'ACTIVE' }));
+  ok(noCard?.status === 422 && noCard.code === 'TOKEN_MISSING' && /card\.code/.test(noCard.message), 'under that rule a position created on its own has no card code: 422 TOKEN_MISSING, in words', why(noCard));
+  const savedPreview = await generate(db, COMPANY, 'hrms_position', 'code', { entityId: s1.id }, { consume: false });
+  ok(savedPreview.text === `${lone.positionCode}-5`, 'previewing a SAVED position reads its card from the chart', JSON.stringify(savedPreview));
+
+  // ── role code plus number (setup-codes.mjs --position-by-role): {role.code}-{#}, counted per role ──
+  const byRoleA = await RC.createRole(db, c, { title: `${TAG} Zeta Alpha`, status: 'ACTIVE' });
+  const byRoleB = await RC.createRole(db, c, { title: `${TAG} Zeta Beta`, status: 'ACTIVE' });
+  await rule('hrms_position', 'BYROLE', [tok('role.code'), lit('-'), seq('0')], [{ tokenKey: 'role', operator: 'in', value: `${byRoleA.id},${byRoleB.id}` }]);
+  const mkBy = async (r) => (await POS.createPosition(db, c, { roleId: r.id, status: 'ACTIVE' })).position;
+  const ra1 = await mkBy(byRoleA);
+  const ra2 = await mkBy(byRoleA);
+  await db.query('INSERT INTO hrms_positions (company_id, position_code, role_id) VALUES (?, ?, ?), (?, ?, ?)',
+    [COMPANY, `${byRoleA.roleCode}-3`, byRoleA.id, COMPANY, `${byRoleA.roleCode}-4`.toLowerCase(), byRoleA.id]);
+  const ra5 = (await POS.addSiblingPosition(db, c, ra1.id, {})).position;
+  const rb1 = await mkBy(byRoleB);
+  const rb2 = await mkBy(byRoleB);
+  ok(ra1.positionCode === `${byRoleA.roleCode}-1` && ra2.positionCode === `${byRoleA.roleCode}-2` && ra5.positionCode === `${byRoleA.roleCode}-5`
+    && rb1.positionCode === `${byRoleB.roleCode}-1` && rb2.positionCode === `${byRoleB.roleCode}-2` && byRoleA.roleCode !== byRoleB.roleCode,
+  'under {role.code}-{#}: two positions of a role are <role>-1 and <role>-2, the next one (added beside the first) continues past the numbers already used (-5), and another role starts its own count at -1',
+  [ra1, ra2, ra5, rb1, rb2].map((p) => p.positionCode).join(' '));
+
+  // ── a code too long for the column is refused in words ──
+  await rule('hrms_location', 'LONG', [lit('X'.repeat(60)), seq('0')]);
+  await db.query('UPDATE cf_code_schemes SET priority = 99 WHERE company_id = ? AND code = ?', [COMPANY, `${TAG}_LONG`]);
+  const tooLong = await caught(() => ORG.createLocation(db, c, { name: `${TAG} Too long` }));
+  ok(refused(tooLong, 422, 'CODE_TOO_LONG') && /50 characters/.test(tooLong.message), 'a format that prints more than the 50 characters a code can hold: 422 CODE_TOO_LONG', why(tooLong));
+
+  // ── the retired import path: a code the record already holds ──
+  const imported = await ORG.createDepartment(db, c, { name: `${TAG} Imported` }, { importedCode: `${TAG}IMP` });
+  const importedAgain = await caught(() => ORG.createDepartment(db, c, { name: `${TAG} Imported twice` }, { importedCode: `${TAG}imp` }));
+  ok(imported.code === `${TAG}IMP` && refused(importedAgain, 409, 'DUPLICATE'), 'the import scripts’ own path (options.importedCode, never a request body) keeps a code as it is, and refuses one already used', why(importedAgain));
+
+  // ── another company’s rules and counters are its own ──
+  const theirRule = await caught(() => createScheme(db, OTHER, null, {
+    code: `${TAG}_THEIRS`, name: 'x', entityType: 'hrms_position', targetField: 'code', seqScope: 'prefix', priority: 0, status: 'active',
+    conditions: [{ tokenKey: 'role', operator: 'eq', value: String(qi.id) }], segments: [seq('0')],
+  }));
+  const theirLabelRule = machine ? await caught(() => createScheme(db, OTHER, null, {
+    code: `${TAG}_THEIRS2`, name: 'x', entityType: 'hrms_department', targetField: 'code', seqScope: 'prefix', priority: 0, status: 'active',
+    conditions: [{ tokenKey: 'label', operator: 'eq', value: String(machine.id) }], segments: [seq('0')],
+  })) : { status: 422 };
+  ok(theirRule?.status === 422 && theirLabelRule?.status === 422, 'another company cannot write a rule that tests this company’s role or label (422)', `${theirRule?.status} ${theirLabelRule?.status}`);
+});
+{
+  const [[left]] = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM hrms_departments WHERE name LIKE ?) AS departments, (SELECT COUNT(*) FROM hrms_roles WHERE title LIKE ?) AS roles,
+            (SELECT COUNT(*) FROM cf_code_schemes WHERE code LIKE ?) AS rules`, [`${TAG}%`, `${TAG}%`, `${TAG}%`]);
+  ok(Number(left.departments) + Number(left.roles) + Number(left.rules) === 0, 'rolled back: no department, role or code rule of this run is left, in any company');
+}
 
 /* ══ 4. the whole flow ════════════════════════════════════════════════════ */
 section('[4] The flow on a vacant position: JD -> offer letter -> again -> accept -> appoint');
@@ -1184,6 +1413,23 @@ section('[8] Permissions and the two Code formats screens, over HTTP');
       const entities = await call(admin, 'GET', `${api}/codegen/entities`);
       ok(entities.status === 200 && JSON.stringify(entities.json.map((e) => e.entityType)) === JSON.stringify(['hrms_department', 'hrms_role', 'hrms_position', 'hrms_location', 'hrms_employee', 'hrms_hiring']),
         'cf_hrms Code formats offers exactly its six: departments, roles, positions, locations, employees, letters', JSON.stringify(entities.json.map?.((e) => e.entityType)));
+      // The four of spec §11 (from cleanup_a_test, 2026-10-16): labels, tokens and conditions, in the order of the screen.
+      const by = Object.fromEntries((entities.json ?? []).map((e) => [e.entityType, e]));
+      const keys = (e) => e.tokens.map((t) => t.key).join(' ');
+      const tests = (e) => e.conditionTokens.map((t) => `${t.key}:${t.operators.join('/')}:${t.valueKind}`).join(' ');
+      ok(JSON.stringify(entities.json.map((e) => e.label)) === JSON.stringify(['Departments', 'Roles', 'Positions', 'Locations', 'Employees', 'Letters (reference numbers)'])
+        && keys(by.hrms_department) === 'label label.initial name.initials name parent.code' && tests(by.hrms_department) === 'label:eq/in:departmentLabel'
+        && keys(by.hrms_role) === 'title.initials title department.code' && tests(by.hrms_role) === ''
+        && keys(by.hrms_position) === 'role.code department.code shift.code location.code card.code' && tests(by.hrms_position) === 'department:under/eq/in:department role:eq/in:role'
+        && keys(by.hrms_location) === 'name.initials name city.initials' && tests(by.hrms_location) === ''
+        && ['hrms_department', 'hrms_role', 'hrms_position', 'hrms_location'].every((k) => by[k].tokens.every((t) => t.label && t.phrase && t.help && t.example && t.available === true)
+          && by[k].conditionTokens.every((t) => t.label && t.phrase && t.help)),
+      'departments, roles, positions, locations: their labels, tokens and conditions, every one with label, phrase, help and example');
+      const rolePreview = await call(admin, 'POST', `${api}/codegen/preview`, { entityType: 'hrms_role', draft: { title: 'Quality Inspector' } });
+      const posRules = await call(admin, 'GET', `${api}/codegen/schemes?entityType=hrms_position`);
+      ok(rolePreview.status === 200 && typeof rolePreview.json.text === 'string' && rolePreview.json.text.length > 0
+        && posRules.status === 200 && Array.isArray(posRules.json) && posRules.json.every((s) => s.entityType === 'hrms_position'),
+      'a role not saved yet previews the shape of its code; ?entityType=hrms_position lists position rules only', JSON.stringify(rolePreview.json));
       const emp = entities.json.find((e) => e.entityType === 'hrms_employee');
       const ref = entities.json.find((e) => e.entityType === 'hrms_hiring');
       ok(emp.label === 'Employees' && JSON.stringify(emp.tokens.map((t) => t.key)) === JSON.stringify(['department.code', 'department.name', 'location.code', 'location.name', 'role.code',
