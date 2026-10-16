@@ -407,7 +407,7 @@ async function requireOrder(db, companyId, id) {
 
 async function requireLine(db, companyId, id) {
   const [[l]] = await db.query(
-    `SELECT l.*, p.status AS po_status, p.code AS po_code, p.supplier_id
+    `SELECT l.*, p.status AS po_status, p.code AS po_code, p.supplier_id, p.supplied_by_customer, p.for_order_id
        FROM cf_purchase_order_lines l JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
       WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL`,
     [companyId, Number(id)],
@@ -531,6 +531,8 @@ export async function getPurchaseOrder(db, companyId, id) {
     status: p.status,
     suggested: !!p.suggested,
     supplier: sup ? { id: sup.id, code: sup.code, name: sup.name } : null,
+    // §66: the customer's own material, asked of the customer as vendor (₹0); its receipt is their lot.
+    suppliedByCustomer: !!Number(p.supplied_by_customer ?? 0),
     expectedDate: p.expected_date,
     orderedAt: p.ordered_at,
     notes: p.notes,
@@ -647,6 +649,7 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
     status: p.status,
     suggested: !!p.suggested,
     supplier: p.supplier_id ? { id: p.supplier_id, code: p.supplier_code, name: p.supplier_name } : null,
+    suppliedByCustomer: !!Number(p.supplied_by_customer ?? 0),
     expectedDate: p.expected_date,
     orderedAt: p.ordered_at,
     createdAt: p.created_at,
@@ -915,6 +918,17 @@ export async function cancelPurchaseOrder(db, c, id, input = {}) {
   const note = blank(input.reason) ? p.notes : `${p.notes ? `${p.notes}\n` : ''}Cancelled: ${String(input.reason).slice(0, 255)}`;
   const boughtFor = await boughtForOf(db, c.companyId, p, { poId: p.id });
   await db.query("UPDATE cf_purchase_orders SET status = 'cancelled', suggested = 0, notes = ? WHERE company_id = ? AND id = ?", [note, c.companyId, p.id]);
+  /*
+   * MATERIAL REQUEST (§66): what the PO was bought for is no longer coming — its shares are DROPPED, so the
+   * MR lines they served show that quantity OPEN again on the next read, with no step by anybody (nothing was
+   * received: a PO with a receipt cannot be cancelled). The MR and the PO still list them, as cancelled.
+   */
+  await db.query(
+    `UPDATE cf_purchase_line_orders a JOIN cf_purchase_order_lines l ON l.id = a.purchase_line_id
+        SET a.deleted_at = NOW()
+      WHERE a.company_id = ? AND l.purchase_order_id = ? AND a.deleted_at IS NULL`,
+    [c.companyId, p.id],
+  );
   const po = await getPurchaseOrder(db, c.companyId, p.id);
   return { ...po, plannedUnits: await plannedUnitsAfter(db, c.companyId, boughtFor, { purchaseOrder: { id: p.id, code: p.code }, cancelled: true }, planStampOf(p)) };
 }
@@ -933,7 +947,18 @@ export async function receiveLine(db, c, lineId, input = {}) {
   const quantity = readQty(input.quantity ?? left, 'Quantity', problems);
   if (quantity != null && quantity > left + EPS) problems.push(`Only ${fmt(left)} ${l.uom} of this line is still outstanding.`);
   if (blank(input.stockingAreaId)) problems.push('Say which stocking area it went into.');
+  const theirs = !!Number(l.supplied_by_customer ?? 0);
   const receipt = receiptLineFor(l, { ...input, quantity }, problems);
+  if (theirs) {
+    /*
+     * CUSTOMER-SUPPLIED (§66): what arrives is the CUSTOMER's lot (owner = the customer, for the order the
+     * PO serves), never ours and never costed as ours. It is then earmarked to the MR line (holdOnReceipt).
+     */
+    delete receipt.unitCost;
+    const [[a]] = await db.query('SELECT order_id FROM cf_purchase_line_orders WHERE company_id = ? AND purchase_line_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [c.companyId, l.id]);
+    receipt.ownerPartyId = l.supplier_id;
+    receipt.ownerOrderId = a?.order_id ?? l.for_order_id ?? undefined;
+  }
   assertNoProblems(problems, 'The delivery cannot be booked.');
   const movement = await postMovement(db, c, {
     movementType: 'receipt',

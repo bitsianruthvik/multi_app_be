@@ -22,16 +22,29 @@
  *
  * THE SAME MEASURES ON BOTH SIDES, by the same code: steel by weight, waste by cause
  * (nestingService.wasteOfLot), cut length and piercings (plateCutsService.cutsOfLots — what a
- * saved nest writes on its cut plates), and cost by the saved nest's own rule
- * (valuationService.orderCosts): what that plate size cost issued to this line, else its average
- * cost, else its last receipt — and, for a plate never received (the usual case before buying),
- * its last purchase price, else its list price; `basis` says which. A plate with none of them has
- * NO cost: the total is then null with the reason, never a partial sum, never zero.
+ * saved nest writes on its cut plates), and cost by the order's own plate rate (2026-10-16:
+ * valuationService.plateRatesPerKg × the plate's kg — average cost, else last receipt, else the last
+ * price paid, else the list price; `basis` says which). A plate with none of them has NO cost: the
+ * total is then null with the reason, never a partial sum, never zero.
+ *
+ * THE AUTOMATIC COMPARISON AFTER AN UPLOAD (2026-10-16, the user: "whenever we are uploading the
+ * nesting done manually by the customer … run a standard nesting and show a comparison. Don't block
+ * the user … Store the auto generated one. Even if the user opens it later, he can see."). When an
+ * upload is SAVED (the files route, a lot taken off, or a plate-change request approved), the route
+ * calls scheduleAutoCompare: it answers at once, and on the next turn of the event loop
+ * startAutoCompare starts a STANDARD run of exactly the pieces the uploaded plates hold (scope
+ * 'subset', `only`) — like for like. Pieces the upload left over, and pieces marked as cut from
+ * untracked offcuts, are in neither side; the answer says them apart (`leftOverSummary`). It is an
+ * ordinary background run (nestRunService): its row is written when it starts, it checkpoints, and
+ * a restart picks it up again. A newer upload with other pieces makes it STALE (another demand) and
+ * starts its own; one with the same pieces is answered by the run already there.
  *
  * ACCEPTING. `uploaded` keeps what is saved and marks the run discarded. `auto` replaces the
  * uploaded plates with the run's WHOLE-LINE plan through acceptNesting (replaceImported), which
  * verifies the geometry against the database and works every derived number out again.
  */
+import { createHash } from 'node:crypto';
+import { pool } from '../lib/db.js';
 import { invalid, notFound } from '../lib/errors.js';
 import {
   importContext, importBlocker, acceptNesting, kgOf, lineHead, exclusionsOfLine, demandFor, assertFrozen, effortOf,
@@ -40,9 +53,9 @@ import { savedLotsOf, coverageOfLots, isUploadedPiece, measureSavedLots } from '
 import { drawingFactsOfLine } from './partDrawingService.js';
 import { untrackedOfLine } from '../lib/nestUntracked.js';
 import { cutsOfLotsAsync } from './plateCutsService.js';
-import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
+import { plateRatesPerKg } from './valuationService.js';
 import { shapeOfCutPlate } from './nestShapes.js';
-import { startRun, memoryRun, snapshot, unpackPlan, packPlan, resumeRun, settleRuns } from './nestRunService.js';
+import { startRun, memoryRun, snapshot, unpackPlan, packPlan, resumeRun, settleRuns, cancelRun } from './nestRunService.js';
 
 const WASTE_KEYS = ['kerf', 'sequenceGaps', 'rim', 'offcut', 'wastage'];
 const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
@@ -55,60 +68,26 @@ const missingTable = (e) => e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146;
 
 /**
  * What one plate of each size costs — Map plateItemId → { unit, basis } | { unit: null, reason }.
+ * THE ORDER'S OWN PLATE RATE (2026-10-16, the user: plate rates as the order's costs price them):
+ * valuationService.plateRatesPerKg — average cost, else last receipt, else the last price paid on a PO,
+ * else the list price, per kg — × the plate's kg. The same rule as the plate-change impact sheet and
+ * the order's costs. A plate with none has NO price: the total is then "not costed", never 0.
  * A fixed number of reads whatever the number of plates.
  */
 async function plateCosts(db, companyId, line, plates) {
   const ids = [...new Set(plates.map((p) => Number(p.id)))];
   const out = new Map();
   if (!ids.length) return out;
-  const [[issued], [pools], [stock], [receipts], paid, listed] = await Promise.all([
-    db.query(
-      `SELECT l.item_id, SUM(-l.quantity) AS qty, SUM(-l.value) AS value
-         FROM cf_stock_ledger l
-         JOIN cf_stock_movements m ON m.id = l.movement_id AND m.movement_type = 'issue'
-         LEFT JOIN cf_stock_batches b ON b.id = l.batch_id
-        WHERE l.company_id = ? AND m.order_line_id = ? AND l.item_id IN (?) AND l.value IS NOT NULL AND b.owner_party_id IS NULL
-        GROUP BY l.item_id`,
-      [companyId, line.id, ids],
-    ),
-    db.query('SELECT item_id, avg_unit_cost FROM cf_item_costs WHERE company_id = ? AND owner_key = 0 AND item_id IN (?) AND avg_unit_cost IS NOT NULL', [companyId, ids]),
-    db.query(
-      `SELECT b.item_id, SUM(k.quantity * b.unit_cost) / SUM(k.quantity) AS avg_cost
-         FROM cf_stock_balances k JOIN cf_stock_batches b ON b.id = k.batch_id
-        WHERE k.company_id = ? AND b.item_id IN (?) AND k.quantity > 0 AND b.unit_cost IS NOT NULL AND b.owner_party_id IS NULL
-        GROUP BY b.item_id`,
-      [companyId, ids],
-    ),
-    db.query(
-      `SELECT l.item_id, l.unit_cost FROM cf_stock_ledger l
-         JOIN cf_stock_movements m ON m.id = l.movement_id AND m.movement_type = 'receipt' AND m.reversal_of_id IS NULL AND m.reversed_by_id IS NULL
-         LEFT JOIN cf_stock_batches b ON b.id = l.batch_id
-        WHERE l.company_id = ? AND l.item_id IN (?) AND l.unit_cost IS NOT NULL AND l.quantity > 0 AND b.owner_party_id IS NULL
-        ORDER BY m.movement_date DESC, m.id DESC`,
-      [companyId, ids],
-    ),
-    lastPricesPaid(db, companyId, ids),
-    listPricesOf(db, companyId, ids),
-  ]);
-  const first = (rows, f) => { const m = new Map(); for (const r of rows) if (!m.has(Number(r.item_id))) { const v = f(r); if (v != null && Number.isFinite(v)) m.set(Number(r.item_id), v); } return m; };
-  const tiers = [
-    ['issued to this line', first(issued, (r) => (Number(r.qty) > 1e-9 ? Number(r.value) / Number(r.qty) : null))],
-    ['average cost', first(pools, (r) => Number(r.avg_unit_cost))],
-    ['stock on hand', first(stock, (r) => (r.avg_cost == null ? null : Number(r.avg_cost)))],
-    ['last receipt', first(receipts, (r) => Number(r.unit_cost))],
-  ];
+  const rates = await plateRatesPerKg(db, companyId, ids);
   for (const p of plates) {
     const id = Number(p.id);
-    let hit = null;
-    for (const [basis, m] of tiers) if (m.has(id)) { hit = { unit: r2(m.get(id)), basis }; break; }
-    if (!hit && paid.get(id)?.unitPrice != null) hit = { unit: r2(paid.get(id).unitPrice), basis: 'last purchase price' };
-    if (!hit && listed.get(id)?.listPrice != null) {
-      const kg = p.steel?.length > 0 ? kgOf(p.steel.length * p.steel.width, p.steel.thickness, p.steel.density) : null;
-      const per = perUnitPrice(listed.get(id).listPrice, listed.get(id).priceBasis, { weightKg: kg, lengthM: p.steel?.length > 0 ? p.steel.length / 1000 : null });
-      if (per != null) hit = { unit: r2(per), basis: 'list price' };
-    }
-    out.set(id, hit ?? { unit: null, reason: `${p.code ?? `plate ${id}`} has never been received or bought and has no list price.` });
+    const r = rates.get(id);
+    const kg = p.steel?.length > 0 ? kgOf(p.steel.length * p.steel.width, p.steel.thickness, p.steel.density) : 0;
+    out.set(id, r && kg > 0
+      ? { unit: r2(r.perKg * kg), basis: r.basis, perKg: r.perKg }
+      : { unit: null, reason: `${p.code ?? `plate ${id}`} has no plate rate: never received, never bought and no list price.` });
   }
+  void line;
   return out;
 }
 
@@ -222,6 +201,10 @@ const describeRun = (row) => (row ? {
   decision: row.status === 'accepted' ? 'auto' : row.status === 'discarded' ? 'uploaded' : null,
   ranAt: row.finished_at ?? row.started_at, startedBy: row.started_by_name ?? null,
   params: (() => { const p = parseJson(row.params_json) ?? {}; return { effort: p.effort ?? 'standard', seed: p.seed ?? 1, guillotine: p.guillotine ?? null }; })(),
+  // 2026-10-16: 'upload' = started by the server after an upload was saved; 'person' = somebody pressed Run.
+  trigger: parseJson(row.params_json)?.trigger ?? 'person',
+  // The upload it was started for: { key, plates, pieces } (null for a run a person started).
+  upload: parseJson(row.params_json)?.upload ?? null,
 } : null);
 
 /**
@@ -240,6 +223,11 @@ async function compareState(db, companyId, lineId) {
   for (const l of uploadedLots) for (const p of l.pieces) if (isUploadedPiece(l, p)) subset.set(p.cutPlateId, (subset.get(p.cutPlateId) ?? 0) + 1);
   // Never more of a cut plate than the line needs: an over-covered upload is compared on what the line needs.
   const only = Object.fromEntries([...subset].map(([id, q]) => [id, Math.min(q, cpById.get(id)?.pieces ?? 0)]).filter(([, q]) => q > 0));
+  // WHICH UPLOAD this is (2026-10-16): the uploaded plates, their files and where every customer part sits — a new
+  // upload changes it even when it nests the same pieces. Stored with the automatic run started for it.
+  const uploadKey = uploadedLots.length
+    ? createHash('sha256').update(JSON.stringify(uploadedLots.map((l) => [l.id, l.nestFileId ?? null, l.plateItemId, l.pieces.filter((p) => isUploadedPiece(l, p)).map((p) => [p.cutPlateId, p.x, p.y]).sort()]).sort((a, b) => a[0] - b[0]))).digest('hex').slice(0, 16)
+    : null;
 
   // The two questions an automatic run can be asked here, fingerprinted from what is already read
   // (demandFor — the same selection and hash planNesting reports for a run).
@@ -268,7 +256,7 @@ async function compareState(db, companyId, lineId) {
   // A finished run of ANOTHER demand: what "stale" means.
   const stale = rows.find((r) => USABLE.has(r.status) && r.demand_hash && r.demand_hash !== demandSubset?.hash && r.demand_hash !== demandLine?.hash) ?? null;
   const failed = rows.find((r) => r.status === 'failed') ?? null;
-  return { ctx, saved, facts, excl, untracked, cpById, mctx, uploadedLots, subset, only, demandSubset, demandLine, demandError, rows, mem, rowSubset, rowLine, stale, failed };
+  return { ctx, saved, facts, excl, untracked, cpById, mctx, uploadedLots, subset, only, uploadKey, demandSubset, demandLine, demandError, rows, mem, rowSubset, rowLine, stale, failed };
 }
 
 async function plansOf(db, companyId, rowIds) {
@@ -311,6 +299,50 @@ function judge(up, auto) {
   if (delta.cutLengthM != null && Math.abs(delta.cutLengthM) >= 0.5) say.push(`The automatic layout cuts ${Math.abs(delta.cutLengthM).toFixed(1)} m ${delta.cutLengthM > 0 ? 'more' : 'less'}.`);
   if (delta.cost == null) say.push('Cost cannot be compared: a plate has no cost yet.');
   return { delta, verdict: say.join(' ') };
+}
+
+/**
+ * THE VERDICT IN ONE PLAIN LINE (2026-10-16, the Compare tab): ours against the customer's, plates, steel and
+ * money, each with its own direction. "Ours uses 2 plates fewer, 1.4 t less steel and ₹61,924 less."
+ * Cost not known on a side: "Cost cannot be compared yet: a plate has no rate." Null without a delta.
+ */
+export function headlineOf(delta) {
+  if (!delta) return null;
+  const bits = [];
+  if (delta.plates) bits.push(`${plural(Math.abs(delta.plates), 'plate', 'plates')} ${delta.plates < 0 ? 'fewer' : 'more'}`);
+  const t = Number(delta.tonnesBought ?? 0);
+  if (Math.abs(t) >= 0.0005) bits.push(`${Math.abs(t) >= 1 ? `${Math.abs(t).toFixed(1)} t` : `${Math.round(Math.abs(t) * 1000).toLocaleString('en-IN')} kg`} ${t < 0 ? 'less' : 'more'} steel`);
+  if (delta.cost != null && Math.abs(delta.cost) >= 0.5) bits.push(`${money(delta.cost)} ${delta.cost < 0 ? 'less' : 'more'}`);
+  const costWord = delta.cost == null ? ' Cost cannot be compared yet: a plate has no rate.' : '';
+  if (!bits.length) return `Ours and the customer's use the same plates and the same steel.${costWord}`;
+  const list = bits.length === 1 ? bits[0] : `${bits.slice(0, -1).join(', ')} and ${bits.at(-1)}`;
+  return `Ours uses ${list}.${costWord}`;
+}
+
+/**
+ * THE FIGURES PER THICKNESS (2026-10-16), from each side's perPlate: plates, steel bought, parts, waste (bought −
+ * parts: offcuts INCLUDED — the user's rule), offcut kg and cost (null = "not costed": a plate of it has no rate).
+ * → [{ thickness, uploaded: { plates, tonnesBought, partsTonnes, wasteKg, wastePct, offcutKg, cost } | null, auto: … | null }]
+ */
+export function byThickness(upPlates, autoPlates) {
+  const agg = (plates) => {
+    if (!plates.length) return null;
+    const kgB = plates.reduce((a, p) => a + Number(p.plateKg ?? 0), 0);
+    const kgP = plates.reduce((a, p) => a + Number(p.partsKg ?? 0), 0);
+    const uncosted = plates.some((p) => p.cost == null);
+    return {
+      plates: plates.length, tonnesBought: r3(kgB / 1000), partsTonnes: r3(kgP / 1000),
+      wasteKg: r3(kgB - kgP), wastePct: kgB > 0 ? r3(((kgB - kgP) / kgB) * 100) : null,
+      offcutKg: r3(plates.reduce((a, p) => a + Number(p.offcutKg ?? 0), 0)),
+      cost: uncosted ? null : r2(plates.reduce((a, p) => a + Number(p.cost ?? 0), 0)),
+    };
+  };
+  const keys = [...new Set([...upPlates, ...autoPlates].map((p) => Number(p.thickness ?? 0)))].sort((a, b) => a - b);
+  return keys.map((t) => ({
+    thickness: t || null,
+    uploaded: agg(upPlates.filter((p) => Number(p.thickness ?? 0) === t)),
+    auto: agg(autoPlates.filter((p) => Number(p.thickness ?? 0) === t)),
+  }));
 }
 
 /**
@@ -385,6 +417,10 @@ export async function getCompare(db, companyId, lineId, { with: other = 'auto', 
     return {
       ...describeRun(row), metrics: m.metrics, perPlate: m.perPlate,
       unplaced: (plan.groups ?? []).flatMap((g) => g.unplaced ?? []), problems: plan.problems ?? [],
+      // 2026-10-16: it was told "stop and use this" (a person started a nesting run, or pressed Stop): its best so far.
+      stoppedEarly: plan.budget?.stopped === true,
+      // Made for the upload saved now (false: for an earlier upload of the same pieces — it still answers them).
+      forThisUpload: (parseJson(row.params_json)?.upload?.key ?? null) === st.uploadKey,
       ...(detail ? { plan } : {}),
     };
   };
@@ -420,6 +456,20 @@ export async function getCompare(db, companyId, lineId, { with: other = 'auto', 
       : 'No automatic run has nested the whole line as it is now. Start the comparison to work it out.';
   const blocker = importBlocker(ctx.line);
   const decided = autoSide?.decision ?? null;
+  // 2026-10-16, the Compare tab: what neither side holds, and the line's ask for the automatic run.
+  const kgOfCp = (id) => { const sz = st.cpById.get(id)?.steel; return sz?.length > 0 ? kgOf(sz.length * sz.width, sz.thickness, sz.density) : 0; };
+  const leftToNest = leftOver.filter((x) => !x.manual && !x.leftOut);
+  const { untracked: marks } = coverageOfLots(ctx.cutPlates, st.saved, st.excl, st.untracked);
+  const leftOverSummary = {
+    pieces: leftOver.reduce((a, x) => a + x.qty, 0), cutPieces: leftOver.length, kg: r3(leftOver.reduce((a, x) => a + x.qty * kgOfCp(x.cutPlateId), 0)),
+    heldBack: leftOver.filter((x) => x.manual || x.leftOut).reduce((a, x) => a + x.qty, 0), toNest: leftToNest.reduce((a, x) => a + x.qty, 0),
+    untrackedPieces: marks.reduce((a, x) => a + x.qty, 0), untrackedKg: r3(marks.reduce((a, x) => a + x.qty * kgOfCp(x.cutPlateId), 0)),
+  };
+  leftOverSummary.sentence = [
+    leftOverSummary.pieces ? `${plural(leftOverSummary.pieces, 'piece is', 'pieces are')} left over by the upload (${Math.round(leftOverSummary.kg).toLocaleString('en-IN')} kg). They are in neither side.` : null,
+    leftOverSummary.untrackedPieces ? `${plural(leftOverSummary.untrackedPieces, 'piece is', 'pieces are')} cut from untracked offcuts (${Math.round(leftOverSummary.untrackedKg).toLocaleString('en-IN')} kg). They are in neither side.` : null,
+  ].filter(Boolean).join(' ') || null;
+  const autoAsk = autoCompareState(companyId, lineId);
   return {
     line: lineHead(ctx.line), with: 'auto',
     demand: {
@@ -431,6 +481,14 @@ export async function getCompare(db, companyId, lineId, { with: other = 'auto', 
     auto,
     stale: st.stale && !autoSide && uploaded ? { ...describeRun(st.stale), reason: 'It nested a different demand: the pieces, their quantities, the cut settings, the plate choices or the drawings have changed since.' } : null,
     delta, verdict,
+    // 2026-10-16: the verdict in one plain line ("Ours uses 2 plates fewer, 1.4 t less steel and ₹61,924 less."), null with delta.
+    headline: headlineOf(delta),
+    // The same figures per thickness: [{ thickness, uploaded: ThicknessFigures | null, auto: ThicknessFigures | null }].
+    byThickness: byThickness(uploaded?.perPlate ?? [], autoSide?.perPlate ?? []),
+    leftOverSummary,
+    // The server's own automatic run after an upload: what it is doing about this line in this process (null after a restart —
+    // the run itself is in `auto` / `run`). { trigger, status: queued | waiting | started | answered | skipped | failed, message, at, runId }
+    autoCompare: autoAsk,
     // Why `delta` / `verdict` are null, when they are (2026-10-10): never a bare null.
     deltaReason: delta ? null : (!uploaded ? 'Nothing is uploaded on this line, so there is nothing to compare.' : auto.reason ?? 'There is no automatic nesting of these pieces to compare with yet.'),
     likeForLike: autoSide ? { same: differ.length === 0, uploadedPieces: upPieces, autoPieces: [...got.values()].reduce((a, b) => a + b, 0), differ, overNested } : null,
@@ -468,6 +526,14 @@ export async function getCompare(db, companyId, lineId, { with: other = 'auto', 
 export async function startCompare(db, c, lineId, input = {}) {
   const companyId = c.companyId;
   if (input.run !== true && input.run !== 'true') return getCompare(db, companyId, lineId, {});
+  // { run: true, auto: true } — the Compare tab asking for the AUTOMATIC run of the upload that is saved (when the
+  // server's own start was lost, e.g. a restart in the moment after the save): the same start as after an upload.
+  if (input.auto === true || input.auto === 'true') {
+    const out = await startAutoCompare(db, c, lineId, { trigger: 'screen', rerun: input.rerun === true || input.rerun === 'true' });
+    if (out.busy) throw invalid('RUN_BUSY', out.message);
+    if (out.reason && !out.started && !out.running && !out.answered) throw invalid(out.reason, out.message);
+    return out;
+  }
   const st = await compareState(db, companyId, lineId);
   if (!st.uploadedLots.length) throw invalid('NOTHING_UPLOADED', 'Nothing is uploaded on this line, so there is nothing to compare our automatic nesting with.');
   if (st.demandError) throw invalid(st.demandError.code, st.demandError.message);
@@ -487,6 +553,104 @@ export async function startCompare(db, c, lineId, input = {}) {
   const snap = startRun(companyId, c, lineId, base, { purpose: 'compare', jobs, db, pack: input.pack ?? null });
   return { started: true, running: true, runId: snap.runId, status: 'running', jobs: jobs.map((j) => j.scope), run: snap };
 }
+
+/* ───────────────────────────── the automatic run after an upload ───────────────────────────── */
+
+/** How hard the server tries on its own: the Standard level (up to 10 minutes; a small line is done in seconds). */
+export const AUTO_COMPARE_EFFORT = 'standard';
+/** A nesting run of a person is working on the line: try again this often, this many times (20 min), then leave it to the Compare tab. */
+const AUTO_RETRY_MS = 30_000;
+const AUTO_TRIES = 40;
+export const AUTO_QUEUED = 'Our own Standard nesting of the same pieces runs in the background now. See the Compare tab.';
+const sameOnly = (a, b) => {
+  const norm = (o) => JSON.stringify(Object.entries(o ?? {}).map(([k, v]) => [Number(k), Number(v)]).filter(([, v]) => v > 0).sort((x, y) => x[0] - y[0]));
+  return norm(a) === norm(b);
+};
+
+/**
+ * START THE AUTOMATIC SIDE FOR THE UPLOAD THAT IS SAVED — one Standard run of exactly the pieces the uploaded
+ * plates hold (scope 'subset', `only`). Never throws for the line's state; it answers what it did:
+ *   { started: true, runId }     a run is working now
+ *   { running: true, runId }     one for these pieces was already working
+ *   { answered: true, runId }    a finished run already answers these pieces (a re-upload of the same pieces): nothing packed
+ *   { busy: true, message }      a person's nesting run (or a comparison of the whole line) holds the line: try later
+ *   { reason, message }          nothing to do (NOTHING_UPLOADED) or the line cannot be nested (NOT_FROZEN …)
+ * `rerun` (the Compare tab's Run again) packs again although a finished run answers.
+ * A comparison still working for OTHER pieces (an earlier upload) is cancelled first: its answer is out of date.
+ */
+export async function startAutoCompare(db, c, lineId, { trigger = 'upload', rerun = false } = {}) {
+  const companyId = c.companyId;
+  const st = await compareState(db, companyId, lineId);
+  if (!st.uploadedLots.length) return { started: false, reason: 'NOTHING_UPLOADED', message: 'Nothing is uploaded on this line, so there is nothing to compare.' };
+  if (st.demandError) return { started: false, reason: st.demandError.code, message: st.demandError.message };
+  if (!st.demandSubset) return { started: false, reason: 'NOTHING_TO_NEST', message: 'The uploaded plates hold no piece the line still needs.' };
+  const mem = st.mem;
+  if (mem?.status === 'running') {
+    const forThese = (mem.purpose ?? 'nest') === 'compare' && mem.jobs?.length === 1 && sameOnly(mem.jobs[0].input?.only, st.only);
+    if (forThese) return { started: false, running: true, runId: mem.id, message: 'Our nesting of these pieces is already running.' };
+    if ((mem.purpose ?? 'nest') === 'compare' && mem.jobs?.every((j) => j.input?.only)) cancelRun(companyId, lineId, { purpose: 'compare' });
+    else return { started: false, busy: true, message: 'A nesting run is working on this line. Our nesting of the upload starts when it is done.' };
+  }
+  if (st.rowSubset && !rerun) return { started: false, answered: true, runId: st.rowSubset.run_uid, message: 'Our nesting of these pieces is already done. It is shown again.' };
+  const pieces = Object.values(st.only).reduce((a, q) => a + q, 0);
+  const upload = { key: st.uploadKey, plates: st.uploadedLots.length, pieces };
+  const base = { effort: AUTO_COMPARE_EFFORT, trigger };
+  const who = c.userName ? `${c.userName} · automatic, after the upload` : 'automatic, after the upload';
+  const snap = startRun(companyId, { ...c, userName: who }, lineId, base, {
+    purpose: 'compare', db: db === pool ? undefined : db,
+    jobs: [{ scope: 'subset', input: { ...base, only: st.only, upload } }],
+  });
+  return { started: true, running: true, runId: snap.runId, status: 'running', jobs: ['subset'], run: snap, message: AUTO_QUEUED };
+}
+
+/** The line's last automatic start in this process: { trigger, status, message, at, runId, tries } (key companyId:lineId). */
+const AUTO = new Map();
+const autoPending = new Set();
+const autoKey = (companyId, lineId) => `${Number(companyId)}:${Number(lineId)}`;
+/** CF_NEST_AUTO_COMPARE=off turns the automatic run off (suites that test other things set it). */
+export const autoCompareOff = () => /^(0|off|false|no)$/i.test(String(process.env.CF_NEST_AUTO_COMPARE ?? '').trim());
+
+/** What the server is doing about the line's automatic comparison, for the GET (null: nothing in this process). */
+export function autoCompareState(companyId, lineId) {
+  const e = AUTO.get(autoKey(companyId, lineId));
+  return e ? { trigger: e.trigger, status: e.status, message: e.message, at: e.at, runId: e.runId, tries: e.tries } : null;
+}
+
+/**
+ * AFTER AN UPLOAD IS SAVED (the route, once its transaction committed): queue the automatic run and answer AT
+ * ONCE — the upload's response never waits for it, not even for its first read. The work starts on the next
+ * turn of the event loop, on the pool. While a person's nesting run holds the line it tries again every 30 s
+ * (20 min); a newer save of the line takes over from an older one. → { queued, effort, message } | null (off).
+ */
+export function scheduleAutoCompare(c, lineId, { trigger = 'upload', db = pool } = {}) {
+  if (autoCompareOff()) return null;
+  const key = autoKey(c.companyId, lineId);
+  const entry = { trigger, status: 'queued', message: AUTO_QUEUED, at: new Date().toISOString(), runId: null, tries: 0 };
+  AUTO.set(key, entry);
+  const track = (p) => { autoPending.add(p); p.finally(() => autoPending.delete(p)); return p; };
+  const attempt = async () => {
+    if (AUTO.get(key) !== entry) return;                     // a newer save took over
+    entry.tries += 1;
+    try {
+      const out = await startAutoCompare(db, c, lineId, { trigger });
+      if (out.busy && entry.tries < AUTO_TRIES) {
+        entry.status = 'waiting'; entry.message = out.message;
+        track(new Promise((r) => { const t = setTimeout(r, AUTO_RETRY_MS); t.unref?.(); }).then(attempt));
+        return;
+      }
+      entry.status = out.started || out.running ? 'started' : out.answered ? 'answered' : out.busy ? 'failed' : 'skipped';
+      entry.runId = out.runId ?? null;
+      entry.message = out.started ? AUTO_QUEUED : out.message ?? null;
+    } catch (e) {
+      entry.status = 'failed'; entry.message = e?.message ?? String(e);
+    }
+  };
+  track(new Promise((r) => { setImmediate(r); }).then(attempt));
+  return { queued: true, effort: AUTO_COMPARE_EFFORT, message: AUTO_QUEUED };
+}
+
+/** Tests: every queued automatic start has been tried (the runs themselves: nestRunService.settleRuns). */
+export async function settleAutoCompares() { while (autoPending.size) await Promise.allSettled([...autoPending]); }
 
 /* ───────────────────────────── POST: take one side ───────────────────────────── */
 

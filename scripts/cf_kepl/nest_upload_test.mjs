@@ -894,7 +894,9 @@ try {
     section('19. One writer at a time: a save is refused while a run works on the line, and when the line changed under it');
     await clearLine(fx);
     await upload(fx, sets.B.slice(0, 2), { dryRun: false });
-    const started = await C.startCompare(conn, c, fx.lineId, { run: true, effort: 'quick' });
+    // rerun: a comparison that nests the WHOLE line too (its 'line' plan reads the saved plates), so it holds the line.
+    // (2026-10-16: a comparison of only the uploaded pieces reads no saved plate and no longer holds it — nest_auto_compare_test.)
+    const started = await C.startCompare(conn, c, fx.lineId, { run: true, effort: 'quick', rerun: true });
     let busy = null; try { await upload(fx, sets.B.slice(2, 3), { dryRun: false }); } catch (e) { busy = e; }
     let busyDel = null; try { await U.deleteNestLot(conn, c, fx.lineId, (await liveLots(fx))[0].id); } catch (e) { busyDel = e; }
     const dryStill = started.running ? await upload(fx, sets.B.slice(2, 3)) : null;

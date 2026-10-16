@@ -30,7 +30,7 @@ import {
 } from './nestingService.js';
 import { rowsCutFrom } from './nestDxfImportService.js';
 import { plateRatesPerKg } from './valuationService.js';
-import { memoryRun } from './nestRunService.js';
+import { memoryRun, blocksLineWrites } from './nestRunService.js';
 
 const round2 = (n) => Math.round(Number(n) * 100) / 100;
 const round3 = (n) => Math.round(Number(n) * 1000) / 1000;
@@ -162,7 +162,8 @@ export async function getUntracked(db, companyId, lineId) {
 /** A nesting run working on the line (in this process): its answer would be for a line that changed under it. */
 function assertNoRun(companyId, lineId, what) {
   const run = memoryRun(companyId, lineId);
-  if (run?.status === 'running') throw invalid('RUN_BUSY', `A nesting run is working on this line — wait for it to finish, then ${what}.`);
+  // The automatic comparison after an upload nests a fixed set of pieces and reads no mark: not held (2026-10-16).
+  if (blocksLineWrites(run)) throw invalid('RUN_BUSY', `A nesting run is working on this line — wait for it to finish, then ${what}.`);
 }
 
 /**

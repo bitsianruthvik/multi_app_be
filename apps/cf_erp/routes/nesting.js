@@ -29,6 +29,10 @@
  *   DELETE /orders/:orderId/lines/:lineId/nesting/untracked      { cutPlateIds? } — undo (none = every mark)
  *   GET    /orders/:orderId/lines/:lineId/nesting/compare        the uploaded nesting beside our automatic one (?with=auto)
  *   POST   /orders/:orderId/lines/:lineId/nesting/compare        { run: true, effort? } — start the automatic side when none answers this demand
+ *                                                                { run: true, auto: true, rerun? } — the Compare tab: our Standard nesting of the upload's pieces
+ *   (2026-10-16) a SAVED upload — POST …/files that applied, DELETE …/lots/:lotId of a customer plate, an approved plate-change
+ *   request of either — queues our own Standard nesting of the same pieces in the background (afterUploadSaved); the answer
+ *   carries autoCompare: { queued, effort, message } and never waits for it.
  *   POST   /orders/:orderId/lines/:lineId/nesting/compare/accept { side: 'uploaded' | 'auto', runId } — take one side
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc/:lotId   one nest's DXF
@@ -72,7 +76,7 @@ import {
 // nestingService is long enough already.
 import { exportSheet, importSheet } from '../services/nestingSheetService.js';
 // A run that outlives the page (2026-10-03): the job, its progress and its proposal, in memory.
-import { startRun, readRun, dismissRun, stopRunAnywhere, cancelRun } from '../services/nestRunService.js';
+import { startRun, readRun, dismissRun, stopRunAnywhere, cancelRun, yieldAutoCompare } from '../services/nestRunService.js';
 // The customer's nesting files (init.sql §55): one DXF per plate, stored exactly as drawn.
 import { uploadNestFiles, getNestFiles, nestFileOf, deleteNestLot } from '../services/nestDxfImportService.js';
 // Plates an uploaded nesting is cut on that are not in the catalog yet (2026-10-14).
@@ -80,7 +84,7 @@ import { createNestPlates } from '../services/nestPlateCatalogService.js';
 // Pieces cut from loose offcuts in the yard that are not in the system (init.sql §61, 2026-10-14).
 import { getUntracked, markUntracked, unmarkUntracked } from '../services/nestUntrackedService.js';
 // The uploaded nesting beside our automatic one, and taking one of them.
-import { getCompare, startCompare, acceptCompare } from '../services/nestCompareService.js';
+import { getCompare, startCompare, acceptCompare, scheduleAutoCompare } from '../services/nestCompareService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
 import { lotDxf, lineCncZip } from '../services/cncExportService.js';
 // Plate changes after a purchase order (init.sql §62): every plate write below goes through the gate.
@@ -93,6 +97,19 @@ const view = guard(PERM.ordersView);
 const manage = guard(PERM.orders);
 const orderId = (req) => intParam(req.params.orderId, 'orderId');
 const lineId = (req) => intParam(req.params.lineId, 'lineId');
+
+/**
+ * AN UPLOAD WAS SAVED (2026-10-16): the transaction has committed, so our own Standard nesting of the same pieces is
+ * queued in the background (nestCompareService.scheduleAutoCompare) and the answer goes back AT ONCE with
+ * `autoCompare: { queued, effort, message }` — the upload never waits for the run. Not on a preview, not on a save that
+ * did not apply, not on a plate-change REQUEST (nothing is saved until it is approved; the approval queues it).
+ */
+function afterUploadSaved(req, out) {
+  if (!out || out.requested || out.applied !== true || out.dryRun === true) return out;
+  const c = { ...ctx(req), userName: req.user?.name ?? req.user?.email ?? null };
+  const auto = scheduleAutoCompare(c, lineId(req));
+  return auto ? { ...out, autoCompare: auto } : out;
+}
 
 /** Reads: one connection from the pool, the order/line agreement checked on it. */
 const read = (req, fn) => (async () => {
@@ -145,8 +162,12 @@ router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,
 
 // BACKGROUND RUNS — the same proposal as /plan, but owned by the server, so
 // leaving the page does not lose it. Read grant, like /plan: it writes nothing.
+// A person's run goes first: the automatic comparison after an upload, if it is working, stops and keeps its best (2026-10-16).
 router.post('/orders/:orderId/lines/:lineId/nesting/runs', view,
-  handle((req) => read(req, (db, companyId, id) => startRun(companyId, { ...ctx(req), userName: req.user?.name ?? req.user?.email ?? null }, id, req.body ?? {}))));
+  handle((req) => read(req, async (db, companyId, id) => {
+    await yieldAutoCompare(companyId, id);
+    return startRun(companyId, { ...ctx(req), userName: req.user?.name ?? req.user?.email ?? null }, id, req.body ?? {});
+  })));
 // readRun: the run in memory, else — after a restart — the finished one the database kept.
 router.get('/orders/:orderId/lines/:lineId/nesting/runs/current', view,
   handle((req) => read(req, (db, companyId, id) => readRun(companyId, id, { withPlan: String(req.query.plan ?? '') === '1' }))));
@@ -216,7 +237,10 @@ router.delete('/orders/:orderId/lines/:lineId/drawings/:drawingId', manage,
 router.get('/orders/:orderId/lines/:lineId/nesting/files', view,
   handle((req) => read(req, (db, companyId, id) => getNestFiles(db, companyId, id))));
 router.post('/orders/:orderId/lines/:lineId/nesting/files', manage,
-  handle((req) => gated(req, 'upload', req.body ?? {}, (db, c, id, b) => uploadNestFiles(db, c, id, b))));
+  handle(async (req) => {
+    const out = await gated(req, 'upload', req.body ?? {}, (db, c, id, b) => uploadNestFiles(db, c, id, b));
+    return afterUploadSaved(req, out);
+  }));
 router.get('/orders/:orderId/lines/:lineId/nesting/files/:lotId', view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => nestFileOf(db, companyId, id, intParam(req.params.lotId, 'lotId')));
   res.setHeader('Content-Type', out.contentType);
@@ -225,7 +249,11 @@ router.get('/orders/:orderId/lines/:lineId/nesting/files/:lotId', view, handle(a
   res.send(out.buffer);
 }));
 router.delete('/orders/:orderId/lines/:lineId/nesting/lots/:lotId', manage,
-  handle((req) => gated(req, 'delete_lot', { ...(req.body ?? {}), lotId: intParam(req.params.lotId, 'lotId') }, (db, c, id, b) => deleteNestLot(db, c, id, b.lotId))));
+  handle(async (req) => {
+    const out = await gated(req, 'delete_lot', { ...(req.body ?? {}), lotId: intParam(req.params.lotId, 'lotId') }, (db, c, id, b) => deleteNestLot(db, c, id, b.lotId));
+    // A customer's plate taken off changes what the upload holds: the comparison follows it.
+    return out?.removed?.origin === 'imported' ? afterUploadSaved(req, out) : out;
+  }));
 
 // PLATES THE FILES USE THAT THE CATALOG DOES NOT HAVE (2026-10-14): the preview lists them
 // (`missingPlates`), this adds them — custom sizes unless told otherwise. It is asked from an order's

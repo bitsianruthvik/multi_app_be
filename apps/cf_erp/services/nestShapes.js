@@ -129,7 +129,14 @@ export function isPlainRect(o) {
 export function shapeOfCutPlate(cp, facts = null) {
   const L = Number(cp?.steel?.length ?? cp?.length);
   const W = Number(cp?.steel?.width ?? cp?.width);
-  const drawn = ringsObject(facts?.get?.(Number(cp?.id))?.rings ?? null);
+  const fact = facts?.get?.(Number(cp?.id)) ?? null;
+  const drawn = ringsObject(fact?.rings ?? null);
+  // CUTTING ALLOWANCE (init.sql §64): a cut piece cut longer than the row its drawing is of is nested as its
+  // rectangle — the drawing is the part as drawn, not the longer piece cut for it.
+  const over = drawn && L > 0 && W > 0 && Number(fact?.partLength) > 0 ? Math.round((L - Number(fact.partLength)) * 10) / 10 : 0;
+  if (drawn && over > 1) {
+    return { rings: ringsObject(rectRings(L, W)), drawn: false, area: r3(L * W), length: L, width: W, shapeFrom: 'dimensions', shapeNote: `It is cut ${over} mm longer than its drawing (the cutting allowance), so it is nested as its rectangle.` };
+  }
   if (drawn) {
     const b = boxOf(drawn.outline);
     return { rings: drawn, drawn: true, area: r3(ringsArea(drawn)), length: r3(b.x1 - b.x0), width: r3(b.y1 - b.y0), shapeFrom: 'drawing', shapeNote: null };
@@ -149,7 +156,10 @@ export function shapeOfCutPlate(cp, facts = null) {
  */
 export function shapeFromOf(cp, facts = null) {
   const f = facts?.get?.(Number(cp?.id)) ?? null;
-  if (f?.rings && ringsObject(f.rings)) return { shapeFrom: 'drawing', shapeNote: null };
+  if (f?.rings && ringsObject(f.rings)) {
+    const s = shapeOfCutPlate(cp, facts);
+    return s && !s.drawn ? { shapeFrom: 'dimensions', shapeNote: s.shapeNote } : { shapeFrom: 'drawing', shapeNote: null };
+  }
   return { shapeFrom: 'dimensions', shapeNote: f?.shapeNote ?? null };
 }
 

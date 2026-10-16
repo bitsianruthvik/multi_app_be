@@ -25,6 +25,10 @@
  *   POST /requisitions/purchase-orders              { orders: [{ supplierId?, expectedDate?, place?, lines: [{ prLineId, quantity?, expectedDate? }] }] }
  *   POST /requisition-lines/:id/release-excess      { apply? } — more is held / coming than the line needs: let it go
  *   GET  /buying/board?orderId=&search=             requisitions by status, and lines that have none yet
+ *   PUT  /order-lines/:id/material-supply           { supply: 'we_buy' | 'customer' | null } — who supplies the line's material (§66)
+ * MATERIAL REQUEST (§66): the requisition is the MR. POST /orders/:id/requisitions { earmark: true } earmarks free
+ * stock as it raises; a customer-supplied MR earmarks the customer's own lots and asks the rest of the customer on
+ * a PO to them as vendor (answer: earmarked, customerPurchaseOrders).
  * A PO line's date and quantity: PUT /purchase-lines/:id (as before). Seeing needs inventory view;
  * raising, holding, skipping and ordering need inventory manage — the purchase routes' own grants.
  */
@@ -40,6 +44,7 @@ import {
   makePurchaseOrders, releaseExcess, buyingBoard,
 } from '../services/requisitionService.js';
 import { lineMaterialReady } from '../services/materialReadyService.js';
+import { setLineSupply } from '../services/salesOrderService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -84,5 +89,6 @@ router.post('/requisition-lines/:id/release-excess', view, handle((req) => {
   return tx(req, (db, c) => releaseExcess(db, c, id(req), body(req)));
 }));
 router.get('/buying/board', view, handle((req) => buyingBoard(pool, ctx(req).companyId, req.query)));
+router.put('/order-lines/:id/material-supply', manage, handle((req) => tx(req, (db, c) => setLineSupply(db, c, id(req), body(req)))));
 
 export default router;

@@ -46,8 +46,10 @@ import { invalid, notFound } from '../lib/errors.js';
 import { revisedOrderMessage, latestRevisionSql } from './records.js';
 import { snapshotSubtrees, writeCopies, copyDrawingLinks, cutPlateNodes, deleteTemporaryItems } from './treeCopyService.js';
 import { refreshCutPieces, rectangleChoices } from './cutPlateService.js';
+import { carryToRevision as carryCutAllowances } from './cutAllowanceService.js';
 import { getOrder } from './salesOrderService.js';
 import { carryRequisitions, returnRequisitions } from './requisitionLifecycle.js';
+import { copyOrderDefaults } from './orderDefaultService.js';
 
 /** The commercial stages a customer order may be revised in. */
 const REVISABLE = new Set(['inquiry', 'quoted', 'confirmed']);
@@ -125,9 +127,9 @@ export async function reviseOrder(db, c, orderId) {
   const [ins] = await db.query(
     `INSERT INTO cf_sales_orders
        (company_id, code, order_type, title, customer_id, customer_reference, status, received_on, committed_date, confirmed_at,
-        delivery_address, notes, process_id, created_by, revision, revision_of_id)
+        delivery_address, notes, process_id, created_by, revision, revision_of_id, material_supply)
      SELECT company_id, code, order_type, title, customer_id, customer_reference, status, received_on, committed_date, confirmed_at,
-            delivery_address, notes, process_id, ?, revision + 1, id
+            delivery_address, notes, process_id, ?, revision + 1, id, material_supply
        FROM cf_sales_orders WHERE company_id = ? AND id = ?`,
     [c.userId ?? null, companyId, o.id],
   );
@@ -138,9 +140,9 @@ export async function reviseOrder(db, c, orderId) {
   await db.query(
     `INSERT INTO cf_sales_order_lines
        (company_id, order_id, line_no, line_type, item_id, design_id, position, quantity, committed_date, bom_revision,
-        description, notes, created_by, revises_line_id, rate, rate_basis, currency)
+        description, notes, created_by, revises_line_id, rate, rate_basis, currency, material_supply)
      SELECT company_id, ?, line_no, line_type, IF(line_type = 'custom', NULL, item_id), design_id, position, quantity, committed_date, bom_revision,
-            description, notes, ?, id, rate, rate_basis, currency
+            description, notes, ?, id, rate, rate_basis, currency, material_supply
        FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL`,
     [newId, c.userId ?? null, companyId, o.id],
   );
@@ -177,6 +179,10 @@ export async function reviseOrder(db, c, orderId) {
     // (treeCopyService.copyDrawingLinks — a paste copies them the same way.)
     await copyDrawingLinks(db, c, idMap, { chunk: COPY_CHUNK });
 
+    // The cutting allowance of the order (init.sql §64): its part-name overrides and its rows' own rules go to
+    // the new revision — each row's to its copy — before its cut pieces are derived below.
+    await carryCutAllowances(db, c, o.id, newId, idMap);
+
     for (const part of chunk(custom, ID_CHUNK)) {
       const params = [];
       const cases = part.map((l) => { params.push(newLineOf.get(l.id).id, idMap.get(Number(l.item_id))); return 'WHEN ? THEN ?'; }).join(' ');
@@ -184,6 +190,10 @@ export async function reviseOrder(db, c, orderId) {
       await db.query(`UPDATE cf_sales_order_lines SET item_id = CASE id ${cases} END WHERE company_id = ? AND id IN (?)`, params);
     }
   }
+
+  // ---- the order's and lines' values for flagged specifications come too (init.sql §65) ----
+  // Each line value goes to the line that revises it; the rows already hold what they took (copied above).
+  await copyOrderDefaults(db, c, o.id, newId);
 
   // ---- the old revision is kept as it was ------------------------------------
   await db.query(

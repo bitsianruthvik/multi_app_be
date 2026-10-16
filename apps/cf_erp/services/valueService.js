@@ -648,6 +648,8 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
         else if (own) touch(s, null, 'inherited');
         break;
       case 'entered':
+        // The order's or line's value (init.sql §65) is stored as a default — a row entry stands over it.
+        if (s.fromOrder && s.value) { touch(s, typedOf(effectiveRows.get(s.spec.id)), 'defaulted'); break; }
         // A section part's steel taken from its stock bar (lib/cutFrom STEEL_FROM_STOCK) is stored
         // 'inherited' under an entered rule; the cut-piece derive owns those rows, not this.
         if (own && own.source !== 'entered' && !(own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(s.spec.code).toUpperCase()))) touch(s, null, own.source);

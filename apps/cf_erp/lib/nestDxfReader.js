@@ -1682,6 +1682,16 @@ const normCode = (s) => String(s ?? '').toUpperCase().replace(/[\s\-_]+/g, '');
 const sizeWords = (a, b) => `${r1(Math.max(a, b))} x ${r1(Math.min(a, b))}`;
 
 /**
+ * How far a size written in a part's name is from a candidate (the larger of the two side differences, either
+ * way round). A candidate with `drawnLengths` (its rows' drawn LENGTH, when it is cut longer by a cutting
+ * allowance — init.sql §64) is measured against those lengths too: the shorter answer wins.
+ */
+function nameSizeOff(c, n0, n1) {
+  const offAt = (L) => Math.min(Math.max(Math.abs(n0 - L), Math.abs(n1 - c.width)), Math.max(Math.abs(n0 - c.width), Math.abs(n1 - L)));
+  return Math.min(offAt(c.length), ...(c.drawnLengths ?? []).map(offAt));
+}
+
+/**
  * Says which candidate every part of a read nest is, and where it sits (see `placeRings`).
  *
  * @param nest        what readNestDxf returned
@@ -1727,6 +1737,9 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
       name: (c.codes ?? []).find((s) => String(s ?? '').trim()) ?? String(c.key),
       length: Number(c.length) > 0 ? Number(c.length) : shape?.length ?? 0,
       width: Number(c.width) > 0 ? Number(c.width) : shape?.width ?? 0,
+      // CUTTING ALLOWANCE (init.sql §64): a cut piece cut longer than its rows are drawn also answers, EXACTLY,
+      // to a name that states the drawn length (nameSizeOff).
+      drawnLengths: (c.drawnLengths ?? []).map(Number).filter((x) => x > 0),
     };
   }).filter((c) => c.shape);
   const byCode = new Map();
@@ -1801,10 +1814,11 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
    * numbers). The candidate is laid along the rectangle round the outline, its length on the side
    * nearer its own; where it sits is the outline's own box.
    */
-  const fitNameSize = (c, shape, nameSize, drawnSize = null, forced = false) => {
+  const fitNameSize = (c, shape, nameSize, drawnSize = null, forced = false, outline = false) => {
     if (!nameSize || !(c.length > 0 && c.width > 0)) return null;
     const [n0, n1] = nameSize;
-    let off = Math.min(Math.max(Math.abs(n0 - c.length), Math.abs(n1 - c.width)), Math.max(Math.abs(n0 - c.width), Math.abs(n1 - c.length)));
+    // A NAME may state the drawn length of a cut piece cut longer by an allowance (§64); an OUTLINE must be the cut piece.
+    let off = outline ? nameSizeOff({ ...c, drawnLengths: [] }, n0, n1) : nameSizeOff(c, n0, n1);
     let allowanceMm = null;
     if (!(off <= 1)) {
       // CUTTING ALLOWANCE (2026-10-14, from a shop's real jobs): the long side is nested a little OVER the finished
@@ -1902,7 +1916,7 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
     // 5. (a ProNest part) no size in its name, or none that fits: the OUTLINE's own size, over by a cutting allowance.
     if (loose) {
       const { a, b } = shape.mbr;
-      const drawn = pool.map((c) => ({ c, f: fitNameSize(c, shape, [a, b], part.drawnSize ?? null) })).filter((h) => h.f);
+      const drawn = pool.map((c) => ({ c, f: fitNameSize(c, shape, [a, b], part.drawnSize ?? null, false, true) })).filter((h) => h.f);
       if (drawn.length) return settle(exactFirst(drawn), 'size');
     }
     if (mislabelled) return mislabelled;
@@ -2029,7 +2043,7 @@ export function matchNest(nest, candidates, { toleranceMm = 0.5, kerfOffsetMaxMm
     if (!f && bare) { marks = true; if (!loose) f = tryFit(c, bare, false); }
     const shape = (marks ? bare : null) ?? full ?? bare;
     if (!f && loose && part.nameSize) f = fitNameSize(c, shape, part.nameSize, part.drawnSize ?? null);
-    if (!f) f = fitNameSize(c, shape, [shape.mbr.a, shape.mbr.b], loose ? part.drawnSize ?? null : null, true);
+    if (!f) f = fitNameSize(c, shape, [shape.mbr.a, shape.mbr.b], loose ? part.drawnSize ?? null : null, true, true);
     if (!f) return null;
     const made = placement(part, c, f, 'choice');
     if (marks) made.marksLeftOut = part.unsureMarks ?? 0;

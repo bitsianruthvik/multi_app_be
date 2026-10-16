@@ -1301,13 +1301,14 @@ async function leanPlannedUnits(db, companyId, ids, e) {
   // The plan entries, the ranks and the requisition lines: one read (each string column comes from one side only).
   const [mix] = await db.query(
     `SELECT 0 AS src, e.unit_key, e.ship_date, e.start_date, e.pinned AS n1, e.material_state, e.material_date,
-            NULL AS pr_id, NULL AS requisition_id, NULL AS order_line_id, NULL AS item_id, NULL AS quantity, NULL AS skipped_at, NULL AS skip_note, NULL AS code
+            NULL AS pr_id, NULL AS requisition_id, NULL AS order_line_id, NULL AS item_id, NULL AS quantity, NULL AS skipped_at, NULL AS skip_note, NULL AS code, NULL AS customer
        FROM cf_plan_entries e WHERE e.company_id = ? AND e.deleted_at IS NULL
       UNION ALL
-     SELECT 1, r.unit_key, NULL, NULL, r.rank_no, NULL, NULL, NULL, NULL, r.order_line_id, NULL, NULL, NULL, NULL, NULL
+     SELECT 1, r.unit_key, NULL, NULL, r.rank_no, NULL, NULL, NULL, NULL, r.order_line_id, NULL, NULL, NULL, NULL, NULL, NULL
        FROM cf_plan_ranks r WHERE r.company_id = ?
       UNION ALL
-     SELECT 2, NULL, NULL, NULL, pl.skipped, NULL, NULL, pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, pl.skipped_at, pl.skip_note, rq.code
+     SELECT 2, NULL, NULL, NULL, pl.skipped, NULL, NULL, pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, pl.skipped_at, pl.skip_note, rq.code,
+            IF(rq.supply = 'customer', 1, 0)
        FROM cf_requisition_lines pl JOIN cf_requisitions rq ON rq.id = pl.requisition_id AND rq.deleted_at IS NULL
       WHERE pl.company_id = ? AND pl.deleted_at IS NULL`,
     [companyId, companyId, companyId],
@@ -1324,7 +1325,7 @@ async function leanPlannedUnits(db, companyId, ids, e) {
       entries[r.unit_key] = { shipDate: dateText(r.ship_date), startDate: r.start_date ? dateText(r.start_date) : null, pinned: !!Number(r.n1) };
       placedWith.set(r.unit_key, { state: r.material_state ?? null, date: r.material_date ? dateText(r.material_date) : null });
     } else if (src === 1) { if (unitKeys.has(r.unit_key)) ranked.push(r); } else {
-      prLines.push({ id: r.pr_id, requisition_id: r.requisition_id, order_line_id: r.order_line_id, item_id: r.item_id, quantity: r.quantity, skipped: r.n1, skipped_at: r.skipped_at, skip_note: r.skip_note, code: r.code });
+      prLines.push({ id: r.pr_id, requisition_id: r.requisition_id, order_line_id: r.order_line_id, item_id: r.item_id, quantity: r.quantity, skipped: r.n1, skipped_at: r.skipped_at, skip_note: r.skip_note, code: r.code, customer: r.customer });
     }
   }
   const ranks = {};

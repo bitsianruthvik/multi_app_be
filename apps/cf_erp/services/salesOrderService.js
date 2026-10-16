@@ -274,6 +274,8 @@ function shapeOrder(o) {
     title: o.title,
     customer: o.customer_id ? { id: o.customer_id, code: o.customer_code ?? null, name: o.customer_name ?? null } : null,
     customerReference: o.customer_reference,
+    // Who supplies the material (§66): 'we_buy' | 'customer'; a line may say otherwise (lines[].materialSupply).
+    materialSupply: o.material_supply === 'customer' ? 'customer' : 'we_buy',
     status: o.status,
     receivedOn: dateText(o.received_on),
     committedDate: committed,
@@ -396,8 +398,43 @@ export async function getOrder(db, companyId, id) {
     lock: l.locked_at ? { lockedAt: l.locked_at, position: l.lock_position } : null,
     // The line of the previous revision this one was copied from (init.sql §27).
     revisesLineId: l.revises_line_id ?? null,
+    // §66: the line's own answer (null = as the order) and the one that counts.
+    materialSupply: l.material_supply ?? null,
+    supply: l.material_supply ?? order.materialSupply,
   }));
   return order;
+}
+
+/** 'we_buy' | 'customer' from a request (§66), null when left out; a stock order has nobody to supply it. */
+function readSupply(v, orderType, problems) {
+  if (blank(v)) return null;
+  const s = String(v);
+  if (!['we_buy', 'customer'].includes(s)) { problems.push('Material: "we_buy" (we buy it) or "customer" (the customer supplies it).'); return null; }
+  if (s === 'customer' && orderType === 'stock') { problems.push('A stock order has no customer to supply its material.'); return null; }
+  return s;
+}
+
+/**
+ * PUT /order-lines/:id/material-supply { supply: 'we_buy' | 'customer' | null } — one line's own answer to
+ * who supplies its material (null = as the order). Refused once the line's material request is raised.
+ */
+export async function setLineSupply(db, c, lineId, input = {}) {
+  const [[l]] = await db.query(
+    `SELECT l.id, l.line_no, l.order_id, l.material_supply, o.code AS order_code, o.order_type, o.status, o.material_supply AS order_supply,
+            (SELECT r.code FROM cf_requisitions r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL LIMIT 1) AS mr_code
+       FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id
+      WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL FOR UPDATE`,
+    [c.companyId, Number(lineId)],
+  );
+  if (!l) throw notFound('Order line');
+  const problems = [];
+  const supply = input.supply === null || input.supply === '' ? null : readSupply(input.supply, l.order_type, problems);
+  if (input.supply != null && input.supply !== '' && !supply && !problems.length) problems.push('Say who supplies the material.');
+  if (l.mr_code && (supply ?? null) !== (l.material_supply ?? null)) problems.push(`Line ${l.line_no}'s material request ${l.mr_code} is raised — who supplies its material is fixed now.`);
+  assertNoProblems(problems, `Line ${l.line_no} of ${l.order_code}: the material supply cannot be changed.`);
+  await db.query('UPDATE cf_sales_order_lines SET material_supply = ? WHERE company_id = ? AND id = ?', [supply, c.companyId, l.id]);
+  const effective = supply ?? (l.order_supply === 'customer' ? 'customer' : 'we_buy');
+  return { lineId: l.id, lineNo: l.line_no, materialSupply: supply, supply: effective, order: { id: l.order_id, code: l.order_code, materialSupply: l.order_supply === 'customer' ? 'customer' : 'we_buy' } };
 }
 
 /** The live release of a line, if it was released to production. */
@@ -430,6 +467,7 @@ export async function createOrder(db, c, input = {}) {
     committed_date: readDate(input.committedDate, 'Committed date', problems),
     delivery_address: blank(input.deliveryAddress) ? null : String(input.deliveryAddress),
     notes: blank(input.notes) ? null : String(input.notes),
+    material_supply: readSupply(input.materialSupply, orderType, problems) ?? 'we_buy',
   };
   let code = blank(input.code) ? null : String(input.code).trim();
   if (code && (!CODE_RE.test(code) || code.length > 100)) problems.push('Order number: up to 100 letters, digits and - _ . /, no spaces.');
@@ -447,10 +485,10 @@ export async function createOrder(db, c, input = {}) {
   const { processId } = await resolveProcess(db, c.companyId, { customerId, orderType });
   const [r] = await db.query(
     `INSERT INTO cf_sales_orders
-       (company_id, code, order_type, title, customer_id, customer_reference, status, received_on, committed_date, delivery_address, notes, process_id, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (company_id, code, order_type, title, customer_id, customer_reference, status, received_on, committed_date, delivery_address, notes, process_id, material_supply, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [c.companyId, code, orderType, body.title, customerId, body.customer_reference, FIRST_STATUS[orderType],
-      body.received_on, body.committed_date, body.delivery_address, body.notes, processId, c.userId],
+      body.received_on, body.committed_date, body.delivery_address, body.notes, processId, body.material_supply, c.userId],
   );
   return getOrder(db, c.companyId, r.insertId);
 }
@@ -482,6 +520,15 @@ export async function updateOrder(db, c, id, input = {}) {
   if (input.committedDate !== undefined) sets.committed_date = readDate(input.committedDate, 'Committed date', problems);
   if (input.deliveryAddress !== undefined) sets.delivery_address = blank(input.deliveryAddress) ? null : String(input.deliveryAddress);
   if (input.notes !== undefined) sets.notes = blank(input.notes) ? null : String(input.notes);
+  if (input.materialSupply !== undefined) {
+    const supply = readSupply(input.materialSupply, o.order_type, problems);
+    if (supply && supply !== (o.material_supply ?? 'we_buy')) {
+      // Fixed once a material request is raised: the MR was raised as it stood (§66).
+      const [mrs] = await db.query('SELECT code FROM cf_requisitions WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 3', [c.companyId, id]);
+      if (mrs.length) problems.push(`Who supplies the material is fixed once a material request is raised (${mrs.map((r) => r.code).join(', ')}). Set it on a line that has no MR yet.`);
+      else sets.material_supply = supply;
+    }
+  }
   assertNoProblems(problems);
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_sales_orders SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,

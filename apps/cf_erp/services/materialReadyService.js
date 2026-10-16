@@ -96,7 +96,7 @@ export async function openLines(db, companyId, { orderIds = null } = {}) {
   const [rows] = await db.query(
     `SELECT ol.id, ol.order_id, ol.line_no, ol.line_type, ol.item_id, ol.quantity, ol.locked_at, ol.committed_date,
             o.code AS order_code, o.status AS order_status, o.order_type, o.customer_id, o.plan_priority, o.committed_date AS order_committed,
-            m.code AS item_code, m.name AS item_name, ol.description,
+            m.code AS item_code, m.name AS item_name, ol.description, ol.material_supply AS own_supply, o.material_supply AS order_supply,
             (SELECT r.id FROM cf_production_releases r
               WHERE r.company_id = ol.company_id AND r.order_line_id = ol.id AND r.deleted_at IS NULL LIMIT 1) AS release_id
        FROM cf_sales_orders o
@@ -291,7 +291,7 @@ export async function loadSupply(db, companyId, itemIds, { needs = new Map(), to
       [companyId, ids, LIVE_PO_STATUSES],
     ),
     db.query(
-      `SELECT pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, pl.skipped, pl.skipped_at, pl.skip_note, r.code
+      `SELECT pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, pl.skipped, pl.skipped_at, pl.skip_note, r.code, IF(r.supply = 'customer', 1, 0) AS customer
          FROM cf_requisition_lines pl
          JOIN cf_requisitions r ON r.id = pl.requisition_id AND r.deleted_at IS NULL
         WHERE pl.company_id = ? AND pl.deleted_at IS NULL AND pl.item_id IN (?)`,
@@ -369,7 +369,7 @@ export async function loadSupply(db, companyId, itemIds, { needs = new Map(), to
   for (const list of supply.pooled.values()) list.sort((a, b) => String(a.date).localeCompare(String(b.date)) || a.poLineId - b.poLineId);
   for (const p of prLines) {
     supply.pr.set(`${p.order_line_id}:${p.item_id}`, {
-      id: p.id, requisitionId: p.requisition_id, code: p.code, skipped: !!Number(p.skipped), quantity: Number(p.quantity),
+      id: p.id, requisitionId: p.requisition_id, code: p.code, skipped: !!Number(p.skipped), quantity: Number(p.quantity), customer: !!Number(p.customer ?? 0),
       skippedAt: p.skipped_at ?? null, note: p.skip_note ?? null,
     });
   }
@@ -409,7 +409,7 @@ async function leanSupplyRows(db, companyId, ids, { prGiven, unknown }) {
   );
   const poRows = await db.query(PO_LINES_SQL, [companyId, ids, LIVE_PO_STATUSES]);
   const prLines = prGiven ? [prGiven] : await db.query(
-    `SELECT pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, pl.skipped, pl.skipped_at, pl.skip_note, r.code
+    `SELECT pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, pl.skipped, pl.skipped_at, pl.skip_note, r.code, IF(r.supply = 'customer', 1, 0) AS customer
        FROM cf_requisition_lines pl JOIN cf_requisitions r ON r.id = pl.requisition_id AND r.deleted_at IS NULL
       WHERE pl.company_id = ? AND pl.deleted_at IS NULL AND pl.item_id IN (?)`, [companyId, ids]);
   const names = unknown.length ? await db.query(
@@ -530,11 +530,12 @@ export function evaluate(supply, consumers, { full = false } = {}) {
             if (lot.partyId !== c.customerId || (lot.orderKey != null && lot.orderKey !== c.orderKey)) continue;
             add(lot.b, { kind: 'free', date: now, owner: 'customer' });
           }
-          add(f.ours, { kind: 'free', date: now });
+          // A material the customer supplies (§66) never leans on OUR stock.
+          if (!pr?.customer) add(f.ours, { kind: 'free', date: now });
         }
       }
       // A skipped material waits for stock, and for nothing else.
-      if (left > tol && !skipped) {
+      if (left > tol && !skipped && !pr?.customer) {
         for (const p of supply.pooled.get(n.itemId) ?? []) {
           add(p.b, { kind: 'po', date: p.date, poCode: p.poCode, poLineId: p.poLineId, poId: p.poId, status: 'dated', pooled: true, ...(p.late ? { late: true } : {}) });
         }

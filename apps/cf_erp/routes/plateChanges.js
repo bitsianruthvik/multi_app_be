@@ -18,6 +18,8 @@ import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import { isPermitted } from '../../../core/middleware/requirePerm.js';
 import { assertLineOnOrder } from '../services/nestingService.js';
 import { dismissRun } from '../services/nestRunService.js';
+// An approved upload (or a customer's plate taken off) is the saved nesting now: our own comparison follows it (2026-10-16).
+import { scheduleAutoCompare } from '../services/nestCompareService.js';
 import {
   lineChanges, listChanges, getChange, approveChange, rejectChange, withdrawChange, tickChecklist,
 } from '../services/plateChangeService.js';
@@ -56,6 +58,8 @@ router.post('/plate-changes/:id/approve', guard(PERM.plateChangeApprove),
     if (out.refusal) throw out.refusal;
     // An approved "save our nesting" is the saved plan now: the finished run has done its job (as /accept).
     if (out.kind === 'accept') await dismissRun(v.companyId, out.lineId, { accepted: true });
+    // Queued after the commit; the approval never waits for it.
+    if (out.kind === 'upload' || out.kind === 'delete_lot') scheduleAutoCompare(v, out.lineId);
     return out.request;
   }));
 

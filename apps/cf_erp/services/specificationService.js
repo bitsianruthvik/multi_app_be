@@ -13,6 +13,7 @@ import { invalid, conflict, notFound, assertNoProblems } from '../lib/errors.js'
 import { findSegmentsUsingToken } from '../modules/codegen/index.js';
 import { resolve } from './resolutionService.js';
 import { requireNode } from './tree.js';
+import { workedOutWhy, LOCKED_ORDER_STATUSES } from './records.js';
 
 export const DATA_TYPES = ['number', 'text', 'boolean', 'date', 'option', 'table'];
 export const MEASUREMENT_TYPES = ['LENGTH', 'AREA', 'VOLUME', 'MASS', 'DENSITY', 'COUNT', 'TIME', 'SPEED', 'FORCE', 'PRESSURE', 'TEMPERATURE', 'ANGLE', 'RATIO'];
@@ -34,6 +35,8 @@ function shapeSpec(s, options = [], usage = {}) {
     defaultUom: s.default_uom, decimals: s.decimals, description: s.description, status: s.status,
     options: s.data_type === 'option' ? options.map((o) => ({ id: o.id, value: o.value, label: o.label, sortOrder: o.sort_order, status: o.status })) : undefined,
     tableConfig: s.data_type === 'table' ? parseJson(s.table_config) : undefined,
+    // Can be set for a whole order (init.sql §65): an order and its lines may carry a value every row takes.
+    orderLevel: !!Number(s.order_level ?? 0),
     ruleCount: Number(usage.rules ?? 0),
     valueCount: Number(usage.values ?? 0),
   };
@@ -113,6 +116,7 @@ function readCommon(input, problems) {
     if (!['active', 'inactive'].includes(input.status)) problems.push('Status is active or inactive.');
     out.status = input.status;
   }
+  if (input.orderLevel !== undefined) out.order_level = input.orderLevel === true || input.orderLevel === 1 || input.orderLevel === '1' || input.orderLevel === 'true' ? 1 : 0;
   return out;
 }
 
@@ -140,6 +144,9 @@ export async function createSpec(db, c, input = {}) {
   } else if (input.tableConfig != null) {
     problems.push('Axes apply to table specifications only.');
   }
+  if (fields.order_level === 1 && (dataType === 'table' || workedOutWhy(code))) {
+    problems.push(`${code} cannot be set for a whole order — ${dataType === 'table' ? 'a table is never set on an order' : 'it is worked out, never typed'}.`);
+  }
   assertNoProblems(problems);
 
   const [r] = await db.query(
@@ -148,6 +155,9 @@ export async function createSpec(db, c, input = {}) {
     [c.companyId, code, fields.name, dataType, fields.measurement_type ?? null, fields.default_uom ?? null,
       fields.decimals ?? null, tableConfig ? JSON.stringify(tableConfig) : null, fields.description ?? null, fields.status ?? 'active', c.userId],
   );
+  if (fields.order_level === 1) {
+    await db.query('UPDATE cf_specifications SET order_level = 1 WHERE company_id = ? AND id = ?', [c.companyId, r.insertId]);
+  }
   for (const [i, o] of options.entries()) {
     await db.query(
       'INSERT INTO cf_spec_options (company_id, specification_id, value, label, sort_order, created_by) VALUES (?, ?, ?, ?, ?, ?)',
@@ -209,6 +219,22 @@ export async function updateSpec(db, c, id, input = {}) {
     }
   } else if (dataType === 'table' && spec.data_type !== 'table') {
     problems.push('A table specification needs its axes.');
+  }
+  // Can be set for a whole order (init.sql §65): never a table or a worked-out value; turned off only
+  // while no open order carries a value for it (the rows would silently lose what they take).
+  if (fields.order_level !== undefined && fields.order_level === Number(spec.order_level ?? 0)) delete fields.order_level;
+  if (fields.order_level === 1 && (dataType === 'table' || workedOutWhy(spec.code))) {
+    problems.push(`${spec.code} cannot be set for a whole order — ${dataType === 'table' ? 'a table is never set on an order' : 'it is worked out, never typed'}.`);
+  }
+  if (fields.order_level === 0) {
+    const [held] = await db.query(
+      `SELECT DISTINCT o.code, o.revision, o.status FROM cf_order_spec_defaults d
+         JOIN cf_sales_orders o ON o.company_id = d.company_id AND o.id = d.order_id AND o.deleted_at IS NULL
+        WHERE d.company_id = ? AND d.specification_id = ? AND d.deleted_at IS NULL`,
+      [c.companyId, id],
+    );
+    const open = held.filter((o) => !LOCKED_ORDER_STATUSES.has(o.status)).map((o) => (Number(o.revision) > 1 ? `${o.code} rev ${o.revision}` : o.code));
+    if (open.length) problems.push(`${spec.code} has a value on ${open.length === 1 ? 'order' : 'orders'} ${open.slice(0, 5).join(', ')}${open.length > 5 ? ` and ${open.length - 5} more` : ''} — take it off there first, so no row loses its value without anyone seeing.`);
   }
   assertNoProblems(problems);
   const keys = Object.keys(fields);

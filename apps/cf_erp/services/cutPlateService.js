@@ -101,6 +101,7 @@ import { refreshValues } from './valueService.js';
 import { autofillLineSelections } from './selectionService.js';
 import { cutPlaces, problemsOf } from '../lib/cutPlaces.js';
 import { syncFlowSpecs } from './flowSpecService.js';
+import { rulesOf as cutAllowanceRules, applyToParts as applyCutAllowances, cutAllowanceOf } from './cutAllowanceService.js';
 import { ensureLineFlowCopies } from './frozenFlowService.js';
 import {
   resolveCodes, sectionSteelOf, profileKeyOf, profileLabelOf, CUT_FROM_CODE, CUT_FROM_VALUES, STEEL_FROM_STOCK,
@@ -213,7 +214,10 @@ async function requireLine(db, companyId, lineId, { lock = false } = {}) {
   const [[l]] = await db.query(
     `SELECT l.*, o.code AS order_code, o.status AS order_status, o.order_type, o.title AS order_title,
             o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision,
-            rel.id AS release_id, NOW() AS db_now
+            rel.id AS release_id, NOW() AS db_now, o.customer_id AS order_customer_id,
+            (SELECT COUNT(*) FROM cf_cut_allowances ca
+              WHERE ca.company_id = l.company_id AND ca.deleted_at IS NULL
+                AND (ca.order_id = o.id OR (ca.scope = 'customer' AND ca.customer_id = o.customer_id))) AS cut_allowance_rules
        FROM cf_sales_order_lines l
        JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL
        LEFT JOIN cf_production_releases rel ON rel.order_line_id = l.id AND rel.deleted_at IS NULL
@@ -469,6 +473,14 @@ async function survey(db, companyId, line, places) {
   for (const m of [...parts, ...blanks]) {
     m.values = values.get(m.id) ?? new Map();
     m.size = sizeOf(m.values);
+  }
+  // CUTTING ALLOWANCE (init.sql §64, cutAllowanceService): on an OPEN line a plate part is pooled and cut at
+  // drawn + its allowance (the customer's, the order's or its own rule for its part name). Its own LENGTH stays as
+  // drawn (`drawnLength`); only the cut piece is longer. A frozen line is never re-planned, so it reads the parts
+  // as drawn and its cut pieces as they stand. One query, and only when some rule reaches the order.
+  for (const p of plateParts) p.drawnLength = p.size.length;
+  if (Number(line.cut_allowance_rules) > 0 && !lockOf(line)) {
+    applyCutAllowances(await cutAllowanceRules(db, companyId, { orderId: line.order_id, customerId: line.order_customer_id }), plateParts);
   }
   const sectionClass = places.all.section.blanksIds;
   const plate = {
@@ -1732,6 +1744,8 @@ const describe = (cp, size, parts, plateLine, kind = 'plate', sec = null) => ({
   lengthMm: kind === 'section' ? sec?.length ?? null : null,
   partCount: parts.length,
   parts: parts.map((p) => ({ id: p.id, code: p.code, name: p.name })),
+  // What the cut piece is cut longer than its parts are drawn (init.sql §64): null when cut as drawn.
+  allowance: kind === 'plate' ? cutAllowanceOf(size.length, parts) : null,
   plate: plateLine.plate,
   plateQuantity: plateLine.quantity,
   plateQuantityBasis: plateLine.basis,

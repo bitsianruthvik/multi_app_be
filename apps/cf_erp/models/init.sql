@@ -5573,3 +5573,205 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
       AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('cf_plate_change_files', 'cf_plate_change_events')) = 2
       AND (SELECT COUNT(*) FROM features_capability WHERE name = 'cf_erp_plate_change_approve' AND deleted_at IS NULL) >= 1,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §64  CUTTING ALLOWANCE by BOM part name (2026-10-16) — the same text as TM/s64.sql
+-- Additive and guarded: safe to re-run. Service: services/cutAllowanceService.js; routes: routes/cutAllowances.js;
+-- applied in services/cutPlateService.js (survey). Contract: TM/CF_ERP_NESTING_V2.md ("Cutting allowance").
+--
+-- User, 2026-10-16: customers cut flanges and webs a little long (+10–15 mm) so welding shrinkage and end trimming
+-- can be absorbed. The allowance is chosen by the BOM PART NAME — the template definition a row comes from
+-- ("Top flange", "Web plate") — at three levels, the most specific winning: the CUSTOMER default, the ORDER
+-- override, and one ROW's override. A rule adds per_end_mm at each of the two ends plus per_metre_mm for every
+-- metre of the drawn length, to the LENGTH only. It changes only the CUT PIECE (its length, code, weight, the
+-- plate it is cut from); the row's own LENGTH and the order weight stay as drawn. A locked line keeps its cut
+-- pieces; a revision takes the allowance in force.
+--
+-- scope          customer | order | row
+-- customer_id    scope customer: whose default it is.
+-- order_id       scope order and row: the order (a row rule carries its order so one read finds every rule).
+-- definition_id  scope customer and order: the part name (template definition). NULL on a row rule.
+-- part_id        scope row: the row (the order line's temporary item). NULL otherwise.
+-- per_end_mm     mm added at EACH end (the length grows by twice this).
+-- per_metre_mm   mm added for every metre of the drawn length.
+-- live_key       one live rule per scope and target.
+CREATE TABLE IF NOT EXISTS cf_cut_allowances (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  scope           VARCHAR(10)    NOT NULL,
+  customer_id     INT            NULL,
+  order_id        INT            NULL,
+  definition_id   INT            NULL,
+  part_id         INT            NULL,
+  per_end_mm      DECIMAL(10,3)  NOT NULL DEFAULT 0,
+  per_metre_mm    DECIMAL(10,3)  NOT NULL DEFAULT 0,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT            NULL,
+  updated_by      INT            NULL,
+  live_key        VARCHAR(80)    GENERATED ALWAYS AS (IF(deleted_at IS NULL, CONCAT(scope, ':', COALESCE(customer_id, 0), ':', COALESCE(order_id, 0), ':', COALESCE(definition_id, 0), ':', COALESCE(part_id, 0)), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cca_tenant   (company_id, id),
+  UNIQUE KEY uq_cca_live     (company_id, live_key),
+  KEY idx_cca_customer (company_id, customer_id),
+  KEY idx_cca_order    (company_id, order_id),
+
+  CONSTRAINT fk_cca_company    FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cca_customer   FOREIGN KEY (company_id, customer_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_cca_order      FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cca_definition FOREIGN KEY (company_id, definition_id) REFERENCES cf_master_records(company_id, id),
+  CONSTRAINT fk_cca_part       FOREIGN KEY (company_id, part_id) REFERENCES cf_master_records(company_id, id),
+  CONSTRAINT fk_cca_creator    FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_cca_updater    FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_cut_allowances'
+             AND COLUMN_NAME IN ('company_id', 'scope', 'customer_id', 'order_id', 'definition_id', 'part_id', 'per_end_mm', 'per_metre_mm', 'deleted_at', 'live_key')) = 10
+      AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_cut_allowances'
+             AND INDEX_NAME IN ('uq_cca_tenant', 'uq_cca_live', 'idx_cca_customer', 'idx_cca_order')) = 4,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §65  ORDER AND LINE VALUES for specifications (2026-10-16) — the same text as TM/s65.sql
+-- Additive and guarded: safe to re-run. Pure rules: lib/orderDefaults.js (both resolvers);
+-- service: services/orderDefaultService.js; routes: routes/orderValues.js
+-- (GET/PUT /orders/:id/spec-defaults). Plan: TM/CF_ERP_ORDER_FLOW_PLAN.md "Order and line values".
+--
+-- User, 2026-10-16: "The various coats, MS BO or BR, all of these are also set at an order or a line level
+-- typically and can be overridden in the values screen if required."
+--
+-- cf_specifications.order_level   1 = "Can be set for a whole order" (Setup › Specifications). Only such a
+--                                 specification may carry an order or line value.
+-- cf_order_spec_defaults          one value per (order, line, specification); order_line_id NULL = the whole
+--                                 order. A row of the order with that specification takes it unless the row
+--                                 has its own entry: row entry > line value > order value > the spec's rule
+--                                 (a Defaulted formula, a default from above). Only entered / defaulted rules,
+--                                 never a table. The value reached is stored on the row as a default
+--                                 (cf_spec_values.source 'defaulted'), so a LOCKED line keeps what it had —
+--                                 a later change of the order's value does not reach it.
+--                                 line_key = IFNULL(order_line_id, 0) so the unique key holds for the order row.
+-- cf_order_spec_default_history   append-only, like cf_spec_value_history: every create / update / delete.
+--
+-- Seed: the flag is turned on for Placebo (company 30005) on COATS, METALLISE_COATS, PAINT_COATS, GRADE,
+-- IMPACT_CLASS and MATERIAL — only those that exist (and are not tables). Set-based, idempotent.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_specifications' AND COLUMN_NAME = 'order_level');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_specifications ADD COLUMN order_level TINYINT(1) NOT NULL DEFAULT 0", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_order_spec_defaults (
+  id                INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  order_id          INT            NOT NULL,
+  order_line_id     INT            NULL,
+  specification_id  INT            NOT NULL,
+
+  value_number      DECIMAL(24,6)  NULL,
+  value_text        VARCHAR(500)   NULL,
+  value_bool        TINYINT(1)     NULL,
+  value_date        DATE           NULL,
+  option_id         INT            NULL,
+  uom               VARCHAR(20)    NULL,
+
+  deleted_at        DATETIME       DEFAULT NULL,
+  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by        INT            NULL,
+  updated_by        INT            NULL,
+
+  line_key          INT            GENERATED ALWAYS AS (IFNULL(order_line_id, 0)) VIRTUAL,
+  is_live           TINYINT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cosd_tenant (company_id, id),
+  UNIQUE KEY uq_cosd_value  (company_id, order_id, line_key, specification_id, is_live),
+  KEY idx_cosd_line (company_id, order_line_id),
+  KEY idx_cosd_spec (company_id, specification_id),
+
+  CONSTRAINT fk_cosd_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cosd_order   FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cosd_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_cosd_spec    FOREIGN KEY (company_id, specification_id) REFERENCES cf_specifications(company_id, id),
+  CONSTRAINT fk_cosd_option  FOREIGN KEY (company_id, option_id) REFERENCES cf_spec_options(company_id, id),
+  CONSTRAINT fk_cosd_creator FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_cosd_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS cf_order_spec_default_history (
+  id                INT       AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT       NOT NULL,
+  default_id        INT       NOT NULL,
+  order_id          INT       NOT NULL,
+  order_line_id     INT       NULL,
+  specification_id  INT       NOT NULL,
+  change_type       ENUM('create','update','delete') NOT NULL,
+  old_value         JSON      NULL,
+  new_value         JSON      NULL,
+  note              VARCHAR(255) NULL,
+  changed_by        INT       NULL,
+  changed_at        DATETIME  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  deleted_at        DATETIME  DEFAULT NULL,           -- never set; required by the query engine
+
+  KEY idx_cosdh_order   (company_id, order_id, changed_at),
+  KEY idx_cosdh_default (company_id, default_id),
+
+  CONSTRAINT fk_cosdh_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+UPDATE cf_specifications SET order_level = 1
+ WHERE company_id = 30005 AND deleted_at IS NULL AND order_level = 0 AND data_type <> 'table'
+   AND code IN ('COATS', 'METALLISE_COATS', 'PAINT_COATS', 'GRADE', 'IMPACT_CLASS', 'MATERIAL');
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_specifications' AND COLUMN_NAME = 'order_level') = 1
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_order_spec_defaults'
+             AND COLUMN_NAME IN ('company_id', 'order_id', 'order_line_id', 'specification_id', 'value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'uom', 'line_key', 'is_live')) = 12
+      AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_order_spec_defaults'
+             AND INDEX_NAME IN ('uq_cosd_tenant', 'uq_cosd_value')) = 2
+      AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_order_spec_default_history') = 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §66  MATERIAL REQUEST (MR) and CUSTOMER-SUPPLIED MATERIAL (2026-10-16) — the same text as TM/s66.sql
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_BUYING_V2.md "2026-10-16 — Material request".
+--
+-- User, 2026-10-16: "Instead of 'buying' in sales order, just mention material request … at the sale order
+-- initiation level, we should capture if the materials will be given by customer or if we need to purchase.
+-- If it is by customer, a PO should get auto generated on the customer as vendor once the MR step is done.
+-- Once the GRN for that is done, we can start using it. Inventory from customer should be separated."
+--
+-- cf_sales_orders.material_supply       'we_buy' (default) | 'customer' — who supplies the order's material.
+-- cf_sales_order_lines.material_supply  NULL = as the order; 'we_buy' | 'customer' = this line's own answer.
+--                                       Both can change until the line's MR is raised.
+-- cf_requisitions.supply                what the MR was raised as ('we_buy' | 'customer'); NULL = an MR raised
+--                                       before §66 (= 'we_buy'). Fixed when raised.
+-- cf_purchase_orders.supplied_by_customer  1 = the customer's own material, ordered on the customer as vendor
+--                                       (₹0). A receipt on it is the CUSTOMER's lot (owner_party_id), earmarked
+--                                       to the MR line it serves.
+-- The order stage "Buying" is called "Material request": the default label of a process stage still named
+-- 'Buying' follows (a stage a person renamed to anything else is left alone).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND COLUMN_NAME = 'material_supply');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_sales_orders ADD COLUMN material_supply VARCHAR(16) NOT NULL DEFAULT 'we_buy'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'material_supply');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN material_supply VARCHAR(16) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'supply');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_requisitions ADD COLUMN supply VARCHAR(16) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'supplied_by_customer');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN supplied_by_customer TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+UPDATE cf_process_stages SET label = 'Material request' WHERE stage_key = 'buying' AND label = 'Buying';
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND ((TABLE_NAME = 'cf_sales_orders' AND COLUMN_NAME = 'material_supply')
+               OR (TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'material_supply')
+               OR (TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'supply')
+               OR (TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'supplied_by_customer'))) = 4,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

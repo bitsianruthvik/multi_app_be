@@ -18,6 +18,13 @@
  *       a released line is a 409. A dry run is the real write in a SAVEPOINT,
  *       rolled back. Answers with the grid as it now stands (`view`).
  *
+ *   GET /orders/:id/spec-defaults
+ *       ORDER and LINE values (init.sql §65, services/orderDefaultService.js): the specifications flagged
+ *       "Can be set for a whole order", the order's values, each line's, and how each line's rows take them
+ *   PUT /orders/:id/spec-defaults   { lineId?: number | null, dryRun?, writes: [{ specCode, value }] }
+ *       lineId null = the whole order; value null / '' takes it away. Every open line it reaches is worked
+ *       out again at once, then its cut pieces follow (withCutPieces); a locked line keeps what it locked with.
+ *
  * WHICH GRANT WRITES
  * Either of two. `PUT /records/:id/values` asks for the catalog grant whatever
  * the record belongs to, so today only a catalog editor can type an order's
@@ -37,6 +44,7 @@ import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { readLineValues, writeLineValues } from '../services/orderValuesService.js';
 import { withCutPieces } from '../services/cutPlateService.js';
 import { designUses } from '../services/partDrawingService.js';
+import { readOrderDefaults, writeOrderDefaults } from '../services/orderDefaultService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -62,6 +70,22 @@ router.put('/order-lines/:id/values', protect, requireAny(VALUES_WRITE_PERMS),
     const c = ctx(req);
     const out = await writeLineValues(db, c, id(req), req.body ?? {});
     return out.applied ? withCutPieces(db, c, id(req), out) : out;
+  })));
+
+
+// Order and line values (init.sql §65). The same grants as the Values stage: they are its values.
+router.get('/orders/:id/spec-defaults', guard(PERM.ordersView), handle((req) => readOrderDefaults(pool, ctx(req).companyId, id(req), { usage: req.query?.usage !== '0' })));
+router.put('/orders/:id/spec-defaults', protect, requireAny(VALUES_WRITE_PERMS),
+  handle((req) => withTransaction(async (db) => {
+    const c = ctx(req);
+    const out = await writeOrderDefaults(db, c, id(req), req.body ?? {});
+    // Each line whose rows moved: its cut pieces (a grade or a size may have changed), as after a Values save.
+    const cutPieces = [];
+    for (const lineId of out.linesWorked) {
+      const r = await withCutPieces(db, c, lineId, {});
+      cutPieces.push({ lineId, ...(r?.cutPieces ?? {}) });
+    }
+    return cutPieces.length ? { ...out, cutPieces } : out;
   })));
 
 export default router;

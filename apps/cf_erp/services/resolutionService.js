@@ -49,6 +49,7 @@ import { ancestors, levelName } from './tree.js';
 import { loadMaster, frozenBy, LIVE_WHEN_FROZEN, DRAWING_FACT_SPECS, workedOutWhy } from './records.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { placementOf, rollupChildren, storedValues } from './bomGraph.js';
+import { orderDefaultOf, ownStands, defaultsForLine, loadOrderDefaultRows, notAllowedNote } from '../lib/orderDefaults.js';
 
 export const CAPTURE_DEPTH = { item: 0, batch: 1, individual: 2 };
 export const TRACK_DEPTH = { quantity: 0, batch: 1, individual: 2 };
@@ -245,8 +246,12 @@ export function drawingFactsOf(ownRows) {
   return out;
 }
 
-/** The specs a formula works out: calculated, roll-up, and Defaulted rules that name one. */
-const formulaSpecs = (specs) => specs.filter((s) => s.applicable && s.captureAt === 'item'
+/**
+ * The specs a formula works out: calculated, roll-up, and Defaulted rules that name one — but not a
+ * Defaulted one the order or line gives a value (init.sql §65: that value stands over the formula,
+ * and the formulas that READ it see it like any other value).
+ */
+const formulaSpecs = (specs) => specs.filter((s) => s.applicable && s.captureAt === 'item' && !s.fromOrder
   && (['calculated', 'rollup'].includes(s.rule.valueRule) || isWorkedDefault(s.rule)));
 
 /** Whether any of a record's formulas reads its BOM children, and which of their values: { any, terms }. */
@@ -421,6 +426,15 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   // were when the order locked — nothing is worked out again (decided 2026-09-22).
   const frozen = master ? frozenBy(master) : null;
 
+  // Order and line values (init.sql §65, lib/orderDefaults): a row of an order reads the values its order
+  // and its line set for flagged specifications. One query, only for an open order's own row.
+  let orderDefaults = null;
+  if (mode === 'item' && !isMachine && !frozen && !draftValues && master?.item_type === 'temporary'
+      && master.owner_order_id != null && master.owner_order_line_id != null
+      && winning.some((r) => r.is_applicable && r.capture_at === 'item' && ['entered', 'defaulted'].includes(r.value_rule))) {
+    orderDefaults = defaultsForLine(await loadOrderDefaultRows(db, companyId, master.owner_order_id, [master.owner_order_line_id]), master.owner_order_line_id);
+  }
+
   // Inherited values come from the BOM parent (Q7). Only looked up when a rule needs it.
   const inheritedSpecIds = mode === 'item' && !frozen && !isMachine
     ? winning.filter((r) => r.is_applicable && r.capture_at === 'item' && r.value_rule === 'inherited').map((r) => r.specification_id)
@@ -493,12 +507,24 @@ export async function resolve(db, companyId, { master = null, machine = null, no
       continue;
     }
 
+    // The order's or line's value for this spec (lib/orderDefaults): row entry > line > order > the rule's own.
+    const od = orderDefaults ? orderDefaultOf(orderDefaults, r, allowed) : null;
+    if (od) {
+      const odRaw = rawOf(od.row, spec.dataType);
+      entry.orderValue = { level: od.level, raw: odRaw, display: displayOf(odRaw, spec, optionById), allowed: od.allowed };
+      if (spec.dataType === 'option') entry.orderValue.optionValue = optionById.get(odRaw)?.value ?? null;
+      if (!od.allowed) entry.note = notAllowedNote(od.level, entry.orderValue.display);
+    }
+    const fromOrder = () => { entry.value = view(od.row, 'defaulted', od.level); entry.status = 'default'; entry.fromOrder = od.level; effectiveRows.set(spec.id, od.row); };
+
     switch (r.value_rule) {
       case 'entered':
-        if (own) { entry.value = view(own, own.source, 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
+        if (od?.allowed && !ownStands(own, spec.code)) fromOrder();
+        else if (own) { entry.value = view(own, own.source, 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
         break;
       case 'defaulted':
         if (own && own.source === 'entered') { entry.value = view(own, 'entered', 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
+        else if (od?.allowed) fromOrder();
         // Its formula gives the default (second pass); the value above only stands in where it cannot.
         else if (isWorkedDefault(entry.rule)) {
           if (above) fallbacks.set(entry, () => { entry.value = view(above.row, 'defaulted', chain[above.levelIndex].level); entry.status = 'default'; effectiveRows.set(spec.id, above.row); });

@@ -554,6 +554,40 @@ export function currentRun(companyId, lineId, { withPlan = false } = {}) {
 /** The run of either purpose the line has in memory (nestCompareService polls a comparison through this). */
 export function memoryRun(companyId, lineId) { sweep(); return runs.get(keyOf(companyId, lineId)) ?? null; }
 
+/**
+ * Does this run hold the line's plates still (2026-10-16, the automatic comparison after an upload)?
+ * A run that is working reads the line as it is, so a plate save under it is refused (RUN_BUSY) —
+ * EXCEPT a comparison whose every plan nests a fixed set of pieces (`only`): it reads no saved plate,
+ * no mark, nothing a save changes, so the line stays free while it works. A newer upload simply makes
+ * its answer stale (another demand), and the automatic comparison of that upload replaces it.
+ */
+export function blocksLineWrites(run) {
+  if (!run || run.status !== 'running') return false;
+  if ((run.purpose ?? 'nest') === 'compare' && run.jobs?.length && run.jobs.every((j) => j.input?.only && Object.keys(j.input.only).length)) return false;
+  return true;
+}
+
+/** A comparison the server started by itself after an upload (input.trigger), not one a person asked for. */
+export const isAutoCompare = (run) => (run?.purpose ?? 'nest') === 'compare' && !!run?.input?.trigger;
+
+/**
+ * A PERSON'S NESTING RUN GOES FIRST (2026-10-16). The automatic comparison after an upload must never
+ * hold the person up: when they start a nesting run while it works, it is told "stop and use this"
+ * (it ends `done` within a rebuild, with the best layout it had, `plan.budget.stopped`) and this waits
+ * for that — at most `waitMs` — so the person's run can start. A comparison a PERSON started is left
+ * alone (the run then refuses with RUN_BUSY, as before). → true when it stopped one.
+ */
+export async function yieldAutoCompare(companyId, lineId, { waitMs = 30_000 } = {}) {
+  const run = runs.get(keyOf(companyId, lineId));
+  if (!run || run.status !== 'running' || !isAutoCompare(run)) return false;
+  stopRun(companyId, lineId, { purpose: 'compare' });
+  log(run, 'Stopped early: a nesting run was started on this line.');
+  const t0 = Date.now();
+  while (run.status === 'running' && Date.now() - t0 < waitMs) await new Promise((r) => { setTimeout(r, 100); });
+  if (run.persist) await run.persist.catch(() => {});
+  return true;
+}
+
 /** A row of cf_nest_runs as the run the page knows. */
 function runOfRow(row, { withPlan }) {
   const startedAt = row.started_at ? new Date(row.started_at).getTime() : Date.now();

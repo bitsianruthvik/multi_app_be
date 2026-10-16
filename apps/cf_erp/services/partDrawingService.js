@@ -1068,7 +1068,7 @@ export async function drawingFactsOfLine(db, companyId, lineId) {
       if (d && p.lengthMm > 0 && p.widthMm > 0) {
         const o = orientTo(d.geometry, p.lengthMm, p.widthMm);
         a.cut += w * d.geometry.cutLengthMm; a.pierce += w * d.geometry.piercings;
-        a.aL += w * o.alongLength; a.aW += w * o.alongWidth; a.drawn += w; a.marks.add(d.id); a.d = d; a.o = o;
+        a.aL += w * o.alongLength; a.aW += w * o.alongWidth; a.drawn += w; a.marks.add(d.id); a.d = d; a.o = o; a.partLength = p.lengthMm;
       } else {
         a.cut += w * 2 * ((p.lengthMm ?? 0) + (p.widthMm ?? 0)); a.pierce += w; a.aL += w; a.aW += w; a.marks.add(null);
       }
@@ -1091,7 +1091,8 @@ export async function drawingFactsOfLine(db, companyId, lineId) {
     const shapeNote = rings ? null
       : a.marks.has(null) ? `${a.drawn} of its ${a.n} pieces ${a.drawn === 1 ? 'has' : 'have'} a drawing and the ${a.n - a.drawn === 1 ? 'other has' : 'others have'} none, so it is nested as its rectangle.`
         : `Its rows have ${kinds} different drawings, so it is nested as its rectangle.`;
-    out.set(cpId, { cutLengthMm: r1(a.cut / a.n), piercings: r3(a.pierce / a.n), alongLength: r3(a.aL / a.n), alongWidth: r3(a.aW / a.n), rings, pieces: a.n, drawnPieces: a.drawn, drawings: kinds, shapeNote });
+    // partLength: the drawn LENGTH of the row the drawing is of — a cut piece longer than it carries a cutting allowance (§64).
+    out.set(cpId, { cutLengthMm: r1(a.cut / a.n), piercings: r3(a.pierce / a.n), alongLength: r3(a.aL / a.n), alongWidth: r3(a.aW / a.n), rings, pieces: a.n, drawnPieces: a.drawn, drawings: kinds, shapeNote, partLength: rings ? a.partLength ?? null : null });
   }
   return out;
 }

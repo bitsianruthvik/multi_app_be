@@ -43,7 +43,8 @@ export async function requireLinkableOrder(db, companyId, orderId, problems) {
  * Allocations of the given PO lines: Map lineId -> [{ id, orderId, orderCode, quantity, received,
  * prLineId, requisition }], oldest first. prLineId (init.sql §56) is the requisition line the share
  * is for — null when it is bought for the order as a whole; `requisition` then names it
- * ({ id, code, lineNo }). 1 read.
+ * ({ id, code, lineNo }). A CANCELLED purchase order's shares were dropped when it was cancelled (§66: the MR
+ * opens again); they are still listed here, for the record — nothing is ever written on a cancelled PO. 1 read.
  */
 export async function allocationsOf(db, companyId, lineIds) {
   const out = new Map();
@@ -52,10 +53,12 @@ export async function allocationsOf(db, companyId, lineIds) {
     `SELECT a.id, a.purchase_line_id, a.order_id, o.code AS order_code, a.quantity, a.qty_received, a.pr_line_id,
             rq.id AS requisition_id, rq.code AS requisition_code, sl.line_no AS requisition_line_no
        FROM cf_purchase_line_orders a JOIN cf_sales_orders o ON o.id = a.order_id
+       JOIN cf_purchase_order_lines pol ON pol.id = a.purchase_line_id
+       JOIN cf_purchase_orders po ON po.id = pol.purchase_order_id
        LEFT JOIN cf_requisition_lines prl ON prl.id = a.pr_line_id
        LEFT JOIN cf_requisitions rq ON rq.id = prl.requisition_id
        LEFT JOIN cf_sales_order_lines sl ON sl.id = rq.order_line_id
-      WHERE a.company_id = ? AND a.purchase_line_id IN (?) AND a.deleted_at IS NULL
+      WHERE a.company_id = ? AND a.purchase_line_id IN (?) AND (a.deleted_at IS NULL OR po.status = 'cancelled')
       ORDER BY a.purchase_line_id, a.id`,
     [companyId, lineIds],
   );
@@ -80,8 +83,9 @@ export async function orderCodesOfPos(db, companyId, poIds) {
     `SELECT DISTINCT l.purchase_order_id, o.code
        FROM cf_purchase_line_orders a
        JOIN cf_purchase_order_lines l ON l.id = a.purchase_line_id AND l.deleted_at IS NULL
+       JOIN cf_purchase_orders po ON po.id = l.purchase_order_id
        JOIN cf_sales_orders o ON o.id = a.order_id
-      WHERE a.company_id = ? AND l.purchase_order_id IN (?) AND a.deleted_at IS NULL
+      WHERE a.company_id = ? AND l.purchase_order_id IN (?) AND (a.deleted_at IS NULL OR po.status = 'cancelled')
       ORDER BY l.purchase_order_id, o.code`,
     [companyId, poIds],
   );

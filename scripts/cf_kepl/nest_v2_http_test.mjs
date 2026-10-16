@@ -29,6 +29,10 @@ import http from 'node:http';
 import { pathToFileURL } from 'node:url';
 import express from 'express';
 
+// Our own nesting after an upload (2026-10-16) is queued by every save through these routes; this suite counts the line's
+// rows and starts its own comparison, so it runs with it off. It has its own suite: nest_auto_compare_test.mjs.
+process.env.CF_NEST_AUTO_COMPARE = 'off';
+
 const BE = process.cwd();
 const imp = (p) => import(pathToFileURL(path.join(BE, p)).href);
 const { pool } = await imp('db.js');

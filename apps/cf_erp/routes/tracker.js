@@ -40,6 +40,7 @@ import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import {
   releaseCheck, releasePreview, releaseLine, getRelease, unrelease, orderProduction, orderProductionSummary, releaseRequirements,
+  takeMrEarmarks, releaseAfterWrite,
   listTrackerSteps, listTrackerMaterials,
   startStep, recordProgress, holdStep, resumeStep, stepHistory,
   reserveRequirement, reserveRelease, issueRequirement, releaseReservation,
@@ -60,7 +61,14 @@ const body = (req) => ({ ...(req.body ?? {}), view: view_(req) });
 
 router.get('/order-lines/:id/release-check', view, handle((req) => releaseCheck(pool, company(req), id(req))));
 router.get('/order-lines/:id/release-preview', view, handle((req) => releasePreview(pool, company(req), id(req))));
-router.post('/order-lines/:id/release', manage, handle((req) => tx(req, (db, c) => releaseLine(db, c, id(req), body(req)))));
+// The material request is the production order's input (§66): what is earmarked for the line's MR becomes the
+// release's reservations at once — { fromMr: false } releases without it. The answer carries `fromMr`.
+router.post('/order-lines/:id/release', manage, handle((req) => tx(req, async (db, c) => {
+  const out = await releaseLine(db, c, id(req), body(req));
+  if (req.body?.fromMr === false) return out;
+  const fromMr = await takeMrEarmarks(db, c, out.id ?? out.release?.id);
+  return { ...(fromMr.reserved.length ? await releaseAfterWrite(db, c.companyId, out.id ?? out.release?.id, view_(req)) : out), fromMr };
+})));
 router.get('/releases/:id', view, handle((req) => getRelease(pool, company(req), id(req))));
 router.delete('/releases/:id', manage, handle((req) => tx(req, (db, c) => unrelease(db, c, id(req)))));
 router.get('/orders/:id/production', view, handle((req) => (String(req.query.full) === '1'

@@ -68,6 +68,12 @@
  * cancelled, or which is locked or released to production, is read-only (409
  * on write), as bomChangeService treats a frozen structure.
  *
+ * ORDER AND LINE VALUES (2026-10-16, init.sql §65, lib/orderDefaults). A flagged specification may
+ * carry a value on the order and on each line (orderDefaultService); a row takes it unless it has its
+ * own entry — row entry > line > order > the rule's own default or formula. The values come with the
+ * line's own read (no extra round trip) and are stored on the row as a default, so readers of
+ * cf_spec_values see it. Emptying a cell that stands over it gives the row the order's value again.
+ *
  * HISTORY
  * Every value a person typed gets its history row, exactly as setValues writes
  * it. A value the refresh re-worked gets ONE row for its net change: the walk
@@ -98,6 +104,7 @@ import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { coerce, refreshValues } from './valueService.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
 import { loadDesignExtras, linksOf, linksBlock, settleLine, designValueOf } from './linkService.js';
+import { orderDefaultOf, ownStands, defaultsForLine, missingSchema, notAllowedNote } from '../lib/orderDefaults.js';
 
 /** explode()'s depth cap, so this screen and the Structure tab stop at the same place. */
 const MAX_DEPTH = 15;
@@ -153,18 +160,35 @@ const sharedWhy = (rec) => `${rec.code ?? rec.name} is not this order’s own wo
  * Loading — everything the line's structure touches, in a fixed number of queries
  * ======================================================================== */
 
+/**
+ * The order's and its lines' values for flagged specifications (init.sql §65, lib/orderDefaults), read
+ * WITH the line — no extra round trip: one JSON array from a SELECT-list subquery (never in a JOIN ON).
+ */
+const ORDER_DEFAULTS_COLUMN = `,
+            (SELECT JSON_ARRAYAGG(JSON_OBJECT('order_line_id', d.order_line_id, 'specification_id', d.specification_id,
+                      'value_number', d.value_number, 'value_text', d.value_text, 'value_bool', d.value_bool,
+                      'value_date', d.value_date, 'option_id', d.option_id, 'uom', d.uom))
+               FROM cf_order_spec_defaults d
+               JOIN cf_specifications ds ON ds.company_id = d.company_id AND ds.id = d.specification_id AND ds.deleted_at IS NULL AND ds.order_level = 1
+              WHERE d.company_id = ol.company_id AND d.order_id = o.id AND d.deleted_at IS NULL) AS order_defaults`;
+
 async function loadLine(db, companyId, lineId, { lock }) {
-  const [[row]] = await db.query(
-    `SELECT ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity, ol.locked_at,
+  const lineSql = (extra) => `SELECT ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity, ol.locked_at,
             o.id AS order_id, o.code AS order_code, o.status AS order_status,
             o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision,
             (SELECT r.id FROM cf_production_releases r
-              WHERE r.company_id = ol.company_id AND r.order_line_id = ol.id AND r.deleted_at IS NULL LIMIT 1) AS release_id
+              WHERE r.company_id = ol.company_id AND r.order_line_id = ol.id AND r.deleted_at IS NULL LIMIT 1) AS release_id${extra}
        FROM cf_sales_order_lines ol
        JOIN cf_sales_orders o ON o.company_id = ol.company_id AND o.id = ol.order_id AND o.deleted_at IS NULL
-      WHERE ol.company_id = ? AND ol.id = ? AND ol.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
-    [companyId, lineId],
-  );
+      WHERE ol.company_id = ? AND ol.id = ? AND ol.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`;
+  let row;
+  try {
+    [[row]] = await db.query(lineSql(ORDER_DEFAULTS_COLUMN), [companyId, lineId]);
+  } catch (err) {
+    // A database without §65 yet: the line as before, and no order values.
+    if (!missingSchema(err)) throw err;
+    [[row]] = await db.query(lineSql(''), [companyId, lineId]);
+  }
   if (!row) throw notFound('Order line');
   if (!row.item_id) throw invalid('NO_ITEM', 'This line has no item yet — there are no values to fill.');
   return {
@@ -180,6 +204,7 @@ async function loadLine(db, companyId, lineId, { lock }) {
     orderLatestRevision: row.order_latest_revision ?? null,
     releaseId: row.release_id ?? null,
     lockedAt: row.locked_at ?? null,
+    orderDefaultRows: (parseJsonCol(row.order_defaults) ?? []).filter(Boolean),
   };
 }
 
@@ -352,6 +377,8 @@ export async function loadContext(db, companyId, lineId, { lock = false } = {}) 
     ),
     loadDesignExtras(db, companyId, ownIds),
   ]);
+  // Order and line values (init.sql §65) came with the line itself.
+  const { orderDefaultRows } = line;
 
   const rulesBySubject = new Map();
   const specMeta = new Map();
@@ -404,7 +431,7 @@ export async function loadContext(db, companyId, lineId, { lock = false } = {}) 
 
   return {
     companyId, line, lines, linesByParent, linesByChild, truncated, records, chains,
-    rulesBySubject, specMeta, store, optionsBySpec, narrowedBy, designExtras,
+    rulesBySubject, specMeta, store, optionsBySpec, narrowedBy, designExtras, orderDefaultRows,
     formulaCache: new Map(),
   };
 }
@@ -553,6 +580,10 @@ export function resolveRecord(ctx, rec) {
   const trackDepth = mode !== 'item' ? Infinity : TRACK_DEPTH[rec.tracked_by ?? 'quantity'];
   const frozen = frozenBy(rec);
   const winning = [...merged.values()].map((m) => m.rule);
+  // Order and line values (init.sql §65): what resolve() reads for a row of an open order, from the loaded rows.
+  const orderDefaults = mode === 'item' && !frozen && !ctx.thaw && rec.item_type === 'temporary' && rec.owner_order_line_id != null
+    && Number(rec.owner_order_id) === Number(ctx.line.orderId) && ctx.orderDefaultRows?.length
+    ? defaultsForLine(ctx.orderDefaultRows, rec.owner_order_line_id) : null;
 
   const inheritedSpecIds = mode === 'item' && !frozen
     ? winning.filter((r) => r.is_applicable && r.capture_at === 'item' && r.value_rule === 'inherited').map((r) => r.specification_id)
@@ -628,12 +659,24 @@ export function resolveRecord(ctx, rec) {
       continue;
     }
 
+    // The order's or line's value for this spec (lib/orderDefaults): row entry > line > order > the rule's own.
+    const od = orderDefaults ? orderDefaultOf(orderDefaults, r, allowed) : null;
+    if (od) {
+      const odRaw = rawOf(od.row, spec.dataType);
+      entry.orderValue = { level: od.level, raw: odRaw, display: displayOf(odRaw, spec, optionById), allowed: od.allowed };
+      if (spec.dataType === 'option') entry.orderValue.optionValue = optionById.get(odRaw)?.value ?? null;
+      if (!od.allowed) entry.note = notAllowedNote(od.level, entry.orderValue.display);
+    }
+    const fromOrder = () => { entry.value = view(od.row, 'defaulted', od.level); entry.status = 'default'; entry.fromOrder = od.level; effectiveRows.set(spec.id, od.row); };
+
     switch (r.value_rule) {
       case 'entered':
-        if (own) { entry.value = view(own, own.source, 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
+        if (od?.allowed && !ownStands(own, spec.code)) fromOrder();
+        else if (own) { entry.value = view(own, own.source, 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
         break;
       case 'defaulted':
         if (own && own.source === 'entered') { entry.value = view(own, 'entered', 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
+        else if (od?.allowed) fromOrder();
         // Its formula gives the default (second pass); the value above only stands in where it cannot.
         else if (isWorkedDefault(entry.rule)) {
           if (above) fallbacks.set(entry, () => { entry.value = view(above.row, 'defaulted', chain[above.levelIndex].level); entry.status = 'default'; effectiveRows.set(spec.id, above.row); });
@@ -827,6 +870,8 @@ function derivedWrites(r) {
         else if (own) touch(s, null, 'inherited');
         break;
       case 'entered':
+        // The order's or line's value (init.sql §65) is stored as a default — a row entry stands over it.
+        if (s.fromOrder && s.value) { touch(s, typedOf(effectiveRows.get(s.spec.id)), 'defaulted'); break; }
         // A section part's steel taken from its stock bar (lib/cutFrom STEEL_FROM_STOCK) is stored
         // 'inherited' under an entered rule; the cut-piece derive owns those rows (valueService too).
         if (own && own.source !== 'entered' && !(own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(s.spec.code).toUpperCase()))) touch(s, null, own.source);
@@ -1079,7 +1124,8 @@ function whyNoAnswer(s) {
 
 /** What an input starts at: the record's own typed value — a default from above is not its own. */
 function ownInput(s) {
-  const own = s.value && (s.value.source === 'entered' || s.rule.valueRule === 'entered');
+  // A value the order or line gives (init.sql §65) is not the row's own either — it shows as a default.
+  const own = s.value && (s.value.source === 'entered' || (s.rule.valueRule === 'entered' && !s.fromOrder));
   if (!own) return '';
   const raw = s.value.raw;
   if (raw === null || raw === undefined) return '';
@@ -1101,7 +1147,11 @@ function ownInput(s) {
  *
  *   column { code, name, dataType, unit, decimals, rule, required, why?, options?, from?, editable }
  *   cell   { input?, display?, defaultDisplay?, missing?, rule?, required?, why?, problem?, note?, options?,
- *            from?, calculated?, noCalc? }
+ *            from?, calculated?, noCalc?, inherit?, override?, orderDisplay? }
+ *
+ *   inherit         'order' | 'line' — the value shown (defaultDisplay) is the order's or the line's (init.sql §65)
+ *   override        'order' | 'line' — the row's own entry stands over that value; orderDisplay is the value
+ *                   it stands over. Emptying the cell (value null) gives the row the order's / line's value again.
  *
  *   from            where a formula value comes from: 'calculated' (worked out), 'drawing' (from the
  *                   part's drawing) or 'typed' (typed by hand over the calculated one). On the column
@@ -1152,7 +1202,7 @@ function buildView(ctx) {
 
   // ---- every row, every cell, in full --------------------------------------
   const groups = new Map();
-  const counts = { rows: 0, own: 0, shared: 0, missingOwn: 0, missingShared: 0, rowsMissing: 0, unresolved: 0, noValues: 0 };
+  const counts = { rows: 0, own: 0, shared: 0, missingOwn: 0, missingShared: 0, rowsMissing: 0, unresolved: 0, noValues: 0, fromOrder: 0, overrides: 0 };
   const resolved = new Map();   // shared with the links below: every record is worked out once
   for (const id of order) {
     const rec = ctx.records.get(id);
@@ -1183,7 +1233,12 @@ function buildView(ctx) {
         input: typeable ? ownInput(s) : '',
         // A typed value is shown by its input; only a value that is not typed here needs words.
         display: typeable ? null : s.value?.display ?? null,
-        defaultDisplay: s.rule.valueRule === 'defaulted' && s.value && s.value.source !== 'entered' ? s.value.display : null,
+        defaultDisplay: (s.rule.valueRule === 'defaulted' || s.fromOrder) && s.value && s.value.source !== 'entered' ? s.value.display : null,
+        // Order and line values (init.sql §65): `inherit` — the cell shows the order's / line's value;
+        // `override` + `orderDisplay` — the row's own entry stands over it (the grid offers the way back).
+        inherit: s.fromOrder ?? null,
+        override: !s.fromOrder && s.orderValue?.allowed && s.value?.source === 'entered' ? s.orderValue.level : null,
+        orderDisplay: !s.fromOrder && s.orderValue?.allowed && s.value?.source === 'entered' ? s.orderValue.display : null,
         missing: s.status === 'missing',
         why: typeable ? null : workedOut ?? whyReadOnly(s),
         problem: s.problem ?? null,
@@ -1195,6 +1250,8 @@ function buildView(ctx) {
         noCalc: whyNoAnswer(s),
       };
       if (cell.missing) missing += 1;
+      if (own && cell.inherit) counts.fromOrder += 1;
+      if (own && cell.override) counts.overrides += 1;
       full.set(s.spec.code, { s, cell });
     }
 
@@ -1286,6 +1343,8 @@ function buildView(ctx) {
         if (cell.from !== col.from) out.from = cell.from;
         if (cell.calculated != null) out.calculated = cell.calculated;
         if (cell.noCalc) out.noCalc = cell.noCalc;
+        if (cell.inherit) out.inherit = cell.inherit;
+        if (cell.override) { out.override = cell.override; out.orderDisplay = cell.orderDisplay; }
         cells[code] = out;
       }
       return { ...row, cells };

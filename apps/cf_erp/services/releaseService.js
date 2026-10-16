@@ -1442,6 +1442,79 @@ export async function releaseLine(db, c, lineId, input = {}) {
   return releaseAfterWrite(db, c.companyId, releaseId, input.view);
 }
 
+/**
+ * MATERIAL FROM THE MR (§66, 2026-10-16): "Let the material request be the input into the production order."
+ * Right after a line is released, what is EARMARKED for its MR — the holds of its MR lines (the stock check,
+ * the raise, a receipt on a PO bought for it; the customer's own lots on a customer-supplied MR) — becomes the
+ * production order's RESERVATIONS: each requirement (in id order) takes the holds of its item, oldest first,
+ * the same lot (batch) the hold was on, up to what it still needs. A hold used up is 'consumed', a part used
+ * keeps the rest (an excess stays earmarked to the MR). Nothing else is reserved here — free stock is still
+ * "Reserve all"'s. The reverse is unrelease (reservations go back to the MR as holds).
+ * Fixed: 3 reads (release, holds, requirements with what they have) + ≤ 3 writes, whatever the size.
+ * Returns { requisition: { id, code } | null, reserved: [{ item, quantity }], left: [{ item, quantity }] }.
+ */
+export async function takeMrEarmarks(db, c, releaseId) {
+  const [[rel]] = await db.query('SELECT id, order_id, order_line_id FROM cf_production_releases WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(releaseId)]);
+  if (!rel) throw notFound('Release');
+  const [holds] = await db.query(
+    `SELECT v.id, v.item_id, v.batch_id, v.quantity, rq.id AS requisition_id, rq.code AS requisition_code, m.code AS item_code, m.name AS item_name, i.uom
+       FROM cf_stock_reservations v
+       JOIN cf_requisition_lines prl ON prl.id = v.pr_line_id AND prl.deleted_at IS NULL
+       JOIN cf_requisitions rq ON rq.id = prl.requisition_id AND rq.deleted_at IS NULL
+       JOIN cf_master_records m ON m.id = v.item_id
+       LEFT JOIN cf_item_details i ON i.master_id = v.item_id AND i.deleted_at IS NULL
+      WHERE v.company_id = ? AND prl.order_line_id = ? AND v.held_for_order_id IS NOT NULL AND v.status = 'active' AND v.deleted_at IS NULL
+      ORDER BY v.id FOR UPDATE`,
+    [c.companyId, rel.order_line_id],
+  );
+  const requisition = holds.length ? { id: holds[0].requisition_id, code: holds[0].requisition_code } : null;
+  if (!holds.length) {
+    const [[rq]] = await db.query('SELECT id, code FROM cf_requisitions WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL LIMIT 1', [c.companyId, rel.order_line_id]);
+    return { requisition: rq ? { id: rq.id, code: rq.code } : null, reserved: [], left: [] };
+  }
+  const [reqs] = await db.query(
+    `SELECT q.id, q.item_id, q.quantity, q.issued, COALESCE(SUM(v.quantity), 0) AS have
+       FROM cf_material_requirements q
+       LEFT JOIN cf_stock_reservations v ON v.requirement_id = q.id AND v.status = 'active' AND v.deleted_at IS NULL
+      WHERE q.company_id = ? AND q.release_id = ? AND q.deleted_at IS NULL
+      GROUP BY q.id, q.item_id, q.quantity, q.issued ORDER BY q.id`,
+    [c.companyId, rel.id],
+  );
+  const left = new Map(holds.map((h) => [h.id, round6(h.quantity)]));
+  const rows = [];
+  const took = new Map();
+  for (const q of reqs) {
+    let want = round6(Number(q.quantity) - Number(q.issued) - Number(q.have));
+    for (const h of holds) {
+      if (want <= EPS) break;
+      if (Number(h.item_id) !== Number(q.item_id) || left.get(h.id) <= EPS) continue;
+      const t = round6(Math.min(want, left.get(h.id)));
+      left.set(h.id, round6(left.get(h.id) - t));
+      want = round6(want - t);
+      rows.push([c.companyId, q.id, q.item_id, h.batch_id ?? null, t, c.userId]);
+      took.set(Number(q.item_id), round6((took.get(Number(q.item_id)) ?? 0) + t));
+    }
+  }
+  if (rows.length) {
+    await insertRows(db, 'cf_stock_reservations', RESERVATION_COLUMNS, rows);
+    const used = holds.filter((h) => left.get(h.id) <= EPS).map((h) => h.id);
+    const part = holds.filter((h) => left.get(h.id) > EPS && left.get(h.id) < round6(h.quantity) - EPS);
+    if (used.length) await db.query("UPDATE cf_stock_reservations SET quantity = 0, status = 'consumed', closed_at = NOW() WHERE company_id = ? AND id IN (?)", [c.companyId, used]);
+    if (part.length) {
+      await db.query(`UPDATE cf_stock_reservations SET quantity = CASE id ${part.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
+        [...part.flatMap((h) => [h.id, left.get(h.id)]), c.companyId, part.map((h) => h.id)]);
+    }
+  }
+  const itemOf = new Map(holds.map((h) => [Number(h.item_id), { id: Number(h.item_id), code: h.item_code, name: h.item_name, uom: h.uom ?? null }]));
+  const rest = new Map();
+  for (const h of holds) if (left.get(h.id) > EPS) rest.set(Number(h.item_id), round6((rest.get(Number(h.item_id)) ?? 0) + left.get(h.id)));
+  return {
+    requisition,
+    reserved: [...took].map(([id, quantity]) => ({ item: itemOf.get(id), quantity })),
+    left: [...rest].map(([id, quantity]) => ({ item: itemOf.get(id), quantity })),
+  };
+}
+
 /** Takes a release back — only while nothing has started and nothing was issued. Its reservations are let go. */
 export async function unrelease(db, c, releaseId) {
   const rel = await requireRelease(db, c.companyId, releaseId, { lock: true });
@@ -2386,7 +2459,10 @@ export async function stepHistory(db, companyId, stepId) {
 
 /** A requirement with what reserving and issuing it need to know — the same columns and row locks for one requirement or a whole release. */
 const REQUIREMENT_SQL = `SELECT q.*, r.order_id, r.order_line_id, o.code AS order_code, o.status AS order_status, l.line_no,
-            m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by
+            m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by,
+            (SELECT COUNT(*) FROM cf_requisition_lines prl JOIN cf_requisitions rq ON rq.id = prl.requisition_id AND rq.deleted_at IS NULL
+              WHERE prl.company_id = q.company_id AND prl.order_line_id = r.order_line_id AND prl.item_id = q.item_id
+                AND prl.deleted_at IS NULL AND rq.supply = 'customer') AS customer_supplied
        FROM cf_material_requirements q
        JOIN cf_production_releases r ON r.id = q.release_id AND r.deleted_at IS NULL
        JOIN cf_sales_orders o ON o.id = r.order_id
@@ -2451,6 +2527,8 @@ function wanted(q, have, input = {}) {
  */
 function takeFrom(q, want, av, input = {}) {
   const rows = [];
+  // A material the customer supplies for this line (§66): their lots only — never our stock.
+  if (Number(q.customer_supplied ?? 0) > 0) av = { ...av, free: av.theirsFree, batches: av.batches.filter((b) => b.owner === 'theirs') };
   // An item counted by quantity has lots too (the customer's, production's): one named is taken from alone.
   if (q.tracked_by !== 'batch' && !blank(input.batchId)) {
     const lot = av.batches.find((x) => x.batchId === Number(input.batchId) && x.status === 'available' && x.free > EPS);

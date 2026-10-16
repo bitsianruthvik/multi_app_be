@@ -460,8 +460,9 @@ export const STAGE_CATALOGUE = [
   },
   {
     key: 'buying',
-    label: 'Buying',
-    description: 'Getting in the material the order consumes but does not make — before production, once the order is confirmed and the design frozen (and nested).',
+    // "Instead of 'buying' in sales order, just mention material request" (user, 2026-10-16, §66). The key stays.
+    label: 'Material request',
+    description: 'The material request (MR): the material the order consumes but does not make — earmarked from stock, bought on purchase orders, or sent by the customer — before production, once the order is confirmed and the design frozen (and nested).',
     /** The line draws material from stock at all — whether or not any is short today. */
     applies: (ctx) => ctx.material.length > 0 || ctx.buyRows.length > 0,
     state(ctx) {

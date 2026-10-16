@@ -95,6 +95,8 @@ import { insertRows } from '../lib/db.js';
 import { readNestDxf, matchNest, styleWords, CUT_ALLOWANCE_MAX_MM } from '../lib/nestDxfReader.js';
 import { readNif, isNif, nestOfNif } from '../lib/nifReader.js';
 import { drawingFactsOfLine } from './partDrawingService.js';
+// Cutting allowance (§64): the drawn lengths a cut piece cut longer than its rows also answers to by name.
+import { drawnLengthsOf } from './cutAllowanceService.js';
 import { writePlateCuts } from './plateCutsService.js';
 import {
   importContext, importBlocker, requireLine, assertNestable, pickCutSettings, wasteOfLot, offcutLetters, writeLots, clearLots,
@@ -102,7 +104,7 @@ import {
   savedLotsOf, isUploadedPiece, relotMany, wastesOf,
 } from './nestingService.js';
 import { measurePlates } from './nestMeasure.js';
-import { memoryRun } from './nestRunService.js';
+import { memoryRun, blocksLineWrites } from './nestRunService.js';
 import { missingPlatesOf } from './nestPlateCatalogService.js';
 import { untrackedOfLine, effectiveUntracked, shrunkUntracked } from '../lib/nestUntracked.js';
 
@@ -1276,15 +1278,17 @@ export async function rowsCutFrom(db, companyId, cutPlateIds) {
     [companyId, cutPlateIds],
   );
   if (!parents.length) return [];
+  // The row's drawn LENGTH comes in the same read: a cut piece longer than it carries a cutting allowance (§64).
   const [marks] = await db.query(
-    `SELECT v.subject_id, v.value_text
+    `SELECT v.subject_id, v.value_text, v.value_number, s.code
        FROM cf_spec_values v
-       JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'DRAWING_MARK'
+       JOIN cf_specifications s ON s.id = v.specification_id AND s.code IN ('DRAWING_MARK', 'LENGTH')
       WHERE v.company_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL AND v.subject_id IN (?)`,
     [companyId, [...new Set(parents.map((p) => p.id))]],
   );
-  const markOf = new Map(marks.map((r) => [Number(r.subject_id), r.value_text]));
-  return parents.map((p) => ({ cutPlateId: Number(p.cut_plate_id), code: p.code ?? null, name: p.name ?? null, mark: markOf.get(Number(p.id)) ?? null }));
+  const markOf = new Map(marks.filter((r) => r.code === 'DRAWING_MARK').map((r) => [Number(r.subject_id), r.value_text]));
+  const lengthOf = new Map(marks.filter((r) => r.code === 'LENGTH' && r.value_number != null).map((r) => [Number(r.subject_id), Number(r.value_number)]));
+  return parents.map((p) => ({ cutPlateId: Number(p.cut_plate_id), code: p.code ?? null, name: p.name ?? null, mark: markOf.get(Number(p.id)) ?? null, length: lengthOf.get(Number(p.id)) ?? null }));
 }
 
 /** Everything an upload is checked against, read once (a fixed number of round trips). */
@@ -1311,7 +1315,7 @@ async function uploadContext(db, companyId, lineId) {
   const shapes = new Map();
   const shapeOf = (cp) => { if (!shapes.has(cp.id)) shapes.set(cp.id, shapeOfCutPlate(cp, facts)); return shapes.get(cp.id); };
   const usable = ctx.cutPlates.filter((cp) => cp.steel?.length > 0 && cp.steel?.width > 0 && cp.steel?.thickness > 0);
-  const candidates = usable.map((cp) => { const s = shapeOf(cp); return { key: `cp${cp.id}`, codes: [...codes.get(cp.id)], rings: s.drawn ? s.rings : null, length: cp.steel.length, width: cp.steel.width }; });
+  const candidates = usable.map((cp) => { const s = shapeOf(cp); return { key: `cp${cp.id}`, codes: [...codes.get(cp.id)], rings: s.drawn ? s.rings : null, length: cp.steel.length, width: cp.steel.width, drawnLengths: drawnLengthsOf(cp, rows) }; });
   return {
     ...ctx, facts, saved, excl, untracked, candidates, shapeOf,
     partsOf: new Map([...partsOf].map(([id, m]) => [id, [...m.values()].sort((a, b) => String(a.name ?? a.mark).localeCompare(String(b.name ?? b.mark)))])),
@@ -1760,7 +1764,8 @@ async function applyChanges(db, c, lineId, ctx, { fresh = [], removeIds = [], re
 /** A nesting run working on the line (in this process): nothing may change the line's plates under it. */
 function assertNoRunWorking(companyId, lineId, what) {
   const run = memoryRun(companyId, lineId);
-  if (run?.status === 'running') {
+  // A comparison of a fixed set of pieces (the automatic one after an upload) reads no saved plate: not held (2026-10-16).
+  if (blocksLineWrites(run)) {
     throw invalid('RUN_BUSY', `A nesting run is working on this line${run.purpose === 'compare' ? ' (the comparison with our automatic nesting)' : ''} — it is laying out the line as it is now. Wait for it to finish, then ${what}.`);
   }
 }
