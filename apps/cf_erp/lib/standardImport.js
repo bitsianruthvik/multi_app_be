@@ -28,11 +28,22 @@ export function normName(s) {
   return t.split(/\s+/).filter(Boolean).map((w) => singular[w] ?? w).join(' ');
 }
 
-/** A NEW definition's name from a description: no brackets, no shipping marks, no section size at the end. */
+/**
+ * A definition name is a SHORT generic part name (sizes and notes belong in values and notes): brackets, anything
+ * after ":" ";" or " - ", a "for … / at … / under … / on … / per …" clause, section designations, every token with a
+ * digit and its unit are taken away; "a/b" keeps b; plurals become singular. Sentence case, like the catalog.
+ *   "Jacking bracket plate 680x12x700" → "Jacking bracket plate"   "Spreader beam 2-ISMC 400 x 3640" → "Spreader beam"
+ *   "Lifting station under one girder end" → "Lifting station"     "Spacer/spreader beam channel" → "Spreader beam channel"
+ */
 export function plainName(s) {
-  const t = String(s ?? '').replace(/\([^)]*\)/g, ' ').replace(/;.*$/, '')
-    .replace(/\s+(ISMC|ISLC|ISMB|ISA|L)\s*\d+(\s*[x×*]\s*\d+)*.*$/i, '').replace(/[,\s]+$/, '');
-  return sentence(t) || sentence(s);
+  let t = ` ${String(s ?? '')} `.replace(/\([^)]*\)/g, ' ').replace(/[:;].*$/, ' ').replace(/\s-\s.*$/, ' ');
+  t = t.replace(/\s(for|at|under|on|per|in|to|from)\s.*$/i, ' ');
+  t = t.replace(/\b(ISMC|ISLC|ISMB|ISJB|ISA|ISHB|ISMB|L)\b(?=\s*\d)/gi, ' ');
+  t = t.replace(/\S*\d\S*(\s*(mm|m|thk|th|dia|long|lg)\b\.?)?/gi, ' ');
+  t = t.replace(/\b(\w+)\/(\w+)\b/g, '$2').replace(/\s[x×*]\s/gi, ' ').replace(/[,./\s-]+$/g, ' ');
+  const singular = { plates: 'plate', stiffeners: 'stiffener', angles: 'angle', beams: 'beam', channels: 'channel', strips: 'strip', bolts: 'bolt', brackets: 'bracket', gussets: 'gusset', stations: 'station' };
+  const words = t.split(/\s+/).filter(Boolean).map((w) => singular[w.toLowerCase()] ?? w);
+  return sentence(words.join(' ')) || sentence(String(s ?? '').replace(/\([^)]*\)/g, ' ')) || 'Part';
 }
 
 /** "TOP FLANGE OUTER COVER PLATE" → "Top flange outer cover plate". */
@@ -96,16 +107,33 @@ export function partCandidates(item, place = {}) {
       if (/\bBOTTOM\b/.test(desc)) return ['X-frame bottom angle'];
       // A lifting-beam angle stiffener: the extractor calls the plate ones jacking stiffeners.
       if (/STIFFENER/.test(desc)) return ['Jacking stiffener'];
-      return ['Bracing'];
-    default: return [plainName(item?.description ?? item?.mark ?? 'Part')];
+      // An "L cleat" is the catalog's angle cleat (before "bracing": "L CLEAT FOR TEMPORARY BRACING" is still a cleat).
+      if (/\bCLEAT/.test(desc)) return ['Angle cleat', 'Angle cleats'];
+      if (/BRACING|BRACE\b/.test(desc)) return ['Bracing'];
+      // Any other angle (a jacking-bracket angle, an X-frame horizontal): its own short name, never "Bracing".
+      return [plainName(item?.description ?? 'Angle')];
+    // A role the list above does not know: a role of two words or more IS the generic name ("batten_plate" →
+    // "Batten plate", "lifting_plate" → "Lifting plate"); else the description, cleaned.
+    default: {
+      const words = String(item?.role ?? '').split('_').filter(Boolean);
+      const fromDesc = plainName(item?.description ?? item?.mark ?? 'Part');
+      const fromRole = sentence(words.join(' '));
+      // The description says more when it starts with the role ("Jacking bracket SEAT PLATE" under jacking_bracket).
+      if (words.length >= 2) return [normName(fromDesc).startsWith(normName(fromRole)) ? fromDesc : fromRole];
+      return [fromDesc];
+    }
   }
 }
 
 /** The definition names an assembly node may take (IMPORT_FORMAT.md `assembly` kinds). */
-export function nodeCandidates(node) {
+export function nodeCandidates(node, items = null) {
   const name = String(node?.name ?? '').toUpperCase();
+  // A group holding ONE kind of part and nothing else ("Lifting plates for the 30.5 m span: …") is a set of that part.
+  const kids = node?.children ?? [];
+  const setOf = () => (items && kids.length === 1 && kids[0].item != null && items.get(kids[0].item) ? `${partCandidates(items.get(kids[0].item))[0]} set` : null);
   switch (node?.kind) {
-    case 'span': return ['Bridge span'];
+    // A launching / lifting tackle is not a bridge span: it gets its own name.
+    case 'span': return /LAUNCH|TACKLE|LIFTING\s+ARRANGEMENT/.test(name) ? [plainName(nodeTitle(name))] : ['Bridge span'];
     case 'girder': return ['Girder line'];
     case 'girder_segment': return ['Girder segment'];
     case 'splice_set': return ['Splice set'];
@@ -115,7 +143,7 @@ export function nodeCandidates(node) {
       if (/X-?\s*FRAME|INTERMEDIATE\s+DIAPHRAGM|CROSS\s+FRAME/.test(name)) return ['Intermediate diaphragm frame', 'Intermediate diaphragm'];
       if (/LATERAL\s+BRAC/.test(name)) return ['Bottom lateral bracing', 'Bracing'];
       if (/BED\s+PLATE|BEARING/.test(name)) return ['Bearing assembly'];
-      return [plainName(nodeTitle(name))];
+      return [setOf() ?? plainName(nodeTitle(name))];
     case 'loose':
       if (/BRAC/.test(name)) return ['Bottom lateral bracing', 'Bracing'];
       return ['Loose items'];
@@ -169,7 +197,11 @@ export function planImport(bom, catalog) {
   const problems = [];
   if (bom?.schema !== 'rdso-standard-drawing-bom/1') problems.push(`bom.json says schema ${bom?.schema ?? '(none)'} — this importer reads rdso-standard-drawing-bom/1.`);
   const dw = bom?.drawing ?? {};
-  const items = new Map((bom?.items ?? []).map((it) => [it.id, it]));
+  // Two DIFFERENT items under one mark (BP = batten plates 200 / 300 / 400; LP = a lifting plate per span) would share a
+  // drawing mark and so one drawing file: each takes its own id (BP200, LP-30.5) as its mark instead.
+  const markCount = new Map();
+  for (const it of bom?.items ?? []) if (it.mark) markCount.set(it.mark, (markCount.get(it.mark) ?? 0) + 1);
+  const items = new Map((bom?.items ?? []).map((it) => [it.id, it.mark && markCount.get(it.mark) > 1 && it.id ? { ...it, mark: it.id } : it]));
   const density = Number(bom?.material?.densityKgM3) || 7850;
   const defsByNorm = new Map();
   for (const d of catalog.defs ?? []) {
@@ -267,7 +299,10 @@ export function planImport(bom, catalog) {
     // A span or a girder line carries no drawing mark of its own; a segment or an assembly does ("GA/…").
     const mark = node.kind === 'span' || node.kind === 'girder' ? null : nodeMark(node);
     const what = `${node.kind} ${node.name}`;
-    const def = mapDef(nodeCandidates(node), 'template', what, node.kind === 'span' || node.kind === 'girder' ? 'structure' : 'assembly', { span: node.kind === 'span' || depth === 0 });
+    const asked = nodeCandidates(node, items);
+    const def = mapDef(asked, 'template', what, node.kind === 'span' || node.kind === 'girder' ? 'structure' : 'assembly', { span: asked[0] === 'Bridge span' });
+    // What a group's name says after ":" ("use only the variant of the span being launched") is a NOTE on its line.
+    const nodeNote = /:\s*(.+)$/.exec(String(node.name ?? '').replace(/\([^)]*\)/g, ''))?.[1]?.trim() ?? null;
     const v = [txt('DRAWING_MARK', mark)].filter(Boolean);
     if (node.kind === 'span') {
       const layout = (bom.assembly?.children ?? []).flatMap((c) => c.layoutMm ?? []);
@@ -276,7 +311,7 @@ export function planImport(bom, catalog) {
     }
     const row = {
       key, parentKey, kind: 'temp', depth, lineNo: place.lineNo ?? null, position: null,
-      role: depth === 0 ? null : roleText(node.name), quantity: Number(node.qtyPerParent ?? 1), notes: null, mark,
+      role: depth === 0 ? null : roleText(String(node.name ?? '').replace(/:.*$/, '')), quantity: Number(node.qtyPerParent ?? 1), notes: depth === 0 ? null : nodeNote?.slice(0, 2000) ?? null, mark,
       def, values: v, node: { id: node.id, kind: node.kind, name: node.name }, item: null, weightKg: null, children: [],
     };
     rows.push(row);
