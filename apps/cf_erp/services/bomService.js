@@ -510,6 +510,8 @@ export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDept
           id: l.child_id, code: l.child_code, shortName: l.child_short_name ?? null, name: l.child_name, kind, status: l.child_status,
           uom: l.child_uom ?? null, depth, quantity: Number(l.quantity), total: Number((parentNode.total * Number(l.quantity)).toFixed(6)),
           lineId: l.id, lineNo: l.line_no, position: l.position, role: l.role,
+          // A remark on the line — e.g. a standard drawing's "DRILL ON ASSEMBLY" or "NEEDS DECISION" (init.sql §69).
+          notes: l.notes ?? null,
           selection: l.selection_definition_id ? { id: l.selection_definition_id, code: l.selection_code, shortName: l.selection_short_name ?? null, name: l.selection_name } : null,
           resolved: l.child_record_kind === 'item',
           // The system chose it (the selection's default, or its only candidate) and no person has since.

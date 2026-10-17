@@ -48,6 +48,9 @@ import { LEAF_DEPTH, levelName } from './tree.js';
 // The production ledger (§45): every step change is followed by its stock move.
 import { ledgerOnSteps } from './productionLedgerService.js';
 import { estimateOnMachine } from './timeEstimateService.js';
+// Is this work in the plan? (2026-10-17 — warn only, never a refusal).
+import { shipDateResolver, plannedEntries, unplannedOf, flagUnplanned, UNPLANNED_TEXT } from './planCheckService.js';
+export { planCheck } from './planCheckService.js';
 
 const EPS = 1e-9;
 const round6 = (n) => Number(Number(n).toFixed(6));
@@ -505,52 +508,8 @@ export async function listReasons(db, companyId) {
   return rows.map(shapeReason);
 }
 
-/**
- * Where the planner ships the unit that holds each production item
- * (cf_plan_entries, keys p<piece> | g<parent piece>.<bom line> | l<line>).
- * The nearest planned unit wins: the piece itself, its lot, then up the
- * locked-piece tree, then the whole line. A grouped tracker node (no locked
- * piece of its own) is looked up through its parent's piece and its BOM row.
- */
-function shipDateResolver(items, pieces, entries) {
-  const pieceById = new Map(pieces.map((p) => [p.id, p]));
-  const itemById = new Map(items.map((x) => [x.id, x]));
-  const entry = new Map(entries.map((e) => [e.unit_key, e.ship_date]));
-  const memo = new Map();
-  const fromPiece = (pid) => {
-    if (memo.has(pid)) return memo.get(pid);
-    const p = pieceById.get(pid);
-    let d = null;
-    if (p) {
-      d = entry.get(`p${p.id}`) ?? (p.parent_id != null && p.bom_line_id != null ? entry.get(`g${p.parent_id}.${p.bom_line_id}`) : null) ?? null;
-      if (d == null && p.parent_id != null) d = fromPiece(p.parent_id);
-    }
-    memo.set(pid, d);
-    return d;
-  };
-  const pieceOfItem = (it) => {
-    for (let x = it, hop = 0; x && hop < 50; x = itemById.get(x.parent_id), hop++) if (x.order_piece_id) return x.order_piece_id;
-    return null;
-  };
-  const sortOf = (it) => {
-    const pid = it.order_piece_id ?? pieceOfItem(it);
-    return pid && pieceById.has(pid) ? pieceById.get(pid).sort_order : null;
-  };
-  return {
-    shipDate(it, lineId) {
-      let d = null;
-      if (it.order_piece_id) d = fromPiece(it.order_piece_id);
-      else {
-        const parent = itemById.get(it.parent_id);
-        const parentPiece = parent ? pieceOfItem(parent) : null;
-        if (parentPiece && it.bom_line_id != null) d = entry.get(`g${parentPiece}.${it.bom_line_id}`) ?? null;
-        if (d == null && parentPiece) d = fromPiece(parentPiece);
-      }
-      return d ?? entry.get(`l${lineId}`) ?? null;
-    },
-    sortOf,
-  };
-}
+// shipDateResolver (where the planner ships the unit holding a piece) lives in planCheckService.js since
+// 2026-10-17: the plan check on a start walks the same way. The queue below reads it unchanged.
 
 const dateStr = (d) => (d == null ? null : d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10));
 const cmpNullLast = (a, b) => (a == null && b == null ? 0 : a == null ? 1 : b == null ? -1 : a < b ? -1 : a > b ? 1 : 0);
@@ -628,6 +587,8 @@ export async function machineQueue(db, companyId, machineId, q = {}) {
   ]);
   const priority = new Map(orders.map((o) => [o.id, o.plan_priority == null ? null : Number(o.plan_priority)]));
   const resolver = shipDateResolver(data.items, pieces, entries);
+  // The plan CHECK (not the sort): a p<piece>#<n> entry counts for its piece too.
+  const planned = shipDateResolver(data.items, pieces, plannedEntries(entries.filter((e) => e.ship_date != null)));
 
   const openByStep = new Map(openSessions.map((ws) => [ws.step_id, ws]));
   const stepById = new Map(data.steps.map((s) => [s.id, s]));
@@ -656,7 +617,7 @@ export async function machineQueue(db, companyId, machineId, q = {}) {
     const why = s._status === 'on_hold' ? 'On hold.' : !ready ? (s._blockers ?? []).map((b) => b.text).slice(0, 2).join(' ') || null : null;
     const shipDate = dateStr(resolver.shipDate(it, rel.order_line_id));
     rows.push({
-      shaped: { ...shaped, ready, why, shipDate, priority: priority.get(rel.order_id) ?? null, committedDate: dateStr(rel.line_committed ?? rel.order_committed) },
+      shaped: { ...shaped, ready, why, shipDate, planned: shipDate != null || planned.shipDate(it, rel.order_line_id) != null, priority: priority.get(rel.order_id) ?? null, committedDate: dateStr(rel.line_committed ?? rel.order_committed) },
       key: [group, shipDate, priority.get(rel.order_id) ?? null, dateStr(rel.line_committed ?? rel.order_committed), rel.order_line_id, resolver.sortOf(it) ?? it.sort_order, s.sequence, s.id],
     });
   }
@@ -995,6 +956,8 @@ export async function startWork(db, c, input = {}) {
   const wall = wallOf(nowMs, tz);
   const pending = [...steps.values()].filter((s) => s.state === 'pending');
   const ready = pending.length ? await readinessOf(db, c.companyId, pending) : new Map();
+  // Not in the plan: warned, never refused (2026-10-17). Read before the writes.
+  const unplanned = await unplannedOf(db, c.companyId, [...steps.keys()]);
   const endedStop = await endOpenStop(db, c, machine.id, wall);
   const rows = await insertSessions(db, c, [...steps.values()].map((s) => ({
     machineId: machine.id, stepId: s.id, operatorId: operator?.id, start: wall, source: 'live',
@@ -1003,8 +966,15 @@ export async function startWork(db, c, input = {}) {
   await applyStepChanges(db, c, {
     starts: rows.map((r) => ({ step: steps.get(r.stepId), atSec: nowSec, sessionId: r.id, operatorId: operator?.id ?? null, source: 'live', machineId: machine.id, beforeReady: r.beforeReady })),
   });
+  const flagged = unplanned.size
+    ? await flagUnplanned(db, c.companyId, { sessionIds: rows.filter((r) => unplanned.has(r.stepId)).map((r) => r.id) })
+    : false;
   return {
-    started: rows.map((r) => ({ sessionId: r.id, stepId: r.stepId, beforeReady: r.beforeReady, why: r.beforeReady ? ready.get(r.stepId)?.why ?? [] : [] })),
+    started: rows.map((r) => ({ sessionId: r.id, stepId: r.stepId, beforeReady: r.beforeReady, why: r.beforeReady ? ready.get(r.stepId)?.why ?? [] : [], unplanned: unplanned.has(r.stepId) })),
+    // Warn only: the work started either way. `flagged` = recorded on the session and start event (§70).
+    unplanned: [...unplanned.values()],
+    warning: unplanned.size ? UNPLANNED_TEXT : null,
+    flagged,
     endedStop,
     now: await machineNow(db, c.companyId, machine.id),
   };

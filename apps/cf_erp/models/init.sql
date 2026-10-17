@@ -6046,3 +6046,175 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
       AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_po_substitutions'
              AND INDEX_NAME IN ('uq_cpos_tenant', 'idx_cpos_order', 'idx_cpos_batch')) = 3,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §69  STANDARD DRAWINGS (2026-10-17) — the same text as TM/s69.sql
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md "Standard drawings".
+--
+-- User, 2026-10-16/17: "if it is a standard drawing, ask for standard name and store that drawing in a tab. And
+-- the BOM that gets generated can be copied onto that drawing along with values. In the SO line input, we can give
+-- a way to input through drawing number. And the BOM and values should get copied." — and "get the standards into
+-- the system ASAP" (scripts/cf_kepl/standard-import.mjs loads ready-made ones, e.g. the RDSO girders).
+--
+-- A STANDARD DRAWING is a number + title + where the sheet lives (a register drawing, cf_drawings, with its URL)
+-- and its VERSIONS. A version is a BOM tree with values: temporary items (cf_master_records + cf_item_details +
+-- cf_boms + cf_bom_lines + cf_spec_values) that belong to NO order line (owner_order_line_id NULL), reached from
+-- the version's root_item_id — the same rows an order line holds, copied in and out by treeCopyService. Its part
+-- files (DXF / PDF) live in cf_standard_drawing_files, each pointing at its register revision like
+-- cf_part_drawings does.
+--
+-- A version never changes. Saving a line's BOM onto a standard writes the NEXT version; lines made from an
+-- earlier version keep their own copy (a line records the standard and the version it came from).
+--
+-- cf_standard_drawings          number (as written, unique live per company), name, description, revision,
+--                               drawing_id (the register drawing), source_url, internal (keep inside the company),
+--                               notes, current_version_id
+-- cf_standard_drawing_versions  version_no (1, 2 …), root_item_id, design_id (the root's template definition),
+--                               rows / parts / weight_kg, made_from ('import' | 'line'), from_line_id, note,
+--                               report_json (the importer's mapping report)
+-- cf_standard_drawing_files     version_id, kind ('part' | 'source'), mark, file, its shape, drawing_id
+-- cf_sales_order_lines          + standard_id, standard_version_id (where the line came from),
+--                               standard_kept_sig (the BOM's signature when "keep the standard as it is" was chosen)
+CREATE TABLE IF NOT EXISTS cf_standard_drawings (
+  id                  INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT            NOT NULL,
+  number              VARCHAR(150)   NOT NULL,
+  name                VARCHAR(255)   NOT NULL,
+  description         TEXT           NULL,
+  revision            VARCHAR(20)    NULL,
+  drawing_id          INT            NULL,
+  source_url          VARCHAR(1000)  NULL,
+  internal            TINYINT(1)     NOT NULL DEFAULT 0,
+  notes               TEXT           NULL,
+  current_version_id  INT            NULL,
+
+  deleted_at          DATETIME       DEFAULT NULL,
+  created_at          TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by          INT            NULL,
+
+  number_active       VARCHAR(150)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(number), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_csd_tenant (company_id, id),
+  UNIQUE KEY uq_csd_number (company_id, number_active),
+  KEY idx_csd_drawing (company_id, drawing_id),
+
+  CONSTRAINT fk_csd_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_standard_drawing_versions (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  standard_id     INT            NOT NULL,
+  version_no      INT            NOT NULL,
+  root_item_id    INT            NULL,
+  design_id       INT            NULL,
+  rows_count      INT            NOT NULL DEFAULT 0,
+  parts_count     INT            NOT NULL DEFAULT 0,
+  weight_kg       DECIMAL(16,3)  NULL,
+  made_from       VARCHAR(12)    NOT NULL DEFAULT 'line',
+  from_line_id    INT            NULL,
+  note            VARCHAR(500)   NULL,
+  report_json     MEDIUMTEXT     NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  created_by      INT            NULL,
+
+  is_live         TINYINT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_csdv_tenant  (company_id, id),
+  UNIQUE KEY uq_csdv_version (company_id, standard_id, version_no, is_live),
+  KEY idx_csdv_root (company_id, root_item_id),
+
+  CONSTRAINT fk_csdv_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_standard_drawing_files (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  version_id      INT            NULL,
+  standard_id     INT            NOT NULL,
+  kind            VARCHAR(8)     NOT NULL DEFAULT 'part',
+  drawing_id      INT            NULL,
+  mark            VARCHAR(120)   NULL,
+  mark_norm       VARCHAR(120)   NULL,
+  file_name       VARCHAR(255)   NOT NULL,
+  file_kind       VARCHAR(4)     NOT NULL DEFAULT 'dxf',
+  length_mm       DECIMAL(12,3)  NULL,
+  width_mm        DECIMAL(12,3)  NULL,
+  area_mm2        DECIMAL(16,3)  NULL,
+  cut_length_mm   DECIMAL(14,3)  NULL,
+  piercings       INT            NULL,
+  holes           INT            NULL,
+  inner_cuts      INT            NULL,
+  geometry_json   MEDIUMTEXT     NULL,
+  warnings_json   TEXT           NULL,
+  file_text       MEDIUMTEXT     NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  created_by      INT            NULL,
+
+  UNIQUE KEY uq_csdf_tenant (company_id, id),
+  KEY idx_csdf_version  (company_id, version_id),
+  KEY idx_csdf_standard (company_id, standard_id),
+
+  CONSTRAINT fk_csdf_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+-- Where a line came from. Each column on its own guarded statement, its index on another (TiDB).
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'standard_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN standard_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'standard_version_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN standard_version_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'standard_kept_sig');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN standard_kept_sig VARCHAR(64) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND INDEX_NAME = 'idx_csol_standard');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_sales_order_lines ADD KEY idx_csol_standard (company_id, standard_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_standard_drawings'
+             AND COLUMN_NAME IN ('company_id', 'number', 'name', 'description', 'revision', 'drawing_id', 'source_url', 'internal', 'notes', 'current_version_id')) = 10
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_standard_drawing_versions'
+             AND COLUMN_NAME IN ('standard_id', 'version_no', 'root_item_id', 'design_id', 'rows_count', 'parts_count', 'weight_kg', 'made_from', 'from_line_id', 'report_json')) = 10
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_standard_drawing_files'
+             AND COLUMN_NAME IN ('version_id', 'standard_id', 'kind', 'drawing_id', 'mark', 'mark_norm', 'file_name', 'file_kind', 'geometry_json', 'file_text')) = 10
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines'
+             AND COLUMN_NAME IN ('standard_id', 'standard_version_id', 'standard_kept_sig')) = 3
+      AND (SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE()
+             AND ((TABLE_NAME = 'cf_standard_drawings' AND INDEX_NAME = 'uq_csd_number')
+               OR (TABLE_NAME = 'cf_standard_drawing_versions' AND INDEX_NAME = 'uq_csdv_version')
+               OR (TABLE_NAME = 'cf_standard_drawing_files' AND INDEX_NAME = 'idx_csdf_version')
+               OR (TABLE_NAME = 'cf_sales_order_lines' AND INDEX_NAME = 'idx_csol_standard'))) = 4,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §70  WORK STARTED OUTSIDE THE PLAN (2026-10-17) — the same text as TM/s70.sql
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_PLANNER_V2_PLAN.md "2026-10-17".
+--
+-- User, 2026-10-17: "when starting work on the floor for a step whose unit has no plan entry,
+-- show 'This work is not in the plan' and still allow the start. Record a flag so the dashboard
+-- can count started unplanned." WARN ONLY — nothing is ever refused for it.
+--
+--   cf_work_sessions.unplanned  1 = this session started work the plan had no ship week for
+--   cf_step_events.unplanned    1 = this START event was outside the plan (floor or tracker start)
+--
+-- The backend tolerates a database without §70 (a start is never flagged, the dashboard counts 0),
+-- but apply it with the backend push. TiDB: each ADD COLUMN on its own guarded statement.
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_work_sessions' AND COLUMN_NAME = 'unplanned');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_work_sessions ADD COLUMN unplanned TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events' AND COLUMN_NAME = 'unplanned');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_step_events ADD COLUMN unplanned TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND ((TABLE_NAME = 'cf_work_sessions' AND COLUMN_NAME = 'unplanned')
+               OR (TABLE_NAME = 'cf_step_events' AND COLUMN_NAME = 'unplanned'))) = 2,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

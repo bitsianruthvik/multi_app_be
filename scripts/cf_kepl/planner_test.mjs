@@ -37,7 +37,7 @@ import { postMovement } from '../../apps/cf_erp/services/stockService.js';
 import { getAssignment, assignCells } from '../../apps/cf_erp/services/workOrderService.js';
 import { productionMachineIds } from '../../apps/cf_erp/services/operationService.js';
 import {
-  getPlanner, horizonOf, putEntries, putChanges, putPriorities, putLineLevel, putTargets, putSettings, putLineSplit, CONTRACTOR,
+  getPlanner, horizonOf, putEntries, putChanges, putPriorities, putLineLevel, putTargets, putLineSplit, CONTRACTOR,
 } from '../../apps/cf_erp/services/plannerService.js';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
@@ -401,16 +401,9 @@ try {
   err = await refusal(() => putTargets(conn, c, { '2026-10': -5 }));
   ok('negative tonnes are refused', err?.status === 422);
 
-  ok('settings default to 1 line a month, partial lines allowed', s.settings.minLinesPerMonth === 1 && s.settings.allowPartialLines === true);
-  w = await measured(() => putSettings(db, c, { minLinesPerMonth: 2 }));
-  ok(`PUT settings (${w.queries} round trips)`, w.result.settings.minLinesPerMonth === 2 && w.result.settings.allowPartialLines === true);
-  await putSettings(conn, c, { allowPartialLines: false });
-  s = await getPlanner(conn, COMPANY, {});
-  ok('GET shows both, the untouched one kept', s.settings.minLinesPerMonth === 2 && s.settings.allowPartialLines === false);
-  err = await refusal(() => putSettings(conn, c, { minLinesPerMonth: -1 }));
-  ok('a bad number is refused', err?.status === 422);
-  err = await refusal(() => putSettings(conn, c, { allowPartialLines: 'maybe' }));
-  ok('a bad yes/no is refused', err?.status === 422);
+  // 2026-10-17: the two settings (at least N lines a month, partial lines) were dropped by planner v2 and
+  // nothing read them — the read no longer carries them and PUT /planner/settings is gone (production_views_test).
+  ok('the planner read carries no settings', !('settings' in s));
 
 
   /* ------------------------------------------------------------------------ */
@@ -476,7 +469,9 @@ try {
   const paths = [];
   const walk = (stack) => { for (const l of stack) { if (l.route) paths.push(`${Object.keys(l.route.methods).join(',')} ${l.route.path}`); else if (l.handle?.stack) walk(l.handle.stack); } };
   walk(indexRouter.stack);
-  ok('GET /planner and the seven PUTs are mounted', ['get /planner', 'put /planner/entries', 'put /planner/changes', 'put /planner/priorities', 'put /planner/lines/:id/level', 'put /planner/lines/:id/splits', 'put /planner/targets', 'put /planner/settings'].every((p) => paths.includes(p)), paths.filter((p) => p.includes('planner')).join(' | '));
+  // PUT /planner/settings went 2026-10-17 (its two settings were dropped by planner v2).
+  ok('GET /planner and the six PUTs are mounted, settings no longer', ['get /planner', 'put /planner/entries', 'put /planner/changes', 'put /planner/priorities', 'put /planner/lines/:id/level', 'put /planner/lines/:id/splits', 'put /planner/targets'].every((p) => paths.includes(p))
+    && !paths.includes('put /planner/settings'), paths.filter((p) => p.includes('planner')).join(' | '));
 
   // A trimmed example for the report.
   const ex = await getPlanner(conn, COMPANY, {});

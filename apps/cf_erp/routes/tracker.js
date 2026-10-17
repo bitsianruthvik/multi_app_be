@@ -21,6 +21,10 @@
  *   GET    /tracker/grid?lineId=&depth=     one released line as a grid: the piece-code tree down the left, the
  *                                           line's operations across, a cell per piece per operation (lineGrid)
  *   GET    /tracker/grid/children?nodeId=&depth=   a branch of that grid, filled in when opened
+ *   GET    /production-orders?status=&customerId=&search=&limit=&offset=   (2026-10-17) every release
+ *                                           (released line) grouped by sales order, paged by order
+ *                                           (productionOrdersService)
+ *   GET    /tracker/plan-check?stepIds=1,2  (2026-10-17) which of these steps the plan has no ship week for
  *
  * Every write below answers with the whole release (getRelease) unless asked
  * ?view=summary (its figures only) or ?view=none — the order page's grid asks
@@ -47,6 +51,8 @@ import {
 } from '../services/releaseService.js';
 import { shipLine, shipmentView } from '../services/dispatchService.js';
 import { trackerTree, trackerTreeChildren, trackerTreeNode, lineGrid, lineGridChildren } from '../services/trackerTreeService.js';
+import { listProductionOrders } from '../services/productionOrdersService.js';
+import { planCheck } from '../services/floorService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -85,6 +91,8 @@ router.get('/tracker/tree/children', view, handle((req) => trackerTreeChildren(p
 router.get('/tracker/tree/node', view, handle((req) => trackerTreeNode(pool, company(req), req.query)));
 router.get('/tracker/grid', view, handle((req) => lineGrid(pool, company(req), req.query)));
 router.get('/tracker/grid/children', view, handle((req) => lineGridChildren(pool, company(req), req.query)));
+router.get('/production-orders', view, handle((req) => listProductionOrders(pool, company(req), req.query)));
+router.get('/tracker/plan-check', view, handle((req) => planCheck(pool, company(req), req.query)));
 
 router.post('/production-steps/:id/start', manage, handle((req) => tx(req, (db, c) => startStep(db, c, id(req), body(req)))));
 router.post('/production-steps/:id/progress', manage, handle((req) => tx(req, (db, c) => recordProgress(db, c, id(req), body(req)))));

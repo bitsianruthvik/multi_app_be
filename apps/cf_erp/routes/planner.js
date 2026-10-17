@@ -13,7 +13,7 @@
  *   GET /planner/units/:unitKey/machines   per machine type: minutes now, and on each machine (§58)
  *   PUT /planner/units/:unitKey/machine    { functionKey, machineId | null } — put its open steps on one machine
  *   PUT /planner/targets               { 'YYYY-MM': tonnes | null }
- *   PUT /planner/settings              { minLinesPerMonth?, allowPartialLines? }
+ *   (PUT /planner/settings removed 2026-10-17 — its two settings were dropped by planner v2.)
  *
  * MATERIAL (init.sql §56, TM/CF_ERP_BUYING_V2.md §5). GET carries the material-ready engine's answer on
  * every unit (`units[].material`), its summary (`materialReady`) and, on a stored placement the material no
@@ -27,7 +27,7 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
-import { getPlanner, putEntries, putChanges, putPriorities, putLineLevel, putLineSplit, putTargets, putSettings, getUnitMachines, putUnitMachine } from '../services/plannerService.js';
+import { getPlanner, putEntries, putChanges, putPriorities, putLineLevel, putLineSplit, putTargets, getUnitMachines, putUnitMachine } from '../services/plannerService.js';
 
 const router = Router();
 
@@ -51,7 +51,5 @@ router.put('/planner/units/:unitKey/machine', guard(PERM.production),
   handle((req) => withTransaction((db) => putUnitMachine(db, ctx(req), req.params.unitKey, req.body ?? {}))));
 router.put('/planner/targets', guard(PERM.production),
   handle((req) => withTransaction((db) => putTargets(db, ctx(req), req.body ?? {}))));
-router.put('/planner/settings', guard(PERM.production),
-  handle((req) => withTransaction((db) => putSettings(db, ctx(req), req.body ?? {}))));
 
 export default router;

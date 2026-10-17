@@ -791,7 +791,7 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
          ${ORD}`;
 
   stage();
-  const [[lines], [stepAgg], [eventAgg], [sessionAgg], [holds], [material], [plan], [output], [invoices], [issued]] = await Promise.all([
+  const [[lines], [stepAgg], [eventAgg], [sessionAgg], [holds], [material], [plan], [output], [invoices], [issued], [unplannedRows]] = await Promise.all([
     db.query(
       `SELECT o.id AS order_id, o.code, o.revision, o.title, o.order_type, o.committed_date AS order_committed, o.plan_priority,
               o.customer_id, p.name AS customer_name,
@@ -816,7 +816,12 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
               SUM(s.eff_minutes IS NOT NULL) AS with_est, SUM(COALESCE(s.eff_minutes, 0)) AS est_total,
               SUM(COALESCE(s.eff_minutes, 0) * IF(s.state = 'done', 1, LEAST(1, s.qty_good / NULLIF(s.quantity, 0)))) AS est_done,
               SUM(IF(s.state = 'done', 1, LEAST(1, COALESCE(s.qty_good / NULLIF(s.quantity, 0), 0)))) AS count_done,
-              AVG(s.sequence) AS seq, SUM(s.work_order_id IS NOT NULL) AS contracted
+              AVG(s.sequence) AS seq, SUM(s.work_order_id IS NOT NULL) AS contracted,
+              -- 2026-10-17 "Own steps": the line's own = the steps of its top pieces (parent_id NULL).
+              SUM(pi.parent_id IS NULL) AS own_steps, SUM(pi.parent_id IS NULL AND s.eff_minutes IS NOT NULL) AS own_with_est,
+              SUM(IF(pi.parent_id IS NULL, COALESCE(s.eff_minutes, 0), 0)) AS own_est_total,
+              SUM(IF(pi.parent_id IS NULL, COALESCE(s.eff_minutes, 0) * IF(s.state = 'done', 1, LEAST(1, s.qty_good / NULLIF(s.quantity, 0))), 0)) AS own_est_done,
+              SUM(IF(pi.parent_id IS NULL, IF(s.state = 'done', 1, LEAST(1, COALESCE(s.qty_good / NULLIF(s.quantity, 0), 0))), 0)) AS own_count_done
            FROM cf_production_releases r
            ${ORD}
            JOIN cf_production_items pi ON pi.company_id = r.company_id AND pi.release_id = r.id AND pi.deleted_at IS NULL
@@ -918,6 +923,20 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
         GROUP BY m.order_id`,
       [companyId],
     ) : [[]],
+    // §70: work started in the period on a step the plan had no ship week for (warned, not blocked).
+    // A database without §70 has no such column: then nothing is counted.
+    db.query(
+      `SELECT r.order_id, COUNT(*) AS n
+         FROM cf_step_events e
+         JOIN cf_production_steps s ON s.id = e.step_id
+         JOIN cf_production_items pi ON pi.id = s.production_item_id
+         JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
+         ${ORD}
+        WHERE e.company_id = ? AND e.event = 'start' AND e.unplanned = 1 AND e.deleted_at IS NULL
+          AND COALESCE(e.at, e.created_at) >= FROM_UNIXTIME(?) AND COALESCE(e.at, e.created_at) < FROM_UNIXTIME(?)
+        GROUP BY r.order_id`,
+      [companyId, fromSec, toSec],
+    ).catch((e) => (e?.errno === 1054 ? [[]] : Promise.reject(e))),
   ]);
 
   // Free stock (ours) and open purchases of what is short, and the lines' measures.
@@ -957,6 +976,10 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
     steps: Number(r.steps), done: Number(r.done), inProgress: Number(r.in_progress), onHold: Number(r.on_hold),
     withEst: Number(r.with_est), estTotal: Number(r.est_total), estDone: Number(r.est_done), countDone: Number(r.count_done),
     seq: Number(r.seq), contracted: Number(r.contracted),
+    own: {
+      steps: Number(r.own_steps ?? 0), withEst: Number(r.own_with_est ?? 0), estTotal: Number(r.own_est_total ?? 0),
+      estDone: Number(r.own_est_done ?? 0), countDone: Number(r.own_count_done ?? 0),
+    },
   })), 'lineId');
   const eventsOf = new Map(eventAgg.map((r) => [r.line_id, r]));
   const sessionMin = new Map(sessionAgg.map((r) => [r.line_id, Number(r.minutes)]));
@@ -971,6 +994,7 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
   }
   const invOf = by(invoices, 'order_id');
   const issuedOf = new Map(issued.map((r) => [r.order_id, r]));
+  const unplannedOf = new Map(unplannedRows.map((r) => [r.order_id, Number(r.n)]));
 
   const orders = [];
   for (const [orderId, ls] of by(lines, 'order_id')) {
@@ -984,6 +1008,9 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
       const prog = lineProgress(ops);
       // A line with nothing released counts what has been made of it (normally nothing).
       const pct = prog ? prog.pct : qty > EPS ? Math.min(100, (made / qty) * 100) : 0;
+      // "Own steps" (2026-10-17): the line's top pieces' own steps only, on the same rule.
+      const ownProg = lineProgress(ops.map((o) => o.own).filter((o) => o.steps > 0));
+      const ownPct = ownProg ? ownProg.pct : prog ? null : pct;
       const ev = eventsOf.get(l.line_id);
       // Share of the line gained in the pace window and in the period, on the same basis as pct.
       const gained = (estKey, cntKey) => {
@@ -1000,6 +1027,8 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
         released: !!l.release_id, releaseId: l.release_id ?? null,
         committedDate: dayText(l.committed_date),
         progressPct: r1(pct), basis: prog ? prog.basis : (made > EPS ? 'made' : null),
+        // progressPct counts every step under the line; own = its top pieces' own steps (null: none).
+        own: { progressPct: ownPct == null ? null : r1(ownPct), basis: ownProg ? ownProg.basis : null, stepsTotal: ownProg ? ownProg.steps : 0 },
         // Released with no steps of its own: bought in or taken from stock, nothing to make.
         noSteps: !!l.release_id && !prog,
         estCoveragePct: prog ? r1(prog.coverage * 100) : null,
@@ -1027,6 +1056,10 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
     const w = (l) => (allWeighed ? l._tonnes : 1);
     const wSum = lineRows.reduce((t, l) => t + w(l), 0) || 1;
     const pct = lineRows.reduce((t, l) => t + w(l) * l.progressPct, 0) / wSum;
+    // "Own steps": the same weighting over the lines that have own steps.
+    const ownLines = lineRows.filter((l) => l.own.progressPct != null);
+    const ownW = ownLines.reduce((t, l) => t + w(l), 0);
+    const ownPct = ownLines.length && ownW > 0 ? ownLines.reduce((t, l) => t + w(l) * l.own.progressPct, 0) / ownW : null;
     const pacePct = lineRows.reduce((t, l) => t + w(l) * l.pacePctGained, 0) / wSum;
     const periodPct = lineRows.reduce((t, l) => t + w(l) * l.period.pctGained, 0) / wSum;
     const delivered = lineRows.every((l) => l.delivered + EPS >= l.quantity);
@@ -1111,6 +1144,7 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
         lineBasis: lineRows.some((l) => l.basis === 'count') ? 'count' : lineRows.some((l) => l.basis === 'work') ? 'work' : null,
         stepsTotal: lineRows.reduce((t, l) => t + l.stepsTotal, 0),
         workMinLeft: workLeft,
+        own: { pct: ownPct == null ? null : r1(ownPct), stepsTotal: lineRows.reduce((t, l) => t + l.own.stepsTotal, 0) },
       },
       tonnes: { total: sumT((l) => l.tonnes), made: sumT((l) => l.tonnesMade), dispatched: sumT((l) => l.tonnesDispatched), unweighedLines: lineRows.filter((l) => l.tonnes == null).map((l) => l.lineNo) },
       lines: {
@@ -1138,6 +1172,8 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
         holdReasons: holdRows.slice(0, 3),
         materialSteps: mats.reduce((t, mt) => t + mt.shortSteps, 0),
       },
+      // Jobs started in the period on work the plan has no ship week for (§70; warned, never blocked).
+      startedUnplanned: unplannedOf.get(orderId) ?? 0,
       material: {
         requirements: reqCount,
         items: mats.length,
@@ -1174,6 +1210,7 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
       periodTonnesDispatched: tSum((x) => x.period.tonnesDispatched),
       onHold: orders.reduce((t, x) => t + x.blocked.onHold, 0),
       materialSteps: orders.reduce((t, x) => t + x.blocked.materialSteps, 0),
+      startedUnplanned: orders.reduce((t, x) => t + x.startedUnplanned, 0),
       value: withMoney && orders.some((x) => x.money?.value != null) ? Math.round(orders.reduce((t, x) => t + (x.money?.value ?? 0), 0)) : null,
       valueComplete: withMoney ? orders.every((x) => x.money?.valueComplete) : null,
       invoiced: withMoney ? Math.round(orders.reduce((t, x) => t + (x.money?.invoiced ?? 0), 0)) : null,
@@ -1344,6 +1381,20 @@ export async function workOrdersDashboard(dbIn, companyId, q = {}) {
   }
   const contractors = [...cmap.values()].map(({ frac, periodOps, ...c }) => ({ ...c, pct: pctOf(frac, c.steps), periodOps: r3(periodOps) }))
     .sort((a, z) => z.open - a.open || String(a.name).localeCompare(String(z.name)));
+  // Sales order summary (2026-10-17, "Group by: Sales order"): the same figures per order.
+  const smap = new Map();
+  for (const w of workOrders) {
+    let s = smap.get(w.order.id);
+    if (!s) { s = { ...w.order, workOrders: 0, open: 0, contractors: new Set(), assigned: 0, steps: 0, done: 0, frac: 0, overdue: 0, periodOps: 0 }; smap.set(s.id, s); }
+    s.workOrders++;
+    if (w.open) s.open++;
+    s.contractors.add(w.contractor.id);
+    s.assigned += w.operations.assigned; s.steps += w.operations.steps; s.done += w.operations.done; s.frac += w.frac;
+    if (w.overdue) s.overdue++;
+    s.periodOps += w.period.opsDone;
+  }
+  const salesOrders = [...smap.values()].map(({ frac, periodOps, contractors: cs, ...s }) => ({ ...s, contractors: cs.size, pct: pctOf(frac, s.steps), periodOps: r3(periodOps) }))
+    .sort((a, z) => z.open - a.open || String(a.code).localeCompare(String(z.code)));
   const fracAll = workOrders.reduce((t, w) => t + w.frac, 0);
   const stepsAll = workOrders.reduce((t, w) => t + w.operations.steps, 0);
   for (const w of workOrders) delete w.frac;
@@ -1365,6 +1416,7 @@ export async function workOrdersDashboard(dbIn, companyId, q = {}) {
       value: null,
     },
     contractors,
+    salesOrders,
     workOrders,
     meta: { ...meta, ms: Date.now() - t0 },
   };

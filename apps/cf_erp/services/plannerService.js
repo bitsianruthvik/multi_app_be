@@ -22,7 +22,8 @@
  *   PUT /planner/priorities   { orderIds: [...] }       a whole ranking
  *   PUT /planner/lines/:id/level  { level }             'line' | '0' | '1' … | null
  *   PUT /planner/targets      { 'YYYY-MM': tonnes|null }
- *   PUT /planner/settings     { minLinesPerMonth?, allowPartialLines? }
+ *   (PUT /planner/settings is gone, 2026-10-17: its two settings — at least N lines a month, partial
+ *    lines — were dropped by planner v2 and nothing read them. cf_plan_settings stays in the schema.)
  *
  * UNITS. A plan unit is what sits on the board: the whole order line
  * ('l<lineId>'), or one piece of the LOCKED piece tree ('p<pieceId>') at a
@@ -97,7 +98,6 @@ const OPEN_ORDER_STATUSES = ['inquiry', 'quoted', 'confirmed'];
 // One status set for "a purchase order that gives a date" — the material-ready engine's own (§56).
 const OPEN_PO_STATUSES = DATED_PO_STATUSES;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-export const DEFAULT_SETTINGS = { minLinesPerMonth: 1, allowPartialLines: true };
 export const CONTRACTOR = 'contractor';
 export const UNASSIGNED = 'unassigned';
 
@@ -295,15 +295,13 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
   const today = todayText();
 
   // ---- orders, and what the company stored about the plan -------------------
-  const [allLineRows, [[settingRow]], [targetRows], [entryRows], [machineRowsAll], [nodeRows], [rankRows], production] = await Promise.all([
+  const [allLineRows, [[weightRow]], [targetRows], [entryRows], [machineRowsAll], [nodeRows], [rankRows], production] = await Promise.all([
     loadOrderLines(db, companyId),
-    // The settings row (if any) and WEIGHT's unit, in one read.
+    // WEIGHT's unit. (The settings row — lines a month, partial lines — is not read any more: planner v2 dropped both.)
     db.query(
-      `SELECT s.min_lines_per_month, s.allow_partial_lines,
-              (SELECT w.default_uom FROM cf_specifications w
-                WHERE w.company_id = ? AND w.code = 'WEIGHT' AND w.deleted_at IS NULL LIMIT 1) AS weight_uom
-         FROM (SELECT 1 AS one) x LEFT JOIN cf_plan_settings s ON s.company_id = ?`,
-      [companyId, companyId],
+      `SELECT (SELECT w.default_uom FROM cf_specifications w
+                WHERE w.company_id = ? AND w.code = 'WEIGHT' AND w.deleted_at IS NULL LIMIT 1) AS weight_uom`,
+      [companyId],
     ),
     db.query('SELECT month, tonnes FROM cf_plan_targets WHERE company_id = ? ORDER BY month', [companyId]),
     db.query('SELECT unit_key, ship_date, start_date, pinned, material_state, material_date FROM cf_plan_entries WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
@@ -324,10 +322,7 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
   ]);
   const lineRows = onlyOrderIds ? allLineRows.filter((l) => onlyOrderIds.has(Number(l.order_id))) : allLineRows;
   const machineRows = machineRowsAll.filter((m) => production.has(m.id));
-  const weightToTonnes = String(settingRow?.weight_uom ?? 'kg').toLowerCase().startsWith('t') ? 1 : 0.001;
-  const settings = settingRow?.min_lines_per_month != null
-    ? { minLinesPerMonth: Number(settingRow.min_lines_per_month), allowPartialLines: !!Number(settingRow.allow_partial_lines) }
-    : { ...DEFAULT_SETTINGS };
+  const weightToTonnes = String(weightRow?.weight_uom ?? 'kg').toLowerCase().startsWith('t') ? 1 : 0.001;
   const targets = {};
   for (const t of targetRows) targets[dateText(t.month).slice(0, 7)] = Number(t.tonnes);
 
@@ -980,7 +975,6 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
 
   const snapshot = {
     horizon: { from: horizon.from, to: horizon.to, today, periods: horizon.periods },
-    settings,
     targets,
     functions,
     orders: orderList,
@@ -1739,29 +1733,6 @@ export async function putTargets(db, c, input = {}) {
   for (const [m, t] of set) targets[m.slice(0, 7)] = t;
   for (const m of clear) targets[m.slice(0, 7)] = null;
   return { targets };
-}
-
-/** PUT /planner/settings { minLinesPerMonth?, allowPartialLines? } — what is left out keeps its value. */
-export async function putSettings(db, c, input = {}) {
-  const problems = [];
-  let min;
-  if (input.minLinesPerMonth !== undefined) {
-    min = Number(input.minLinesPerMonth);
-    if (!Number.isInteger(min) || min < 0 || min > 100) problems.push('minLinesPerMonth is a whole number from 0 to 100.');
-  }
-  const partial = toBool(input.allowPartialLines, 'allowPartialLines', problems);
-  assertNoProblems(problems, 'The settings need attention.');
-  const [[row]] = await db.query('SELECT min_lines_per_month, allow_partial_lines FROM cf_plan_settings WHERE company_id = ? FOR UPDATE', [c.companyId]);
-  const next = {
-    minLinesPerMonth: min !== undefined ? min : row ? Number(row.min_lines_per_month) : DEFAULT_SETTINGS.minLinesPerMonth,
-    allowPartialLines: partial !== undefined ? partial : row ? !!Number(row.allow_partial_lines) : DEFAULT_SETTINGS.allowPartialLines,
-  };
-  await db.query(
-    `INSERT INTO cf_plan_settings (company_id, min_lines_per_month, allow_partial_lines, updated_by) VALUES (?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE min_lines_per_month = VALUES(min_lines_per_month), allow_partial_lines = VALUES(allow_partial_lines), updated_by = VALUES(updated_by)`,
-    [c.companyId, next.minLinesPerMonth, next.allowPartialLines ? 1 : 0, c.userId ?? null],
-  );
-  return { settings: next };
 }
 
 /* ===========================================================================

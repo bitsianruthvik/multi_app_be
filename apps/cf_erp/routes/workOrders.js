@@ -16,6 +16,8 @@
  * The work orders themselves (Production > Work orders):
  *   GET   /work-orders                 a bare array; ?status=open (draft+issued+in_progress) or a
  *                                      list (draft,issued), &contractorId=&orderId=&lineId=&search=
+ *   GET   /work-orders/by-order        (2026-10-17) one row per SALES ORDER: { order, totals, workOrders[] },
+ *                                      paged by order (limit, offset); ?status=&search=&contractorId=
  *   GET   /work-orders/:id             header, scope by piece, progress once released
  *   PATCH /work-orders/:id             { startDate?, dueDate?, notes? }
  *   POST  /work-orders/:id/status      { status }  draft -> issued -> in_progress -> done; open -> cancelled
@@ -24,7 +26,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import {
-  getAssignment, assignCells, listWorkOrders, getWorkOrder, updateWorkOrder, setWorkOrderStatus,
+  getAssignment, assignCells, listWorkOrders, listWorkOrdersByOrder, getWorkOrder, updateWorkOrder, setWorkOrderStatus,
 } from '../services/workOrderService.js';
 
 const router = Router();
@@ -38,6 +40,7 @@ router.post('/orders/:orderId/lines/:lineId/assignment', guard(PERM.production),
   handle((req) => withTransaction((db) => assignCells(db, ctx(req), orderId(req), lineId(req), req.body ?? {}))));
 
 router.get('/work-orders', guard(PERM.productionView), handle((req) => listWorkOrders(pool, ctx(req).companyId, req.query)));
+router.get('/work-orders/by-order', guard(PERM.productionView), handle((req) => listWorkOrdersByOrder(pool, ctx(req).companyId, req.query)));
 router.get('/work-orders/:id', guard(PERM.productionView), handle((req) => getWorkOrder(pool, ctx(req).companyId, id(req))));
 router.patch('/work-orders/:id', guard(PERM.production),
   handle((req) => withTransaction((db) => updateWorkOrder(db, ctx(req), id(req), req.body ?? {}))));

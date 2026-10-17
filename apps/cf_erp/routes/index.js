@@ -36,6 +36,8 @@ import sectionNestingRoutes from './sectionNesting.js';
 import plateChangeRoutes from './plateChanges.js';
 // Cutting allowance by BOM part name (init.sql §64).
 import cutAllowanceRoutes from './cutAllowances.js';
+// Standard drawings (init.sql §69): numbered standards with a BOM tree, copied onto order lines and back.
+import standardRoutes from './standards.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -129,5 +131,6 @@ router.use(cuttingRoutes);
 router.use(sectionNestingRoutes);
 router.use(plateChangeRoutes);
 router.use(cutAllowanceRoutes);
+router.use(standardRoutes);
 
 export default router;

@@ -37,6 +37,8 @@ import { generate } from '../modules/codegen/index.js';
 import { ownHoldRows, takeHolds, writeHoldTakes } from './purchaseLinkService.js';
 // The production ledger (§45): every step change is followed by its stock move.
 import { ledgerOnSteps, wipArea, writeTransform } from './productionLedgerService.js';
+// A start on work the plan has no ship week for is flagged, never refused (2026-10-17).
+import { unplannedOf, flagUnplanned } from './planCheckService.js';
 import {
   availability, availabilityRows, shapeAvailability, rollOutPlan, codeNodes, seedPieceMemo, linePositionOf, takenCodes,
   lockedPiecesOf, lockedBothOf, attachLockedCodes, unmatchedProblem, nameOf, MAX_DEPTH,
@@ -2264,6 +2266,8 @@ export async function startStep(db, c, stepId, input = {}) {
     [...(at == null ? [] : [at]), machineId, c.companyId, step.id],
   );
   await logEvent(db, c, step.id, 'start', { machineId, note: blank(input.note) ? null : String(input.note).slice(0, 500), at, beforeReady });
+  // Not in the plan (2026-10-17): the start stands; its start event is flagged unplanned (§70).
+  if ((await unplannedOf(db, c.companyId, [step.id])).size) await flagUnplanned(db, c.companyId, { stepIds: [step.id] });
   await ledgerOnSteps(db, c, [step.id]);
   return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }

@@ -9,7 +9,8 @@
  *   GET  /floor/machines/:id/now              { running, stop } — what the machine is doing now
  *   GET  /floor/machines/:id/day?date=        { shifts, sessions, stops, notRecorded, totals }
  *   PUT  /floor/machines/:id/day              { date, operatorId, rows, deletedRows } — the day from paper
- *   POST /floor/start                         { machineId, operatorId, stepIds[] }
+ *   GET  /floor/plan-check?stepIds=1,2        (2026-10-17) { unplanned: [...] } — the steps the plan has no ship week for
+ *   POST /floor/start                         { machineId, operatorId, stepIds[] } — answers started[].unplanned too
  *   POST /floor/pause                         { sessionIds[] }
  *   POST /floor/resume                        { sessionIds[] }
  *   POST /floor/finish                        { sessionId, good, scrap, done }
@@ -31,7 +32,7 @@ import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
   listMachines, listFloorOperators, listReasons, machineQueue, getMachineNow, getDay, putDay,
-  startWork, pauseWork, resumeWork, finishWork, startStop, endStop, getFloorSettings, putFloorSettings,
+  startWork, planCheck, pauseWork, resumeWork, finishWork, startStop, endStop, getFloorSettings, putFloorSettings,
   listOperators, createOperator, updateOperator, deleteOperator,
   listStopReasons, createStopReason, updateStopReason, deleteStopReason,
 } from '../services/floorService.js';
@@ -48,6 +49,7 @@ router.get('/floor/machines', floor, handle((req) => listMachines(pool, company(
 router.get('/floor/operators', floor, handle((req) => listFloorOperators(pool, company(req), req.query)));
 router.get('/floor/reasons', floor, handle((req) => listReasons(pool, company(req))));
 router.get('/floor/machines/:id/queue', floor, handle((req) => machineQueue(pool, company(req), id(req), req.query)));
+router.get('/floor/plan-check', floor, handle((req) => planCheck(pool, company(req), req.query)));
 router.get('/floor/machines/:id/now', floor, handle((req) => getMachineNow(pool, company(req), id(req))));
 router.get('/floor/machines/:id/day', floor, handle((req) => getDay(pool, company(req), id(req), req.query.date)));
 router.put('/floor/machines/:id/day', floor, handle((req) => tx(req, (db, c) => putDay(db, c, id(req), req.body ?? {}))));

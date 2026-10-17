@@ -148,6 +148,10 @@ function operationOf(s, ctx) {
   // `name` only when it is not the operation's own (a pass, a named step) — the
   // names travel once per read in `operations`; a diaphragm has eleven steps.
   const op = { stepId: s.id, operationId: s.operation_id, done, total, state };
+  // 2026-10-17: the step's planned minutes (the time the completion weighs by), for the
+  // dashboard's "Own steps" / "Including everything below". null = no time on the step.
+  const minutes = s.eff_minutes !== undefined ? s.eff_minutes : s.est_minutes;
+  op.minutes = minutes == null ? null : round6(Number(minutes));
   const label = s._opLabel ?? s.op_name;
   if (label !== s.op_name) op.name = label;
   if (state === 'todo' && s._status === 'ready') op.ready = true;
@@ -168,9 +172,11 @@ function addOp(agg, s, op) {
   const est = minutes == null ? null : Number(minutes);
   if (est == null) agg.minKnown = false;
   else { agg.minT += est; agg.minD += op.total > 0 ? est * (op.done / op.total) : 0; }
-  const b = agg.byOp.get(s.operation_id) ?? { operationId: s.operation_id, done: 0, total: 0 };
+  const b = agg.byOp.get(s.operation_id) ?? { operationId: s.operation_id, done: 0, total: 0, minutes: 0, minutesDone: 0, minutesKnown: true };
   b.done = round6(b.done + op.done);
   b.total = round6(b.total + op.total);
+  if (est == null) b.minutesKnown = false;
+  else { b.minutes = round6(b.minutes + est); b.minutesDone = round6(b.minutesDone + (op.total > 0 ? est * (op.done / op.total) : 0)); }
   agg.byOp.set(s.operation_id, b);
 }
 
@@ -181,11 +187,34 @@ function mergeAgg(into, from) {
   into.blocked += from.blocked; into.running += from.running;
   if (!into.first && from.first) into.first = from.first;
   for (const [k, v] of from.byOp) {
-    const b = into.byOp.get(k) ?? { operationId: v.operationId, done: 0, total: 0 };
+    const b = into.byOp.get(k) ?? { operationId: v.operationId, done: 0, total: 0, minutes: 0, minutesDone: 0, minutesKnown: true };
     b.done = round6(b.done + v.done);
     b.total = round6(b.total + v.total);
+    b.minutes = round6(b.minutes + v.minutes);
+    b.minutesDone = round6(b.minutesDone + v.minutesDone);
+    b.minutesKnown = b.minutesKnown && v.minutesKnown;
     into.byOp.set(k, b);
   }
+}
+
+/** One operation's figures as the read sends them: minutes only when every step of it has a time. */
+const opFigures = (b) => ({
+  operationId: b.operationId, done: b.done, total: b.total,
+  minutes: b.minutesKnown ? b.minutes : null, minutesDone: b.minutesKnown ? b.minutesDone : null,
+});
+
+/**
+ * A node's OWN figures (2026-10-17, the dashboard's "Own steps"): its own steps only. A line has
+ * no steps: its own = its top pieces' own steps; an order's = its lines'. A piece's own operations are
+ * its `ops` (each with its minutes), so byOperation is sent for a line and an order only.
+ */
+function ownOf(agg, withOps) {
+  const { completion, weight } = completionOf(agg);
+  return {
+    completion, weight, steps: agg.steps, stepsDone: agg.stepsDone,
+    minutes: agg.minKnown ? round6(agg.minT) : null, minutesDone: agg.minKnown ? round6(agg.minD) : null,
+    ...(withOps ? { byOperation: [...agg.byOp.values()].map(opFigures) } : {}),
+  };
 }
 
 function completionOf(agg) {
@@ -279,11 +308,16 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
   };
   for (const n of raw.values()) if (!n.parentId) walk(n.id, 0);
 
-  // Roll up, children before parents.
+  // Roll up, children before parents. `ownAgg` = the node's own steps only (a line: its top
+  // pieces' own steps; an order: its lines'); `agg` = the whole subtree, own steps included.
   for (let i = order.length - 1; i >= 0; i--) {
     const n = order[i];
     const own = emptyAgg();
     for (const { s, op } of n.ops) addOp(own, s, op);
+    const mine = emptyAgg();
+    for (const { s, op } of n.ops) addOp(mine, s, op);
+    if (n.kind !== 'piece') for (const k of n.kids) mergeAgg(mine, raw.get(k).ownAgg);
+    n.ownAgg = mine;
     const blockedOp = n.ops.find(({ op }) => op.state === 'blocked')?.op ?? null;
     if (n.kind === 'piece') own.pieces = 1;
     if (blockedOp) { own.blocked = 1; own.first = { at: n.code, reason: blockedOp.reason ?? 'Blocked' }; }
@@ -304,6 +338,11 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
       blockedAt: n.agg.first && n.agg.first.at !== n.code ? n.agg.first.at : null,
       running: n.agg.running,
       childCount: n.kids.length,
+      // Own vs including (2026-10-17): `own` = this node's own steps; completion / minutes /
+      // byOperation = the whole subtree, own steps included.
+      own: ownOf(n.ownAgg, n.kind !== 'piece'),
+      minutes: n.agg.minKnown ? round6(n.agg.minT) : null,
+      minutesDone: n.agg.minKnown ? round6(n.agg.minD) : null,
     };
     if (n.kind === 'piece') { out.pieceNo = n.pieceNo; out.basis = n.basis; out.itemId = n.itemId; }
     if (n.kind !== 'order') { out.lineId = n.lineId; out.releaseId = n.releaseId; }
@@ -312,7 +351,7 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
       out.pieces = n.agg.pieces;
       out.steps = n.agg.steps;
       out.stepsDone = n.agg.stepsDone;
-      out.byOperation = [...n.agg.byOp.values()];
+      out.byOperation = [...n.agg.byOp.values()].map(opFigures);
     }
     nodes.push(out);
     byId.set(out.id, out);
@@ -326,6 +365,21 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
 }
 
 // --- pruning -----------------------------------------------------------------------
+
+/**
+ * The own / minutes figures (2026-10-17) come only when asked (?figures=1 — the dashboard's tree
+ * asks): the Tracker page's default read stays the size it was (~190 KB on the KEPL line; with
+ * them ~256 KB). The built tree keeps them; a read without them is mapped lean.
+ */
+const wantsFigures = (q) => String(q?.figures ?? '') === '1';
+function leanNode(n) {
+  const { own, minutes, minutesDone, ...rest } = n;
+  void own; void minutes; void minutesDone;
+  rest.ops = n.ops.map(({ minutes: m, ...o }) => { void m; return o; });
+  if (n.byOperation) rest.byOperation = n.byOperation.map(({ minutes: m, minutesDone: d, ...b }) => { void m; void d; return b; });
+  return rest;
+}
+const shapeFor = (q) => (wantsFigures(q) ? (n) => n : leanNode);
 
 /** Marks whether each returned node's children all came with it. */
 function finish(list, childrenOf) {
@@ -347,7 +401,8 @@ function summaryOf(tree) {
 const intOr = (v, d) => (blank(v) ? d : Math.max(1, Math.min(50, Math.floor(Number(v)) || d)));
 
 /**
- * GET /tracker/tree?orderId=&lineId=&depth=&search=&onlyBlocked=&includeClosed=
+ * GET /tracker/tree?orderId=&lineId=&depth=&search=&onlyBlocked=&includeClosed=&figures=
+ *   figures=1 (2026-10-17): each node also carries `own` (its own steps) and its subtree minutes.
  *   default: every released line of a confirmed order (includeClosed=1: every
  *   released line); orderId / lineId narrow it and may name a closed order.
  *   depth = levels returned (order = 1, line = 2, top piece = 3 …), default 4.
@@ -402,7 +457,8 @@ export async function trackerTree(db, companyId, q = {}) {
     if (list.length > FILTER_CAP) { list = list.slice(0, FILTER_CAP); truncated = true; }
   }
   const matchSet = new Set(matches ?? []);
-  const out = finish(list, tree.childrenOf).map((n) => (matchSet.has(n.id) ? { ...n, match: true } : n));
+  const shape = shapeFor(q);
+  const out = finish(list.map(shape), tree.childrenOf).map((n) => (matchSet.has(n.id) ? { ...n, match: true } : n));
   return {
     scope: { orderId, lineId, includeClosed },
     orders: pickerOf(all),
@@ -431,7 +487,7 @@ async function linesOfNode(db, companyId, nodeId) {
   return { kind: 'p', lines: it ? all.filter((l) => l.release_id === it.release_id) : [] };
 }
 
-/** GET /tracker/tree/children?nodeId=&depth= — a branch: the node's descendants up to `depth` levels below it (default 1). */
+/** GET /tracker/tree/children?nodeId=&depth=&figures= — a branch: the node's descendants up to `depth` levels below it (default 1). */
 export async function trackerTreeChildren(db, companyId, q = {}) {
   const { lines } = await linesOfNode(db, companyId, q.nodeId);
   const tree = await buildTree(db, companyId, lines);
@@ -445,7 +501,8 @@ export async function trackerTreeChildren(db, companyId, q = {}) {
     list.push(n);
     if (n.level - node.level < depth) stack.push(...[...(tree.childrenOf.get(n.id) ?? [])].reverse());
   }
-  return { node: finish([node], tree.childrenOf)[0], operations: tree.operations, nodes: finish(list, tree.childrenOf) };
+  const shape = shapeFor(q);
+  return { node: finish([shape(node)], tree.childrenOf)[0], operations: tree.operations, nodes: finish(list.map(shape), tree.childrenOf) };
 }
 
 // --- the order line's grid -------------------------------------------------------------

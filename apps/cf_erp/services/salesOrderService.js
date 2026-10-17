@@ -357,6 +357,15 @@ export async function getOrder(db, companyId, id) {
     linesP,
   ]);
   const order = shapeOrder({ ...o, customer_code: cust?.code, customer_name: cust?.name });
+  // The standard drawing each line came from (init.sql §69) — only asked when a line names one.
+  const stdIds = [...new Set(lines.map((l) => l.standard_id).filter(Boolean))];
+  const verIds = [...new Set(lines.map((l) => l.standard_version_id).filter(Boolean))];
+  const [[stds], [vers]] = stdIds.length ? await Promise.all([
+    db.query('SELECT id, number, name, current_version_id FROM cf_standard_drawings WHERE company_id = ? AND id IN (?)', [companyId, stdIds]),
+    verIds.length ? db.query('SELECT id, version_no FROM cf_standard_drawing_versions WHERE company_id = ? AND id IN (?)', [companyId, verIds]) : [[]],
+  ]) : [[[]], [[]]];
+  const stdOf = new Map(stds.map((s) => [Number(s.id), s]));
+  const verNo = new Map(vers.map((v) => [Number(v.id), Number(v.version_no)]));
   order.revisions = revs.map((r) => ({ id: r.id, revision: Number(r.revision), status: r.status, revisedAt: r.revised_at ?? null }));
   const [stats, amounts] = await Promise.all([
     structureStats(db, companyId, lines.filter((l) => l.line_type === 'custom').map((l) => l.id)),
@@ -401,6 +410,11 @@ export async function getOrder(db, companyId, id) {
     // §66: the line's own answer (null = as the order) and the one that counts.
     materialSupply: l.material_supply ?? null,
     supply: l.material_supply ?? order.materialSupply,
+    // The standard drawing it came from, and which version (init.sql §69); null for an ordinary line.
+    standard: l.standard_id && stdOf.has(Number(l.standard_id)) ? {
+      id: Number(l.standard_id), number: stdOf.get(Number(l.standard_id)).number, name: stdOf.get(Number(l.standard_id)).name,
+      versionId: l.standard_version_id ?? null, versionNo: l.standard_version_id ? verNo.get(Number(l.standard_version_id)) ?? null : null,
+    } : null,
   }));
   return order;
 }
@@ -648,7 +662,7 @@ async function requireOrderLine(db, companyId, lineId) {
  * recordId is a catalog item (standard line) or a template definition (custom
  * line — its temporary item and Custom BOM are created now).
  */
-export async function addOrderLine(db, c, orderId, input = {}) {
+export async function addOrderLine(db, c, orderId, input = {}, opts = {}) {
   const o = await requireOrder(db, c.companyId, orderId, { lock: true });
   assertOpen(o);
   const problems = [];
@@ -709,7 +723,10 @@ export async function addOrderLine(db, c, orderId, input = {}) {
       Number(quantity.toFixed(6)), committedDate, bomRevision, description, blank(input.notes) ? null : String(input.notes), c.userId,
       price.rate ?? null, price.rate_basis ?? 'unit', CURRENCY],
   );
-  if (kind === 'template') {
+  if (kind === 'template' && opts.build) {
+    // A line made from a STANDARD DRAWING (standardDrawingService): its rows are the standard's, copied — not the template's.
+    await opts.build(r.insertId, rec);
+  } else if (kind === 'template') {
     // The copy points the line at the item it makes, and settles the values,
     // names and codes of everything it creates — in bulk (instantiationService).
     await instantiateTemplate(db, c, { definition: rec, ownerLineId: r.insertId });

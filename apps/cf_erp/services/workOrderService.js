@@ -491,6 +491,70 @@ export async function listWorkOrders(db, companyId, q = {}) {
   return pageOf(out, total, page, { counts: { status, open, all } });
 }
 
+/**
+ * GET /work-orders/by-order?status=&search=&contractorId=&limit=&offset= (2026-10-17, "Group by:
+ * Sales order") — the same filters as the list, one row per SALES ORDER with its work orders and
+ * totals (work orders, open, operations, steps done of released). Pages by sales order, so an
+ * order's work orders never split across pages. 3 reads in one round trip whatever the size:
+ * the page of orders, their count, and the work orders of the orders on the page (one query, joined
+ * to the page by a derived table — no subquery in an ON).
+ */
+export async function listWorkOrdersByOrder(db, companyId, q = {}) {
+  const where = ['w.company_id = ?', 'w.deleted_at IS NULL'];
+  const params = [companyId];
+  if (!blank(q.contractorId)) { where.push('w.contractor_id = ?'); params.push(Number(q.contractorId)); }
+  const like = likeOf(q.search);
+  if (like) { where.push('(w.code LIKE ? OR p.name LIKE ? OR p.code LIKE ? OR o.code LIKE ? OR o.title LIKE ?)'); params.push(like, like, like, like, like); }
+  if (!blank(q.status)) {
+    const statuses = String(q.status).split(',').map((s) => s.trim())
+      .flatMap((s) => (s === 'open' ? WO_OPEN : [s])).filter((s) => WO_STATUSES.includes(s));
+    if (statuses.length) { where.push('w.status IN (?)'); params.push(statuses); }
+  }
+  const page = pageArgs(q, { def: 25, max: 200 });
+  const from = 'FROM cf_work_orders w JOIN cf_parties p ON p.id = w.contractor_id JOIN cf_sales_orders o ON o.id = w.order_id';
+  const cond = where.join(' AND ');
+  const [[orders], [[{ n: total }]], [rows]] = await Promise.all([
+    db.query(
+      `SELECT o.id, o.code, o.revision, o.title, o.status, o.customer_id, cu.name AS customer_name, COUNT(*) AS n
+         ${from} LEFT JOIN cf_parties cu ON cu.id = o.customer_id
+        WHERE ${cond} GROUP BY o.id, o.code, o.revision, o.title, o.status, o.customer_id, cu.name
+        ORDER BY o.code DESC, o.id DESC LIMIT ? OFFSET ?`,
+      [...params, page.limit, page.offset],
+    ),
+    db.query(`SELECT COUNT(DISTINCT w.order_id) AS n ${from} WHERE ${cond}`, params),
+    // The work orders of the same page of orders: the page's order ids come from the same ORDER BY / LIMIT.
+    db.query(
+      `${WO_SELECT}
+         JOIN (SELECT o.id FROM cf_work_orders w JOIN cf_parties p ON p.id = w.contractor_id JOIN cf_sales_orders o ON o.id = w.order_id
+                WHERE ${cond} GROUP BY o.id, o.code ORDER BY o.code DESC, o.id DESC LIMIT ? OFFSET ?) pg ON pg.id = w.order_id
+        WHERE ${cond} ORDER BY w.order_line_id, w.code`,
+      [...params, page.limit, page.offset, ...params],
+    ),
+  ]);
+  const byOrder = new Map(orders.map((o) => [o.id, []]));
+  for (const r of rows) byOrder.get(r.order_id)?.push(shapeWorkOrder(r));
+  const out = orders.map((o) => {
+    const ws = byOrder.get(o.id) ?? [];
+    const released = ws.filter((w) => w.progress);
+    const total = released.reduce((t, w) => t + w.progress.total, 0);
+    const done = released.reduce((t, w) => t + w.progress.done, 0);
+    return {
+      order: { id: o.id, code: o.code, revision: o.revision ?? 1, title: o.title ?? null, status: o.status, customer: o.customer_id ? { id: o.customer_id, name: o.customer_name } : null },
+      totals: {
+        workOrders: ws.length,
+        open: ws.filter((w) => WO_OPEN.includes(w.status)).length,
+        contractors: new Set(ws.map((w) => w.contractorId)).size,
+        operations: ws.reduce((t, w) => t + w.cellCount, 0),
+        steps: total, stepsDone: done,
+        pct: total > 0 ? Math.round((done / total) * 1000) / 10 : null,
+        notReleased: ws.length - released.length,
+      },
+      workOrders: ws,
+    };
+  });
+  return pageOf(out, total, page);
+}
+
 async function requireWorkOrder(db, companyId, id, { lock = false } = {}) {
   const [[w]] = await db.query(`${WO_SELECT} WHERE w.company_id = ? AND w.id = ? AND w.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`, [companyId, id]);
   if (!w) throw notFound('Work order');
