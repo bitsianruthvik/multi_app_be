@@ -83,6 +83,13 @@ try {
   const c = { companyId: COMPANY, userId };
   // DB_HOST, not @@hostname: TiDB Cloud answers "localhost" for that.
   console.log(`${APPLY ? 'APPLY' : 'DRY RUN (read-only)'} — database ${db.d} at ${process.env.DB_HOST ?? '?'}, company ${co.id} ${co.name}, ${wanted.length} sets from ${OUT}\n`);
+  // THE SETUP STEP first, in its own transaction (options the standards need, labels put right). A dry run says what it would do.
+  if (APPLY) await conn.beginTransaction();
+  const setup = await STD.importSetup(conn, c, { apply: APPLY });
+  if (APPLY) await conn.commit();
+  console.log(`Setup${APPLY ? '' : ' (would do)'}: ${setup.actions.length ? '' : 'nothing to do'}`);
+  for (const a of setup.actions) console.log(`  ${a.problem ? 'PROBLEM: ' : ''}${a.what}${a.done ? ' — done' : ''}`);
+  console.log('');
   let catalog = APPLY ? null : await STD.importCatalog(conn, COMPANY);
   for (const set of wanted) {
     const dir = path.join(OUT, set);
@@ -100,6 +107,7 @@ try {
         steelKg: rep.totals.steelKg, bomSteelKg: rep.totals.bomSteelKg == null ? null : Number(rep.totals.bomSteelKg) + Number(rep.totals.bomNonSteelKg ?? 0), newDefinitions: rep.newDefinitions.map((d) => d.name),
         problems: rep.problems, fallbacks: rep.fallbacks.length, files: `${rep.files.filter((f) => f.read).length}/${rep.files.length}`,
         unmapped: rep.rows.filter((x) => x.to === '(left out)').length,
+        grades: rep.grades, info: rep.info, definitionValues: rep.definitionValues,
       });
       if (APPLY) {
         if (rep.standard.alreadyThere) { await conn.rollback(); r.applied = 'already there — not written'; continue; }
@@ -136,6 +144,15 @@ function printSummary(rs) {
       r.unmapped ? `${r.unmapped} unmapped` : null, r.fallbacks ? `${r.fallbacks} second-choice names` : null,
       r.alreadyThere ? `already there (#${r.alreadyThere})` : null, r.applied ?? null, r.failed ? `FAILED: ${r.failed}` : null].filter(Boolean).join(' · ');
     console.log(`${pad(r.set, 15)} ${pad(r.number, 22)} ${pad(r.rows, 5)} ${pad(r.parts, 6)} ${pad(kg(r.steelKg), 9)} ${pad(kg(r.bomSteelKg), 9)} ${pad(d, 6)} ${pad(r.files, 6)} ${notes}`);
+    const g = r.grades;
+    if (g) {
+      const parts = [g.asWritten && `${g.asWritten} as written`, g.eNamed && `${g.eNamed} E-grade named`, g.legacyE250 && `${g.legacyE250} old IS grade → E250`,
+        g.impactBR && `${g.impactBR} impact BR`, g.impactA && `${g.impactA} impact A`, g.legacyNoClass && `${g.legacyNoClass} IS 2062 no class letter (E250, no impact class)`,
+        g.bronze && `${g.bronze} phosphor bronze → MATERIAL PB`, g.missed && `${g.missed} NOT MAPPED`].filter(Boolean);
+      console.log(`${' '.repeat(16)}grades: ${parts.join(' · ') || 'none'}`);
+    }
+    for (const x of r.definitionValues ?? []) console.log(`${' '.repeat(16)}definition value: ${x}`);
+    for (const x of r.info ?? []) console.log(`${' '.repeat(16)}note: ${x}`);
     for (const p of r.problems ?? []) console.log(`${' '.repeat(16)}- ${p}`);
   }
   const union = new Map();

@@ -184,6 +184,37 @@ try {
   ok('a new definition is named plainly (no brackets, no section size)', p1623.newDefinitions.every((d) => !/[()]|ISMC|ISLC/i.test(d.name)), JSON.stringify(p1623.newDefinitions.map((d) => d.name)));
   ok('a grade that is not an option is said once per grade, with its count', p1623.problems.filter((x) => /Grade/.test(x)).length <= 3);
 
+  // User decisions, 2026-10-17: the old IS grades, impact classes, phosphor bronze.
+  const rowOf = (plan, mark) => plan.rows.find((r) => r.mark === mark && r.kind === 'temp');
+  const optOf = (r, code) => r?.values.find((x) => x.code === code);
+  const grB = p1623.rows.find((r) => /Gr\s*B/i.test(r.item?.grade ?? ''));
+  const grA = p1623.rows.find((r) => /IS\s*226|Gr\s*A/i.test(r.item?.grade ?? '') && !/Gr\s*B/i.test(r.item?.grade ?? ''));
+  ok('IS 2062-84 Gr B → GRADE E250 and IMPACT_CLASS BR, with the original grade as a note',
+    optOf(grB, 'GRADE')?.display === 'E250' && optOf(grB, 'IMPACT_CLASS')?.optionValue === 'BR' && /Original grade on drawing: IS 2062-84 Gr B/.test(grB.notes ?? ''), JSON.stringify(grB?.values));
+  ok('IS 226 / Gr A → GRADE E250 and IMPACT_CLASS A', optOf(grA, 'GRADE')?.display === 'E250' && optOf(grA, 'IMPACT_CLASS')?.optionValue === 'A' && /Original grade on drawing/.test(grA.notes ?? ''));
+  const pb = p1623.rows.find((r) => /PHOSPHOR/i.test(r.item?.description ?? ''));
+  ok('a phosphor bronze plate: no GRADE, MATERIAL PB, and its definition holds MATERIAL PB too',
+    !optOf(pb, 'GRADE') && optOf(pb, 'MATERIAL')?.optionValue === 'PB' && p1623.definitionValues.some((d) => (d.def.name ?? d.def.new) === 'Phosphor bronze plate' && d.value.optionValue === 'PB'));
+  eq('the grade counts per set', [p1623.gradeMap.legacyE250, p1623.gradeMap.impactBR, p1623.gradeMap.impactA, p1623.gradeMap.bronze, p1623.gradeMap.missed], [29, 18, 11, 1, 0]);
+  // Mapping overrides onto production's names, and the restrainer under a Seismic stopper.
+  const prodNames = [spanDef(-11, 'SFP', 'Stiffener plate'), spanDef(-12, 'BKT', 'Bracket plate'), spanDef(-13, 'ACL', 'Angle cleat'),
+    spanDef(-14, 'STP', 'Seismic stopper'), spanDef(-15, 'XTA', 'X-frame top angle'), spanDef(-16, 'XBA', 'X-frame bottom angle')];
+  const prodLike = { ...catalog, defs: [...catalog.defs.filter((d) => !['stiffener plate', 'bracket plate', 'angle cleat', 'seismic stopper'].includes(PLAN.normName(d.name))), ...prodNames] };
+  const pS = PLAN.planImport(s11751.bom, prodLike);
+  const rsp = rowOf(pS, 'RSP'); const rp = rowOf(pS, 'RP');
+  eq('RSP → Stiffener plate (SFP)', rsp?.def?.code, 'SFP');
+  const stopper = pS.rows.find((r) => r.key === rp?.parentKey);
+  ok('RP and its RSPs sit under a Seismic stopper (STP), in the segment', stopper?.def?.code === 'STP' && rsp.parentKey === stopper.key && pS.rows.find((r) => r.key === stopper.parentKey)?.node?.kind === 'girder_segment');
+  near('…and the weight is the same', pS.totals.steelKg, plan.totals.steelKg, 0.01);
+  ok('no "Seismic stopper" in the catalog: they stay direct parts, and the plan says so', rowOf(plan, 'RP').parentKey === plan.rows.find((r) => r.mark === 'GA')?.key || plan.info.some((x) => /Seismic stopper/.test(x)));
+  const s1534 = readSet('RDSO_1534R');
+  const p1534 = PLAN.planImport(s1534.bom, prodLike);
+  eq('Jacking bracket plate → Bracket plate (BKT); its angle → Angle cleat (ACL)', [rowOf(p1534, 'JP')?.def?.code, rowOf(p1534, 'JA')?.def?.code], ['BKT', 'ACL']);
+  const p516 = PLAN.planImport(readSet('RDSO_516').bom, prodLike);
+  const ha = p516.rows.filter((r) => r.mark === 'HA');
+  ok('RDSO_516 HA (not told top from bottom) → X-frame top and bottom angles, split evenly, with a note',
+    ha.length === 4 && ha.filter((r) => r.def?.code === 'XTA').reduce((a, r) => a + r.quantity, 0) === 3 && ha.filter((r) => r.def?.code === 'XBA').reduce((a, r) => a + r.quantity, 0) === 3 && ha.every((r) => /split evenly/.test(r.notes ?? '')), JSON.stringify(ha.map((r) => [r.def?.code, r.quantity])));
+
   /* ------------------------------------------------------------------------ */
   section('2. The importer: dry run reads only; --apply writes it in one go');
   const c0 = await counts(conn);
@@ -224,11 +255,36 @@ try {
   says(`11753R3: ${a3.out.report.written.rows} rows, ${a3.n} trips · 11754R3: ${a4.out.report.written.rows} rows, ${a4.n} trips`);
   ok('the same number of round trips for two sets of different sizes', a3.n === a4.n && a3.out.report.written.newDefinitions.length === 0, `${a3.n} vs ${a4.n}`);
   ok('…and few of them (production ~49 ms each)', a3.n <= 40, `${a3.n}`);
+  const noSetup = await refusal(() => STD.importStandard(conn, c, { ...readSet('RDSO_1623', true), apply: true }));
+  const [[aOpt]] = await conn.query("SELECT COUNT(*) AS n FROM cf_spec_options o JOIN cf_specifications s ON s.id = o.specification_id WHERE o.company_id = ? AND s.code = 'IMPACT_CLASS' AND o.value = 'A' AND o.deleted_at IS NULL", [COMPANY]);
+  if (!Number(aOpt.n)) ok('an older set without the setup step is refused, and says to run it', noSetup?.code === 'OPTIONS_MISSING', noSetup?.message);
+  const setup1 = await STD.importSetup(conn, c, { apply: true });
+  const setup2 = await STD.importSetup(conn, c, { apply: false });
+  says(`setup: ${setup1.actions.map((a) => a.what).join(' · ') || 'nothing to do'}`);
+  eq('the setup step is idempotent: a second run has nothing to do', setup2.actions.filter((a) => !a.problem).length, 0);
+  const [[bo]] = await conn.query("SELECT o.label FROM cf_spec_options o JOIN cf_specifications s ON s.id = o.specification_id WHERE o.company_id = ? AND s.code = 'IMPACT_CLASS' AND o.value = 'BO' AND o.deleted_at IS NULL", [COMPANY]);
+  eq('the BO impact class reads just "BO"', bo?.label, 'BO');
   const t1623 = await STD.importStandard(conn, c, { ...readSet('RDSO_1623', true), apply: true });
   const [[v1623]] = await conn.query('SELECT * FROM cf_standard_drawing_versions WHERE id = ?', [t1623.report.written.versionId]);
   const r1623 = await rowsByMark(conn, [v1623.root_item_id]);
   ok('an older set applies too: its rows, its new definitions made once', r1623.ids.length === Number(v1623.rows_count) && t1623.report.written.newDefinitions.length === new Set(t1623.plan.newDefinitions.map((d) => d.name)).size, `${r1623.ids.length} rows, ${t1623.report.written.newDefinitions.length} new`);
   says(`RDSO_1623: ${r1623.ids.length} rows, new: ${t1623.report.written.newDefinitions.map((d) => d.name).join(', ')}`);
+  const [impact] = await conn.query(
+    `SELECT o.value, COUNT(*) AS n FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'IMPACT_CLASS'
+       JOIN cf_spec_options o ON o.id = v.option_id WHERE v.subject_id IN (?) AND v.deleted_at IS NULL GROUP BY o.value ORDER BY o.value`, [r1623.ids]);
+  eq('…its rows hold IMPACT_CLASS A ×11 and BR ×18', impact.map((x) => [x.value, Number(x.n)]), [['A', 11], ['BR', 18]]);
+  const pbDef = t1623.report.written.newDefinitions.find((d) => d.name === 'Phosphor bronze plate');
+  const [[pbv]] = await conn.query(
+    `SELECT o.value FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'MATERIAL' JOIN cf_spec_options o ON o.id = v.option_id
+      WHERE v.subject_type = 'master' AND v.subject_id = ? AND v.deleted_at IS NULL`, [pbDef?.id ?? 0]);
+  eq('…and the new "Phosphor bronze plate" definition holds MATERIAL PB', pbv?.value, 'PB');
+  // MATERIAL is a FIXED rule on Parts: the row takes the nearest value above it — its definition's PB, not Mild steel.
+  const [[pbRow]] = await conn.query("SELECT i.master_id FROM cf_item_details i WHERE i.source_definition_id = ? AND i.master_id IN (?) AND i.deleted_at IS NULL LIMIT 1", [pbDef?.id ?? 0, r1623.ids]);
+  const RES = await imp('apps/cf_erp/services/resolutionService.js');
+  const { loadMaster } = await imp('apps/cf_erp/services/records.js');
+  const resolved = pbRow ? RES.effectiveByCode(await RES.resolve(conn, COMPANY, { master: await loadMaster(conn, COMPANY, pbRow.master_id) })) : new Map();
+  const mat = resolved.get?.('MATERIAL') ?? resolved.MATERIAL;
+  ok('…so its rows resolve MATERIAL = Phosphor bronze', /PB|Phosphor/i.test(JSON.stringify(mat ?? null)), JSON.stringify(mat ?? null));
 
   /* ------------------------------------------------------------------------ */
   section('3. The list and the detail');

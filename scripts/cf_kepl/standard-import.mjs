@@ -75,7 +75,10 @@ try {
   const c = { companyId: COMPANY, userId };
   count.reset();
   if (APPLY) await conn.beginTransaction();
+  // The setup step (options the standards need, the BO label) — in this same transaction when applying.
+  const setup = await STD.importSetup(conn, c, { apply: APPLY });
   const out = await STD.importStandard(conn, c, { bom, files, apply: APPLY, sourceUrl: arg('source-url') });
+  out.report.setup = setup.actions;
   if (APPLY) await conn.commit();
   const trips = count.get();
   if (JSON_OUT) { console.log(JSON.stringify({ ...out.report, roundTrips: trips }, null, 1)); }
@@ -114,6 +117,10 @@ function printReport(r, { host, co, trips }) {
   line(`\nPart files: ${r.files.filter((f) => f.read).length} of ${r.files.length} read as shapes`);
   for (const f of r.files) line(`  ${f.mark.padEnd(6)} ${f.file.padEnd(28)} ${f.missing ? 'MISSING' : f.read ? `${f.sizeMm} mm, ${f.holes} holes` : 'NOT READ'}`);
   line(`\nWeight per span: ${r.totals.steelKg} kg steel (bom.json says ${r.totals.bomSteelKg ?? '—'}), + ${r.totals.studKg} kg studs (with studs bom.json says ${r.totals.bomSteelKgInclStuds ?? '—'})`);
+  if (r.setup?.length) { line(`\nSetup${APPLY ? '' : ' (would do)'}:`); for (const a of r.setup) line(`  ${a.problem ? 'PROBLEM: ' : ''}${a.what}${a.done ? ' — done' : ''}`); }
+  if (r.grades) line(`\nGrades: ${Object.entries(r.grades).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(' · ') || 'none'}`);
+  for (const x of r.definitionValues ?? []) line(`Definition value: ${x}`);
+  for (const x of r.info ?? []) line(`Note: ${x}`);
   if (r.problems.length) { line('\nPROBLEMS:'); for (const p of r.problems) line(`  - ${p}`); }
   if (r.written) line(`\nWritten: standard #${r.written.standardId}, version #${r.written.versionId}, register drawing #${r.written.drawingId}, ${r.written.rows} rows, ${r.written.files} files.`);
   line(`\nRound trips: ${trips}${APPLY ? '' : ' (dry run reads)'}`);

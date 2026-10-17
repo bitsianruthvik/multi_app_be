@@ -95,7 +95,12 @@ export function partCandidates(item, place = {}) {
     case 'bottom_flange_cover_inner': return ['Bottom flange inner cover plate', 'Cover plate'];
     case 'web_cover_plate': return ['Web cover plate', 'Cover plate'];
     case 'restrainer_plate': return ['Restrainer plate'];
-    case 'restrainer_stiffener': return ['Restrainer stiffener plate', 'Restrainer stiffener'];
+    // User, 2026-10-17: the restrainer's stiffeners are the catalog's Stiffener plate (SFP).
+    case 'restrainer_stiffener': return ['Stiffener plate', 'Restrainer stiffener plate'];
+    // User, 2026-10-17: a jacking bracket's PLATE is the catalog's Bracket plate (BKT); its seat plate keeps its own name.
+    case 'jacking_bracket':
+      if (/BRACKET\s+PLATE/.test(desc)) return ['Bracket plate', 'Jacking bracket plate'];
+      return [plainName(item?.description ?? 'Jacking bracket part')];
     case 'pad_plate': return ['Pad plate'];
     case 'packing_plate': return ['Packing plate'];
     case 'shear_stud': return ['Shear stud'];
@@ -109,6 +114,8 @@ export function partCandidates(item, place = {}) {
       if (/STIFFENER/.test(desc)) return ['Jacking stiffener'];
       // An "L cleat" is the catalog's angle cleat (before "bracing": "L CLEAT FOR TEMPORARY BRACING" is still a cleat).
       if (/\bCLEAT/.test(desc)) return ['Angle cleat', 'Angle cleats'];
+      // User, 2026-10-17: a jacking bracket's angle is an Angle cleat (ACL).
+      if (/BRACKET/.test(desc)) return ['Angle cleat', 'Angle cleats'];
       if (/BRACING|BRACE\b/.test(desc)) return ['Bracing'];
       // Any other angle (a jacking-bracket angle, an X-frame horizontal): its own short name, never "Bracing".
       return [plainName(item?.description ?? 'Angle')];
@@ -228,19 +235,59 @@ export function planImport(bom, catalog) {
   const num = (code, v) => (v == null || !Number.isFinite(Number(v)) || !spec(code) ? null : { code, number: r3(v), uom: spec(code).default_uom ?? null });
   const txt = (code, v) => (v == null || v === '' || !spec(code) ? null : { code, text: String(v).slice(0, 255) });
   const gradeMisses = new Map();   // the grade as written -> rows left without one (said once, below)
-  const grade = (g) => {
-    if (!g || !spec('GRADE')) return null;
-    let id = catalog.gradeOption?.get(String(g).toUpperCase());
-    // Older wording names today's grade in passing ("IRS B1 & B2 … = today IS 2062 E250"): that grade — nothing guessed.
-    const named = /\bE\s?(250|275|300|350|410|450)\b/i.exec(String(g));
-    if (id == null && named) id = catalog.gradeOption?.get(`E${named[1]}`);
-    if (id == null) { gradeMisses.set(String(g), (gradeMisses.get(String(g)) ?? 0) + 1); return null; }
-    return { code: 'GRADE', optionId: id, display: named && !catalog.gradeOption?.has(String(g).toUpperCase()) ? `E${named[1]}` : g };
+  /** What each set's grades became, row by row — the summary prints it. */
+  const gradeMap = { asWritten: 0, eNamed: 0, legacyE250: 0, impactBR: 0, impactA: 0, legacyNoClass: 0, bronze: 0, missed: 0 };
+  /** An option value as a row value: its id when the option exists, else the value to find once the setup made it. */
+  const optionValue = (code, value, display = value) => {
+    if (!spec(code)) return null;
+    const map = code === 'GRADE' ? catalog.gradeOption : code === 'IMPACT_CLASS' ? catalog.impactOption : catalog.materialOption;
+    return { code, optionId: map?.get(String(value).toUpperCase()) ?? null, optionValue: value, display };
   };
+  /**
+   * GRADE (and what goes with it) from the grade a drawing writes. User, 2026-10-17:
+   *   an option as written, or the grade the wording names ("… = today IS 2062 E250")   → that grade
+   *   IS 2062-84 Gr B                                      → E250, IMPACT_CLASS BR
+   *   IS 2062-84 Gr A, IS 226                              → E250, IMPACT_CLASS A ("A — no impact test")
+   *   IS 2062 with no grade letter                         → E250, no impact class (said in the note)
+   *   phosphor bronze                                      → no GRADE; MATERIAL PB ("Phosphor bronze")
+   * Every row whose grade was translated carries "Original grade on drawing: <text>".
+   * → { values, note }
+   */
+  const gradeOf = (it) => {
+    const g = String(it?.grade ?? '').trim();
+    if (!g) return { values: [], note: null };
+    const original = `Original grade on drawing: ${g}`;
+    if (/PHOSPHOR|BRONZE/i.test(`${g} ${it.material ?? ''}`)) {
+      gradeMap.bronze++;
+      return { values: [optionValue('MATERIAL', 'PB', 'Phosphor bronze')].filter(Boolean), note: original, bronze: true };
+    }
+    if (!spec('GRADE')) return { values: [], note: null };
+    const exact = catalog.gradeOption?.get(g.toUpperCase());
+    if (exact != null) { gradeMap.asWritten++; return { values: [{ code: 'GRADE', optionId: exact, display: g }], note: null }; }
+    const named = /\bE\s?(250|275|300|350|410|450)\b/i.exec(g);
+    if (named && catalog.gradeOption?.get(`E${named[1]}`) != null) {
+      gradeMap.eNamed++;
+      return { values: [{ code: 'GRADE', optionId: catalog.gradeOption.get(`E${named[1]}`), display: `E${named[1]}` }], note: original };
+    }
+    if (/IS\s*2062|IS\s*226/i.test(g) && catalog.gradeOption?.get('E250') != null) {
+      gradeMap.legacyE250++;
+      const v = [{ code: 'GRADE', optionId: catalog.gradeOption.get('E250'), display: 'E250' }];
+      if (/\bGr\.?\s*B\b/i.test(g)) { gradeMap.impactBR++; v.push(optionValue('IMPACT_CLASS', 'BR')); }
+      else if (/\bGr\.?\s*A\b/i.test(g) || /IS\s*226/i.test(g)) { gradeMap.impactA++; v.push(optionValue('IMPACT_CLASS', 'A', 'A — no impact test')); }
+      else gradeMap.legacyNoClass++;
+      return { values: v.filter(Boolean), note: original };
+    }
+    gradeMap.missed++;
+    gradeMisses.set(g, (gradeMisses.get(g) ?? 0) + 1);
+    return { values: [], note: original };
+  };
+  /** Definitions that must hold a value themselves (MATERIAL PB on the phosphor bronze plate: a fixed rule reads it there). */
+  const definitionValues = [];
 
   /** The values a part row holds; its weight each (kg, gross: bom.json's own figure when it gives one). */
   function partValues(it, mark) {
-    const v = [txt('DRAWING_MARK', mark), grade(it.grade)];
+    const gv = gradeOf(it);
+    const v = [txt('DRAWING_MARK', mark), ...gv.values];
     let kg = null;
     const L = Number(it.lengthMm);
     if (it.category === 'plate') {
@@ -261,8 +308,9 @@ export function planImport(bom, catalog) {
     // bom.json's gross weight each wins when it gives one (shaped plates, channels); else the one worked out here.
     if (Number(it.unitWeightKg) > 0) kg = Number(it.unitWeightKg);
     if (kg != null && spec('WEIGHT')) v.push({ code: 'WEIGHT', number: r3(kg), uom: spec('WEIGHT').default_uom ?? 'kg', source: 'calculated' });
-    return { values: v.filter(Boolean), kg };
+    return { values: v.filter(Boolean), kg, gradeNote: gv.note, bronze: !!gv.bronze };
   }
+  const joinNotes = (...xs) => { const t = xs.filter(Boolean).join(' · '); return t ? t.slice(0, 2000) : null; };
 
   /** The span (root): an existing span definition before a new one — SPAN-001, the names asked, then any "…span…". */
   const pickSpan = (names) => {
@@ -287,8 +335,36 @@ export function planImport(bom, catalog) {
     return { new: name, name, classHint };
   }
 
-  function walk(node, parentKey, depth, place) {
+  /**
+   * User, 2026-10-17: a restrainer plate and its stiffeners sit together under the catalog's "Seismic stopper"
+   * assembly when the catalog has one — a node put in between, quantities divided so the pieces (and the weight)
+   * are the same. Without that definition they stay direct parts, and the plan says so.
+   */
+  const stopperDef = pick(['Seismic stopper'], 'template');
+  const info = [];
+  const withStopper = (node) => {
     const children = node.children ?? [];
+    if (/seismic\s+stopper/i.test(String(node.name ?? ''))) return children;
+    const rp = children.filter((c) => c.item != null && items.get(c.item)?.role === 'restrainer_plate');
+    const rsp = children.filter((c) => c.item != null && items.get(c.item)?.role === 'restrainer_stiffener');
+    if (!rp.length) return children;
+    if (!stopperDef) {
+      if (!info.some((x) => /Seismic stopper/.test(x))) info.push('No "Seismic stopper" assembly in the catalog: the restrainer plates and their stiffeners stay direct parts of their segment.');
+      return children;
+    }
+    const k = rp.length === 1 && [...rp, ...rsp].every((c) => Number(c.qtyPerParent) % Number(rp[0].qtyPerParent) === 0) ? Number(rp[0].qtyPerParent) : 1;
+    const stopper = {
+      id: `${node.id ?? 'N'}-STP`, kind: 'assembly', name: 'Seismic stopper', qtyPerParent: k,
+      children: [...rp, ...rsp].map((c) => ({ ...c, qtyPerParent: Number(c.qtyPerParent) / k })),
+    };
+    const at = children.indexOf(rp[0]);
+    const rest = children.filter((c) => !rp.includes(c) && !rsp.includes(c));
+    rest.splice(Math.min(at, rest.length), 0, stopper);
+    return rest;
+  };
+
+  function walk(node, parentKey, depth, place) {
+    const children = withStopper(node);
     const leaves = children.filter((c) => c.item != null);
     // A node of bought items only is not made: list it, write nothing.
     if (node.item == null && leaves.length && leaves.length === children.length && leaves.every((l) => BOUGHT_ROLES.has(items.get(l.item)?.role))) {
@@ -345,17 +421,24 @@ export function planImport(bom, catalog) {
         mappings[mappings.length - 1].chosen = match ? match.name : null;
         continue;
       }
-      // An angle written TOP/BOTTOM is two rows of the frame, one each — the catalog names them apart.
-      const split = it.role === 'angle' && /TOP\s*\/\s*BOTTOM/i.test(it.description ?? '') && q % 2 === 0;
+      // An angle written TOP/BOTTOM is two rows of the frame, one each — the catalog names them apart. An X-frame
+      // HORIZONTAL that does not say which (RDSO_516) is split too, evenly, and says so (user, 2026-10-17).
+      const desc = String(it.description ?? '');
+      const both = /TOP\s*\/\s*BOTTOM/i.test(desc);
+      const horizontal = !both && /X-?\s*FRAME/i.test(desc) && /HORIZONTAL/i.test(desc) && !/\bTOP\b|\bBOTTOM\b/i.test(desc);
+      const split = it.role === 'angle' && (both || horizontal) && q >= 2;
+      const top = Math.ceil(q / 2);
+      const splitNote = horizontal ? `Top or bottom is not told apart on the drawing: the ${q} split evenly (${top} top, ${q - top} bottom).` : null;
       const parts = split
-        ? [{ names: ['X-frame top angle'], quantity: q / 2, role: 'Top angle' }, { names: ['X-frame bottom angle'], quantity: q / 2, role: 'Bottom angle' }]
+        ? [{ names: ['X-frame top angle'], quantity: top, role: 'Top angle' }, { names: ['X-frame bottom angle'], quantity: q - top, role: 'Bottom angle' }]
         : [{ names: partCandidates(it, { endDiaphragm, single: q === 1 }), quantity: q, role: roleText(it.description) }];
       for (const [i, p] of parts.entries()) {
         const d = mapDef(p.names, 'template', split ? `${what2} (${p.role.toLowerCase()})` : what2, it.category === 'section' ? 'profile' : 'plate');
-        const { values: pv, kg } = partValues(it, it.mark);
+        const { values: pv, kg, gradeNote, bronze } = partValues(it, it.mark);
+        if (bronze && d) definitionValues.push({ def: d, code: 'MATERIAL', value: optionValue('MATERIAL', 'PB', 'Phosphor bronze') });
         rows.push({
           key: `n${++seq}`, parentKey: key, kind: 'temp', depth: depth + 1, lineNo: lineNo + i, position: null,
-          role: p.role, quantity: p.quantity, mark: it.mark, notes: rowNote(it, bom.decisions),
+          role: p.role, quantity: p.quantity, mark: it.mark, notes: joinNotes(rowNote(it, bom.decisions), splitNote, gradeNote),
           def: d, values: pv, item: it, weightKg: kg == null ? null : r3(kg), children: [],
         });
       }
@@ -413,6 +496,9 @@ export function planImport(bom, catalog) {
     newDefinitions: [...newDefs.values()],
     mappings,
     problems,
+    info,
+    gradeMap,
+    definitionValues,
     totals: {
       rows: tempRows.length,
       parts: tempRows.filter((r) => !r.children.length).length,

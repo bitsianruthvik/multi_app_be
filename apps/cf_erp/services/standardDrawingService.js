@@ -626,8 +626,8 @@ export async function importCatalog(db, companyId) {
     ),
     db.query('SELECT id, UPPER(code) AS code, data_type, default_uom FROM cf_specifications WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
     db.query(
-      `SELECT o.id, o.value, o.label FROM cf_spec_options o JOIN cf_specifications s ON s.id = o.specification_id AND s.deleted_at IS NULL
-        WHERE s.company_id = ? AND s.code = 'GRADE' AND o.deleted_at IS NULL`,
+      `SELECT o.id, o.value, o.label, UPPER(s.code) AS spec FROM cf_spec_options o JOIN cf_specifications s ON s.id = o.specification_id AND s.deleted_at IS NULL
+        WHERE s.company_id = ? AND s.code IN ('GRADE', 'IMPACT_CLASS', 'MATERIAL') AND o.deleted_at IS NULL`,
       [companyId],
     ),
     db.query(
@@ -637,15 +637,95 @@ export async function importCatalog(db, companyId) {
     ),
     db.query('SELECT id, number FROM cf_standard_drawings WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
   ]);
-  const gradeOption = new Map();
-  for (const g of grades) { if (g.value) gradeOption.set(String(g.value).toUpperCase(), Number(g.id)); if (g.label && !gradeOption.has(String(g.label).toUpperCase())) gradeOption.set(String(g.label).toUpperCase(), Number(g.id)); }
+  const optionMap = (code) => {
+    const m = new Map();
+    for (const g of grades.filter((x) => x.spec === code)) {
+      if (g.value) m.set(String(g.value).toUpperCase(), Number(g.id));
+      if (g.label && !m.has(String(g.label).toUpperCase())) m.set(String(g.label).toUpperCase(), Number(g.id));
+    }
+    return m;
+  };
   return {
     defs: defs.map((d) => ({ ...d, id: Number(d.id) })),
     specs: new Map(specs.map((s) => [s.code, { id: Number(s.id), data_type: s.data_type, default_uom: s.default_uom }])),
-    gradeOption,
+    gradeOption: optionMap('GRADE'),
+    impactOption: optionMap('IMPACT_CLASS'),
+    materialOption: optionMap('MATERIAL'),
     studs: studs.map((s) => ({ id: Number(s.id), code: s.code, name: s.name })),
     standards: new Map(existing.map((s) => [String(s.number).toLowerCase(), Number(s.id)])),
   };
+}
+
+/** An option's id by its value (or label) in the catalog read for an import; null when it is not there. */
+function optionIdOf(catalog, code, value) {
+  if (value == null) return null;
+  const map = code === 'GRADE' ? catalog.gradeOption : code === 'IMPACT_CLASS' ? catalog.impactOption : code === 'MATERIAL' ? catalog.materialOption : null;
+  return map?.get(String(value).toUpperCase()) ?? null;
+}
+
+/** The options the standards need that a tenant may not have yet (user, 2026-10-17). */
+export const SETUP_OPTIONS = [
+  { spec: 'IMPACT_CLASS', value: 'A', label: 'A — no impact test' },
+  { spec: 'MATERIAL', value: 'PB', label: 'Phosphor bronze' },
+];
+/** Labels to put right: the BO impact class reads just "BO" (user, 2026-10-17). */
+export const SETUP_LABELS = [{ spec: 'IMPACT_CLASS', value: 'BO', label: 'BO' }];
+
+/**
+ * THE IMPORT'S SETUP STEP — one transaction, run before any set (standard-import-all.mjs --apply does it first):
+ * creates the options in SETUP_OPTIONS that are missing (and adds each to every rule of that specification that keeps
+ * its own list of allowed options, so the new value is allowed where the others are), and puts the labels in
+ * SETUP_LABELS right. Idempotent: a second run finds nothing to do. `apply: false` only says what it would do.
+ * → { actions: [{ what, done }] }   A fixed handful of queries.
+ */
+export async function importSetup(db, c, { apply = false } = {}) {
+  const { companyId } = c;
+  const codes = [...new Set([...SETUP_OPTIONS, ...SETUP_LABELS].map((x) => x.spec))];
+  const [specs] = await db.query('SELECT id, UPPER(code) AS code FROM cf_specifications WHERE company_id = ? AND deleted_at IS NULL AND code IN (?)', [companyId, codes]);
+  const specOf = new Map(specs.map((s) => [s.code, Number(s.id)]));
+  const ids = [...specOf.values()];
+  const [opts] = ids.length ? await db.query('SELECT id, specification_id, value, label, sort_order FROM cf_spec_options WHERE company_id = ? AND deleted_at IS NULL AND specification_id IN (?)', [companyId, ids]) : [[]];
+  const actions = [];
+  const create = [];
+  for (const o of SETUP_OPTIONS) {
+    const specId = specOf.get(o.spec);
+    if (!specId) { actions.push({ what: `${o.spec} is not a specification here — option ${o.value} cannot be made`, done: false, problem: true }); continue; }
+    if (opts.some((x) => Number(x.specification_id) === specId && String(x.value).toUpperCase() === o.value.toUpperCase())) continue;
+    const sort = Math.max(0, ...opts.filter((x) => Number(x.specification_id) === specId).map((x) => Number(x.sort_order) || 0)) + 1;
+    create.push({ ...o, specId, sort });
+    actions.push({ what: `create ${o.spec} option "${o.value}" — ${o.label}`, done: apply });
+  }
+  const relabel = [];
+  for (const l of SETUP_LABELS) {
+    const specId = specOf.get(l.spec);
+    const o = opts.find((x) => Number(x.specification_id) === specId && String(x.value).toUpperCase() === l.value.toUpperCase());
+    if (!o) { actions.push({ what: `${l.spec} has no option ${l.value} to relabel`, done: false, problem: true }); continue; }
+    if ((o.label ?? null) === l.label) continue;
+    relabel.push({ id: Number(o.id), label: l.label });
+    actions.push({ what: `relabel ${l.spec} option ${l.value}: "${o.label ?? ''}" → "${l.label}"`, done: apply });
+  }
+  // Rules of these specifications that keep their own list of allowed options: a new option joins each list.
+  const [lists] = create.length ? await db.query(
+    `SELECT DISTINCT a.id, a.specification_id FROM cf_spec_assignments a JOIN cf_spec_assignment_options ao ON ao.assignment_id = a.id AND ao.deleted_at IS NULL
+      WHERE a.company_id = ? AND a.deleted_at IS NULL AND a.specification_id IN (?)`, [companyId, [...new Set(create.map((x) => x.specId))]],
+  ) : [[]];
+  for (const x of create) for (const l of lists.filter((y) => Number(y.specification_id) === x.specId)) actions.push({ what: `allow ${x.spec} "${x.value}" on rule #${l.id} (it lists its options)`, done: apply });
+  if (!apply) return { actions };
+  if (create.length) {
+    await insertRows(db, 'cf_spec_options', ['company_id', 'specification_id', 'value', 'label', 'sort_order', 'status', 'created_by'],
+      create.map((x) => [companyId, x.specId, x.value, x.label, x.sort, 'active', c.userId ?? null]));
+    if (lists.length) {
+      const [made] = await db.query('SELECT id, specification_id, value FROM cf_spec_options WHERE company_id = ? AND deleted_at IS NULL AND specification_id IN (?)', [companyId, [...new Set(create.map((x) => x.specId))]]);
+      const rowsToAdd = [];
+      for (const x of create) {
+        const opt = made.find((m) => Number(m.specification_id) === x.specId && String(m.value).toUpperCase() === x.value.toUpperCase());
+        for (const l of lists.filter((y) => Number(y.specification_id) === x.specId)) rowsToAdd.push([companyId, Number(l.id), Number(opt.id), c.userId ?? null]);
+      }
+      if (rowsToAdd.length) await insertRows(db, 'cf_spec_assignment_options', ['company_id', 'assignment_id', 'option_id', 'created_by'], rowsToAdd);
+    }
+  }
+  for (const r of relabel) await db.query('UPDATE cf_spec_options SET label = ? WHERE company_id = ? AND id = ?', [r.label, companyId, r.id]);
+  return { actions };
 }
 
 /** Where a NEW definition is filed: beside the definitions its kind of row already uses. */
@@ -697,6 +777,14 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
   if (!apply) return { plan, report, standardId: existingId };
   if (existingId) throw conflict('DUPLICATE', `Standard drawing ${plan.standard.number} is already there (id ${existingId}). Nothing was written.`, { standardId: existingId });
 
+  // Options the setup step makes (IMPACT_CLASS A, MATERIAL PB) must exist before anything is written.
+  const needed = new Set();
+  for (const r of plan.rows) for (const v of r.values) if (v.optionValue != null && v.optionId == null && optionIdOf(catalog, v.code, v.optionValue) == null) needed.add(`${v.code} ${v.optionValue}`);
+  for (const dv of plan.definitionValues ?? []) if (dv.value?.optionValue != null && dv.value.optionId == null && optionIdOf(catalog, dv.code, dv.value.optionValue) == null) needed.add(`${dv.code} ${dv.value.optionValue}`);
+  if (needed.size) {
+    throw invalid('OPTIONS_MISSING', `These options are not set up yet: ${[...needed].join(', ')}. Run the import's setup step first (standard-import-all.mjs --apply does it). Nothing was written.`);
+  }
+
   // ---- 1. the new definitions (rare: only what nothing in the catalog fits) ----
   const { createDefinition, setStatus } = await import('./masterRecordService.js');
   const made = new Map();
@@ -710,6 +798,33 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
     made.set(nd.name, { id: Number(rec.id), code: active.code ?? null, name: nd.name, classification_id: classificationId, default_flow_id: null, bom_id: null });
   }
   for (const r of plan.rows) if (r.def?.new) r.def = made.get(r.def.new);
+  const unresolved = new Set();
+
+  // ---- 1b. values a DEFINITION holds itself (MATERIAL PB on the phosphor bronze plate: a fixed rule reads the
+  //          nearest value above the row, so the definition's own value is what its rows take). Only where missing.
+  const defValues = [];
+  for (const dv of plan.definitionValues ?? []) {
+    const defId = dv.def?.id ?? made.get(dv.def?.new)?.id ?? null;
+    const spec = catalog.specs.get(dv.code);
+    const optionId = dv.value?.optionId ?? optionIdOf(catalog, dv.code, dv.value?.optionValue);
+    if (!defId || !spec) continue;
+    if (optionId == null) { unresolved.add(`${dv.code} ${dv.value?.optionValue}`); continue; }
+    if (!defValues.some((x) => x.defId === defId && x.specId === spec.id)) defValues.push({ defId, specId: spec.id, optionId });
+  }
+  if (defValues.length) {
+    const [have] = await db.query("SELECT subject_id, specification_id FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND deleted_at IS NULL AND subject_id IN (?)", [companyId, defValues.map((x) => x.defId)]);
+    const held = new Set(have.map((h) => `${h.subject_id}:${h.specification_id}`));
+    const fresh = defValues.filter((x) => !held.has(`${x.defId}:${x.specId}`));
+    if (fresh.length) {
+      await insertRows(db, 'cf_spec_values', ['company_id', 'specification_id', 'subject_type', 'subject_id', 'option_id', 'source', 'created_by'],
+        fresh.map((x) => [companyId, x.specId, 'master', x.defId, x.optionId, 'entered', c.userId ?? null]));
+      const [ids] = await db.query("SELECT id, subject_id, specification_id FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND deleted_at IS NULL AND subject_id IN (?)", [companyId, fresh.map((x) => x.defId)]);
+      const idOf = new Map(ids.map((r) => [`${r.subject_id}:${r.specification_id}`, r.id]));
+      await insertRows(db, 'cf_spec_value_history', ['company_id', 'value_id', 'specification_id', 'subject_type', 'subject_id', 'change_type', 'old_value', 'new_value', 'changed_by'],
+        fresh.map((x) => [companyId, idOf.get(`${x.defId}:${x.specId}`), x.specId, 'master', x.defId, 'create', null,
+          JSON.stringify({ number: null, text: null, bool: null, date: null, option_id: x.optionId, json: null, uom: null, source: 'entered' }), c.userId ?? null]));
+    }
+  }
 
   // ---- 2. the sheet in the register, and the standard ----------------------
   const s = plan.standard;
@@ -740,11 +855,14 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
     });
     snap.values.set(id, r.values.map((v) => {
       const spec = catalog.specs.get(v.code);
+      // An option the setup step makes (IMPACT_CLASS A, MATERIAL PB) is found by its value in the catalog read now.
+      const optionId = v.optionId ?? (v.optionValue != null ? optionIdOf(catalog, v.code, v.optionValue) : null);
+      if (v.optionValue != null && optionId == null) { unresolved.add(`${v.code} ${v.optionValue}`); return null; }
       return {
         specification_id: spec.id, subject_id: id, value_number: v.number ?? null, value_text: v.text ?? null, value_bool: null, value_date: null,
-        option_id: v.optionId ?? null, value_json: null, uom: v.uom ?? null, source: v.source ?? 'entered',
+        option_id: optionId ?? null, value_json: null, uom: v.uom ?? null, source: v.source ?? 'entered',
       };
-    }));
+    }).filter(Boolean));
     if (r.children.length) {
       snap.linesByBom.set(bomOf.get(r.key), r.children.map((k) => {
         const sel = k.kind === 'selection';
@@ -756,6 +874,9 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
         };
       }));
     }
+  }
+  if (unresolved.size) {
+    throw invalid('OPTIONS_MISSING', `These options are not set up yet: ${[...unresolved].join(', ')}. Run the import's setup step first (standard-import-all.mjs --apply does it). Nothing was written.`);
   }
   const rootKey = plan.rows[0]?.key;
   const { idMap } = await writeCopies(db, c, snap, [{ srcId: srcOf.get(rootKey), ownerLineId: null }], { chunk: COPY_CHUNK });
@@ -835,5 +956,8 @@ function reportOf(plan, fileRows, existingId) {
     files: fileRows.map((f) => ({ mark: f.mark, file: f.file, read: !!f.geometry, sizeMm: f.geometry ? `${r3(f.geometry.lengthMm)} × ${r3(f.geometry.widthMm)}` : null, holes: f.geometry?.holes ?? null, missing: !!f.missing })),
     notes: rows.filter((r) => r.note).map((r) => ({ mark: r.mark, note: r.note })),
     problems: plan.problems,
+    info: plan.info ?? [],
+    grades: plan.gradeMap ?? null,
+    definitionValues: (plan.definitionValues ?? []).map((d) => `${d.def?.name ?? d.def?.new} ${d.code}=${d.value?.optionValue}`).filter((x, i, a) => a.indexOf(x) === i),
   };
 }
