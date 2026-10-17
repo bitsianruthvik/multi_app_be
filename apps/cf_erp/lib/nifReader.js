@@ -326,13 +326,35 @@ function interiorPoint(p) {
   xs.sort((a, b) => a - b);
   return xs.length >= 2 ? [(xs[0] + xs[1]) / 2, y] : p[0];
 }
+/** A point certainly on a piece's steel: inside its outline and outside every cut-out. */
+function materialPoint(P) {
+  if (!P.cutouts?.length) return interiorPoint(P.outline);
+  const rings = [P.outline, ...P.cutouts];
+  const ys = [...new Set(rings.flat().map((q) => q[1]))].sort((a, b) => a - b);
+  // Try the mid-heights between corner heights, middle first, until a span of steel is found.
+  const mids = [];
+  for (let k = 0; k + 1 < ys.length; k++) mids.push((ys[k] + ys[k + 1]) / 2);
+  mids.sort((a, b) => Math.abs(a - (ys[0] + ys[ys.length - 1]) / 2) - Math.abs(b - (ys[0] + ys[ys.length - 1]) / 2));
+  for (const y of mids) {
+    const xs = [];
+    for (const r of rings) for (let i = 0, j = r.length - 1; i < r.length; j = i++) { const a = r[i]; const c = r[j]; if ((a[1] > y) !== (c[1] > y)) xs.push(a[0] + ((y - a[1]) * (c[0] - a[0])) / (c[1] - a[1])); }
+    xs.sort((a, b) => a - b);
+    for (let i = 0; i + 1 < xs.length; i += 2) {
+      const pt = [(xs[i] + xs[i + 1]) / 2, y];
+      if (xs[i + 1] - xs[i] > 1e-6 && inside(pt, P.outline) && !P.cutouts.some((h) => inside(pt, h))) return pt;
+    }
+  }
+  return interiorPoint(P.outline);
+}
 /** Do two pieces overlap? Outline against outline; one lying in a real cut-out of the other does not. */
 function piecesOverlap(A, B, budget) {
   const p = A.outline; const q = B.outline;
   budget.edges += p.length * q.length;
   if (budget.edges > MAX_EDGE_TESTS) throw invalid('TOO_BIG', 'The job is too intricate to check for overlapping parts — more than this reads. Split it into smaller jobs.');
   for (let i = 0, a = p.length - 1; i < p.length; a = i++) for (let j = 0, c = q.length - 1; j < q.length; c = j++) if (segCross(p[a], p[i], q[c], q[j])) return true;
-  const within = (X, Y) => { const pt = interiorPoint(X.outline); return inside(pt, Y.outline) && !Y.cutouts.some((h) => inside(pt, h)); };
+  // The test point must be on X's STEEL: the middle of a web with a big opening is the opening, and a
+  // part nested in that opening (part in part) would read as an overlap (2026-10-17, NithinSai 12 mm job).
+  const within = (X, Y) => { const pt = materialPoint(X); return inside(pt, Y.outline) && !Y.cutouts.some((h) => inside(pt, h)); };
   return within(A, B) || within(B, A);
 }
 

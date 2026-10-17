@@ -287,5 +287,15 @@ section('6. Fuzz — truncations, bit flips and smeared bytes of the six real fi
   console.log('        (a flipped bit that is read "ok" sits where nothing reads it — padding, settings, costing — or moves a figure by less than the checks\' 0.05 mm.)');
 }
 
+// Part in part (2026-10-17): the NithinSai 12 mm job nests ID stiffeners inside the big opening of
+// each ID web. The overlap check once sampled the web at its middle — the opening — and refused it.
+{
+  const f = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../NITHINSAI_36M_NESTING_NIF/12MM-NITHIN SAI-ED-ID-STIFFENERS.nif');
+  if (fs.existsSync(f)) {
+    const r = outcome(fs.readFileSync(f), '12MM-NITHIN SAI-ED-ID-STIFFENERS.nif');
+    ok('part in part: stiffeners nested in a web\'s opening are not an overlap (NithinSai 12 mm job reads)', r.code === 'ok', `${r.code}: ${r.message}`);
+  } else console.log('  SKIP  part in part (TM/NITHINSAI_36M_NESTING_NIF not present)');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
