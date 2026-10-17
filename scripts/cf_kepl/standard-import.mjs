@@ -92,7 +92,8 @@ process.exit(code);
 
 function printReport(r, { host, co, trips }) {
   const line = (s = '') => console.log(s);
-  line(`${APPLY ? 'APPLIED' : 'DRY RUN (read-only)'} — ${host.d} on ${host.h}, company ${co.id} ${co.name}`);
+  // DB_HOST, not @@hostname: TiDB Cloud answers "localhost" for that, which reads as the local database.
+  line(`${APPLY ? 'APPLIED' : 'DRY RUN (read-only)'} — database ${host.d} at ${process.env.DB_HOST ?? host.h}, company ${co.id} ${co.name}`);
   line(`\n${r.standard.number} — ${r.standard.name}`);
   line(`  source: ${r.standard.sourceUrl ?? '(no link recorded)'}${r.standard.internal ? '   · INTERNAL USE ONLY (RDSO property)' : ''}`);
   if (r.standard.alreadyThere) line(`  ALREADY THERE as standard #${r.standard.alreadyThere} — --apply would refuse.`);

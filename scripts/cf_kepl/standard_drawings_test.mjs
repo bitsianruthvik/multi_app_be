@@ -165,6 +165,24 @@ try {
   eq('rowNote: DRILL ON ASSEMBLY', PLAN.rowNote({ status: 'drill on assembly', notes: ['DRILL ON ASSEMBLY: bracing holes'] }), 'DRILL ON ASSEMBLY: bracing holes');
   eq('rowNote: an open decision', PLAN.rowNote({ decisions: ['C9'] }, [{ id: 'C9', what: 'hole positions', status: 'needs decision' }]), 'NEEDS DECISION C9: hole positions');
   eq('rowNote: nothing to say', PLAN.rowNote({ status: 'ok', notes: ['weld only'] }), null);
+  // The span maps to an EXISTING span definition before a new one (production: "Composite girder span", SPAN-001).
+  const spanDef = (id, code, name) => ({ id, code, name, short_name: null, status: 'active', classification_id: 1, default_flow_id: null, definition_type: 'template', bom_id: null });
+  const noBridge = { ...catalog, defs: catalog.defs.filter((d) => PLAN.normName(d.name) !== 'bridge span') };
+  const p1 = PLAN.planImport(s11751.bom, { ...noBridge, defs: [...noBridge.defs, spanDef(-1, 'SPAN-001', 'Composite girder span'), spanDef(-2, 'SPAN-009', 'Other span')] });
+  eq('the root takes SPAN-001 when the catalog has it', p1.rows[0].def.name, 'Composite girder span');
+  const p2 = PLAN.planImport(s11751.bom, { ...noBridge, defs: [...noBridge.defs, spanDef(-2, 'X-9', 'Steel span')] });
+  eq('…else any definition named "… span"', p2.rows[0].def.name, 'Steel span');
+  ok('…and never a new "Bridge span"', !p1.newDefinitions.some((d) => /span/i.test(d.name)) && !p2.newDefinitions.some((d) => /span/i.test(d.name)));
+  // An older set: a sentence where the revision goes, channels, legacy grades, bronze plates.
+  const s1623 = readSet('RDSO_1623');
+  const p1623 = PLAN.planImport(s1623.bom, catalog);
+  eq('a sentence in the revision field is a note, not part of the number', [p1623.standard.number, p1623.standard.revision], ['RDSO/B-1623', null]);
+  near('its weight is the steel + non-steel of bom.json to the kilogram', p1623.totals.steelKg, s1623.bom.totals.steelKg + (s1623.bom.totals.nonSteelKg ?? 0), 1);
+  const tc = p1623.rows.find((r) => r.mark === 'TC');
+  const vv = (r, code) => r.values.find((x) => x.code === code)?.number;
+  ok('a channel holds depth 250, width 80 and its section area from the weight in bom.json', vv(tc, 'DEPTH') === 250 && vv(tc, 'WIDTH') === 80 && vv(tc, 'SECTION_AREA') > 0, JSON.stringify(tc.values));
+  ok('a new definition is named plainly (no brackets, no section size)', p1623.newDefinitions.every((d) => !/[()]|ISMC|ISLC/i.test(d.name)), JSON.stringify(p1623.newDefinitions.map((d) => d.name)));
+  ok('a grade that is not an option is said once per grade, with its count', p1623.problems.filter((x) => /Grade/.test(x)).length <= 3);
 
   /* ------------------------------------------------------------------------ */
   section('2. The importer: dry run reads only; --apply writes it in one go');
@@ -206,6 +224,11 @@ try {
   says(`11753R3: ${a3.out.report.written.rows} rows, ${a3.n} trips · 11754R3: ${a4.out.report.written.rows} rows, ${a4.n} trips`);
   ok('the same number of round trips for two sets of different sizes', a3.n === a4.n && a3.out.report.written.newDefinitions.length === 0, `${a3.n} vs ${a4.n}`);
   ok('…and few of them (production ~49 ms each)', a3.n <= 40, `${a3.n}`);
+  const t1623 = await STD.importStandard(conn, c, { ...readSet('RDSO_1623', true), apply: true });
+  const [[v1623]] = await conn.query('SELECT * FROM cf_standard_drawing_versions WHERE id = ?', [t1623.report.written.versionId]);
+  const r1623 = await rowsByMark(conn, [v1623.root_item_id]);
+  ok('an older set applies too: its rows, its new definitions made once', r1623.ids.length === Number(v1623.rows_count) && t1623.report.written.newDefinitions.length === new Set(t1623.plan.newDefinitions.map((d) => d.name)).size, `${r1623.ids.length} rows, ${t1623.report.written.newDefinitions.length} new`);
+  says(`RDSO_1623: ${r1623.ids.length} rows, new: ${t1623.report.written.newDefinitions.map((d) => d.name).join(', ')}`);
 
   /* ------------------------------------------------------------------------ */
   section('3. The list and the detail');

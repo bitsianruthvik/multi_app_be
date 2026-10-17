@@ -28,6 +28,13 @@ export function normName(s) {
   return t.split(/\s+/).filter(Boolean).map((w) => singular[w] ?? w).join(' ');
 }
 
+/** A NEW definition's name from a description: no brackets, no shipping marks, no section size at the end. */
+export function plainName(s) {
+  const t = String(s ?? '').replace(/\([^)]*\)/g, ' ').replace(/;.*$/, '')
+    .replace(/\s+(ISMC|ISLC|ISMB|ISA|L)\s*\d+(\s*[x×*]\s*\d+)*.*$/i, '').replace(/[,\s]+$/, '');
+  return sentence(t) || sentence(s);
+}
+
 /** "TOP FLANGE OUTER COVER PLATE" → "Top flange outer cover plate". */
 export function sentence(s) {
   const t = String(s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -46,15 +53,31 @@ export function partCandidates(item, place = {}) {
     case 'bottom_flange': return ['Bottom flange'];
     case 'web': return ['Web plate', 'Web'];
     case 'intermediate_stiffener': return stiffener('Intermediate');
-    case 'bearing_stiffener':
+    // Older sets call the stiffener at the bearing an END STIFFENER — the catalog has that name too.
+    case 'bearing_stiffener': return /END\s+STIFFENER/.test(desc) ? [...stiffener('End'), ...stiffener('Bearing')] : stiffener('Bearing');
     case 'diaphragm_bearing_stiffener': return stiffener('Bearing');
+    case 'lifting_stiffener': return ['Lifting stiffener'];
     case 'jacking_stiffener': return ['Jacking stiffener'];
     case 'diaphragm_top_flange': return place.endDiaphragm ? ['Diaphragm top flange', 'End diaphragm top flange'] : ['Diaphragm top flange', 'Intermediate diaphragm top flange'];
     case 'diaphragm_bottom_flange': return place.endDiaphragm ? ['Diaphragm bottom flange', 'End diaphragm bottom flange'] : ['Diaphragm bottom flange', 'Intermediate diaphragm bottom flange'];
     // The End diaphragm template's own web is "Intermediate diaphragm web" (the catalog's convention, and the user's list).
     case 'diaphragm_web': return ['Intermediate diaphragm web', 'End diaphragm web', 'Diaphragm web'];
     // One gusset of its frame, without holes, where the diagonals cross: the centre gusset.
-    case 'gusset': return place.single && !holed ? ['Centre gusset', 'Gusset plate'] : ['Gusset plate'];
+    case 'gusset':
+      if (/CENTRAL|CENTRE|CENTER/.test(desc)) return ['Centre gusset', 'Gusset plate'];
+      if (/CORNER\s+TOP|TOP\s+CORNER/.test(desc)) return ['Top gusset', 'Gusset plate'];
+      if (/CORNER\s+BOTTOM|BOTTOM\s+CORNER/.test(desc)) return ['Bottom gusset', 'Gusset plate'];
+      return place.single && !holed ? ['Centre gusset', 'Gusset plate'] : ['Gusset plate'];
+    // Older sets (riveted and early welded spans, rocker / sliding bearings):
+    case 'shear_connector_channel': return ['Channel shear connector'];
+    case 'bearing_sole_plate': return [plainName(item?.description ?? 'Bearing plate')];
+    case 'bed_plate': return ['Bed plate'];
+    case 'bearing_sliding_plate': return /PHOSPHOR/.test(desc) ? ['Phosphor bronze plate'] : ['Sliding plate'];
+    case 'bearing_location_strip': return ['Location strip'];
+    case 'bearing_top_plate': return ['Bearing top plate'];
+    case 'bearing_bottom_plate': return ['Bearing bottom plate'];
+    case 'bearing_stopper': return ['Bearing stopper'];
+    case 'channel': return [plainName(item?.description ?? 'Channel')];
     case 'top_flange_cover_outer': return ['Top flange outer cover plate', 'Cover plate'];
     case 'top_flange_cover_inner': return ['Top flange inner cover plate', 'Cover plate'];
     case 'bottom_flange_cover_outer': return ['Bottom flange outer cover plate', 'Cover plate'];
@@ -71,8 +94,10 @@ export function partCandidates(item, place = {}) {
       if (/TOP\s*\/\s*BOTTOM/.test(desc)) return ['X-frame top angle'];
       if (/\bTOP\b/.test(desc)) return ['X-frame top angle'];
       if (/\bBOTTOM\b/.test(desc)) return ['X-frame bottom angle'];
+      // A lifting-beam angle stiffener: the extractor calls the plate ones jacking stiffeners.
+      if (/STIFFENER/.test(desc)) return ['Jacking stiffener'];
       return ['Bracing'];
-    default: return [sentence(item?.description ?? item?.mark ?? 'Part')];
+    default: return [plainName(item?.description ?? item?.mark ?? 'Part')];
   }
 }
 
@@ -86,14 +111,20 @@ export function nodeCandidates(node) {
     case 'splice_set': return ['Splice set'];
     case 'assembly':
       if (/END\s+DIAPHRAGM/.test(name)) return ['End diaphragm'];
+      if (/END\s+X-?\s*FRAME/.test(name)) return ['End diaphragm frame', 'End diaphragm'];
       if (/X-?\s*FRAME|INTERMEDIATE\s+DIAPHRAGM|CROSS\s+FRAME/.test(name)) return ['Intermediate diaphragm frame', 'Intermediate diaphragm'];
-      return [sentence(name.split('/').pop())];
+      if (/LATERAL\s+BRAC/.test(name)) return ['Bottom lateral bracing', 'Bracing'];
+      if (/BED\s+PLATE|BEARING/.test(name)) return ['Bearing assembly'];
+      return [plainName(nodeTitle(name))];
     case 'loose':
       if (/BRAC/.test(name)) return ['Bottom lateral bracing', 'Bracing'];
-      return [sentence(name.split('/').pop())];
-    default: return [sentence(name.split('/').pop() || 'Assembly')];
+      return ['Loose items'];
+    default: return [plainName(nodeTitle(name)) || 'Assembly'];
   }
 }
+
+/** "GA/GIRDER COMPLETE 7925*750" → "GIRDER COMPLETE 7925*750": the words after a leading mark. */
+function nodeTitle(name) { return String(name ?? '').replace(/^[A-Z][A-Z0-9-]{0,11}\s*\//, ''); }
 
 /** "GA/GIRDER COMPLETE" → "GA"; a node without a mark → null. */
 export const nodeMark = (node) => {
@@ -162,35 +193,59 @@ export function planImport(bom, catalog) {
   let seq = 0;
 
   const spec = (code) => catalog.specs?.get(code) ?? null;
-  const num =(code, v) => (v == null || !Number.isFinite(Number(v)) || !spec(code) ? null : { code, number: r3(v), uom: spec(code).default_uom ?? null });
+  const num = (code, v) => (v == null || !Number.isFinite(Number(v)) || !spec(code) ? null : { code, number: r3(v), uom: spec(code).default_uom ?? null });
   const txt = (code, v) => (v == null || v === '' || !spec(code) ? null : { code, text: String(v).slice(0, 255) });
+  const gradeMisses = new Map();   // the grade as written -> rows left without one (said once, below)
   const grade = (g) => {
     if (!g || !spec('GRADE')) return null;
-    const id = catalog.gradeOption?.get(String(g).toUpperCase());
-    if (id == null) { problems.push(`Grade ${g} is not an option of GRADE here — the rows are left without a grade.`); return null; }
-    return { code: 'GRADE', optionId: id, display: g };
+    let id = catalog.gradeOption?.get(String(g).toUpperCase());
+    // Older wording names today's grade in passing ("IRS B1 & B2 … = today IS 2062 E250"): that grade — nothing guessed.
+    const named = /\bE\s?(250|275|300|350|410|450)\b/i.exec(String(g));
+    if (id == null && named) id = catalog.gradeOption?.get(`E${named[1]}`);
+    if (id == null) { gradeMisses.set(String(g), (gradeMisses.get(String(g)) ?? 0) + 1); return null; }
+    return { code: 'GRADE', optionId: id, display: named && !catalog.gradeOption?.has(String(g).toUpperCase()) ? `E${named[1]}` : g };
   };
 
-  /** The values a part row holds; its weight each (kg, gross, as bom.json works it out). */
+  /** The values a part row holds; its weight each (kg, gross: bom.json's own figure when it gives one). */
   function partValues(it, mark) {
     const v = [txt('DRAWING_MARK', mark), grade(it.grade)];
     let kg = null;
+    const L = Number(it.lengthMm);
     if (it.category === 'plate') {
       v.push(num('THICKNESS', it.thicknessMm), num('WIDTH', it.widthMm), num('LENGTH', it.lengthMm));
       if ([it.thicknessMm, it.widthMm, it.lengthMm].every((x) => Number(x) > 0)) kg = (it.lengthMm * it.widthMm * it.thicknessMm * density) / 1e9;
     } else if (it.category === 'section') {
-      // An equal angle: legs a, thickness t. Its gross section is t (2a - t) (IMPORT_FORMAT.md, no root fillet).
-      const a = Number(it.widthMm); const t = Number(it.thicknessMm);
-      const area = a > 0 && t > 0 ? t * (2 * a - t) : null;
-      v.push(num('THICKNESS', t), num('WIDTH', a), num('DEPTH', a), num('LENGTH', it.lengthMm), num('SECTION_AREA', area));
-      if (area && Number(it.lengthMm) > 0) kg = (area * it.lengthMm * density) / 1e9;
+      // An angle "ISA a x b x t": legs a and b, gross section t (a + b - t) (IMPORT_FORMAT.md, no root fillet).
+      // Any other section (a channel "ISMC 250x80"): depth and width from the profile, its area from bom.json's weight.
+      const p = /(\d+(?:\.\d+)?)\s*[x×*]\s*(\d+(?:\.\d+)?)(?:\s*[x×*]\s*(\d+(?:\.\d+)?))?/.exec(String(it.profile ?? ''));
+      const isAngle = it.role === 'angle' || /\bISA\b|^L\s?\d/i.test(String(it.profile ?? ''));
+      const a = p ? Number(p[1]) : Number(it.widthMm); const b = p ? Number(p[2]) : Number(it.widthMm);
+      const t = p?.[3] ? Number(p[3]) : Number(it.thicknessMm);
+      let area = isAngle && a > 0 && b > 0 && t > 0 ? t * (a + b - t) : null;
+      if (!area && Number(it.unitWeightKg) > 0 && L > 0) area = (Number(it.unitWeightKg) * 1e9) / (L * density);
+      v.push(num('THICKNESS', t > 0 ? t : null), num('WIDTH', isAngle ? a : b), num('DEPTH', isAngle ? b : a), num('LENGTH', it.lengthMm), num('SECTION_AREA', area));
+      if (area && L > 0) kg = (area * L * density) / 1e9;
     }
+    // bom.json's gross weight each wins when it gives one (shaped plates, channels); else the one worked out here.
+    if (Number(it.unitWeightKg) > 0) kg = Number(it.unitWeightKg);
     if (kg != null && spec('WEIGHT')) v.push({ code: 'WEIGHT', number: r3(kg), uom: spec('WEIGHT').default_uom ?? 'kg', source: 'calculated' });
     return { values: v.filter(Boolean), kg };
   }
 
-  function mapDef(names, type, what, classHint) {
-    const hit = pick(names, type);
+  /** The span (root): an existing span definition before a new one — SPAN-001, the names asked, then any "…span…". */
+  const pickSpan = (names) => {
+    const live = (catalog.defs ?? []).filter((d) => d.status === 'active' && d.definition_type === 'template');
+    const byCode = live.find((d) => String(d.code ?? '').toUpperCase() === 'SPAN-001');
+    if (byCode) return { def: byCode, asked: byCode.name };
+    const named = pick(names, 'template');
+    if (named) return named;
+    const spans = live.filter((d) => /\bspan\b/i.test(String(d.name ?? '')));
+    const best = spans.find((d) => d.bom_id) ?? spans[0];
+    return best ? { def: best, asked: best.name } : null;
+  };
+
+  function mapDef(names, type, what, classHint, { span = false } = {}) {
+    const hit = span ? pickSpan(names) : pick(names, type);
     if (hit) { mappings.push({ what, asked: names, to: { id: hit.def.id, code: hit.def.code, name: hit.def.name }, fallback: hit.asked !== names[0] }); return { id: hit.def.id, code: hit.def.code, name: hit.def.name, classification_id: hit.def.classification_id, default_flow_id: hit.def.default_flow_id, bom_id: hit.def.bom_id ?? null }; }
     const name = names[0];
     if (type === 'selection') { problems.push(`${what}: no selection definition named ${names.join(' / ')} — left out.`); return null; }
@@ -212,7 +267,7 @@ export function planImport(bom, catalog) {
     // A span or a girder line carries no drawing mark of its own; a segment or an assembly does ("GA/…").
     const mark = node.kind === 'span' || node.kind === 'girder' ? null : nodeMark(node);
     const what = `${node.kind} ${node.name}`;
-    const def = mapDef(nodeCandidates(node), 'template', what, node.kind === 'span' || node.kind === 'girder' ? 'structure' : 'assembly');
+    const def = mapDef(nodeCandidates(node), 'template', what, node.kind === 'span' || node.kind === 'girder' ? 'structure' : 'assembly', { span: node.kind === 'span' || depth === 0 });
     const v = [txt('DRAWING_MARK', mark)].filter(Boolean);
     if (node.kind === 'span') {
       const layout = (bom.assembly?.children ?? []).flatMap((c) => c.layoutMm ?? []);
@@ -238,6 +293,8 @@ export function planImport(bom, catalog) {
         continue;
       }
       const what2 = `${it.mark} ${it.description}`;
+      // A placeholder for parts the drawing does not size: not a row — said, so a person adds them.
+      if (it.role === 'main_girder_unsized') { problems.push(`${what2.slice(0, 120)}: not sized in the drawing — left out; add these parts by hand.`); continue; }
       if (it.role === 'shear_stud') {
         const sel = mapDef(partCandidates(it), 'selection', what2, null);
         if (!sel) continue;
@@ -272,6 +329,7 @@ export function planImport(bom, catalog) {
   }
   if (bom?.assembly) walk(bom.assembly, null, 0, { lineNo: null, mult: 1 });
   else problems.push('bom.json has no assembly tree.');
+  for (const [g, n] of gradeMisses) problems.push(`Grade "${g}" is not an option of GRADE here — ${n} row${n === 1 ? '' : 's'} left without a grade.`);
 
   // Children, positions (per parent and definition, 1, 2 …), and the roll-up of weights per unit.
   const byKey = new Map(rows.map((r) => [r.key, r]));
@@ -298,14 +356,17 @@ export function planImport(bom, catalog) {
   const w = root ? roll(root) : { steel: 0, studs: 0 };
 
   const tempRows = rows.filter((r) => r.kind === 'temp');
-  const number = `${dw.number ?? bom?.set ?? 'STANDARD'}${dw.revision ?? ''}`;
+  // A revision is a short mark ("R3"). Older sets put a sentence there ("PROVISIONAL 8-8-91; …"): that is a note, not a revision.
+  const rev = /^[A-Za-z0-9._/-]{1,20}$/.test(String(dw.revision ?? '').trim()) ? String(dw.revision).trim() : null;
+  const revNote = !rev && dw.revision ? String(dw.revision).trim() : null;
+  const number = `${dw.number ?? bom?.set ?? 'STANDARD'}${rev ?? ''}`;
   return {
     standard: {
       number,
       registerNumber: dw.number ?? number,
-      revision: dw.revision ?? null,
-      name: `${dw.number ?? number}${dw.revision ?? ''} — ${dw.spanM ? `${dw.spanM} m span` : ''}${dw.loading ? `, ${dw.loading}` : ''}`.replace(/ — $/, ''),
-      description: dw.title ?? null,
+      revision: rev,
+      name: `${number} — ${dw.spanM ? `${dw.spanM} m span` : ''}${dw.loading ? `, ${dw.loading}` : ''}`.replace(/ — $/, '').replace(/ — , /, ' — ').slice(0, 255),
+      description: [dw.title ?? null, revNote ? `Revision: ${revNote}` : null].filter(Boolean).join('\n') || null,
       sourceUrl: dw.sourceUrl ?? null,
       internal: /internal/i.test(String(dw.ownership ?? '')),
       ownership: dw.ownership ?? null,
@@ -323,6 +384,8 @@ export function planImport(bom, catalog) {
       steelKg: r3(w.steel),
       studKg: r3(w.studs),
       bomSteelKg: bom?.totals?.steelKg ?? null,
+      // Older sets keep non-steel parts (phosphor bronze plates) apart from steelKg; the tree weighs them too.
+      bomNonSteelKg: bom?.totals?.nonSteelKg ?? 0,
       bomSteelKgInclStuds: bom?.totals?.steelKgInclStuds ?? null,
     },
   };
