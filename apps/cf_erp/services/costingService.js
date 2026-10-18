@@ -43,8 +43,14 @@ export function earnedOf(F, P) {
     });
   }
   if (est.material?.amount) {
-    rows.push({ key: 'material', label: 'Material', kind: 'material', quantity: est.material.quantity, earnedQuantity: round3(Number(est.material.quantity ?? 0) * P.materialShare), unit: 't', rate: est.material.rate,
-      amount: round2(Number(est.material.amount) * P.materialShare), contract: round2(est.material.amount), note: `${Math.round(P.materialShare * 100)} % of the material in place` });
+    // The material is earned once it is in place. "In place" is only OBSERVED for orders billed on a material_in_place
+    // milestone (billingService.observeMaterial), so an order billed on dispatch never had it and earned ₹0 for its
+    // material (SO260014, 2026-10-18). What has been dispatched certainly had its material: take the larger share.
+    const shipped = Math.min(1, (P.shipments ?? []).reduce((t, s) => t + Number(s.frac ?? 0), 0));
+    const share = Math.max(Number(P.materialShare ?? 0), shipped);
+    rows.push({ key: 'material', label: 'Material', kind: 'material', quantity: est.material.quantity, earnedQuantity: round3(Number(est.material.quantity ?? 0) * share), unit: 't', rate: est.material.rate,
+      amount: round2(Number(est.material.amount) * share), contract: round2(est.material.amount),
+      note: share > Number(P.materialShare ?? 0) + EPS ? `${Math.round(share * 100)} % — its share dispatched` : `${Math.round(share * 100)} % of the material in place` });
   }
   for (const l of est.lumpSums ?? []) {
     rows.push({ key: l.key, label: l.label, kind: 'lump_sum', quantity: null, earnedQuantity: null, unit: null, rate: null,
