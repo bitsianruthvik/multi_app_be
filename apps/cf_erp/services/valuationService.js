@@ -597,10 +597,13 @@ export async function orderCostSheets(db, companyId, orderIds) {
     const s = out.get(ownerOf.get(Number(r.order_id)));
     if (!s) continue;
     const purpose = r.purpose;
-    if (purpose === 'dispatch' || purpose === 'wip') continue;         // shipments; pieces in production
     const qty = Number(r.qty);
     const value = Number(r.value ?? 0);
     const uncosted = Number(r.uncosted);
+    // An offcut cut from the order's plate is a credit wherever it was put: cutting leaves it in the production (WIP)
+    // area, which is skipped below as "pieces in production" — so the credit was lost (SO260014, 2026-10-18).
+    if (purpose === 'wip' && !Number(r.theirs) && isOffcut(r.item_id) && value > 0) { s.credits.offcuts = round2(s.credits.offcuts + value); addItem(s, r.item_id, 'offcut', qty, value, uncosted); continue; }
+    if (purpose === 'dispatch' || purpose === 'wip') continue;         // shipments; pieces in production
     if (Number(r.theirs)) {
       if (purpose !== 'scrap' && qty < 0) { s.customer.rows += Number(r.n); s.customer.quantity = round6(s.customer.quantity - qty); addItem(s, r.item_id, 'customer', -qty, 0, 0); }
       continue;
