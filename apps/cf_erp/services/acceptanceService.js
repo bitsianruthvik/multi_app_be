@@ -253,18 +253,27 @@ export function readTerms(input = {}, ctx, { requireAll = true } = {}) {
 
 /** The order with its lines, their supply and weight. 2 reads. */
 async function orderFacts(db, companyId, orderId, { lock = false } = {}) {
-  const [[o]] = await db.query(
+  const readOrder = () => db.query(
     `SELECT o.*, p.name AS customer_name, p.code AS customer_code FROM cf_sales_orders o LEFT JOIN cf_parties p ON p.id = o.customer_id
       WHERE o.company_id = ? AND o.id = ? AND o.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
     [companyId, Number(orderId)],
   );
-  if (!o) throw notFound('Sales order');
-  const [lines] = await db.query(
+  const readLines = () => db.query(
     `SELECT l.id, l.line_no, l.line_type, l.item_id, l.quantity, l.committed_date, l.material_supply, l.delivered_qty, m.code AS item_code, m.name AS item_name
        FROM cf_sales_order_lines l LEFT JOIN cf_master_records m ON m.id = l.item_id
       WHERE l.company_id = ? AND l.order_id = ? AND l.deleted_at IS NULL ORDER BY l.line_no, l.id`,
-    [companyId, o.id],
+    [companyId, Number(orderId)],
   );
+  // A plain read takes the order and its lines side by side (speed, 2026-10-19); a locking one locks the order first.
+  let o; let lines;
+  if (lock) {
+    [[o]] = await readOrder();
+    if (!o) throw notFound('Sales order');
+    [lines] = await readLines();
+  } else {
+    [[[o]], [lines]] = await Promise.all([readOrder(), readLines()]);
+    if (!o) throw notFound('Sales order');
+  }
   const measures = await measuresOf(db, companyId, lines.map((l) => l.item_id));
   const orderSupply = o.material_supply === 'customer' ? 'customer' : 'we_buy';
   const shaped = lines.map((l) => {
@@ -681,14 +690,16 @@ async function mrsOf(db, companyId, orderId) {
  * checklist. Fixed reads.
  */
 export async function getAcceptance(db, companyId, orderId) {
-  const facts = await orderFacts(db, companyId, orderId);
-  const [ctx, versions, mrs, stagesBy, templates, values] = await Promise.all([
+  // Side by side (speed, 2026-10-19): the order's facts and everything else read for it, the default terms
+  // too (one small read, used when the order has no terms of its own) — one wave where there were three more.
+  const [facts, ctx, versions, mrs, stagesBy, templates, values, defaults] = await Promise.all([
+    orderFacts(db, companyId, orderId),
     termContext(db, companyId), versionsOf(db, companyId, orderId), mrsOf(db, companyId, orderId), postStagesOf(db, companyId, [orderId]),
-    listTemplates(db, companyId), orderValuesFor(db, companyId, [Number(facts.o.id)]),
+    listTemplates(db, companyId), orderValuesFor(db, companyId, [Number(orderId)]), prefill(db, companyId),
   ]);
   const { approved, pending, sentBack } = standing(versions);
   const shown = pending ?? sentBack ?? approved;
-  const terms = shown?.terms ?? await prefill(db, companyId);
+  const terms = shown?.terms ?? defaults;
   const anyWeBuy = facts.lines.some((l) => l.supply === 'we_buy');
   const anyCustomer = facts.lines.some((l) => l.supply === 'customer');
   const full = { ...ctx, anyWeBuy, anyCustomer, stageKeys: new Set((terms.stages ?? []).map((s) => s.key)) };

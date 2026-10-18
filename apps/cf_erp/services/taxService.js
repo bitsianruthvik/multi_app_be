@@ -356,14 +356,16 @@ const PROBLEM_NOTE = (p) => p.replace(/ \(Setup › Company tax details\)\.$/, '
  * Map lineId → { amount }. Three round trips whatever the size (company, items,
  * customers). Returns { lineTax: Map lineId → {...}, orderTax: Map orderId → {...} }.
  */
-export async function salesOrderTax(db, companyId, orders, lines, amounts) {
+export async function salesOrderTax(db, companyId, orders, lines, amountsIn) {
   const lineTax = new Map();
   const orderTax = new Map();
   if (!orders.length) return { lineTax, orderTax };
-  const [company, items, parties] = await Promise.all([
+  // amountsIn: the Map, or a promise of it — the reads below do not wait for it (speed, 2026-10-19).
+  const [company, items, parties, amounts] = await Promise.all([
     companyTax(db, companyId),
     itemTaxOf(db, companyId, lines.map((l) => l.item_id)),
     partyTaxOf(db, companyId, orders.map((o) => o.customer_id)),
+    amountsIn,
   ]);
   const byOrder = new Map(orders.map((o) => [o.id, []]));
   for (const l of lines) byOrder.get(l.order_id)?.push(l);

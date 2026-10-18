@@ -133,15 +133,19 @@ export async function itemCost(db, companyId, itemId) {
 
 /** Every revision of an order (they share its number): [ids], with the asked one's row. */
 export async function orderFamily(db, companyId, orderId) {
-  const [[o]] = await db.query(
-    `SELECT o.id, o.code, o.code_active, o.revision, o.status, o.customer_id, p.code AS customer_code, p.name AS customer_name
+  // The order and its live revisions in ONE read (speed, 2026-10-19: two before).
+  const [rows] = await db.query(
+    `SELECT o.id, o.code, o.code_active, o.revision, o.status, o.customer_id, p.code AS customer_code, p.name AS customer_name, f.id AS fam_id
        FROM cf_sales_orders o LEFT JOIN cf_parties p ON p.id = o.customer_id
-      WHERE o.company_id = ? AND o.id = ? AND o.deleted_at IS NULL`,
+       LEFT JOIN cf_sales_orders f ON f.company_id = o.company_id AND f.code_active = o.code_active AND f.deleted_at IS NULL
+      WHERE o.company_id = ? AND o.id = ? AND o.deleted_at IS NULL
+      ORDER BY f.id`,
     [companyId, Number(orderId)],
   );
-  if (!o) throw notFound('Sales order');
-  const [fam] = await db.query('SELECT id FROM cf_sales_orders WHERE company_id = ? AND code_active = ? AND deleted_at IS NULL', [companyId, o.code_active]);
-  return { order: o, ids: fam.length ? fam.map((r) => r.id) : [o.id] };
+  if (!rows.length) throw notFound('Sales order');
+  const { fam_id: _famId, ...o } = rows[0];
+  const fam = rows.filter((r) => r.fam_id != null).map((r) => r.fam_id);
+  return { order: o, ids: fam.length ? fam : [o.id] };
 }
 
 /**
@@ -265,24 +269,27 @@ export async function plateCostLadder(db, companyId, plateIds) {
   const avg = new Map();
   const lastCost = new Map();
   if (!ids.length) return { avg, lastCost };
-  const [pools] = await db.query('SELECT item_id, avg_unit_cost FROM cf_item_costs WHERE company_id = ? AND owner_key = 0 AND item_id IN (?) AND avg_unit_cost IS NOT NULL', [companyId, ids]);
-  for (const p of pools) avg.set(p.item_id, Number(p.avg_unit_cost));
-  const [lotCosts] = await db.query(
+  // The three reads side by side (speed, 2026-10-19); merged in the same order as before.
+  const [[pools], [lotCosts], [lasts]] = await Promise.all([
+    db.query('SELECT item_id, avg_unit_cost FROM cf_item_costs WHERE company_id = ? AND owner_key = 0 AND item_id IN (?) AND avg_unit_cost IS NOT NULL', [companyId, ids]),
+    db.query(
     `SELECT b.item_id, SUM(k.quantity * b.unit_cost) / SUM(k.quantity) AS avg_cost
        FROM cf_stock_balances k JOIN cf_stock_batches b ON b.id = k.batch_id
       WHERE k.company_id = ? AND b.item_id IN (?) AND k.quantity > 0 AND b.unit_cost IS NOT NULL AND b.owner_party_id IS NULL
       GROUP BY b.item_id`,
     [companyId, ids],
-  );
-  for (const r of lotCosts) if (!avg.has(r.item_id) && r.avg_cost != null) avg.set(r.item_id, Number(r.avg_cost));
-  const [lasts] = await db.query(
+  ),
+    db.query(
     `SELECT l.item_id, l.unit_cost FROM cf_stock_ledger l
        JOIN cf_stock_movements m ON m.id = l.movement_id AND m.movement_type = 'receipt' AND m.reversal_of_id IS NULL AND m.reversed_by_id IS NULL
        LEFT JOIN cf_stock_batches b ON b.id = l.batch_id
       WHERE l.company_id = ? AND l.item_id IN (?) AND l.unit_cost IS NOT NULL AND l.quantity > 0 AND b.owner_party_id IS NULL
       ORDER BY m.movement_date DESC, m.id DESC`,
     [companyId, ids],
-  );
+  ),
+  ]);
+  for (const p of pools) avg.set(p.item_id, Number(p.avg_unit_cost));
+  for (const r of lotCosts) if (!avg.has(r.item_id) && r.avg_cost != null) avg.set(r.item_id, Number(r.avg_cost));
   for (const r of lasts) if (!lastCost.has(r.item_id)) lastCost.set(r.item_id, Number(r.unit_cost));
   return { avg, lastCost };
 }
@@ -366,13 +373,14 @@ export async function cutPieceKgOf(db, companyId, itemIds) {
  */
 export async function orderCosts(db, companyId, orderId) {
   const { order, ids } = await orderFamily(db, companyId, orderId);
-  const [lines] = await db.query(
+  // Speed (2026-10-19): the lines and the movements side by side; then the lots and the
+  // untracked marks; then the plate costs and the bars' figures — four waves where there were nine.
+  const [[lines], [moves]] = await Promise.all([db.query(
     `SELECT l.id, l.line_no, l.order_id, o.revision, l.item_id, m.code AS item_code, m.name AS item_name
        FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id JOIN cf_master_records m ON m.id = l.item_id
       WHERE l.company_id = ? AND l.order_id IN (?) AND l.deleted_at IS NULL ORDER BY o.revision, l.line_no, l.id`,
     [companyId, ids],
-  );
-  const [moves] = await db.query(
+  ), db.query(
     `SELECT m.order_line_id, m.movement_type, l.item_id, (b.owner_party_id IS NOT NULL) AS theirs,
             SUM(-l.quantity) AS qty, SUM(-l.value) AS value, SUM(l.value IS NULL) AS uncosted
        FROM cf_stock_ledger l
@@ -384,25 +392,34 @@ export async function orderCosts(db, companyId, orderId) {
         AND b.production_item_id IS NULL
       GROUP BY m.order_line_id, m.movement_type, l.item_id, (b.owner_party_id IS NOT NULL)`,
     [companyId, ids],
-  );
+  )]);
   const lineIds = lines.map((l) => l.id);
-  const [lots] = lineIds.length ? await db.query(
-    `SELECT id, order_line_id, plate_item_id, lot_no, kind, length_mm, width_mm, thickness_mm, density, waste_json, owner_party_id
-       FROM cf_plate_lots WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL`,
-    [companyId, lineIds],
-  ) : [[]];
+  // §61: the pieces each line marked as cut from untracked offcuts — one read; the rest only when there are any.
+  const [[lots], marksBy] = await Promise.all([
+    lineIds.length ? db.query(
+      `SELECT id, order_line_id, plate_item_id, lot_no, kind, length_mm, width_mm, thickness_mm, density, waste_json, owner_party_id
+         FROM cf_plate_lots WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL`,
+      [companyId, lineIds],
+    ) : [[]],
+    untrackedOf(db, companyId, lineIds),
+  ]);
   // A BAR lot (section nesting): its steel by the bar's weight (lot length ×
   // section area × density, barKgPerMmOf), split by LENGTH — the pieces placed on it, the
   // offcut kept from it, the rest scrap. Two reads, only when the order has bars.
   const barLots = lots.filter((l) => l.kind === 'bar');
-  const barPerMm = barLots.length ? await barKgPerMmOf(db, companyId, barLots.map((l) => l.plate_item_id)) : new Map();
+  const barIds = barLots.map((l) => l.id);
+  // The cost of a plate size: issued to the line, else its average, else its last receipt.
+  const plateIds = [...new Set(lots.map((l) => l.plate_item_id))];
+  const [barPerMm, [[placedRows], [offcutRows]], { avg, lastCost }] = await Promise.all([
+    barLots.length ? barKgPerMmOf(db, companyId, barLots.map((l) => l.plate_item_id)) : new Map(),
+    barLots.length ? Promise.all([
+      db.query('SELECT plate_lot_id, SUM(length_mm) AS len FROM cf_nest_placements WHERE company_id = ? AND plate_lot_id IN (?) AND deleted_at IS NULL GROUP BY plate_lot_id', [companyId, barIds]),
+      db.query("SELECT plate_lot_id, SUM(length_mm) AS len FROM cf_offcuts WHERE company_id = ? AND plate_lot_id IN (?) AND kind = 'bar' AND deleted_at IS NULL GROUP BY plate_lot_id", [companyId, barIds]),
+    ]) : [[[]], [[]]],
+    plateCostLadder(db, companyId, plateIds),
+  ]);
   const barUse = new Map();
   if (barLots.length) {
-    const ids = barLots.map((l) => l.id);
-    const [[placedRows], [offcutRows]] = await Promise.all([
-      db.query('SELECT plate_lot_id, SUM(length_mm) AS len FROM cf_nest_placements WHERE company_id = ? AND plate_lot_id IN (?) AND deleted_at IS NULL GROUP BY plate_lot_id', [companyId, ids]),
-      db.query("SELECT plate_lot_id, SUM(length_mm) AS len FROM cf_offcuts WHERE company_id = ? AND plate_lot_id IN (?) AND kind = 'bar' AND deleted_at IS NULL GROUP BY plate_lot_id", [companyId, ids]),
-    ]);
     for (const r of placedRows) barUse.set(r.plate_lot_id, { parts: Number(r.len ?? 0), offcut: 0 });
     for (const r of offcutRows) { const e = barUse.get(r.plate_lot_id) ?? { parts: 0, offcut: 0 }; e.offcut = Number(r.len ?? 0); barUse.set(r.plate_lot_id, e); }
   }
@@ -415,12 +432,6 @@ export async function orderCosts(db, companyId, orderId) {
     return { parts, offcut, scrap: Math.max(0, 1 - parts - offcut) };
   };
   const barLotKg = (lot) => lotPlateKg(lot, barPerMm.get(lot.plate_item_id) ?? null);
-
-  // The cost of a plate size: issued to the line, else its average, else its last receipt.
-  const plateIds = [...new Set(lots.map((l) => l.plate_item_id))];
-  const { avg, lastCost } = await plateCostLadder(db, companyId, plateIds);
-  // §61: the pieces each line marked as cut from untracked offcuts — one read; the rest only when there are any.
-  const marksBy = await untrackedOf(db, companyId, lineIds);
 
   const blank = () => ({
     issued: { value: 0, quantity: 0, uncostedRows: 0 },

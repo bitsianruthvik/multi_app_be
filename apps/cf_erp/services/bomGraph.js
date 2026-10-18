@@ -95,6 +95,38 @@ export async function linesOfBomsWithChildBom(db, companyId, bomIds) {
   return rows;
 }
 
+/**
+ * linesOfBomsWithChildBom for EVERY level under a parent at once (speed, 2026-10-19):
+ * the parent's live BOM, and below it every BOM a line's child has, down to
+ * `maxDepth` levels — one round trip where a level-by-level walk took one per
+ * level (KEPL: 5). Same columns and order (bom_id, line_no, id) as the
+ * per-level read, so a walk over its rows level by level sees what that read
+ * would have given it. The recursion follows the same live rows and inner
+ * joins (child and design records) as the line read itself; a BOM reached at
+ * several depths is listed once.
+ */
+export async function linesUnderParent(db, companyId, parentId, maxDepth = 15) {
+  const [rows] = await db.query(
+    `WITH RECURSIVE walk (bom_id, depth) AS (
+       SELECT b.id, CAST(1 AS SIGNED) FROM cf_boms b WHERE b.company_id = ? AND b.parent_id = ? AND b.deleted_at IS NULL
+       UNION
+       SELECT cb.id, w.depth + 1 FROM walk w
+         JOIN cf_bom_lines wl ON wl.company_id = ? AND wl.bom_id = w.bom_id AND wl.deleted_at IS NULL
+         JOIN cf_master_records wc ON wc.id = wl.child_id
+         JOIN cf_master_records wd ON wd.id = wl.design_id
+         JOIN cf_boms cb ON cb.company_id = wl.company_id AND cb.parent_id = wl.child_id AND cb.deleted_at IS NULL
+        WHERE w.depth < ?
+     )
+     SELECT ${LINE_COLUMNS}, cb.id AS cb_id, cb.bom_type AS cb_bom_type, cb.status AS cb_status, cb.revision AS cb_revision
+       FROM cf_bom_lines l ${LINE_JOINS}
+       LEFT JOIN cf_boms cb ON cb.company_id = l.company_id AND cb.parent_id = l.child_id AND cb.deleted_at IS NULL
+      WHERE l.company_id = ? AND l.bom_id IN (SELECT DISTINCT bom_id FROM walk) AND l.deleted_at IS NULL
+      ORDER BY l.bom_id, l.line_no, l.id`,
+    [companyId, parentId, companyId, Math.max(1, Number(maxDepth) || 1), companyId],
+  );
+  return rows;
+}
+
 export async function loadLine(db, companyId, lineId) {
   const [[row]] = await db.query(
     `SELECT ${LINE_COLUMNS}, b.parent_id, b.bom_type, b.status AS bom_status

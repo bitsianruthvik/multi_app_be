@@ -20,7 +20,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { memoized } from '../lib/requestMemo.js';
 import { requireMaster, kindOf, LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import {
-  bomTypeOf, bomOfParent, bomsOfParents, linesOfBom, linesOfBoms, linesOfBomsWithChildBom, loadLine, childKindOf, descendantIds,
+  bomTypeOf, bomOfParent, bomsOfParents, linesOfBom, linesOfBoms, linesUnderParent, loadLine, childKindOf, descendantIds,
   createBom, insertLine, nextLineNo, nextPosition, effectiveFlowOf, definitionFlowOf,
 } from './bomGraph.js';
 import { refreshValues } from './valueService.js';
@@ -462,18 +462,31 @@ export function explode(db, companyId, rootId, { rootQuantity = 1, maxDepth = 15
 }
 
 async function readExplode(db, companyId, rootId, { rootQuantity = 1, maxDepth = 15, withCut = false } = {}) {
-  // Side by side; and below, one read per level (the children's BOMs come with their lines).
-  const [root, rootBom] = await Promise.all([requireMaster(db, companyId, rootId), bomOfParent(db, companyId, rootId)]);
-  const [[rf]] = await db.query(
-    `SELECT f.id AS child_flow_id, f.code AS child_flow_code, f.name AS child_flow_name,
-            df.id AS def_flow_id, df.code AS def_flow_code, df.name AS def_flow_name
-       FROM cf_master_records m
-       LEFT JOIN cf_operation_flows f ON f.id = m.default_flow_id
-       LEFT JOIN cf_master_records sd ON sd.id = ?
-       LEFT JOIN cf_operation_flows df ON df.id = sd.default_flow_id
-      WHERE m.company_id = ? AND m.id = ?`,
-    [root.source_definition_id ?? null, companyId, root.id],
-  );
+  // ONE wave (speed, 2026-10-19): the root, its BOM, its flows and every level's lines side by side.
+  // The root's definition is reached through its detail row — the row requireMaster reads it from.
+  // The lines of every level come in one read (bomGraph.linesUnderParent) and are walked level by
+  // level below exactly as the per-level reads were (one read per level before: KEPL 5 levels, ~49 ms each).
+  const [root, rootBom, [[rf]], allLines] = await Promise.all([
+    requireMaster(db, companyId, rootId),
+    bomOfParent(db, companyId, rootId),
+    db.query(
+      `SELECT f.id AS child_flow_id, f.code AS child_flow_code, f.name AS child_flow_name,
+              df.id AS def_flow_id, df.code AS def_flow_code, df.name AS def_flow_name
+         FROM cf_master_records m
+         LEFT JOIN cf_operation_flows f ON f.id = m.default_flow_id
+         LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+         LEFT JOIN cf_master_records sd ON sd.id = i.source_definition_id
+         LEFT JOIN cf_operation_flows df ON df.id = sd.default_flow_id
+        WHERE m.company_id = ? AND m.id = ?`,
+      [companyId, rootId],
+    ),
+    linesUnderParent(db, companyId, rootId, maxDepth),
+  ]);
+  const linesByBom = new Map();
+  for (const l of allLines) {
+    if (!linesByBom.has(l.bom_id)) linesByBom.set(l.bom_id, []);
+    linesByBom.get(l.bom_id).push(l);
+  }
   const rootNode = {
     key: `r${root.id}`, id: root.id, code: root.code, shortName: root.short_name ?? null, name: root.name, kind: kindOf(root), status: root.status,
     uom: root.uom ?? null, depth: 0, quantity: rootQuantity, total: rootQuantity, lineId: null, lineNo: null,
@@ -502,7 +515,8 @@ async function readExplode(db, companyId, rootId, { rootQuantity = 1, maxDepth =
       if (!byParent.has(n.bom.id)) byParent.set(n.bom.id, []);
       byParent.get(n.bom.id).push(n);
     }
-    const lines = await linesOfBomsWithChildBom(db, companyId, [...byParent.keys()]);
+    // The level's BOMs in id order, each its lines in line order — the per-level read's ORDER BY.
+    const lines = [...byParent.keys()].sort((a, b) => a - b).flatMap((id) => linesByBom.get(id) ?? []);
     const next = [];
     for (const l of lines) {
       const cb = l.cb_id ? { id: l.cb_id, bom_type: l.cb_bom_type, status: l.cb_status, revision: l.cb_revision } : null;

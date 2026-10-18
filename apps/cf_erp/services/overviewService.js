@@ -93,6 +93,21 @@ export async function search(db, companyId, q) {
  */
 export async function cockpit(db, companyId) {
   const c = [companyId];
+  // Everything side by side (speed, 2026-10-19): the tracker and buying counts (several reads each)
+  // and the two order counts used to wait for the plain counts, then for each other.
+  const tP = trackerCounts(db, companyId);
+  const bP = purchaseCounts(db, companyId);
+  const releaseP = one(db, `SELECT COUNT(*) FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL AND o.status = 'confirmed'
+     WHERE l.company_id = ? AND l.deleted_at IS NULL
+       AND NOT EXISTS (SELECT 1 FROM cf_production_releases r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL)`, c);
+  // Fully delivered = no line still owes anything. NOT EXISTS over the lines that
+  // still owe also skips an order with no lines at all, which owes nothing by accident.
+  const deliveredP = one(db, `SELECT COUNT(*) FROM cf_sales_orders o
+     WHERE o.company_id = ? AND o.deleted_at IS NULL AND o.status = 'confirmed'
+       AND EXISTS (SELECT 1 FROM cf_sales_order_lines l WHERE l.company_id = o.company_id AND l.order_id = o.id AND l.deleted_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM cf_sales_order_lines l WHERE l.company_id = o.company_id AND l.order_id = o.id AND l.deleted_at IS NULL
+                         AND l.delivered_qty < l.quantity)`, c);
+  for (const p of [tP, bP, releaseP, deliveredP]) p.catch(() => {});   // awaited below; never an unhandled rejection meanwhile
   const [inquiries, quoted, confirmed, overdue, selections, itemDrafts, defDrafts, draftFlows, idleMachines, heldBatches, untimedOps, openOrders, machines, stockLines] = await Promise.all([
     one(db, "SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status = 'inquiry'", c),
     one(db, "SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status = 'quoted'", c),
@@ -121,18 +136,7 @@ export async function cockpit(db, companyId) {
     one(db, 'SELECT COUNT(*) FROM cf_stock_balances WHERE company_id = ? AND quantity <> 0', c),
   ]);
   const plural = (n, one1, many) => (n === 1 ? one1 : many);
-  const t = await trackerCounts(db, companyId);
-  const toRelease = await one(db, `SELECT COUNT(*) FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL AND o.status = 'confirmed'
-     WHERE l.company_id = ? AND l.deleted_at IS NULL
-       AND NOT EXISTS (SELECT 1 FROM cf_production_releases r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL)`, c);
-  // Fully delivered = no line still owes anything. NOT EXISTS over the lines that
-  // still owe also skips an order with no lines at all, which owes nothing by accident.
-  const delivered = await one(db, `SELECT COUNT(*) FROM cf_sales_orders o
-     WHERE o.company_id = ? AND o.deleted_at IS NULL AND o.status = 'confirmed'
-       AND EXISTS (SELECT 1 FROM cf_sales_order_lines l WHERE l.company_id = o.company_id AND l.order_id = o.id AND l.deleted_at IS NULL)
-       AND NOT EXISTS (SELECT 1 FROM cf_sales_order_lines l WHERE l.company_id = o.company_id AND l.order_id = o.id AND l.deleted_at IS NULL
-                         AND l.delivered_qty < l.quantity)`, c);
-  const b = await purchaseCounts(db, companyId);
+  const [t, toRelease, delivered, b] = await Promise.all([tP, releaseP, deliveredP, bP]);
   const queues = [
     { key: 'buy', title: 'Material to buy', count: b.toBuy, unit: plural(b.toBuy, 'item', 'items'), tone: 'danger',
       description: 'Short after what is held and what is already on order — nobody has this steel.', actionLabel: 'Open material requests', path: 'material-requests' },

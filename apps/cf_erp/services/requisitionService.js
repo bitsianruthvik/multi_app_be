@@ -396,8 +396,8 @@ export async function lineSupplies(db, companyId, orderId) {
  * that have none yet (with what they need and who supplies it, so the screen can offer "Raise").
  */
 export async function orderRequisitions(db, companyId, orderId, { R: given = null } = {}) {
-  const o = await requireOrderRow(db, companyId, orderId);
-  const R = given ?? await lineReadiness(db, companyId, { full: true });
+  // The order and the readiness engine side by side (speed, 2026-10-19).
+  const [o, R] = await Promise.all([requireOrderRow(db, companyId, orderId), given ?? lineReadiness(db, companyId, { full: true })]);
   // The order's own MRs (one per line); one raised by hand for the order (§79) lives in Stores' inbox.
   const requisitions = await readRequisitions(db, companyId, { orderId: o.id, lineBound: true }, { R });
   const have = new Set(requisitions.map((r) => r.line.id));

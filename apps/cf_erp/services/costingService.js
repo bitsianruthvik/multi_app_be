@@ -151,8 +151,8 @@ export async function costingList(db, companyId, q = {}) {
 /** GET /accounts/costing/:orderId — the cost sheet of one order: the row, what each charge earned, the items, and the
  *  per-line nest figures (valuationService.orderCosts). */
 export async function costSheet(db, companyId, orderId) {
-  const facts = await billingFacts(db, companyId, { orderIds: [Number(orderId)] });
-  const [sheets, detail, cws, rate] = await Promise.all([orderCostSheets(db, companyId, [Number(orderId)]), orderCosts(db, companyId, orderId), contractorCostOf(db, companyId, [Number(orderId)]), scrapRate(db, companyId)]);
+  // Side by side (speed, 2026-10-19): none of these needs the billing facts.
+  const [facts, sheets, detail, cws, rate] = await Promise.all([billingFacts(db, companyId, { orderIds: [Number(orderId)] }), orderCostSheets(db, companyId, [Number(orderId)]), orderCosts(db, companyId, orderId), contractorCostOf(db, companyId, [Number(orderId)]), scrapRate(db, companyId)]);
   const cw = cws.get(Number(orderId));
   const F = facts[0];
   const s = sheets.get(Number(orderId));

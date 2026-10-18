@@ -211,6 +211,12 @@ async function plannedRows(db, companyId) {
 export async function buyList(db, companyId, q = {}) {
   // One row per item and ORDER, folded into one row per item below: the parts
   // let what is held / bought for an order cover that order only (init.sql §43).
+  // Speed (2026-10-19): the reads that need no item list go side by side with it — planned
+  // demand, what is on order, what is linked to orders — then the per-item reads all at once.
+  const plannedP = plannedRows(db, companyId);
+  const onOrderP = onOrderByItem(db, companyId, { exceptOrderId: q.exceptOrderId ?? null });
+  const linkedP = linkedOnOrder(db, companyId, OPEN_STATUSES, { exceptPoId: q.exceptOrderId ?? null });
+  for (const x of [plannedP, onOrderP, linkedP]) x.catch(() => {});   // awaited below
   const [parts] = await db.query(
     `SELECT q.item_id, m.code AS item_code, m.name AS item_name, i.uom, i.tracked_by, o.id AS order_id, o.code AS order_code,
             SUM(GREATEST(q.quantity - q.issued, 0)) AS wanted,
@@ -237,13 +243,12 @@ export async function buyList(db, companyId, q = {}) {
     }
     r.parts.push({ orderId: p.order_id, orderCode: p.order_code, wanted: round6(p.wanted), reserved: round6(p.reserved) });
   }
-  const planned = await plannedRows(db, companyId);
+  const planned = await plannedP;
   const itemIds = [...new Set([...rows.map((r) => r.item_id), ...planned.map((p) => p.item.id)])];
-  const onOrder = await onOrderByItem(db, companyId, { exceptOrderId: q.exceptOrderId ?? null });
-  const free = await availability(db, companyId, itemIds);
-  const [estimates, inProc, holds, linked] = await Promise.all([
+  const [onOrder, free, estimates, inProc, holds, linked] = await Promise.all([
+    onOrderP, availability(db, companyId, itemIds),
     buyEstimates(db, companyId, itemIds), inProcurementByItem(db, companyId, itemIds),
-    holdsByOrderItem(db, companyId, itemIds), linkedOnOrder(db, companyId, OPEN_STATUSES, { exceptPoId: q.exceptOrderId ?? null }),
+    holdsByOrderItem(db, companyId, itemIds), linkedP,
   ]);
   /*
    * Free stock and what is on order are per ITEM, and an item can now be on a
@@ -525,8 +530,11 @@ const shapeLastPaid = (p) => (p
   : null);
 
 export async function getPurchaseOrder(db, companyId, id) {
+  const poId = Number(id);
+  // Speed (2026-10-19): the header, its lines, receipts, date changes and what waits for Management
+  // side by side (each needs only the PO's id); then what needs the lines, side by side. Two waves where there were eight.
   // The header with its supplier and the sales order it is for: one read (they were three).
-  const [[p]] = await db.query(
+  const [[[p]], [lines], [receipts], [dateRows], pendingMap] = await Promise.all([db.query(
     `SELECT p.*, s.id AS sup_id, s.code AS sup_code, s.name AS sup_name, fo.id AS for_id, fo.code AS for_code,
             au.name AS approved_by_name, cu.name AS closed_by_name
        FROM cf_purchase_orders p
@@ -535,50 +543,52 @@ export async function getPurchaseOrder(db, companyId, id) {
        LEFT JOIN users au ON au.id = p.approved_by
        LEFT JOIN users cu ON cu.id = p.closed_by
       WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`,
-    [companyId, Number(id)],
-  );
-  if (!p) throw notFound('Purchase order');
-  const sup = p.sup_id ? { id: p.sup_id, code: p.sup_code, name: p.sup_name } : null;
-  const forOrder = p.for_id ? { id: p.for_id, code: p.for_code } : null;
-  const [lines] = await db.query(
+    [companyId, poId],
+  ), db.query(
     `SELECT l.*, m.code AS item_code, m.name AS item_name, i.tracked_by
        FROM cf_purchase_order_lines l
        JOIN cf_master_records m ON m.id = l.item_id
        JOIN cf_item_details i ON i.master_id = l.item_id
       WHERE l.company_id = ? AND l.purchase_order_id = ? AND l.deleted_at IS NULL
       ORDER BY l.line_no, l.id`,
-    [companyId, p.id],
-  );
-  const [receipts] = await db.query(
+    [companyId, poId],
+  ), db.query(
     `SELECT v.id, v.code, v.movement_date, v.purchase_line_id, SUM(k.quantity) AS quantity
        FROM cf_stock_movements v JOIN cf_stock_ledger k ON k.movement_id = v.id AND k.deleted_at IS NULL
       WHERE v.company_id = ? AND v.deleted_at IS NULL AND v.purchase_line_id IN
             (SELECT id FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ?)
       GROUP BY v.id, v.code, v.movement_date, v.purchase_line_id ORDER BY v.id`,
-    [companyId, companyId, p.id],
-  );
+    [companyId, companyId, poId],
+  ),
   // Every change of the PO's or a line's expected date, newest first (§71). Tolerates a database without the table.
-  const [dateRows] = await db.query(
+  db.query(
     `SELECT d.id, d.purchase_line_id, d.from_date, d.to_date, d.changed_at, d.changed_by, u.name AS changed_by_name
        FROM cf_purchase_date_changes d LEFT JOIN users u ON u.id = d.changed_by
       WHERE d.company_id = ? AND d.purchase_order_id = ? AND d.deleted_at IS NULL ORDER BY d.id DESC LIMIT 100`,
-    [companyId, p.id],
-  ).catch(() => [[]]);
+    [companyId, poId],
+  ).catch(() => [[]]),
+  // §73: what waits for Management about this PO (its approval, a close short) — the PO page says so.
+  pendingFor(db, companyId, 'purchase_order', [poId]),
+  ]);
+  if (!p) throw notFound('Purchase order');
+  const sup = p.sup_id ? { id: p.sup_id, code: p.sup_code, name: p.sup_name } : null;
+  const forOrder = p.for_id ? { id: p.for_id, code: p.for_code } : null;
   const ordered = round6(lines.reduce((t, l) => t + Number(l.quantity), 0));
   const received = round6(lines.reduce((t, l) => t + Number(l.qty_received), 0));
-  // Bought for which sales orders (init.sql §43): the header default, and each line's allocations.
-  const alloc = await allocationsOf(db, companyId, lines.map((l) => l.id));
-  // The last price paid elsewhere, beside each line — the buyer's yardstick.
-  const lastPaid = lines.length ? await lastPricesPaid(db, companyId, lines.map((l) => l.item_id), { exceptOrderId: p.id }) : new Map();
+  const [alloc, lastPaid, { lineTax, poTax }] = await Promise.all([
+    // Bought for which sales orders (init.sql §43): the header default, and each line's allocations.
+    allocationsOf(db, companyId, lines.map((l) => l.id)),
+    // The last price paid elsewhere, beside each line — the buyer's yardstick.
+    lines.length ? lastPricesPaid(db, companyId, lines.map((l) => l.item_id), { exceptOrderId: p.id }) : new Map(),
+    // Input GST (init.sql §37): per line and in total; reverse charge keeps it out of the supplier total.
+    purchaseOrderTax(db, companyId, [p],
+      lines.map((l) => ({ id: l.id, purchase_order_id: p.id, item_id: l.item_id, amount: l.unit_price == null ? null : round2(Number(l.unit_price) * Number(l.quantity)) }))),
+  ]);
   const priced = lines.filter((l) => l.unit_price != null);
   const amount = round2(priced.reduce((t, l) => t + Number(l.unit_price) * Number(l.quantity), 0));
   const amountReceived = round2(priced.reduce((t, l) => t + Number(l.unit_price) * Number(l.qty_received), 0));
-  // Input GST (init.sql §37): per line and in total; reverse charge keeps it out of the supplier total.
-  const { lineTax, poTax } = await purchaseOrderTax(db, companyId, [p],
-    lines.map((l) => ({ id: l.id, purchase_order_id: p.id, item_id: l.item_id, amount: l.unit_price == null ? null : round2(Number(l.unit_price) * Number(l.quantity)) })));
   const stage = poStage(p);
-  // §73: what waits for Management about this PO (its approval, a close short) — the PO page says so.
-  const waiting = (await pendingFor(db, companyId, 'purchase_order', [p.id])).get(Number(p.id)) ?? [];
+  const waiting = pendingMap.get(Number(p.id)) ?? [];
   return {
     id: p.id,
     code: p.code,
@@ -1355,10 +1365,18 @@ export function receiptLineFor(l, input, problems = []) {
 /** For the nav badge and Home: how many items are short, and how many orders are waiting. */
 export async function purchaseCounts(db, companyId) {
   // Items, not rows: an item short on a released row and a planned row is one item to buy.
-  const short = new Set((await buyList(db, companyId, { show: 'short' })).map((r) => r.item.id)).size;
-  const [[{ drafts }]] = await db.query("SELECT COUNT(*) AS drafts FROM cf_purchase_orders WHERE company_id = ? AND status IN ('requested','quoting','draft') AND deleted_at IS NULL", [companyId]);
-  const [[{ awaiting }]] = await db.query("SELECT COUNT(*) AS awaiting FROM cf_purchase_orders WHERE company_id = ? AND status IN ('ordered','partially_received') AND deleted_at IS NULL", [companyId]);
-  // §71: POs waiting for the MD.
-  const [[{ pending }]] = await db.query("SELECT COUNT(*) AS pending FROM cf_purchase_orders WHERE company_id = ? AND status IN ('requested','quoting','draft') AND approval_status = 'pending' AND deleted_at IS NULL", [companyId]);
+  // The three order counts in ONE read, beside the buy list (speed, 2026-10-19: they were three reads after it).
+  // pending = §71: POs waiting for the MD.
+  const [list, [[{ drafts, awaiting, pending }]]] = await Promise.all([
+    buyList(db, companyId, { show: 'short' }),
+    db.query(
+      `SELECT COALESCE(SUM(status IN ('requested','quoting','draft')), 0) AS drafts,
+              COALESCE(SUM(status IN ('ordered','partially_received')), 0) AS awaiting,
+              COALESCE(SUM(status IN ('requested','quoting','draft') AND approval_status = 'pending'), 0) AS pending
+         FROM cf_purchase_orders WHERE company_id = ? AND deleted_at IS NULL`,
+      [companyId],
+    ),
+  ]);
+  const short = new Set(list.map((r) => r.item.id)).size;
   return { toBuy: short, draftOrders: Number(drafts), awaitingDelivery: Number(awaiting), pendingApproval: Number(pending) };
 }

@@ -248,18 +248,20 @@ export async function listOrders(db, companyId, q = {}) {
   const totals = new Map();
   let termsOf = new Map();
   if (rows.length) {
-    const [lines] = await db.query(
+    // Speed (2026-10-19): the terms beside the lines; the GST's reads beside the amounts (it takes them as a promise).
+    const [[lines], terms] = await Promise.all([db.query(
       `SELECT l.id, l.order_id, l.line_no, l.item_id, l.quantity, l.rate, l.rate_basis
          FROM cf_sales_order_lines l WHERE l.company_id = ? AND l.order_id IN (?) AND l.deleted_at IS NULL`,
       [companyId, rows.map((o) => o.id)],
-    );
-    const [amounts, terms] = await Promise.all([lineAmounts(db, companyId, lines), acceptedValuesOf(db, companyId, rows.map((o) => o.id))]);
+    ), acceptedValuesOf(db, companyId, rows.map((o) => o.id))]);
     termsOf = terms;
+    const amountsP = lineAmounts(db, companyId, lines);
+    amountsP.catch(() => {});   // awaited below
+    // Estimated GST on each order (init.sql §37) — three more reads for the whole list.
+    const [amounts, { orderTax }] = await Promise.all([amountsP, salesOrderTax(db, companyId, rows, lines, amountsP)]);
     const byOrder = new Map();
     for (const l of lines) { if (!byOrder.has(l.order_id)) byOrder.set(l.order_id, []); byOrder.get(l.order_id).push(l); }
     for (const [orderId, ls] of byOrder) totals.set(orderId, orderTotal(ls, amounts));
-    // Estimated GST on each order (init.sql §37) — three more reads for the whole list.
-    const { orderTax } = await salesOrderTax(db, companyId, rows, lines, amounts);
     for (const o of rows) totals.set(o.id, { ...(totals.get(o.id) ?? orderTotal([], new Map())), ...orderTax.get(o.id) });
   }
   const shaped = rows.map((o) => {
@@ -318,7 +320,8 @@ async function structureStats(db, companyId, lineIds) {
   const out = new Map(lineIds.map((id) => [id, { temporaryItems: 0, unresolvedSelections: 0, cutPieces: 0 }]));
   if (!lineIds.length) return out;
   // cutPieces (2026-10-18): a line with cut pieces keeps its number — their codes carry it (reorderLines).
-  const [items] = await db.query(
+  // The two counts side by side (speed, 2026-10-19).
+  const [[items], [sel]] = await Promise.all([db.query(
     `SELECT i.owner_order_line_id AS line_id, COUNT(DISTINCT i.master_id) AS n,
             COUNT(DISTINCT CASE WHEN cp.id IS NOT NULL THEN i.master_id END) AS cut
        FROM cf_item_details i JOIN cf_master_records m ON m.id = i.master_id AND m.deleted_at IS NULL
@@ -326,9 +329,7 @@ async function structureStats(db, companyId, lineIds) {
       WHERE i.company_id = ? AND i.owner_order_line_id IN (?) AND i.deleted_at IS NULL
       GROUP BY i.owner_order_line_id`,
     [companyId, lineIds],
-  );
-  for (const r of items) { out.get(r.line_id).temporaryItems = Number(r.n); out.get(r.line_id).cutPieces = Number(r.cut); }
-  const [sel] = await db.query(
+  ), db.query(
     `SELECT pi.owner_order_line_id AS line_id, COUNT(*) AS n
        FROM cf_bom_lines l
        JOIN cf_boms b ON b.id = l.bom_id AND b.deleted_at IS NULL
@@ -342,7 +343,8 @@ async function structureStats(db, companyId, lineIds) {
         AND ${NOT_UNDER_CUT_PLATE_WHERE}
       GROUP BY pi.owner_order_line_id`,
     [companyId, lineIds],
-  );
+  )]);
+  for (const r of items) { out.get(r.line_id).temporaryItems = Number(r.n); out.get(r.line_id).cutPieces = Number(r.cut); }
   for (const r of sel) out.get(r.line_id).unresolvedSelections = Number(r.n);
   return out;
 }
@@ -379,22 +381,26 @@ export async function getOrder(db, companyId, id) {
   // The standard drawing each line came from (init.sql §69) — only asked when a line names one.
   const stdIds = [...new Set(lines.map((l) => l.standard_id).filter(Boolean))];
   const verIds = [...new Set(lines.map((l) => l.standard_version_id).filter(Boolean))];
-  const [[stds], [vers]] = stdIds.length ? await Promise.all([
-    db.query('SELECT id, number, name, current_version_id FROM cf_standard_drawings WHERE company_id = ? AND id IN (?)', [companyId, stdIds]),
-    verIds.length ? db.query('SELECT id, version_no FROM cf_standard_drawing_versions WHERE company_id = ? AND id IN (?)', [companyId, verIds]) : [[]],
-  ]) : [[[]], [[]]];
+  // One wave (speed, 2026-10-19): the standards, the structure counts, the amounts and the GST's own reads
+  // side by side — the tax reads do not need the amounts, only its sums do (salesOrderTax takes them as a promise).
+  const amountsP = lineAmounts(db, companyId, lines);
+  amountsP.catch(() => {});   // awaited below
+  const [[[stds], [vers]], stats, amounts, { lineTax, orderTax }] = await Promise.all([
+    stdIds.length ? Promise.all([
+      db.query('SELECT id, number, name, current_version_id FROM cf_standard_drawings WHERE company_id = ? AND id IN (?)', [companyId, stdIds]),
+      verIds.length ? db.query('SELECT id, version_no FROM cf_standard_drawing_versions WHERE company_id = ? AND id IN (?)', [companyId, verIds]) : [[]],
+    ]) : [[[]], [[]]],
+    structureStats(db, companyId, lines.filter((l) => l.line_type === 'custom').map((l) => l.id)),
+    amountsP,
+    // Estimated GST (init.sql §37): per line and on the total, by the ship-to state.
+    salesOrderTax(db, companyId, [o], lines, amountsP),
+  ]);
   const stdOf = new Map(stds.map((s) => [Number(s.id), s]));
   const verNo = new Map(vers.map((v) => [Number(v.id), Number(v.version_no)]));
   order.revisions = revs.map((r) => ({ id: r.id, revision: Number(r.revision), status: r.status, revisedAt: r.revised_at ?? null }));
-  const [stats, amounts] = await Promise.all([
-    structureStats(db, companyId, lines.filter((l) => l.line_type === 'custom').map((l) => l.id)),
-    lineAmounts(db, companyId, lines),
-  ]);
   order.total = orderTotal(lines, amounts);
   // ONE order value (orderValueService): the accepted terms once they exist, else the estimate from the line rates.
   order.value = orderValueOf(order.total, terms.get(Number(o.id)), { lineCount: lines.length });
-  // Estimated GST (init.sql §37): per line and on the total, by the ship-to state.
-  const { lineTax, orderTax } = await salesOrderTax(db, companyId, [o], lines, amounts);
   Object.assign(order.total, orderTax.get(o.id));
   order.lines = lines.map((l) => ({
     id: l.id,

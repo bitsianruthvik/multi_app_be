@@ -330,8 +330,14 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
   const lockedIds = lineRows.filter((l) => l.locked_at).map((l) => l.id);
   const releaseIds = lineRows.filter((l) => l.release_id).map((l) => l.release_id);
 
+  // The machines' calendars need only the machines: read beside everything below (speed, 2026-10-19).
+  const calendarsP = machinesCalendar(db, companyId, { from: horizon.from, to: horizon.to, machineIds: machineRows.map((m) => m.id) });
+  calendarsP.catch(() => {});   // awaited below
+
   // ---- line-wide reads, all lines at once -------------------------------------
-  const [[pieceRows], [placementRows], [overrideRows], [cellRows], [stepRows]] = await Promise.all([
+  // Rows planned "their parts separately" (§47; a database without §47 yet plans none) and the
+  // locked lines' own flow copies (init.sql §60) come in the same wave (speed, 2026-10-19: two waves after it before).
+  const [[pieceRows], [placementRows], [overrideRows], [cellRows], [stepRows], splitRows, frozenFlows] = await Promise.all([
     lockedIds.length
       ? db.query(
         `SELECT id, order_line_id, parent_id, item_id, bom_line_id, piece_no, piece_seq, quantity, code, rule_code, path_key, depth, sort_order
@@ -371,6 +377,12 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
           WHERE s.company_id = ? AND pi.release_id IN (?) AND s.deleted_at IS NULL`,
         [companyId, releaseIds])
       : [[]],
+    lineIds.length
+      ? db.query('SELECT order_line_id, bom_line_id FROM cf_plan_splits WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds])
+        .then(([rows]) => rows, (e) => { if (e?.code !== 'ER_NO_SUCH_TABLE' && e?.errno !== 1146) throw e; return []; })
+      : [],
+    // A locked line is planned by its OWN copy of each flow (init.sql §60): the copies of every locked line, one read.
+    frozenFlowMap(db, companyId, lockedIds),
   ]);
   const piecesOfLine = new Map();
   for (const p of pieceRows) {
@@ -395,17 +407,9 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
   const contractorCells = new Set(cellRows.map((c) => `${c.order_piece_id}:${c.operation_id}`));
   // Rows planned "their parts separately" (§47). A database without §47 yet plans none.
   const splitsOfLine = new Map();
-  if (lineIds.length) {
-    let rows = [];
-    try {
-      [rows] = await db.query('SELECT order_line_id, bom_line_id FROM cf_plan_splits WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds]);
-    } catch (e) { if (e?.code !== 'ER_NO_SUCH_TABLE' && e?.errno !== 1146) throw e; }
-    for (const r of rows) { if (!splitsOfLine.has(r.order_line_id)) splitsOfLine.set(r.order_line_id, new Set()); splitsOfLine.get(r.order_line_id).add(Number(r.bom_line_id)); }
-  }
+  for (const r of splitRows) { if (!splitsOfLine.has(r.order_line_id)) splitsOfLine.set(r.order_line_id, new Set()); splitsOfLine.get(r.order_line_id).add(Number(r.bom_line_id)); }
 
   // ---- the per-line structure, side by side ---------------------------------
-  // A locked line is planned by its OWN copy of each flow (init.sql §60): the copies of every locked line, one read.
-  const frozenFlows = await frozenFlowMap(db, companyId, lockedIds);
   const structures = await Promise.all(lineRows.map((l) => loadLineStructure(db, companyId, l, l.locked_at ? piecesOfLine.get(l.id) ?? [] : null, frozenFlows.get(Number(l.id)))));
 
   // ---- flows, operations, the machine side: once for every line -------------
@@ -419,7 +423,7 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
 
   const [machineSide, calendars] = await Promise.all([
     loadMachineSide(db, companyId, operations, today),
-    machinesCalendar(db, companyId, { from: horizon.from, to: horizon.to, machineIds: machineRows.map((m) => m.id) }),
+    calendarsP,
   ]);
   const machineById = new Map(machineRows.map((m) => [m.id, m]));
   // A machine that is not active (or deleted) can still be named on an old step.
