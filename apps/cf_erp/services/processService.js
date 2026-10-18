@@ -53,6 +53,7 @@ import { plannedMaterialOfLines } from './releaseService.js';
 import { availability, madeRule } from './rollOutService.js';
 import { cutPieceGaps } from './lockService.js';
 import { lineReadiness, dayWords, DATED_PO_STATUSES } from './materialReadyService.js';
+import { planRowsOf, linePlanStates } from './executionPlanService.js';
 
 /**
  * Backend B's section nesting state for a line — { needed, accepted } — asked
@@ -149,7 +150,15 @@ const readSettings = (v) => {
  * itself opens from a button on Nesting. A stored 'cut_pieces' row is kept and
  * hidden, exactly like 'confirm'.
  */
-export const RETIRED_STAGE_KEYS = new Set(['confirm', 'cut_pieces']);
+/*
+ * LINE ITEMS ARE NOT A STAGE ANY MORE (user, 2026-10-18: "merge the first two steps — line items and structure,
+ * with values — into ONE first step that captures the entire order's structure and values in one view"). The
+ * lines are the top-level groups of the Structure & values step, and what the Line items stage said about a line
+ * (nothing chosen, no quantity, an obsolete item, no committed date) is said by Structure now. A stored 'lines'
+ * row is kept and hidden like 'confirm'; a process that had Line items but no Structure is READ with its Line
+ * items row standing in as Structure (getProcess), so it never loses its first step.
+ */
+export const RETIRED_STAGE_KEYS = new Set(['confirm', 'cut_pieces', 'lines']);
 /** The same keys as an SQL list literal, for the counts and the replace below. Constants, never input. */
 const RETIRED_SQL = [...RETIRED_STAGE_KEYS].map((k) => `'${k}'`).join(', ');
 const confirmFirst = (message) => ({ stageKey: null, action: 'confirm', message });
@@ -157,85 +166,77 @@ const orderStatusOf = (order) => (order.status === 'revised' ? order.status_befo
 
 export const STAGE_CATALOGUE = [
   {
-    key: 'lines',
-    label: 'Line items',
-    description: 'What the order sells: an item, how many, and by when.',
-    /** Always: an order with no lines sells nothing, which is itself the answer. */
+    key: 'structure',
+    label: 'Structure & values',
+    description: 'The whole order in one view: its lines, what each is made of (its BOM, drawn, copied from a template or from a standard drawing) and the values the setup asks for.',
+    /**
+     * ALWAYS, since Line items merged into it (2026-10-18): every line is a group of this step. A line sold as a
+     * catalog item has nothing to draw, so for it the step is the line itself — what it sells, how many, by when.
+     */
     always: true,
     applies: () => true,
+    /** One step for the whole order: the screen shows every line at once, so the tabs show the order's roll-up. */
+    scope: 'order',
     state(ctx) {
       const { line, order } = ctx;
-      const blockers = [];
+      const L = line.line_no;
       if (!line.item_id) {
         return {
           state: 'todo',
           detail: 'Nothing chosen to sell yet',
-          blockers: [{ count: 0, message: `Line ${line.line_no} has no item — choose a catalog item or a template.` }],
+          blockers: [{ count: 0, message: `Line ${L} has no item — choose a catalog item or a template.` }],
         };
       }
-      const problems = [];
-      if (!(Number(line.quantity) > 0)) problems.push('no quantity');
-      // A DRAFT item is not this stage's business. Every custom line's item is
-      // born draft (instantiationService) and stays so until the structure
-      // under it is settled — which is the `structure` stage's whole job, and
-      // where it is already counted. Reporting it twice would make a line that
-      // has only just been added look broken in two places at once. Obsolete
-      // is different: selling a retired item is a line-level mistake.
-      if (line.item_status === 'obsolete') problems.push(`${nameOf(line)} is obsolete`);
-      // Confirming needs a date somewhere — on the order or on every line
-      // (salesOrderService.setOrderStatus). Saying so here, on the step that
-      // owns the line, beats finding out at the Confirm button.
-      if (order.order_type === 'customer' && !order.committed_date && !line.committed_date) problems.push('no committed date');
-      for (const p of problems) blockers.push({ count: 0, message: `Line ${line.line_no}: ${p}.` });
-      return {
-        state: problems.length ? 'partial' : 'done',
-        detail: problems.length
-          ? `${nameOf(line)} — ${problems.join(', ')}`
-          : `${Number(line.quantity)} × ${nameOf(line)}`,
-        blockers,
-      };
-    },
-  },
-  {
-    key: 'structure',
-    label: 'Structure',
-    description: 'What the thing sold is made of — its BOM, drawn or copied from a template.',
-    /** The data knows: the line sells something with a BOM, or built from a template. */
-    applies: (ctx) => ctx.hasBom || ctx.fromTemplate,
-    state(ctx) {
+      // What the Line items stage used to say about the line itself.
+      const lineProblems = [];
+      if (!(Number(line.quantity) > 0)) lineProblems.push('no quantity');
+      // A DRAFT item is not a line problem: every custom line's item is born draft and is activated by the freeze.
+      // Obsolete is different: selling a retired item is a line-level mistake.
+      if (line.item_status === 'obsolete') lineProblems.push(`${nameOf(line)} is obsolete`);
+      // Confirming needs a date somewhere — on the order or on every line (salesOrderService.setOrderStatus).
+      if (order.order_type === 'customer' && !order.committed_date && !line.committed_date) lineProblems.push('no committed date');
+      const lineBlockers = lineProblems.map((p) => ({ count: 0, message: `Line ${L}: ${p}.` }));
+      const lineNote = lineProblems.length ? ` · ${lineProblems.join(', ')}` : '';
+      if (!ctx.hasBom && !ctx.fromTemplate) {
+        return {
+          state: lineProblems.length ? 'partial' : 'done',
+          detail: `${Number(line.quantity)} × ${nameOf(line)} — sold as it is${lineNote}`,
+          blockers: lineBlockers,
+        };
+      }
       const { tree, drafts } = ctx;
       // A cut plate that has not picked its raw plate is not a structure
       // problem — NESTING chooses the plates, after the freeze — so it is not
       // counted here at all (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30).
       const unresolved = ctx.unresolved.filter((x) => !x.underCutPlate);
       const rows = tree ? tree.stats.nodes - 1 : 0;   // the root is the thing sold, not part of it
-      const blockers = [];
+      const blockers = [...lineBlockers];
       if (rows === 0) {
         return {
           state: 'todo',
-          detail: ctx.fromTemplate ? 'Built from a template, but nothing in it yet' : 'No parts yet',
-          blockers: [{ count: 0, message: `Line ${ctx.line.line_no} has no structure yet, so there is nothing to make.` }],
+          detail: `${ctx.fromTemplate ? 'Built from a template, but nothing in it yet' : 'No parts yet'}${lineNote}`,
+          blockers: [...blockers, { count: 0, message: `Line ${L} has no structure yet, so there is nothing to make.` }],
         };
       }
       if (unresolved.length) {
         blockers.push({
           count: unresolved.length,
-          message: `${n(unresolved.length, 'row')} under line ${ctx.line.line_no} still need an item chosen — ${nameList(unresolved.map(nameOf), 3)}.`,
+          message: `${n(unresolved.length, 'row')} under line ${L} still need an item chosen — ${nameList(unresolved.map(nameOf), 3)}.`,
         });
       }
       if (drafts.length) {
         blockers.push({
           count: drafts.length,
-          message: `${n(drafts.length, 'row')} under line ${ctx.line.line_no} are still drafts — ${nameList(drafts.map(nameOf), 3)}.`,
+          message: `${n(drafts.length, 'row')} under line ${L} are still drafts — ${nameList(drafts.map(nameOf), 3)}.`,
         });
       }
       return {
         state: blockers.length ? 'partial' : 'done',
-        detail: unresolved.length
+        detail: (unresolved.length
           ? `${n(unresolved.length, 'row')} still to choose an item for — ${nameList(unresolved.map(nameOf))}`
           : drafts.length
             ? `${n(drafts.length, 'row')} still a draft — ${nameList(drafts.map(nameOf))}`
-            : `${n(rows, 'row')}`,
+            : `${n(rows, 'row')}`) + lineNote,
         blockers,
       };
     },
@@ -252,6 +253,7 @@ export const STAGE_CATALOGUE = [
      * A process without a Structure stage still shows it as its own tab.
      */
     shownIn: 'structure',
+    scope: 'order',
     /** Something under the line has a required, applicable, item-level rule. */
     applies: (ctx) => ctx.values.required > 0,
     state(ctx) {
@@ -270,6 +272,46 @@ export const STAGE_CATALOGUE = [
           message: `${n(missing.length, 'required value')} under line ${ctx.line.line_no} are empty — ${named.join(', ')}${rest > 0 ? ` and ${rest} more` : ''}.`,
         }],
       };
+    },
+  },
+  {
+    key: 'execution_plan',
+    label: 'Execution plan',
+    description: 'How the order is made and shipped: one production order for the whole order, per line, per unit (each span) or per sub-assembly, and the dispatch units. Captured before the design is frozen, and fixed with it.',
+    /**
+     * Something under the line is made, or it is built from a template (user, 2026-10-18). Its own screen sets the
+     * plan for the WHOLE order (lines may differ), so the tabs show the order's roll-up. Done when a plan is saved
+     * and fits the line's structure, or once the line is frozen (its plan is fixed then).
+     */
+    scope: 'order',
+    applies: (ctx) => ctx.made.length > 0 || ctx.fromTemplate,
+    state(ctx) {
+      const p = ctx.plan;
+      const L = ctx.line.line_no;
+      if (ctx.lock.lockedAt) {
+        return { state: 'done', detail: `Fixed at the freeze — ${p ? p.words.charAt(0).toLowerCase() + p.words.slice(1) : 'one production order for the line'}`, blockers: [] };
+      }
+      const rows = ctx.tree ? ctx.tree.stats.nodes - 1 : 0;
+      if (ctx.fromTemplate && rows === 0) {
+        return {
+          state: 'todo',
+          detail: 'Waiting for the structure — the plan picks its levels from it',
+          blockers: [],
+          waitingOn: { stageKey: 'structure', message: 'Draw the structure first — the plan picks its levels from it.' },
+        };
+      }
+      if (!p) return { state: 'todo', detail: 'Not saved yet — the default is one production order per line', blockers: [] };
+      if (p.problems.length) {
+        return { state: 'partial', detail: p.problems[0], blockers: p.problems.map((message) => ({ count: 0, message })) };
+      }
+      if (!p.saved) {
+        return {
+          state: 'todo',
+          detail: `Not saved yet — the default is: ${p.words.charAt(0).toLowerCase()}${p.words.slice(1)}`,
+          blockers: [{ count: 0, message: 'The execution plan is not saved yet. Check it and save it — the default is one production order per line.' }],
+        };
+      }
+      return { state: 'done', detail: `${p.words}${p.source === 'line' ? ` (line ${L}'s own)` : ''}`, blockers: [] };
     },
   },
   {
@@ -312,6 +354,12 @@ export const STAGE_CATALOGUE = [
           count: others.length,
           message: `${n(others.length, 'row')} under line ${L} still need an item chosen before its design can be frozen — ${nameList(others.map(nameOf), 3)}.`,
         });
+      }
+      // The execution plan is fixed by the freeze (§72), so lockLine REFUSES until it is saved (coordinator,
+      // 2026-10-18) — on a process with the Execution plan stage. Prefilled, so saving it is one click.
+      if (ctx.planStage && ctx.plan && !ctx.plan.saved) {
+        waitingOn ??= { stageKey: 'execution_plan', message: 'Save the execution plan first — it is fixed when the design is frozen.' };
+        blockers.push({ count: 0, message: `Line ${L}'s design cannot be frozen until the execution plan is saved. It is filled in already — open the Execution plan step and press Save the plan.` });
       }
       return {
         // Waiting on something is untouched; with nothing in the way, only the act is left.
@@ -460,6 +508,8 @@ export const STAGE_CATALOGUE = [
   },
   {
     key: 'buying',
+    /** The material request is raised for the whole order (OrderPurchasePanel), so the tabs show its roll-up. */
+    scope: 'order',
     // "Instead of 'buying' in sales order, just mention material request" (user, 2026-10-16, §66). The key stays.
     label: 'Material request',
     description: 'The material request (MR): the material the order consumes but does not make — earmarked from stock, bought on purchase orders, or sent by the customer — before production, once the order is confirmed and the design frozen (and nested).',
@@ -598,7 +648,7 @@ export const STAGE_KEYS = STAGE_CATALOGUE.map((s) => s.key);
 
 /** What `GET /stage-catalogue` serves: the kinds a process can be built from. */
 export function stageCatalogue() {
-  return STAGE_CATALOGUE.map(({ key, label, description }) => ({ key, label, description }));
+  return STAGE_CATALOGUE.map(({ key, label, description, scope }) => ({ key, label, description, scope: scope ?? 'line' }));
 }
 
 /**
@@ -698,6 +748,12 @@ export function inCatalogueOrder(stages, keyOf = (s) => s.stageKey) {
   return stages.map((s, i) => ({ s, i })).sort((a, b) => rank(a.s) - rank(b.s) || a.i - b.i).map((x) => x.s);
 }
 
+/** Line items merged into Structure & values (2026-10-18): a process with the one and not the other reads it as Structure. */
+function asMerged(stages) {
+  if (stages.some((s) => s.stage_key === 'structure')) return stages;
+  return stages.map((s) => (s.stage_key === 'lines' ? { ...s, stage_key: 'structure', label: null } : s));
+}
+
 export async function getProcess(db, companyId, id) {
   const p = await requireProcess(db, companyId, id);
   const [stages] = await db.query(
@@ -715,8 +771,9 @@ export async function getProcess(db, companyId, id) {
     name: p.name,
     description: p.description,
     status: p.status,
-    // A retired kind (confirm) is kept in the table and left out here.
-    stages: inCatalogueOrder(stages.filter((s) => !RETIRED_STAGE_KEYS.has(s.stage_key)).map(shapeStage)).map((s, i) => ({ ...s, sequence: i + 1 })),
+    // A retired kind (confirm, cut_pieces, lines) is kept in the table and left out here — except that a process
+    // with Line items and no Structure reads its Line items row AS Structure (they merged, 2026-10-18).
+    stages: inCatalogueOrder(asMerged(stages).filter((s) => !RETIRED_STAGE_KEYS.has(s.stage_key)).map(shapeStage)).map((s, i) => ({ ...s, sequence: i + 1 })),
     rules: rules.get(id) ?? [],
     createdAt: p.created_at,
     updatedAt: p.updated_at,
@@ -1290,8 +1347,9 @@ async function loadOrderContext(db, companyId, order, lines) {
     walk(tree.root);
   }
   const [detailRows] = itemIds.size ? await db.query(
-    `SELECT i.master_id, i.item_type, i.sourcing, i.source_definition_id, m.classification_id, m.code, m.name
+    `SELECT i.master_id, i.item_type, i.sourcing, i.source_definition_id, m.classification_id, m.code, m.name, sd.name AS source_definition_name
        FROM cf_item_details i JOIN cf_master_records m ON m.id = i.master_id
+       LEFT JOIN cf_master_records sd ON sd.id = i.source_definition_id
       WHERE i.company_id = ? AND i.master_id IN (?) AND i.deleted_at IS NULL`,
     [companyId, [...itemIds]],
   ) : [[]];
@@ -1398,7 +1456,7 @@ async function loadOrderContext(db, companyId, order, lines) {
   })();
 
   const [
-    free, ready, rel, lots, spec, [blankRows], [pieceRows], cut, [cutClassRows],
+    free, ready, rel, lots, spec, [blankRows], [pieceRows], cut, [cutClassRows], planRows,
   ] = await Promise.all([
     // 3. Free stock, once, for every item that could be drawn from it.
     itemIds.size ? availability(db, companyId, [...itemIds]) : new Map(),
@@ -1434,6 +1492,8 @@ async function loadOrderContext(db, companyId, order, lines) {
     // The classification a cut plate is filed under, so a selection hanging off
     // one can be told from any other unfinished row.
     db.query("SELECT blanks_node_id AS id FROM cf_cut_places WHERE company_id = ? AND kind = 'plate' AND blanks_node_id IS NOT NULL", [companyId]),
+    // 5g. The execution plan (§72): the order's rows — one read.
+    planRowsOf(db, companyId, [order.id]),
   ]);
 
   // On order = still to come on purchase orders placed with a date-giving status (ordered / part received).
@@ -1474,7 +1534,11 @@ async function loadOrderContext(db, companyId, order, lines) {
     for (const [id, v] of await availability(db, companyId, extra)) free.set(id, v);
   }
 
-  return { trees, detail, free, onOrder, ready, releases, lotsBy, cutPiecesBy, sectionPiecesBy, sectionBy, driftBy, leftOutBy, untrackedBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
+  // Each line's execution plan against its own tree: the definitions the rows were made from are in `detail`.
+  const defOf = (id) => { const d = detail.get(id); return d?.source_definition_id ? { id: Number(d.source_definition_id), name: d.source_definition_name ?? 'Level' } : null; };
+  const planBy = linePlanStates(planRows, lines, trees, defOf);
+
+  return { planBy, trees, detail, free, onOrder, ready, releases, lotsBy, cutPiecesBy, sectionPiecesBy, sectionBy, driftBy, leftOutBy, untrackedBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
 }
 
 /**
@@ -1603,7 +1667,7 @@ function buyRowsOf(ctx, line, material) {
 }
 
 /** One line's slice of the order context — the object every stage is handed. */
-function lineContext(ctx, order, line) {
+function lineContext(ctx, order, line, { planStage = false } = {}) {
   const tree = ctx.trees.get(line.id);
   const split = splitLine(ctx, order, line);
 
@@ -1651,6 +1715,9 @@ function lineContext(ctx, order, line) {
     ...buyRowsOf(ctx, line, split.material),
     today: ctx.ready?.today ?? null,
     lock: { lockedAt: line.locked_at ?? null, pieces: ctx.locksBy.get(line.id)?.pieces ?? 0 },
+    // The execution plan (§72) and whether this process has its stage (Freeze design points at it only then).
+    plan: ctx.planBy?.get(line.id) ?? null,
+    planStage,
     // This line's plate parts, each once, and whether each has its cut piece.
     cut: { parts: [...new Set(split.made.map((x) => x.id))].map((id) => ctx.partById.get(id)).filter(Boolean) },
   };
@@ -1667,8 +1734,12 @@ function lineContext(ctx, order, line) {
  * skipped the work of finding out cannot tell you what changed when somebody
  * switches it back on.
  */
-/** Where a stage is drawn when it is a check on another stage's tab (Values on Structure); absent otherwise. */
-const shownInOf = (kind) => (kind?.shownIn ? { shownIn: kind.shownIn } : {});
+/**
+ * Where a stage is drawn when it is a check on another stage's tab (Values on Structure), and whether its screen is
+ * for the whole ORDER (scope 'order': Structure & values, Execution plan, Material request — the tabs show the
+ * order's roll-up there, and no line picker) or for one line (no scope: Freeze design, Nesting, Production).
+ */
+const shownInOf = (kind) => ({ ...(kind?.shownIn ? { shownIn: kind.shownIn } : {}), ...(kind?.scope ? { scope: kind.scope } : {}) });
 
 function stageForLine(stage, kind, ctx, overrideValue) {
   const label = stage.label || kind.label;
@@ -1725,6 +1796,7 @@ function notApplicableDetail(key, ctx) {
     case 'structure': return 'Sells a catalog item with no BOM — there is nothing under it';
     case 'values': return 'Nothing under this line has a required value to capture';
     case 'lock': return 'Sells a catalog item as it is — only a line built from a template has a structure to lock';
+    case 'execution_plan': return 'Nothing under this line is made, so there is nothing to plan';
     case 'nesting':
       // "No material says yes" sends somebody looking at the plates. If the
       // specification was never created, the plates are not the problem.
@@ -1764,7 +1836,7 @@ function rollUp(stage, kind, perLine) {
       decidedBy: always ? 'always' : 'data',
       state: always ? 'todo' : 'not_applicable',
       detail: always ? 'Nothing sold yet' : 'No line needs it — this order has no lines yet',
-      blockers: always && stage.stage_key === 'lines' ? [{ stageKey: 'lines', count: 0, message: 'This order has no lines.' }] : [],
+      blockers: always && stage.stage_key === 'structure' ? [{ stageKey: 'structure', count: 0, message: 'This order has no lines.' }] : [],
     };
   }
   // Mixed derivation: if ANY line had the answer DECLARED on it, say so — that
@@ -1804,7 +1876,10 @@ function rollUp(stage, kind, perLine) {
     decidedBy,
     state,
     detail,
-    blockers: live.flatMap((x) => x.s.blockers),
+    // An order-wide step (scope 'order') says a thing about the order once, however many lines repeat it.
+    blockers: kind?.scope === 'order'
+      ? [...new Map(live.flatMap((x) => x.s.blockers).map((b) => [b.message, b])).values()]
+      : live.flatMap((x) => x.s.blockers),
     waitingOn: state === 'done' ? null : (worst.s.waitingOn ?? live.find((x) => x.s.waitingOn)?.s.waitingOn ?? null),
   };
 }
@@ -1876,8 +1951,9 @@ export async function orderProcess(db, companyId, orderId) {
   })();
   const [ctx, overrideValues] = await Promise.all([ctxP ?? loadOrderContext(db, companyId, order, lines), overrides]);
 
+  const planStage = stageRows.some((s) => s.stage_key === 'execution_plan');
   const perLine = lines.map((line) => {
-    const lctx = lineContext(ctx, order, line);
+    const lctx = lineContext(ctx, order, line, { planStage });
     return {
       lineId: line.id,
       lineNo: line.line_no,

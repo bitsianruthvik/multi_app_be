@@ -50,6 +50,7 @@ import { carryToRevision as carryCutAllowances } from './cutAllowanceService.js'
 import { getOrder } from './salesOrderService.js';
 import { carryRequisitions, returnRequisitions } from './requisitionLifecycle.js';
 import { copyOrderDefaults } from './orderDefaultService.js';
+import { copyExecutionPlan, retirePlanRowsOfOrder } from './executionPlanService.js';
 
 /** The commercial stages a customer order may be revised in. */
 const REVISABLE = new Set(['inquiry', 'quoted', 'confirmed']);
@@ -194,6 +195,8 @@ export async function reviseOrder(db, c, orderId) {
   // ---- the order's and lines' values for flagged specifications come too (init.sql §65) ----
   // Each line value goes to the line that revises it; the rows already hold what they took (copied above).
   await copyOrderDefaults(db, c, o.id, newId);
+  // ---- the execution plan (init.sql §72): the order's choice, and each line's onto the line that revises it ----
+  await copyExecutionPlan(db, c, o.id, newId);
 
   // ---- the old revision is kept as it was ------------------------------------
   await db.query(
@@ -276,6 +279,7 @@ export async function discardRevision(db, c, orderId) {
       await db.query('UPDATE cf_sales_order_lines SET deleted_at = NOW() WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL', [companyId, part]);
     }
   }
+  await retirePlanRowsOfOrder(db, companyId, o.id);
   await db.query('UPDATE cf_sales_orders SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [companyId, o.id]);
 
   // ---- the revision it replaced is the latest again, as it stood ----------------

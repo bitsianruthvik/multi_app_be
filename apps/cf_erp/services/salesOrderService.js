@@ -44,6 +44,7 @@ import { autofillLineSelections, PARENT_CLASS_JOIN, NOT_UNDER_CUT_PLATE_WHERE } 
 import { CURRENCY, readPrice, readBasis, readCurrency, round2, num, measuresOf, amountOf, listPricesOf } from './priceService.js';
 import { releaseOrderHolds } from './purchaseLinkService.js';
 import { releaseOrderAllocations, retireRequisitionsOfLines } from './requisitionLifecycle.js';
+import { retirePlanRowsOfLines, retirePlanRowsOfOrder } from './executionPlanService.js';
 
 /**
  * Amount per line: Map lineId → { billed, billedUom, amount, amountNote }. One
@@ -301,16 +302,19 @@ function shapeOrder(o) {
  * has no draft life of its own — locking the line activates it (lockService).
  */
 async function structureStats(db, companyId, lineIds) {
-  const out = new Map(lineIds.map((id) => [id, { temporaryItems: 0, unresolvedSelections: 0 }]));
+  const out = new Map(lineIds.map((id) => [id, { temporaryItems: 0, unresolvedSelections: 0, cutPieces: 0 }]));
   if (!lineIds.length) return out;
+  // cutPieces (2026-10-18): a line with cut pieces keeps its number — their codes carry it (reorderLines).
   const [items] = await db.query(
-    `SELECT i.owner_order_line_id AS line_id, COUNT(*) AS n
+    `SELECT i.owner_order_line_id AS line_id, COUNT(DISTINCT i.master_id) AS n,
+            COUNT(DISTINCT CASE WHEN cp.id IS NOT NULL THEN i.master_id END) AS cut
        FROM cf_item_details i JOIN cf_master_records m ON m.id = i.master_id AND m.deleted_at IS NULL
+       LEFT JOIN cf_cut_places cp ON cp.company_id = m.company_id AND cp.blanks_node_id = m.classification_id
       WHERE i.company_id = ? AND i.owner_order_line_id IN (?) AND i.deleted_at IS NULL
       GROUP BY i.owner_order_line_id`,
     [companyId, lineIds],
   );
-  for (const r of items) out.get(r.line_id).temporaryItems = Number(r.n);
+  for (const r of items) { out.get(r.line_id).temporaryItems = Number(r.n); out.get(r.line_id).cutPieces = Number(r.cut); }
   const [sel] = await db.query(
     `SELECT pi.owner_order_line_id AS line_id, COUNT(*) AS n
        FROM cf_bom_lines l
@@ -645,6 +649,7 @@ export async function deleteOrder(db, c, id) {
   // The rows every line owns are retired together, in a handful of statements.
   await retireLineOwnedRows(db, c.companyId, lines.map((l) => l.id));
   for (const l of lines) await removeLineRows(db, c, l.id, { ownedDone: true });
+  await retirePlanRowsOfOrder(db, c.companyId, id);
   await db.query('UPDATE cf_sales_orders SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   return { ok: true };
 }
@@ -785,6 +790,8 @@ async function retireLineOwnedRows(db, companyId, lineIds) {
   if (!lineIds.length) return;
   // The lines' requisitions (§56): their holds are let go, what was coming for them is bought for nobody.
   await retireRequisitionsOfLines(db, companyId, lineIds);
+  // Their own execution plans (init.sql §72).
+  await retirePlanRowsOfLines(db, companyId, lineIds);
   await db.query(
     `UPDATE cf_nest_placements p JOIN cf_plate_lots l ON l.company_id = p.company_id AND l.id = p.plate_lot_id
         SET p.deleted_at = NOW()
@@ -828,6 +835,86 @@ export async function removeOrderLine(db, c, lineId) {
   if (line.locked_at) throw invalid('LOCKED', lockedLineMessage(line.line_no, o.code));
   await removeLineRows(db, c, lineId);
   return getOrder(db, c.companyId, line.order_id);
+}
+
+/**
+ * PUT /orders/:id/line-order { lineIds } — the lines in a new order, from the one Structure & values screen
+ * (user, 2026-10-18: "add/remove/reorder lines right there"). Every live line exactly once. The order's line
+ * numbers stay the same SET — they are handed out again in the new order — so a line numbered 10 / 20 / 30
+ * keeps those numbers. A frozen or released line keeps its own number (its pieces carry it), and so does a line
+ * that already HAS CUT PIECES (their codes carry its line number — coordinator, 2026-10-18); a move that would
+ * renumber one is refused, with the line named and why. Two statements, whatever the number of lines: park the
+ * moving lines on a number nobody uses (−id), then one CASE update.
+ */
+export async function reorderLines(db, c, orderId, input = {}) {
+  const o = await requireOrder(db, c.companyId, orderId, { lock: true });
+  assertOpen(o);
+  const [lines] = await db.query(
+    `SELECT l.id, l.line_no, l.locked_at,
+            (SELECT COUNT(*) FROM cf_production_releases r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL) AS releases,
+            (SELECT COUNT(*) FROM cf_item_details i
+               JOIN cf_master_records m ON m.id = i.master_id AND m.deleted_at IS NULL
+               JOIN cf_cut_places cp ON cp.company_id = m.company_id AND cp.blanks_node_id = m.classification_id
+              WHERE i.company_id = l.company_id AND i.owner_order_line_id = l.id AND i.deleted_at IS NULL) AS cut_pieces
+       FROM cf_sales_order_lines l
+      WHERE l.company_id = ? AND l.order_id = ? AND l.deleted_at IS NULL
+      ORDER BY l.line_no, l.id`,
+    [c.companyId, orderId],
+  );
+  const ids = Array.isArray(input.lineIds) ? input.lineIds.map(Number) : null;
+  const problems = [];
+  if (!ids) problems.push('Send the lines as a list, in their new order.');
+  else {
+    const live = new Set(lines.map((l) => l.id));
+    if (ids.length !== lines.length || new Set(ids).size !== ids.length || ids.some((x) => !live.has(x))) {
+      problems.push(`Send every line of ${o.code} once — ${lines.length} ${lines.length === 1 ? 'line' : 'lines'}.`);
+    }
+  }
+  assertNoProblems(problems);
+  const numbers = lines.map((l) => l.line_no).sort((a, b) => a - b);
+  const byId = new Map(lines.map((l) => [l.id, l]));
+  const moves = ids.map((lineId, i) => ({ line: byId.get(lineId), to: numbers[i] })).filter((m) => m.line.line_no !== m.to);
+  const fixed = moves.filter((m) => m.line.locked_at || Number(m.line.releases) > 0).map((m) => m.line.line_no);
+  if (fixed.length) {
+    throw invalid('LOCKED', `${fixed.length === 1 ? 'Line' : 'Lines'} ${fixed.join(', ')} ${fixed.length === 1 ? 'is' : 'are'} frozen, so ${fixed.length === 1 ? 'its number stays' : 'their numbers stay'}. Move the other lines around ${fixed.length === 1 ? 'it' : 'them'}.`);
+  }
+  const cut = moves.filter((m) => Number(m.line.cut_pieces) > 0).map((m) => m.line.line_no);
+  if (cut.length) {
+    throw invalid('HAS_CUT_PIECES', `${cut.length === 1 ? 'Line' : 'Lines'} ${cut.join(', ')} cannot move: ${cut.length === 1 ? 'its' : 'their'} cut pieces carry ${cut.length === 1 ? 'its' : 'their'} line number. Move the other lines around ${cut.length === 1 ? 'it' : 'them'}.`);
+  }
+  if (moves.length) {
+    const moving = moves.map((m) => m.line.id);
+    await db.query('UPDATE cf_sales_order_lines SET line_no = -id WHERE company_id = ? AND id IN (?)', [c.companyId, moving]);
+    const params = [];
+    const cases = moves.map((m) => { params.push(m.line.id, m.to); return 'WHEN ? THEN ?'; }).join(' ');
+    await db.query(`UPDATE cf_sales_order_lines SET line_no = CASE id ${cases} END WHERE company_id = ? AND id IN (?)`, [...params, c.companyId, moving]);
+  }
+  return getOrder(db, c.companyId, orderId);
+}
+
+/**
+ * GET /orders/:id/structure — the WHOLE order's structure and values in one answer (user, 2026-10-18: the first
+ * step captures the entire order in one view): every line with its own tree (lineStructure's shape), so one
+ * screen can draw all the lines as groups of one grid. Each line's read is lineStructure's own (the values of a
+ * line stay GET /order-lines/:id/values). A read that may write (an editable line's
+ * selections the system can answer are chosen first), so it runs in a transaction when `c` is given.
+ */
+export async function orderStructure(db, companyId, orderId, { c = null } = {}) {
+  const o = await requireOrder(db, companyId, orderId);
+  const [lines] = await db.query(
+    `SELECT l.id, l.line_no, l.line_type, l.item_id, l.quantity, l.locked_at
+       FROM cf_sales_order_lines l WHERE l.company_id = ? AND l.order_id = ? AND l.deleted_at IS NULL ORDER BY l.line_no, l.id`,
+    [companyId, orderId],
+  );
+  const out = [];
+  // One after another inside a transaction (one connection); a structure read may write selections.
+  for (const l of lines) {
+    out.push({
+      lineId: l.id, lineNo: l.line_no, lineType: l.line_type, quantity: Number(l.quantity), frozen: !!l.locked_at,
+      structure: l.item_id ? await lineStructure(db, companyId, l.id, { c }) : null,
+    });
+  }
+  return { order: { id: o.id, code: o.code, status: o.status }, lines: out };
 }
 
 /**

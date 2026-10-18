@@ -50,12 +50,14 @@ const SO = await imp('apps/cf_erp/services/salesOrderService.js');
 const B = await imp('apps/cf_erp/services/bomService.js');
 const AREAS = await imp('apps/cf_erp/services/stockingAreaService.js');
 const BUY = await imp('apps/cf_erp/services/purchaseService.js');
+const EP = await imp('apps/cf_erp/services/executionPlanService.js');
 
 const COMPANY = Number(process.env.CF_FLOW_COMPANY ?? 2);
 const LINE = Number(process.env.CF_FLOW_LINE ?? 923);
 const RUN = `OF${Date.now().toString(36).toUpperCase()}`;
 const EPS = 1e-6;
-const TRAIN = ['lines', 'structure', 'values', 'lock', 'nesting', 'buying', 'production'];
+// Line items merged into Structure & values, and the Execution plan comes before the freeze (2026-10-18).
+const TRAIN = ['structure', 'values', 'execution_plan', 'lock', 'nesting', 'buying', 'production'];
 
 let passed = 0;
 let failed = 0;
@@ -118,10 +120,12 @@ try {
   console.log(`\nCompany ${COMPANY}, ${line.order_code} line ${line.line_no} (${LINE}) — run ${RUN}`);
   // A committed date, so the order can be confirmed (setOrderStatus asks for one).
   await conn.query("UPDATE cf_sales_orders SET committed_date = COALESCE(committed_date, '2026-12-31') WHERE company_id = ? AND id = ?", [COMPANY, line.order_id]);
+  // Freeze design refuses until the execution plan is saved (§72, 2026-10-18): save the prefilled one, as a person would.
+  await EP.saveExecutionPlan(conn, c, line.order_id, {});
 
   /* ---- 1. the train ---------------------------------------------------------- */
   section('1. The stage train');
-  eq('the catalogue is lines, structure, values, freeze, nesting, buying, production — no cut pieces', PROC.STAGE_KEYS, TRAIN);
+  eq('the catalogue is structure, values, execution plan, freeze, nesting, buying, production — no cut pieces, no line items', PROC.STAGE_KEYS, TRAIN);
   ok('cut_pieces is not a stage a process can be built from', !PROC.stageCatalogue().some((s) => s.key === 'cut_pieces'));
   ok('cut_pieces is retired like confirm', PROC.RETIRED_STAGE_KEYS.has('cut_pieces') && PROC.RETIRED_STAGE_KEYS.has('confirm'));
   eq('lock reads "Freeze design"', PROC.stageCatalogue().find((s) => s.key === 'lock')?.label, 'Freeze design');

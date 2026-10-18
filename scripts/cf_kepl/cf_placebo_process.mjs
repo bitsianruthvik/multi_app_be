@@ -36,15 +36,16 @@ const c = { companyId: COMPANY, userId: USER };
 const CODE = 'PRC-SALES';
 
 /** Sequence, key, requirement. Order is the dependency order, not a preference. */
+// 2026-10-18: Line items merged into Structure & values; the Execution plan comes before Freeze design. (Line items,
+// cut_pieces and confirm are retired — processService RETIRED_STAGE_KEYS — and would be dropped if sent.)
 const STAGES = [
-  { stageKey: 'lines', sequence: 10, requirement: 'required' },
-  { stageKey: 'structure', sequence: 20, requirement: 'required' },
-  { stageKey: 'values', sequence: 30, requirement: 'optional' },
-  { stageKey: 'cut_pieces', sequence: 40, requirement: 'required' },
+  { stageKey: 'structure', sequence: 10, requirement: 'required' },
+  { stageKey: 'values', sequence: 20, requirement: 'optional' },
+  { stageKey: 'execution_plan', sequence: 30, requirement: 'required' },
+  { stageKey: 'lock', sequence: 40, requirement: 'required' },
   { stageKey: 'nesting', sequence: 50, requirement: 'required' },
   { stageKey: 'buying', sequence: 60, requirement: 'optional' },
   { stageKey: 'production', sequence: 70, requirement: 'optional' },
-  { stageKey: 'confirm', sequence: 80, requirement: 'required' },
 ];
 
 const conn = await pool.getConnection();

@@ -43,6 +43,7 @@ import { refreshCutPieces, previewCutPieces, cutPartsOf } from './cutPlateServic
 import { problemsOf } from '../lib/cutPlaces.js';
 import { retireCellsOfRetiredPieces } from './workOrderService.js';
 import { ensureLineFlowCopies } from './frozenFlowService.js';
+import { planGate, SAVE_PLAN_FIRST } from './executionPlanService.js';
 import {
   rollOutPlan, codeNodes, seedPieceMemo, siblingLines, positionAmong, lockedPiecesOf, nameOf,
 } from './rollOutService.js';
@@ -170,6 +171,18 @@ async function lockChecks(db, companyId, line, { refreshed = null } = {}) {
     todo: missingOwn === 0 ? null : 'Fill them on the Values stage. The values freeze when the line is locked.',
     problems: missingOwn === 0 ? [] : [`${plural(missingOwn, 'required value')} of line ${line.line_no} ${missingOwn === 1 ? 'is' : 'are'} still empty — ${examples([...new Set(missing)])}.`],
   });
+
+  // 3b. The execution plan (init.sql §72, 2026-10-18): fixed by the freeze, so it must be saved first — when the
+  //     order's process has the Execution plan step. It is prefilled, so saving it is one click.
+  const gate = await planGate(db, companyId, line.order_id);
+  if (gate.required) {
+    add({
+      key: 'execution_plan', ok: gate.saved, title: 'The execution plan is saved', stageKey: 'execution_plan',
+      detail: gate.saved ? 'Saved — it is fixed for this line when the design is frozen.' : 'Not saved yet.',
+      todo: gate.saved ? null : 'Open the Execution plan step and press Save the plan.',
+      problems: gate.saved ? [] : [SAVE_PLAN_FIRST],
+    });
+  }
 
   // 4. The roll-out. Flows and the rows' own draft status are not asked here:
   //    a row is activated by lock, and a flow is release's business.

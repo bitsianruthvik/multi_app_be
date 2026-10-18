@@ -69,7 +69,7 @@ async function family(db, c, tag) {
 /** A process of this run with a Buying stage, to stamp on its orders (orderProcess reads the order's own process). */
 export async function ownProcess(db, c, tag) {
   const prc = await PROC.createProcess(db, c, { code: `${tag}-PRC`, name: `Buying test ${tag}` });
-  await PROC.replaceStages(db, c, prc.id, { stages: ['lines', 'structure', 'values', 'lock', 'nesting', 'buying', 'production'].map((stageKey) => ({ stageKey })) });
+  await PROC.replaceStages(db, c, prc.id, { stages: ['structure', 'values', 'lock', 'nesting', 'buying', 'production'].map((stageKey) => ({ stageKey })) });
   await PROC.setProcessStatus(db, c, prc.id, 'active');
   return prc;
 }

@@ -395,8 +395,9 @@ try {
   // The process was stored as lines, structure, values, cut_pieces, LOCK, NESTING, BUYING, PRODUCTION, confirm; it is read in the order the
   // dependencies demand (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30): freeze, then nesting, then buying, then production — and
   // confirm (the order's status) and cut_pieces (made automatically, 2026-10-02) are not stages, so both are dropped.
-  same('the stages come back in the catalogue order, whatever order they were stored in, without confirm or cut_pieces', procBefore.stages.map((st) => st.stageKey),
-    ['lines', 'structure', 'values', 'lock', 'nesting', 'buying', 'production']);
+  // …and Line items is merged into Structure & values since 2026-10-18, so it is dropped too.
+  same('the stages come back in the catalogue order, whatever order they were stored in, without confirm, cut_pieces or lines', procBefore.stages.map((st) => st.stageKey),
+    ['structure', 'values', 'lock', 'nesting', 'buying', 'production']);
   const nestStage0 = procBefore.lines[0].stages.find((st) => st.stageKey === 'nesting');
   same('Nesting applies to a line with cut plates even with no NESTING specification, and is not done until a plan is saved', [nestStage0?.applies, nestStage0?.state], [true, 'todo']);
   says(nestStage0?.detail);

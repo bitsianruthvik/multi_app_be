@@ -15,6 +15,12 @@
  *   PUT    /order-lines/:id            { quantity?, committedDate?, description?, lineNo?, notes?, rate?, rateBasis? }
  *                                      rate/rateBasis also on a locked or released line (init.sql §36)
  *   DELETE /order-lines/:id            a custom line takes its structure with it
+ *   GET    /orders/:id/structure       the WHOLE order's structure: every line with its tree (lineStructure's shape)
+ *   POST   /orders/:id/structure/changes { dryRun?, lines: [{ lineId, changes }] } — bom-changes for several lines of
+ *                                      the order in ONE transaction: all saved or none (each line's cut pieces follow)
+ *   PUT    /orders/:id/line-order      { lineIds } — the lines in a new order; their numbers are handed out again
+ *   GET    /orders/:id/execution-plan  how the order is made and shipped (executionPlanService, init.sql §72)
+ *   PUT    /orders/:id/execution-plan  { production?, dispatch?, lines?: [{ lineId, own }], dryRun? }
  *   GET    /order-lines/:id/structure  the whole structure the line sells
  *   GET    /order-lines/:id/cut-plates the blanks its plate parts are cut from
  *   POST   /order-lines/:id/cut-plates { flowId? } — work them out again; re-runnable
@@ -24,11 +30,13 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, assertPerm } from '../lib/http.js';
 import {
   listOrders, getOrder, createOrder, updateOrder, setOrderStatus, deleteOrder,
-  addOrderLine, updateOrderLine, removeOrderLine, lineStructure,
+  addOrderLine, updateOrderLine, removeOrderLine, lineStructure, reorderLines, orderStructure,
 } from '../services/salesOrderService.js';
+import { applyOrderStructureChanges } from '../services/orderStructureService.js';
+import { getExecutionPlan, saveExecutionPlan } from '../services/executionPlanService.js';
 import { deriveCutPlates, getCutPlates, setCutPlateFlows } from '../services/cutPlateService.js';
 import { assertLineUnlocked } from '../services/lockService.js';
 import { reviseOrder, discardRevision } from '../services/revisionService.js';
@@ -47,6 +55,17 @@ router.delete('/orders/:id', guard(PERM.orders), handle((req) => tx(req, (db, c)
 // write the whole order in one transaction, so a refusal leaves nothing behind.
 router.post('/orders/:id/revise', guard(PERM.orders), handle((req) => tx(req, (db, c) => reviseOrder(db, c, id(req)))));
 router.delete('/orders/:id/revision', guard(PERM.orders), handle((req) => tx(req, (db, c) => discardRevision(db, c, id(req)))));
+
+router.put('/orders/:id/line-order', guard(PERM.orders), handle((req) => tx(req, (db, c) => reorderLines(db, c, id(req), req.body ?? {}))));
+// The whole order's structure — every line — for the one Structure & values screen. A read that may write (selections), so in a transaction.
+router.get('/orders/:id/structure', guard(PERM.ordersView), handle((req) => tx(req, (db, c) => orderStructure(db, c.companyId, id(req), { c }))));
+// Several lines' structure changes in ONE transaction: a refusal on any line leaves every line as it was.
+router.post('/orders/:id/structure/changes', guard(PERM.orders), handle((req) => tx(req, (db, c) => applyOrderStructureChanges(db, c, id(req), req.body ?? {}, {
+  allow: (bomType) => assertPerm(req, bomType === 'custom' ? PERM.orders : PERM.catalog),
+}))));
+// The execution plan (init.sql §72): how the order is made and shipped. dryRun = the live preview, nothing written.
+router.get('/orders/:id/execution-plan', guard(PERM.ordersView), handle((req) => getExecutionPlan(pool, ctx(req).companyId, id(req))));
+router.put('/orders/:id/execution-plan', guard(PERM.orders), handle((req) => tx(req, (db, c) => saveExecutionPlan(db, c, id(req), req.body ?? {}))));
 
 router.post('/orders/:id/lines', guard(PERM.orders), handle((req) => tx(req, (db, c) => addOrderLine(db, c, id(req), req.body ?? {}))));
 router.put('/order-lines/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => updateOrderLine(db, c, id(req), req.body ?? {}))));

@@ -6417,3 +6417,73 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
       AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
              AND TABLE_NAME IN ('cf_buy_requests','cf_buy_request_lines','cf_buy_request_vendors','cf_buy_request_quotes','cf_purchase_date_changes')) = 5,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §72  SALES ORDER STEPS v2 (2026-10-18): ONE "Structure & values" step for the whole order, then the
+--      EXECUTION PLAN, captured before Freeze design — the same text as TM/s72.sql
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md "2026-10-18 — Sales order steps v2".
+-- Service: executionPlanService.js (GET / PUT /orders/:id/execution-plan); processService stage 'execution_plan'.
+--
+-- User, 2026-10-18: before the design is frozen, say how the order is MADE and how it is SHIPPED.
+--   cf_order_execution_plans   one row per order (order_line_id NULL = the order's own choice, the default for
+--                              every line) and one per line that differs from it. No row at all = the house
+--                              default: one production order per line, dispatched the same way.
+--     production_level         'order' (one production order for every line on this level) · 'line' · 'unit'
+--                              (one per unit of the line: each span of a line of 3) · 'assembly' (one per
+--                              sub-assembly of the BOM level below, plus one for the rest of each unit).
+--     production_level_id      the BOM LEVEL for 'assembly': the definition the rows were made from
+--                              (cf_item_details.source_definition_id), e.g. "Girder line". NULL otherwise.
+--     dispatch_level           'same' (as the production orders) · 'line' · 'unit' · 'assembly' — never coarser
+--                              than the production order (a dispatch unit lies inside one production order).
+--     dispatch_level_id        the BOM level for a dispatch 'assembly'.
+--   A FROZEN line's plan is fixed: a change needs a revision (the revision copies the rows). Nothing builds
+--   production orders from it yet, and nesting is not changed by it yet (later steps: nesting will run per
+--   production order).
+-- Process data (company 30005 only): every process with a Structure or Freeze design stage gets an
+-- 'execution_plan' stage. Its stored sequence is only a position — the stage catalogue orders the stages
+-- when a process is read — so it is placed after the last stored stage. The 'lines' stage is retired in code
+-- (processService RETIRED_STAGE_KEYS): its rows are kept and hidden, nothing is deleted.
+-- TiDB: one CREATE TABLE IF NOT EXISTS; a set-based INSERT … SELECT; no subquery inside a JOIN … ON.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS cf_order_execution_plans (
+  id                  INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT          NOT NULL,
+  order_id            INT          NOT NULL,
+  order_line_id       INT          NULL,               -- NULL = the order's own choice (the default for its lines)
+  production_level    ENUM('order','line','unit','assembly') NOT NULL DEFAULT 'line',
+  production_level_id INT          NULL,               -- 'assembly': the definition the rows were made from
+  dispatch_level      ENUM('same','line','unit','assembly') NOT NULL DEFAULT 'same',
+  dispatch_level_id   INT          NULL,
+  saved_by            INT          NULL,
+  saved_at            DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  deleted_at          DATETIME     DEFAULT NULL,
+  created_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  line_live           INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, COALESCE(order_line_id, 0), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_coep_tenant (company_id, id),
+  UNIQUE KEY uq_coep_line   (company_id, order_id, line_live),
+  KEY idx_coep_line (company_id, order_line_id),
+
+  CONSTRAINT fk_coep_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_coep_order    FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_coep_line     FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id),
+  CONSTRAINT fk_coep_plevel   FOREIGN KEY (company_id, production_level_id) REFERENCES cf_master_records(company_id, id),
+  CONSTRAINT fk_coep_dlevel   FOREIGN KEY (company_id, dispatch_level_id) REFERENCES cf_master_records(company_id, id),
+  CONSTRAINT fk_coep_saver    FOREIGN KEY (saved_by) REFERENCES users(id)
+);
+
+-- The Execution plan stage, for Placebo's processes that have a Structure or Freeze design stage and none yet.
+INSERT INTO cf_process_stages (company_id, process_id, stage_key, sequence, requirement)
+SELECT s.company_id, s.process_id, 'execution_plan', MAX(s.sequence) + 1, 'required'
+  FROM cf_process_stages s
+ WHERE s.company_id = 30005 AND s.deleted_at IS NULL
+ GROUP BY s.company_id, s.process_id
+HAVING SUM(s.stage_key IN ('structure', 'lock')) > 0 AND SUM(s.stage_key = 'execution_plan') = 0;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_order_execution_plans'
+             AND COLUMN_NAME IN ('order_id','order_line_id','production_level','production_level_id','dispatch_level','dispatch_level_id','saved_by','saved_at','line_live')) = 9,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
