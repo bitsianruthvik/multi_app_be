@@ -624,8 +624,8 @@ export function readNif(buffer, { filename } = {}) {
         throw failed('inside plate', where, `its plate is not lying at the corner the pieces are measured from (${r4(PW)} × ${r4(PH)} mm expected)`, { nestNo });
       }
     }
-    checks += 1;
-    if (quantity !== plate.quantity) throw failed('counts', where, `it is to be cut ${quantity} times and its plate is counted ${plate.quantity} times`, { nestNo });
+    // A plate record may be shared by several nests (VRC 12 mm job: nests 1, 2 and 3 on one record
+    // counted 6 = 1 + 1 + 4, 2026-10-18): the counts are checked per plate record after the loop.
 
     // What ProNest cached for the nest (optional: it leaves the block empty on some nests).
     let outputFile = null; let utilisationStored = null;
@@ -721,6 +721,18 @@ export function readNif(buffer, { filename } = {}) {
     const steel = pieces.reduce((a, q) => a + q.part.areaIn2 * IN * IN, 0);
     const used = pieces.length ? [Math.min(...pieces.map((q) => q.box[0])), Math.min(...pieces.map((q) => q.box[1])), Math.max(...pieces.map((q) => q.box[2])), Math.max(...pieces.map((q) => q.box[3]))] : null;
     nests.push({ nestNo, quantity, plate, pieces, clcGroups, outputFile, utilisationStored, steel, used });
+  }
+
+  // Every plate record is cut as often as the nests that use it, added up.
+  {
+    const cut = new Map();
+    for (const n of nests) { const g = cut.get(n.plate) ?? { sum: 0, nos: [] }; g.sum += n.quantity; g.nos.push(n.nestNo); cut.set(n.plate, g); }
+    for (const [plate, g] of cut) {
+      checks += 1;
+      if (g.sum !== plate.quantity) {
+        throw failed('counts', `nest${g.nos.length > 1 ? 's' : ''} ${g.nos.join(', ')}`, `${g.nos.length > 1 ? 'they are' : 'it is'} to be cut ${g.sum} times and ${g.nos.length > 1 ? 'their' : 'its'} plate is counted ${plate.quantity} times`, { nestNo: g.nos[0] });
+      }
+    }
   }
 
   // ---- what is nested, counted, is what the part headers say ----------------------

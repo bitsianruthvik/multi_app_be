@@ -296,6 +296,15 @@ section('6. Fuzz — truncations, bit flips and smeared bytes of the six real fi
     ok('part in part: stiffeners nested in a web\'s opening are not an overlap (NithinSai 12 mm job reads)', r.code === 'ok', `${r.code}: ${r.message}`);
   } else console.log('  SKIP  part in part (TM/NITHINSAI_36M_NESTING_NIF not present)');
 }
+// Shared plate records (2026-10-18): the VRC 12 mm job's nests 1, 2 and 3 share one plate record
+// counted 6 = 1 + 1 + 4. The count is checked per plate record, not per nest.
+{
+  const f = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../VRC_36M_NESTING_NIF/12MM-VRC-36MTR.nif');
+  if (fs.existsSync(f)) {
+    const r = outcome(fs.readFileSync(f), '12MM-VRC-36MTR.nif');
+    ok('shared plate record: nests on one plate record add up to its count (VRC 12 mm job reads)', r.code === 'ok', `${r.code}: ${r.message}`);
+  } else console.log('  SKIP  shared plate record (TM/VRC_36M_NESTING_NIF not present)');
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
