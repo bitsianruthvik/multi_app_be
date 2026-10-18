@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Router } from 'express';
 import { pool } from '../../../db.js';
-import { DATASETS, byKey, pathFor, keyOf, dateOf } from '../lib/datasets.js';
+import { DATASETS, byKey, pathFor, keyOf, dateOf, flatten } from '../lib/datasets.js';
 import { invalidate } from '../services/reportService.js';
 
 /**
@@ -72,22 +72,28 @@ async function connectorAuth(req, res, next) {
 }
 
 router.get('/connector/plan', connectorAuth, async (req, res) => {
-  const [state] = await pool.query('SELECT dataset, since_date FROM kd_dataset_state WHERE company_id = ?', [req.company.id]);
+  const [state] = await pool.query('SELECT dataset, since_date, last_ok_at FROM kd_dataset_state WHERE company_id = ?', [req.company.id]);
   const since = Object.fromEntries(state.map((s) => [s.dataset, s.since_date]));
+  const lastOk = Object.fromEntries(state.map((s) => [s.dataset, s.last_ok_at]));
+  // A dataset with everyMinutes waits until its last good read is that old.
+  const due = (d) => !d.everyMinutes || !lastOk[d.key]
+    || Date.now() - new Date(lastOk[d.key]).getTime() >= (d.everyMinutes - 2) * 60000;
   res.json({
     intervalMin: INTERVAL_MIN,
     pageSize: 500,
     // full: the connector gathers every page and pushes once (see /push).
-    datasets: DATASETS.map((d) => ({ key: d.key, path: pathFor(d, since[d.key]), full: !!d.full })),
+    datasets: DATASETS.filter(due).map((d) => ({ key: d.key, path: pathFor(d, since[d.key]), full: !!d.full })),
   });
 });
 
 router.post('/connector/push', connectorAuth, async (req, res) => {
   const { dataset, pages, done, startedAt } = req.body || {};
   // The connector forwards SAP's pages untouched; the rows are each page's "value".
-  const rows = Array.isArray(pages) ? pages.flatMap((p) => (Array.isArray(p?.value) ? p.value : [])) : req.body?.rows;
   const ds = byKey[dataset];
-  if (!ds || !Array.isArray(rows)) return res.status(400).json({ error: 'dataset and rows[] are required.' });
+  const raw = Array.isArray(pages) ? pages.flatMap((p) => (Array.isArray(p?.value) ? p.value : [])) : req.body?.rows;
+  if (!ds || !Array.isArray(raw)) return res.status(400).json({ error: 'dataset and rows[] are required.' });
+  // Line datasets arrive as crossjoin pairs; keep one flat record per line.
+  const rows = raw.map((r) => (r && typeof r === 'object' ? flatten(ds, r) : r));
   const cid = req.company.id;
   for (let i = 0; i < rows.length; i += 500) {
     const chunk = rows.slice(i, i + 500).filter((r) => r && typeof r === 'object');
@@ -117,7 +123,7 @@ router.post('/connector/push', connectorAuth, async (req, res) => {
        VALUES (?, ?, ?, NOW(), NULL, ?)
        ON DUPLICATE KEY UPDATE since_date = VALUES(since_date), last_ok_at = NOW(), last_error = NULL, last_rows = VALUES(last_rows)`,
       [cid, ds.key, since, n]);
-    invalidate(cid);
+    invalidate(cid, ds.key);
   }
   res.json({ ok: true, stored: rows.length });
 });
