@@ -47,6 +47,8 @@ export const SHOP_DEFAULTS = Object.freeze({
 });
 
 import { invalid, conflict } from '../lib/errors.js';
+import { GRADE_RULES, DEFAULT_GRADE_RULE, IMPACT_ORDER_WORDS } from '../lib/plateGrade.js';
+import { customPlateInput } from './nestCustomPlate.js';
 
 /** The columns of cf_nest_shop_rules ↔ the rule names. */
 const COLS = Object.freeze({
@@ -150,20 +152,30 @@ export async function readShopRules(db, companyId) {
   let on = false;
   // §83 (2026-10-18): the plate-size limit rides on the same read; null = the default (nestCost: 2), 0 = no limit.
   let maxPlateSizes = null; let sizesSchema = true;
+  // §90 (2026-10-19): the grade / impact rule and the custom plate sizes ride on the same read.
+  let gradeRule = null; let customPlates = null; let plateSchema = true;
   try {
     let s;
     try {
-      [[s]] = await db.query('SELECT nest_shop_spacing, nest_max_plate_sizes FROM cf_company_settings WHERE company_id = ?', [companyId]);
-    } catch (e) {
-      if (!isMissing(e)) throw e;
-      sizesSchema = false;
-      [[s]] = await db.query('SELECT nest_shop_spacing FROM cf_company_settings WHERE company_id = ?', [companyId]);
+      [[s]] = await db.query('SELECT nest_shop_spacing, nest_max_plate_sizes, nest_grade_rule, nest_custom_plates FROM cf_company_settings WHERE company_id = ?', [companyId]);
+    } catch (e0) {
+      if (!isMissing(e0)) throw e0;
+      plateSchema = false;
+      try {
+        [[s]] = await db.query('SELECT nest_shop_spacing, nest_max_plate_sizes FROM cf_company_settings WHERE company_id = ?', [companyId]);
+      } catch (e) {
+        if (!isMissing(e)) throw e;
+        sizesSchema = false;
+        [[s]] = await db.query('SELECT nest_shop_spacing FROM cf_company_settings WHERE company_id = ?', [companyId]);
+      }
     }
+    gradeRule = s?.nest_grade_rule ?? null;
+    customPlates = s?.nest_custom_plates ?? null;
     on = !!Number(s?.nest_shop_spacing ?? 0);
     maxPlateSizes = s?.nest_max_plate_sizes == null ? null : Number(s.nest_max_plate_sizes);
   } catch (e) {
     if (!isMissing(e)) throw e;
-    return { on: false, rows: [], schema: false, maxPlateSizes: null, sizesSchema: false };
+    return { on: false, rows: [], schema: false, maxPlateSizes: null, sizesSchema: false, plateSchema: false, gradeRule: null, customPlates: null };
   }
   try {
     const [rows] = await db.query(
@@ -171,10 +183,10 @@ export async function readShopRules(db, companyId) {
          FROM cf_nest_shop_rules WHERE company_id = ? AND deleted_at IS NULL ORDER BY thickness_mm`,
       [companyId],
     );
-    return { on, rows, schema: true, maxPlateSizes, sizesSchema };
+    return { on, rows, schema: true, maxPlateSizes, sizesSchema, plateSchema, gradeRule, customPlates };
   } catch (e) {
     if (!isMissing(e)) throw e;
-    return { on: false, rows: [], schema: false, maxPlateSizes, sizesSchema };
+    return { on: false, rows: [], schema: false, maxPlateSizes, sizesSchema, plateSchema, gradeRule, customPlates };
   }
 }
 
@@ -199,6 +211,14 @@ export async function getShopRules(db, companyId) {
     maxPlateSizes: s.maxPlateSizes ?? null,
     maxPlateSizesDefault: 2,
     sizesSchema: !!s.sizesSchema,
+    // §90: which plate may carry a piece (null = 'warn': the 'better' check shown, never refused) and the custom plate sizes
+    // the AI may propose ({ on, maxLength, maxWidth, minLength, minWidth, step }; on false / null = off).
+    plateSchema: !!s.plateSchema,
+    gradeRule: s.gradeRule ?? null,
+    gradeRuleDefault: DEFAULT_GRADE_RULE,
+    gradeRules: GRADE_RULES,
+    impactOrder: IMPACT_ORDER_WORDS,
+    customPlates: customView(s.customPlates),
     defaults: { ...SHOP_DEFAULTS, kerf: SHOP_KERF_POINTS },
     rows: s.rows.map((r) => ({ id: r.id, thicknessMm: Number(r.thickness_mm), ...Object.fromEntries(SHOP_RULE_FIELDS.map((f) => [f, num(r[COLS[f]])])), notes: r.notes ?? null })),
     resolved: thick.map((t) => shopRulesFor(t, s.rows)),
@@ -206,6 +226,14 @@ export async function getShopRules(db, companyId) {
 }
 
 const bad = (msg) => invalid('INVALID_SHOP_RULES', msg);
+
+/** The custom-plate setting as the screen reads it: { on, maxLength, maxWidth, minLength, minWidth, step } (blank = null). */
+function customView(v) {
+  let o = v;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { o = null; } }
+  const n = (x) => (x == null || x === '' || !(Number(x) > 0) ? null : Number(x));
+  return { on: !!(o && (o.on === true || o.on === 1)), maxLength: n(o?.maxLength), maxWidth: n(o?.maxWidth), minLength: n(o?.minLength), minWidth: n(o?.minWidth), step: n(o?.step) };
+}
 
 /**
  * Save the whole setting: `{ on?: boolean, maxPlateSizes?: number|null, rows?: [{ thicknessMm, kerfMm?, edgeMarginMm?, … }] }`.
@@ -225,6 +253,19 @@ export async function saveShopRules(db, c, input = {}) {
       `INSERT INTO cf_company_settings (company_id, nest_max_plate_sizes, updated_by) VALUES (?, ?, ?)
        ON DUPLICATE KEY UPDATE nest_max_plate_sizes = VALUES(nest_max_plate_sizes), updated_by = VALUES(updated_by)`,
       [companyId, v, c.userId ?? null],
+    );
+  }
+  // §90: the grade rule and the custom plate sizes (one statement for both, only when either is sent).
+  if (input.gradeRule !== undefined || input.customPlates !== undefined) {
+    if (!s.plateSchema) throw conflict('SCHEMA_MISSING', 'The grade rule and custom plate sizes need init.sql §90 (TM/s90.sql) applied to this database first.');
+    const rule = input.gradeRule == null || input.gradeRule === '' ? null : String(input.gradeRule).toLowerCase();
+    if (rule != null && !GRADE_RULES.includes(rule)) throw bad(`Grade rule: one of ${GRADE_RULES.join(', ')}, or blank for the default (warn).`);
+    const cp = input.customPlates === undefined ? { value: s.customPlates == null ? null : (typeof s.customPlates === 'string' ? s.customPlates : JSON.stringify(s.customPlates)), problems: [] } : customPlateInput(input.customPlates);
+    if (cp.problems.length) throw bad(`Custom plate sizes: ${cp.problems.join(' ')}`);
+    await db.query(
+      `INSERT INTO cf_company_settings (company_id, nest_grade_rule, nest_custom_plates, updated_by) VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE nest_grade_rule = VALUES(nest_grade_rule), nest_custom_plates = VALUES(nest_custom_plates), updated_by = VALUES(updated_by)`,
+      [companyId, input.gradeRule === undefined ? s.gradeRule ?? null : rule, cp.value, c.userId ?? null],
     );
   }
   if (input.on != null) {

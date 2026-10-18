@@ -100,12 +100,13 @@ import { drawnLengthsOf } from './cutAllowanceService.js';
 import { writePlateCuts } from './plateCutsService.js';
 import {
   importContext, importBlocker, requireLine, assertNestable, pickCutSettings, wasteOfLot, offcutLetters, writeLots, clearLots,
-  replaceAreaFractions, autoLotNumbers, agrees, kgOf, lineHead, exclusionsOfLine, DEFAULT_CUT_SETTINGS,
+  replaceAreaFractions, autoLotNumbers, agrees, gradeOk, kgOf, lineHead, exclusionsOfLine, DEFAULT_CUT_SETTINGS,
   savedLotsOf, isUploadedPiece, relotMany, wastesOf,
 } from './nestingService.js';
 import { measurePlates } from './nestMeasure.js';
 import { memoryRun, blocksLineWrites } from './nestRunService.js';
 import { missingPlatesOf } from './nestPlateCatalogService.js';
+import { fits as gradeFits, needWords, blocks as blocksGrade, IMPACT_ORDER_WORDS } from '../lib/plateGrade.js';
 import { untrackedOfLine, effectiveUntracked, shrunkUntracked } from '../lib/nestUntracked.js';
 
 export { savedLotsOf, isUploadedPiece };
@@ -386,6 +387,13 @@ function resolvePlate({ file, nest, placed, ctx }) {
     const same = hits.filter((p) => norm(p.steel.impactClass) === impact);
     const mixed = new Set(steels.map((s) => norm(s.impactClass)).filter((v) => v != null)).size > 1;
     if (same.length >= 1 && same.length < hits.length && !mixed) { hits = same; byImpact = true; }
+    // §90: pieces of mixed classes on one nest — the ONE plate of that size that holds every one of them (BR and BO
+    // pieces: the BO plate, under the default rule) is the plate; still more than one, the file has to name it.
+    if (mixed && hits.length > 1) {
+      const rule = ctx.settingRows?.gradeRule ?? 'warn';
+      const all = hits.filter((p) => steels.every((s) => { const v = gradeFits(p.steel, s, rule); return v.ok && v.sure; }));
+      if (all.length === 1) { hits = all; byImpact = true; }
+    }
   }
   if (hits.length > 1) {
     return { error: { code: 'PLATE_AMBIGUOUS', message: `${sizeWords}${thickness != null ? ` at ${fmt(thickness)} mm` : ''} is ${plural(hits.length, 'catalog plate', 'catalog plates')} (${hits.map((p) => `${p.code}${p.steel.grade ? ` ${p.steel.grade}` : ''}`).join(', ')}) — name the one you mean (plateCode).`, choices: hits.map((p) => p.code) } };
@@ -782,6 +790,9 @@ function prepareFile(file, ctx, choices) {
     // ---- the steel has to agree, part by part ---------------------------------
     if (plate) {
       const thinner = new Map();                      // cut plate id → { cp, parts } — ProNest: a piece cut from the next plate up
+      const gradeRule = ctx.settingRows?.gradeRule ?? 'warn';
+      const impactUnknown = new Set();                // the classes asked of a plate that states none
+      const impactWarn = new Map();                   // 'warn': cut piece code → what does not match (said, not refused)
       for (const pl of placed) {
         const s = pl.cp.steel;
         const by = thinnerBy(pl.cp);
@@ -789,9 +800,19 @@ function prepareFile(file, ctx, choices) {
           if (!thinner.has(pl.cp.id)) thinner.set(pl.cp.id, { cp: pl.cp, parts: [] });
           thinner.get(pl.cp.id).parts.push(pl.partId);
         } else if (Math.abs(s.thickness - plate.steel.thickness) > 0.0005) partErr('PART_WRONG_THICKNESS', pl.part, `${pl.cp.code} is ${fmt(s.thickness)} mm and ${plate.code} is ${fmt(plate.steel.thickness)} mm, so it cannot be cut from it.`, { cutPlateCode: pl.cp.code });
-        else if (!agrees(plate.steel.grade, s.grade)) partErr('PART_WRONG_GRADE', pl.part, `${pl.cp.code} is ${s.grade ?? 'of no stated grade'} and ${plate.code} is ${plate.steel.grade}. A nest cannot mix grades.`, { cutPlateCode: pl.cp.code });
+        else if (!gradeOk(plate.steel, s, gradeRule)) partErr('PART_WRONG_GRADE', pl.part, `${pl.cp.code} is ${s.grade ?? 'of no stated grade'} and ${plate.code} is ${plate.steel.grade}. A nest cannot mix grades.`, { cutPlateCode: pl.cp.code });
         else if (!agrees(plate.steel.material, s.material)) partErr('PART_WRONG_GRADE', pl.part, `${pl.cp.code} is ${s.material ?? 'of no stated material'} and ${plate.code} is ${plate.steel.material}.`, { cutPlateCode: pl.cp.code });
+        else {
+          // §90 (item 22): the impact class — a plate of a class the piece may not be cut from is refused, naming both;
+          // a plate that states none where the piece asks one is said once a plate (a note), never refused.
+          const v = gradeFits(plate.steel, s, gradeRule);
+          if (!v.ok && v.code === 'IMPACT' && !blocksGrade(gradeRule)) impactWarn.set(pl.cp.code, `${pl.cp.code} (${needWords(s)}): ${v.why}`);
+          else if (!v.ok && v.code === 'IMPACT') partErr('PART_WRONG_IMPACT', pl.part, `${pl.cp.code} needs ${needWords(s)} and ${plate.code} is ${needWords(plate.steel)}: ${v.why}. Nest it on a plate of that impact class${gradeRule === 'exact' ? '' : ' or better'} (${IMPACT_ORDER_WORDS}), or name another plate.`, { cutPlateCode: pl.cp.code, need: needWords(s), plateClass: plate.steel.impactClass ?? null });
+          else if (v.ok && !v.sure) impactUnknown.add(needWords(s));
+        }
       }
+      if (impactWarn.size) entry.notes.push(`Impact class does not match on ${plate.code} (${needWords(plate.steel)}): ${[...impactWarn.values()].join('; ')}. Saved anyway — the company's rule only warns (Setup › Cutting).`);
+      if (impactUnknown.size) entry.notes.push(`Impact class not checked: the pieces need ${[...impactUnknown].join(', ')} and ${plate.code} does not state an impact class — check the mill certificate, or give the plate its impact class in Items.`);
       for (const { cp, parts } of thinner.values()) {
         warn('PART_THINNER_THAN_PLATE', `${cp.code} is ${fmt(cp.steel.thickness)} mm and is nested on ${fmt(plate.steel.thickness)} mm plate (${plural(parts.length, 'piece', 'pieces')}). A piece may be cut from the next plate up — it is then ${fmt(plate.steel.thickness)} mm thick, not ${fmt(cp.steel.thickness)} — so check that is meant, then save anyway. The cut piece keeps its own thickness and weight.`,
           { cutPlateId: cp.id, cutPlateCode: cp.code, cutPlateThickness: cp.steel.thickness, plateThickness: plate.steel.thickness, parts });

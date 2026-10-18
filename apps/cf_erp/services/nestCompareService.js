@@ -59,6 +59,7 @@ import { startRun, memoryRun, snapshot, unpackPlan, packPlan, resumeRun, settleR
 // §87 (2026-10-18): the AI alternative stored beside the uploaded nesting, and which of the two is the main one.
 import { readAlternative, recordAlternativeRun, alternativeView } from './nestAlternativeService.js';
 import { savedLotsOf as savedLotsById } from './nestingService.js';
+import { gradeCheck } from '../lib/plateGrade.js';
 
 const WASTE_KEYS = ['kerf', 'sequenceGaps', 'rim', 'offcut', 'wastage'];
 const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
@@ -108,6 +109,8 @@ const fromPlanNest = (n, g) => ({
   free: n.layout === 'free',
   pieces: (n.pieces ?? []).map((p, i) => ({ key: i, cutPlateId: p.cutPlateId, x: p.x, y: p.y, length: p.length, width: p.width, rotationDeg: p.rotationDeg ?? (p.rotated ? 90 : 0), rings: p.rings ?? null })),
   waste: n.waste, wasteKg: n.wasteKg, partsKg: n.partsKg, offcuts: n.offcuts ?? [],
+  // §90: a plate of a custom size the AI proposed (no catalog plate yet unless `inCatalog`).
+  customPlate: n.customPlate ?? null,
 });
 
 /** Saved lots as the measures read them — [[lot, pieces], …] — measured together, off this thread. */
@@ -148,8 +151,11 @@ export async function nestingMetrics(nests, { facts, sizeOf, costs, cuts: withCu
     }
     let plateCost = null; let basis = null;
     if (n.ownerPartyId) { plateCost = 0; basis = "the customer's own plate"; customerPlates += 1; } else {
-      const c = costs.get(Number(n.plateItemId));
-      if (c?.unit != null) { plateCost = c.unit; basis = c.basis; bases.add(c.basis); cost += c.unit; } else if (!uncosted.includes(n.plateCode ?? `plate ${n.plateItemId}`)) uncosted.push(n.plateCode ?? `plate ${n.plateItemId}`);
+      // §90: a custom size not in the catalog yet is priced at the per-kg rate of the plate it replaces.
+      const custom = n.customPlate && (n.plateItemId == null || n.plateItemId === '');
+      const c = costs.get(Number(custom ? n.customPlate.replaces?.plateItemId : n.plateItemId));
+      const unit = custom ? (c?.perKg != null && plateKg > 0 ? r2(c.perKg * plateKg) : null) : c?.unit;
+      if (unit != null) { plateCost = unit; basis = custom ? `${c.basis} (the rate of the plate it replaces)` : c.basis; bases.add(c.basis); cost += unit; } else if (!uncosted.includes(n.plateCode ?? `plate ${n.plateItemId}`)) uncosted.push(n.plateCode ?? `plate ${n.plateItemId}`);
     }
     perPlate.push({
       lotNo: n.lotNo, lotId: n.lotId ?? null, origin: n.origin ?? null, file: n.sourceFile ?? null,
@@ -160,6 +166,8 @@ export async function nestingMetrics(nests, { facts, sizeOf, costs, cuts: withCu
       wastePct: plateKg > 0 ? r3(((plateKg - Number(n.partsKg ?? 0)) / plateKg) * 100) : null,
       wasteKg: Object.fromEntries(WASTE_KEYS.map((k) => [k, r3(Number(n.wasteKg?.[k] ?? 0))])),
       offcuts: (n.offcuts ?? []).length, offcutKg: r3(offKg), cost: plateCost, costBasis: basis,
+      // §90: a custom plate size — 'not in the catalog yet' until the nesting is used (inCatalog false).
+      custom: n.customPlate ? { inCatalog: !!n.customPlate.inCatalog, length: n.customPlate.length, width: n.customPlate.width, grade: n.customPlate.grade ?? null, impactClass: n.customPlate.impactClass ?? null, replaces: n.customPlate.replaces ?? null } : null,
     });
   }
   // `cuts: false` (the plate-change sheet, which shows no cut length): the true-shape cut walk is skipped — null below.
@@ -182,6 +190,20 @@ export async function nestingMetrics(nests, { facts, sizeOf, costs, cuts: withCu
     },
     perPlate,
   };
+}
+
+/**
+ * §90 (item 22): the grade check of one side's plates (lib/plateGrade.gradeCheck) — each piece's steel (its cut plate)
+ * against its plate's (the catalog plate; a custom size not in the catalog yet carries its own). A plate the catalog no
+ * longer has is left out (nothing to say of it). → (nests) → { ok, rule, mismatches, unknown, substitutes, sentence }
+ */
+function sideGrade(plates, cpById, rule) {
+  const byId = new Map((plates ?? []).map((p) => [Number(p.id), p]));
+  return (nests) => gradeCheck(nests.map((n) => {
+    const plate = n.customPlate && (n.plateItemId == null || n.plateItemId === '') ? n.customPlate : byId.get(Number(n.plateItemId))?.steel;
+    if (!plate) return null;
+    return { lotNo: n.lotNo, plateCode: n.plateCode, plate, pieces: n.pieces.map((p) => { const cp = cpById.get(Number(p.cutPlateId)); return { cutPlateId: p.cutPlateId, code: cp?.code ?? null, steel: cp?.steel ?? {} }; }) };
+  }).filter(Boolean), rule);
 }
 
 const nestsOfPlan = (plan) => (plan?.groups ?? []).flatMap((g) => (g.nests ?? []).map((n) => fromPlanNest(n, g)));
@@ -416,17 +438,21 @@ export async function getCompare(db, companyId, lineId, { with: other = 'auto', 
   ], st.mctx);
   const upNests = bothSides.slice(0, st.uploadedLots.length);
   const savedNests = bothSides.slice(st.uploadedLots.length);
-  const plateIds = new Set([...autoNests, ...lineNests, ...upNests, ...savedNests].map((n) => Number(n.plateItemId)));
+  const plateIds = new Set([...autoNests, ...lineNests, ...upNests, ...savedNests].map((n) => Number(n.plateItemId ?? n.customPlate?.replaces?.plateItemId)));
   const costs = await plateCosts(db, companyId, ctx.line, ctx.plates.filter((p) => plateIds.has(Number(p.id))));
   const measure = (nests) => nestingMetrics(nests, { facts: st.facts, sizeOf, costs });
 
-  const uploaded = upNests.length ? { ...(await measure(upNests)), files: st.uploadedLots.map((l) => ({ lotId: l.id, lotNo: l.lotNo, filename: l.sourceFile, sourceKind: l.sourceKind })) } : null;
+  // §90 (item 22): grade / impact class of every piece against its plate, on both sides, by the company's rule.
+  const gradeOf = sideGrade(ctx.plates, st.cpById, ctx.settingRows?.gradeRule);
+  const uploaded = upNests.length ? { ...(await measure(upNests)), gradeCheck: gradeOf(upNests), files: st.uploadedLots.map((l) => ({ lotId: l.id, lotNo: l.lotNo, filename: l.sourceFile, sourceKind: l.sourceKind })) } : null;
   const running = st.mem?.status === 'running' && st.mem.purpose === 'compare' ? snapshot(st.mem) : null;
   const sideOf = async (row, plan, nests) => {
     if (!row || !plan) return null;
     const m = await measure(nests);
     return {
       ...describeRun(row), metrics: m.metrics, perPlate: m.perPlate,
+      // §90: grade / impact class on this side, and the custom plate sizes it proposes ("custom size, not in the catalog yet").
+      gradeCheck: gradeOf(nests), customPlates: plan.customPlates ?? [],
       unplaced: (plan.groups ?? []).flatMap((g) => g.unplaced ?? []), problems: plan.problems ?? [],
       // 2026-10-16: it was told "stop and use this" (a person started a nesting run, or pressed Stop): its best so far.
       stoppedEarly: plan.budget?.stopped === true,

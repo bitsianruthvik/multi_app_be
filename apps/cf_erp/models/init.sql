@@ -8035,3 +8035,33 @@ CREATE TABLE IF NOT EXISTS cf_nest_alternatives (
 SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
              AND TABLE_NAME = 'cf_nest_alternatives') = 1,
           'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §90  AI NESTING — GRADE / IMPACT RULE and CUSTOM PLATE SIZES (2026-10-19)
+-- The same text as TM/s90.sql. Additive and guarded: safe to re-run. Two company settings (Setup › Cutting):
+--
+--   cf_company_settings.nest_grade_rule     which plate may carry a piece (lib/plateGrade.js): NULL / 'warn' = the check is
+--                                           shown, never refused (the default);
+--                                           'better' = the piece's grade, its impact class or a better one
+--                                           (A < BR < BO/B0 < C); 'exact' = grade and impact class exactly;
+--                                           'higher' = a higher grade of the same family may stand in, impact as 'better'.
+--   cf_company_settings.nest_custom_plates  the AI may propose ONE custom plate size per steel, within the mill's
+--                                           sizes (services/nestCustomPlate.js), added to the catalog when that
+--                                           nesting is used. JSON { on, maxLength, maxWidth, minLength, minWidth, step }
+--                                           (mm; a blank limit = the catalog's own range). NULL = off.
+-- The code works without these columns (rule 'warn', no custom sizes): one failed read per plan read.
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'nest_grade_rule');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN nest_grade_rule VARCHAR(16) NULL DEFAULT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'nest_custom_plates');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN nest_custom_plates JSON NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME IN ('nest_grade_rule', 'nest_custom_plates')) = 2,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

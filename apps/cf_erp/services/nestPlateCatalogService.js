@@ -438,6 +438,18 @@ export async function createNestPlates(db, c, lineId, input = {}) {
     return { dryRun, created, skipped, message: say(created) };
   }
 
+  await writeNewPlates(db, c, make);
+  const created = make.map((p) => ({ key: p.key, itemId: p.id, code: p.code, name: p.name, kind: p.kind }));
+  return { dryRun: false, created, skipped, message: say(created) };
+}
+
+
+/**
+ * Writes planned plates (planPlates entries, nothing wrong with them), all of them in a fixed number of round trips: a
+ * running number drawn per plate where the coding rule has one, then the records, their ids read back by code, the item
+ * details, the values and their history. Sets `p.id` on each.
+ */
+async function writeNewPlates(db, c, make) {
   // ---- a code its rule numbers is drawn now, for real (one plate at a time: the number is the point) ----
   for (const p of make) {
     if (p.askedCode || !p.codeRule?.numbered) continue;
@@ -479,8 +491,44 @@ export async function createNestPlates(db, c, lineId, input = {}) {
         option_id: v.typed.option_id, json: v.typed.value_json, uom: v.uom, source: v.source,
       }), c.userId ?? null]));
   }
-  const created = make.map((p) => ({ key: p.key, itemId: p.id, code: p.code, name: p.name, kind: p.kind }));
-  return { dryRun: false, created, skipped, message: say(created) };
 }
 
+/**
+ * §90 (2026-10-19, item 20) — the CUSTOM plate sizes of an accepted AI nesting, made catalog plates before the plates
+ * are saved (nestingService.acceptNesting). The same planning and writing as "Add to the catalog" from an upload: the
+ * plate is modelled on the nearest catalog plate of its thickness, grade and impact class (classification, unit, HSN /
+ * GST, a per-kg rate), its values worked out by the rules, its code and name by the tenant's rules.
+ *
+ * IDEMPOTENT: a plate the catalog already has — the same thickness, size (either way round), grade and impact class —
+ * is USED, never made again; the same size asked twice in one call is made once.
+ *   wanted   [{ thickness, length, width, grade, impactClass, material?, density?, kind: 'custom' }]
+ *   plates   the catalog plates already read (candidatePlates) — no catalog read here
+ * → { plates: [{ itemId, code, name, reused }] in the order asked, created: [{ itemId, code, name }], reused: [{ itemId, code }] }
+ * Throws CUSTOM_PLATE_INVALID, with every reason, when one cannot be made (nothing is written then).
+ */
+export async function ensureCatalogPlates(db, c, wanted, { plates }) {
+  const plans = await planPlates(db, c.companyId, wanted, { plates });
+  const problems = [];
+  const make = [];
+  const byKey = new Map();
+  for (const p of plans) {
+    const words = plateWords(p);
+    if (p.existing || byKey.has(p.key)) continue;
+    if (p.cannot) { problems.push(`${words}: ${p.cannot}.`); continue; }
+    if (p.problems.length) { problems.push(...p.problems.map((x) => `${words}: ${x}.`)); continue; }
+    if (!p.code) { problems.push(`${words}: no coding rule gives a raw plate its code here — add a rule in Setup › Coding rules, or add the size in Items.`); continue; }
+    byKey.set(p.key, p);
+    make.push(p);
+  }
+  if (problems.length) throw invalid('CUSTOM_PLATE_INVALID', `The custom plate size could not be added to the catalog, so the nesting was not saved — ${plural(problems.length, 'thing needs', 'things need')} fixing first.`, { problems });
+  if (make.length) await writeNewPlates(db, c, make);
+  const out = plans.map((p) => {
+    if (p.existing) return { itemId: p.existing.id, code: p.existing.code ?? null, name: p.existing.name ?? null, reused: true };
+    const m = byKey.get(p.key);
+    return { itemId: m.id, code: m.code, name: m.name, reused: false };
+  });
+  const created = make.map((p) => ({ itemId: p.id, code: p.code, name: p.name }));
+  const reused = [...new Map(out.filter((x) => x.reused).map((x) => [x.itemId, { itemId: x.itemId, code: x.code }])).values()];
+  return { plates: out, created, reused };
+}
 export const _test = { nameLike, modelFor, existingPlate, readOnce, valueRows };

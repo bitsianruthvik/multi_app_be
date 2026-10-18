@@ -153,9 +153,10 @@ router.post('/orders/:orderId/lines/:lineId/nesting/plan', view,
   handle((req) => read(req, (db, companyId, id) => {
     // A plan made INSIDE the request: the short synchronous budget, whatever the body says (the
     // 5 / 10 / 20 minute budgets belong to background runs — POST …/nesting/runs).
-    const { background, control, budgetMs, workers, pack, onProgress, onDemand, resume, onCheckpoint, checkpointMs, ...body } = req.body ?? {};
+    const { background, control, budgetMs, workers, pack, onProgress, onDemand, resume, onCheckpoint, checkpointMs, customPlates, ...body } = req.body ?? {};
     void background; void control; void budgetMs; void workers; void pack; void onProgress; void onDemand; void resume; void onCheckpoint; void checkpointMs;
-    return planNesting(db, companyId, id, body);
+    // §90: custom plate sizes follow the company's setting (Setup › Cutting); a request may only switch them off.
+    return planNesting(db, companyId, id, { ...body, ...(customPlates === false ? { customPlates: false } : {}) });
   })));
 
 router.post('/orders/:orderId/lines/:lineId/nesting/accept', manage,

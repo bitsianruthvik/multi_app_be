@@ -116,7 +116,9 @@ import { shapeJobsAvailable, shapeCapMs, checkpointOf } from './packJob.js';
 import { measurePlates } from './nestMeasure.js';
 // The shop's cutting habits (init.sql §75): spacing over the cut settings, the rim and rotations the packers get.
 import { shopRuleRows, withShopSpacing, shopRimOf, rotationsOf } from './shopRules.js';
-import { plateCosts, ratePerKg, costRulesFor, layoutScore, extentOf } from './nestCost.js';
+import { plateCosts, ratePerKg, costRulesFor, layoutScore, extentOf, COST_DEFAULTS } from './nestCost.js';
+import { ruleOf, fits as gradeFits, platesForAll, needWords, gradeRelation, gradeCheck, impactRank as impactRankOf, blocks as blocksGrade, IMPACT_ORDER_WORDS } from '../lib/plateGrade.js';
+import { customPlateSetting, customLimits, proposeCustomSize } from './nestCustomPlate.js';
 // Exact outline checks for two parts whose BOXES conflict (pairVerdict): one rule for the proposal and the accept.
 import { toPolygon, polygonsOverlap, polygonsDistance } from '../lib/polyGeom.js';
 
@@ -346,7 +348,9 @@ async function readCutSettingRows(db, companyId) {
             order_margin_length_mm, order_margin_width_mm, order_step_mm, guillotine,
             offcut_min_area_mm2, offcut_min_side_mm, notes${level >= 1 ? `,
             (SELECT cs.nest_shop_spacing FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS shop_on` : ''}${level >= 2 ? `,
-            (SELECT cs.nest_max_plate_sizes FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS max_sizes` : ''}
+            (SELECT cs.nest_max_plate_sizes FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS max_sizes` : ''}${level >= 3 ? `,
+            (SELECT cs.nest_grade_rule FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS grade_rule,
+            (SELECT cs.nest_custom_plates FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS custom_plates` : ''}
        FROM cf_cut_settings
       WHERE company_id = ? AND deleted_at IS NULL
       ORDER BY id`;
@@ -354,7 +358,7 @@ async function readCutSettingRows(db, companyId) {
   // same read: the company's settings are columns of this query, and only when the spacing is ON is one more
   // read made for the per-thickness rows. A database without §83 / §75 answers the older query.
   let rows;
-  let level = 2;
+  let level = 3;
   for (;;) {
     try { [rows] = await db.query(sql(level), [companyId]); break; } catch (e) {
       if (level === 0 || !(e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054 || e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146)) throw e;
@@ -367,6 +371,10 @@ async function readCutSettingRows(db, companyId) {
   // NULL (or no §83) = the default limit (nestCost.COST_DEFAULTS.maxSizes, 2); 0 = no limit.
   const ms = rows.find((r) => r.max_sizes != null)?.max_sizes;
   Object.defineProperty(rows, 'maxPlateSizes', { value: ms == null ? undefined : Number(ms), enumerable: false });
+  // §90 (2026-10-19): the grade / impact rule (lib/plateGrade.js; NULL = 'better') and the custom plate sizes the AI may
+  // propose (nestCustomPlate.js; NULL = off) ride on the same read. A database without §90 answers the older query.
+  Object.defineProperty(rows, 'gradeRule', { value: ruleOf(rows.find((r) => r.grade_rule != null)?.grade_rule), enumerable: false });
+  Object.defineProperty(rows, 'customPlates', { value: customPlateSetting(rows.find((r) => r.custom_plates != null)?.custom_plates), enumerable: false });
   return rows;
 }
 
@@ -1563,6 +1571,9 @@ export async function customerPlates(db, companyId, orderId, plateIds) {
 }
 
 export const agrees = (plateValue, groupValue) => plateValue == null || norm(plateValue) === norm(groupValue);
+/** The plate's GRADE may carry the piece's: the same (or blank, as `agrees`), or — when the company allows it — a higher one of the family. */
+export const gradeOk = (plateSteel, pieceSteel, rule = 'better') => agrees(plateSteel?.grade, pieceSteel?.grade)
+  || (rule === 'higher' && gradeRelation(plateSteel?.grade, pieceSteel?.grade) === 'higher');
 
 /** The catalog plates a steel (thickness, grade, material) may be cut from — the packer's own candidates. */
 export function sheetsFor(plates, group) {
@@ -1573,6 +1584,22 @@ export function sheetsFor(plates, group) {
     && agrees(p.steel.grade, group.grade)
     && agrees(p.steel.material, group.material));
 }
+
+/**
+ * The catalog plates of a steel by the company's grade rule (lib/plateGrade.js): the same thickness and material,
+ * and the same grade — or, under 'higher', a higher grade of the same family. Impact class is left to platesForAll.
+ */
+export function gradeSheets(plates, group, rule = 'better') {
+  return plates.filter((p) =>
+    p.steel.thickness != null
+    && Math.abs(p.steel.thickness - group.thickness) <= EPS
+    && p.steel.length > 0 && p.steel.width > 0
+    && (agrees(p.steel.grade, group.grade) || (rule === 'higher' && gradeRelation(p.steel.grade, group.grade) === 'higher'))
+    && agrees(p.steel.material, group.material));
+}
+
+/** A planned group's own plates: those its grade check allowed (planNesting), else the steel's (sheetsFor). */
+export const groupSheets = (plates, g) => (g.allowed ? plates.filter((p) => g.allowed.has(p.id)) : sheetsFor(plates, g));
 
 /**
  * SORTED EXPLICITLY, ALWAYS. The database returns rows in whatever order it
@@ -1696,12 +1723,46 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   // A steel whose every candidate plate is excluded cannot be nested — refused
   // up front, all such groups named at once, rather than half a plan.
   say(`${nestable.reduce((a, cp) => a + cp.pieces, 0)} pieces of ${nestable.length} cut pieces to nest, in ${byGroup.size} steel${byGroup.size === 1 ? '' : 's'} · ${plates.length} plate${plates.length === 1 ? '' : 's'} to choose from${line.nest_plates === 'standard' ? ' (standard only)' : ''}`, { phase: 'grouping' });
+  /*
+   * GRADE AND IMPACT CLASS (2026-10-19, item 22; lib/plateGrade.js). A steel group is one thickness, grade and
+   * material — its pieces may still ask for different impact classes (RDSO orders: BR), and a plate of the wrong
+   * class must never be chosen. Each group's plates are those that hold EVERY piece of it by the company's rule
+   * (`gradeRule`: exact grade, impact equal or better by default); when no plate holds them all, the group is split
+   * by the plates each piece may go on (`|BR`, `|BO` on the key). A piece only plates that state no impact class may
+   * carry is nested on those, and said (`notes`). The common case — one class, or none asked — keeps its key.
+   */
+  // 'warn' (the default until a company picks a rule): the plates are not narrowed by impact class — accept and the
+  // Compare tab say what does not match.
+  const gradeRule = settingRows.gradeRule ?? 'warn';
+  for (const g of blocksGrade(gradeRule) ? [...byGroup.values()] : []) {
+    const steel = gradeSheets(plates, g, gradeRule);
+    const all = platesForAll(steel, g.cutPlates.map((cp) => cp.steel), gradeRule);
+    if (all.plates.length || !steel.length) { g.allowed = new Set(all.plates.map((p) => p.id)); g.allowedSure = all.sure; g.steelPlates = steel; continue; }
+    byGroup.delete(g.key);
+    const parts = new Map();
+    for (const cp of g.cutPlates) {
+      const own = platesForAll(steel, [cp.steel], gradeRule);
+      const sig = `${own.sure ? 's' : 'u'}:${own.plates.map((p) => p.id).sort((a, b) => a - b).join(',')}`;
+      if (!parts.has(sig)) parts.set(sig, { own, cutPlates: [] });
+      parts.get(sig).cutPlates.push(cp);
+    }
+    for (const { own, cutPlates: cps } of parts.values()) {
+      const need = [...new Set(cps.map((cp) => norm(cp.steel.impactClass) ?? '-'))].join('/');
+      const key = `${g.key}|${need}`;
+      byGroup.set(key, { ...g, key, baseKey: g.key, cutPlates: cps, allowed: new Set(own.plates.map((p) => p.id)), allowedSure: own.sure, steelPlates: steel });
+    }
+  }
   const blocked = [...byGroup.values()]
-    .filter((g) => sheetsFor(plates, g).length > 0 && !sheetsFor(plates, g).some((p) => !excl.plates.has(p.id)))
+    .filter((g) => groupSheets(plates, g).length > 0 && !groupSheets(plates, g).some((p) => !excl.plates.has(p.id)))
     .map(noPlatesLeft);
   if (blocked.length) throw invalid('NO_PLATES_LEFT', blocked.length === 1 ? blocked[0] : `${blocked.length} steels have no plate left ticked — tick at least one plate for each.`, { problems: blocked });
 
   const groups = [];
+  // §90: the custom plate size the AI may propose (nestCustomPlate.js) — the company's setting, or the caller's
+  // (`customPlates: false` never; an object = on, with those limits, for a what-if or a test).
+  const customSetting = input.customPlates === false ? null
+    : input.customPlates && typeof input.customPlates === 'object' ? customPlateSetting({ ...input.customPlates, on: true }) : settingRows.customPlates ?? null;
+  const customPlates = [];
   const sizeAdvice = [];
   const notes = [];
   /*
@@ -1756,7 +1817,19 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   for (const g of [...byGroup.values()].sort((a, b) => a.thickness - b.thickness || String(a.key).localeCompare(String(b.key)))) {
     const settings = pickCutSettings(settingRows, g.thickness);
     const guillotine = input.guillotine == null ? settings.guillotine : !!input.guillotine;
-    const candidates = sheetsFor(plates, g).filter((p) => !excl.plates.has(p.id));
+    const candidates = groupSheets(plates, g).filter((p) => !excl.plates.has(p.id));
+    if (!candidates.length && g.steelPlates?.length) {
+      // Plates of this thickness and grade exist, but none of the impact class (or grade, by the rule) its pieces ask.
+      const have = [...new Set(g.steelPlates.map((p) => norm(p.steel.impactClass) ?? 'no stated class'))].join(', ');
+      const needs = [...new Set(g.cutPlates.map((cp) => needWords(cp.steel)))].join(', ');
+      const why = `no catalog plate of ${fmt(g.thickness)} mm ${g.material} is ${needs}${gradeRule === 'exact' ? '' : ' or better'} (the ${fmt(g.thickness)} mm ${g.grade} plates are ${have})`;
+      problems.push(`${g.cutPlates.length === 1 ? nameOf(g.cutPlates[0]) : `${g.cutPlates.length} cut plates`} cannot be nested: ${why}. Add a plate of that grade and impact class to the catalog, or correct the pieces' impact class (${IMPACT_ORDER_WORDS}).`);
+      groups.push(emptyGroup(g, settings, guillotine, `no plate of its grade and impact class: ${why}`));
+      continue;
+    }
+    if (candidates.length && g.allowedSure === false) {
+      notes.push(`${fmt(g.thickness)} mm ${g.grade ?? ''} — ${[...new Set(g.cutPlates.map((cp) => needWords(cp.steel)))].join(', ')}: no catalog plate states that impact class, so these pieces are nested on plates that state none (${candidates.map((p) => nameOf(p)).join(', ')}). Check the mill certificate, or give the plates their impact class.`);
+    }
     if (!candidates.length && line.nest_plates === 'standard' && sheetsFor(everyPlate, g).length) {
       problems.push(noStandardPlate(g, sheetsFor(everyPlate, g).length, g.cutPlates.length));
       groups.push(emptyGroup(g, settings, guillotine, 'no standard plate'));
@@ -1848,7 +1921,11 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     // is not its bounding rectangle — laid out as that rectangle it would claim steel it does not use.
     // (`input.drawingsDecide: false` asks for the rule as it was — true shapes only when they beat the rows — to compare.)
     const realShapes = useShapes && input.drawingsDecide !== false ? g.cutPlates.filter((cp) => { const sh = shapeOf(cp); return sh?.drawn && !isPlainRect({ outline: sh.rings.outline, cutouts: [], holes: [] }); }).length : 0;
-    const fill = useShapes ? (fillable.get(g.key) ?? []) : [];
+    // A saved customer plate takes more of this steel's pieces only when it holds every one of them by grade and impact class.
+    const fill = useShapes ? (fillable.get(g.baseKey ?? g.key) ?? []).filter((e) => {
+      const pl = everyPlate.find((p) => p.id === Number(e.lot.plateItemId));
+      return !pl || !blocksGrade(gradeRule) || g.cutPlates.every((cp) => gradeFits(pl.steel, cp.steel, gradeRule).ok);
+    }) : [];
     const shapeInput = useShapes ? {
       pieces: pieces.map((p) => { const sh = shapeOf(p.cutPlate); return { key: p.key, qty: p.qty, rings: sh?.drawn ? sh.rings : null, length: p.length, width: p.width, grain: 'any', allowMirror: false }; }),
       sheets: sheets.map((s) => ({ key: s.key, length: s.length, width: s.width, available: s.available, preferred: s.preferred, areaCost: s.areaCost, penalty: s.penalty ?? 0 })),
@@ -2117,6 +2194,15 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       rowsNote = `${fmt(g.thickness)} mm${g.grade ? ` ${g.grade}` : ''}: ${plural(realShapes, 'cut plate has', 'cut plates have')} a drawing that is not a rectangle, so the layout should follow the drawings — but ${reason}, so the row layout stands: on these plates each drawn part takes the room of the rectangle round it.${b.why === 'time' ? ' Run it again at a higher effort.' : ''}`;
       notes.push(rowsNote);
     }
+    // ONE CUSTOM PLATE SIZE (§90, nestCustomPlate.js): the plates whose layouts stop short move to the size they need,
+    // when that saves steel by the packers' own cost. Off unless the company switched it on (or the caller asks).
+    const custom = customSetting && line.nest_plates !== 'standard' && nests.length
+      ? customSizeFor(nests, { g, sheets, settings, everyPlate, customSetting, maxPlateSizes: settingRows.maxPlateSizes, discipline: input.plateDiscipline !== false })
+      : null;
+    if (custom) {
+      customPlates.push(custom);
+      notes.push(custom.sentence);
+    }
     for (const a of out.sizeAdvice ?? []) sizeAdvice.push({ thickness: g.thickness, grade: g.grade, material: g.material, ...a });
     for (const n of nests) {
       if (n.requiredLength > n.length + EPS || n.requiredWidth > n.width + EPS) continue;
@@ -2137,6 +2223,8 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       nests,
       unplaced,
       metrics: metricsOf(nests, g),
+      // §90: the custom plate size proposed for this steel (absent = none): it is added to the catalog when this nesting is used.
+      ...(custom ? { customPlate: custom } : {}),
       deterministic: out.deterministic ?? null,
       elapsedMs: out.elapsedMs ?? out.tookMs ?? null,
       budgetCut: budgetCut.get(g.key) ?? false,
@@ -2209,6 +2297,8 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     groups,
     manual,
     sizeAdvice,
+    // §90: one entry per steel whose plates moved to a custom size — "custom size, not in the catalog yet".
+    ...(customPlates.length ? { customPlates } : {}),
     problems,
     // Things the reader should know that block nothing (2026-10-13): a steel whose drawings should have decided its layout and did not.
     notes,
@@ -2555,6 +2645,64 @@ function drawOnto(n, pieceByKey, shapeOf, g) {
   n.wasteTotalKg = kgOf(n.sheetArea - usedArea, g.thickness, n.density);
 }
 
+/** "Custom 9100 × 2400" — what a custom plate is called until the catalog has it. */
+export const customPlateCode = (length, width) => `CUSTOM ${fmt(Math.max(length, width))} × ${fmt(Math.min(length, width))}`;
+export const CUSTOM_NOT_IN_CATALOG = 'Custom size, not in the catalog yet — it is added to the catalog when this nesting is used.';
+
+/**
+ * §90 (2026-10-19, item 20): ONE custom plate size for a steel's plates (nestCustomPlate.proposeCustomSize), applied
+ * to the plates that move to it. The custom plate's steel is the pieces' — their grade and material, the strictest
+ * impact class they ask (else that of the plate it replaces) — so it holds every piece by construction. A size the
+ * catalog already has (an earlier accepted nesting made it) is that catalog plate, never a new one.
+ * Mutates the nests that move; → the group's `customPlate` summary, or null.
+ */
+function customSizeFor(nests, { g, sheets, settings, everyPlate, customSetting, maxPlateSizes, discipline }) {
+  const limits = customLimits(customSetting, everyPlate, g.thickness, settings);
+  const density = nests.find((n) => n.density > 0)?.density ?? g.cutPlates.find((cp) => cp.steel.density > 0)?.steel.density ?? FALLBACK_DENSITY;
+  const sheetOf = (n) => sheets.find((s) => s.id === n.plateItemId && !s.ownerPartyId);
+  const priced = nests.map((n) => { const s = sheetOf(n); return { ...n, areaCost: discipline ? s?.areaCost : null, penalty: discipline ? s?.penalty ?? 0 : 0 }; });
+  const ms = maxPlateSizes === undefined ? COST_DEFAULTS.maxSizes : (Number(maxPlateSizes) > 0 ? Number(maxPlateSizes) : null);
+  const prop = proposeCustomSize(priced, { limits, thickness: g.thickness, density, maxSizes: ms, rules: { offcutMinArea: settings.offcutMinAreaMm2, offcutMinSide: settings.offcutMinSideMm } });
+  if (!prop) return null;
+  const replaced = everyPlate.find((p) => p.id === Number(nests[prop.moves[0]].plateItemId));
+  const asks = g.cutPlates.map((cp) => cp.steel.impactClass).filter((v) => !blank(v))
+    .sort((a, b) => (impactRankOf(b) ?? -1) - (impactRankOf(a) ?? -1));
+  const steel = {
+    thickness: g.thickness, length: prop.length, width: prop.width, grade: g.grade ?? replaced?.steel.grade ?? null,
+    material: g.material ?? replaced?.steel.material ?? null, impactClass: asks[0] ?? replaced?.steel.impactClass ?? null, density,
+  };
+  const sameSize = (p) => Math.abs(p.steel.thickness - steel.thickness) <= 0.01
+    && ((Math.abs(p.steel.length - steel.length) <= 0.5 && Math.abs(p.steel.width - steel.width) <= 0.5) || (Math.abs(p.steel.length - steel.width) <= 0.5 && Math.abs(p.steel.width - steel.length) <= 0.5))
+    && norm(p.steel.grade) === norm(steel.grade) && norm(p.steel.impactClass) === norm(steel.impactClass) && agrees(p.steel.material, steel.material);
+  const existing = everyPlate.find(sameSize) ?? null;
+  const code = existing?.code ?? customPlateCode(steel.length, steel.width);
+  const name = existing?.name ?? `Custom plate ${fmt(steel.thickness)} x ${fmt(steel.width)} x ${fmt(steel.length)}${steel.grade ? ` ${steel.grade}` : ''}${steel.impactClass ? ` ${steel.impactClass}` : ''}`;
+  for (const i of prop.moves) {
+    const n = nests[i];
+    const was = { plateItemId: n.plateItemId, plateCode: n.plateCode, length: n.length, width: n.width };
+    const area = steel.length * steel.width;
+    Object.assign(n, {
+      plateItemId: existing?.id ?? null, plateCode: code, plateName: name,
+      length: steel.length, width: steel.width, density: n.density ?? density,
+      sheetArea: round3(area), wasteArea: round3(area - n.usedArea),
+      wastePct: area > 0 ? round3(((area - n.usedArea) / area) * 100) : 0,
+      weightKg: kgOf(area, g.thickness, n.density ?? density), wasteTotalKg: kgOf(area - n.usedArea, g.thickness, n.density ?? density),
+      customPlate: { ...steel, inCatalog: !!existing, itemId: existing?.id ?? null, code: existing?.code ?? null, replaces: was, ...(existing ? {} : { note: CUSTOM_NOT_IN_CATALOG }) },
+    });
+  }
+  const instead = prop.replaces.map((r) => `${plural(r.plates, 'plate', 'plates')} of ${r.plateCode ?? `${fmt(r.length)} × ${fmt(r.width)}`}`).join(' and ');
+  const words = `${fmt(steel.thickness)} mm × ${fmt(steel.length)} × ${fmt(steel.width)}${steel.grade ? ` ${steel.grade}` : ''}${steel.impactClass ? ` ${steel.impactClass}` : ''}`;
+  return {
+    steelKey: g.key, ...steel, inCatalog: !!existing, itemId: existing?.id ?? null, code: existing?.code ?? null,
+    plates: prop.moves.length, replaces: prop.replaces, savingKg: prop.savingKg, netSavingKg: prop.netSavingKg,
+    before: prop.before, after: prop.after, sizesBefore: prop.sizesBefore, sizesAfter: prop.sizesAfter,
+    limits: { maxLength: limits.maxLength, maxWidth: limits.maxWidth, minLength: limits.minLength, minWidth: limits.minWidth, step: limits.step, basis: limits.basis },
+    sentence: existing
+      ? `AI uses the catalog's custom size ${existing.code} (${words}) for ${instead}: ${fmt(prop.savingKg)} kg less steel bought, and as much less waste.`
+      : `AI proposes a custom plate ${words} for ${instead}: ${fmt(prop.savingKg)} kg less steel bought, and as much less waste. ${CUSTOM_NOT_IN_CATALOG}`,
+  };
+}
+
 /** What the packer put into the free space of ONE saved plate: an addition to that lot. */
 function additionOf(lot, n, pieceByKey, settings, shapeOf) {
   const pieces = freePieces(n.placements, pieceByKey, shapeOf).map((p) => ({ ...p, placedBy: 'ours' }));
@@ -2759,6 +2907,11 @@ export async function acceptNesting(db, c, orderLineId, plan = {}, { allowLeftOv
   // An empty plan is fine when there is nothing left to nest — the imported
   // nests already hold it all, and accepting just clears old automatic lots.
   const submitted = flattenNests(plan, required.size && !additionsIn.length ? problems : []);
+  // §90 (item 22): which plate may carry which piece, by the company's grade / impact rule.
+  const gradeRule = settingRows.gradeRule ?? 'warn';
+  // §90 (item 20): a plate of a CUSTOM size the AI proposed (no catalog plate yet) is checked on a stand-in plate of
+  // that size; the catalog plate is made (or found) only once the whole layout has passed — below, before the writes.
+  const customs = customStandIns(submitted, { line, cpById, plates, plateById, settingRows, gradeRule, problems });
 
   const lots = [];
   const placed = new Map();
@@ -2800,7 +2953,7 @@ export async function acceptNesting(db, c, orderLineId, plan = {}, { allowLeftOv
       settings,
       pieces: [],
     };
-    verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts: imported.counts, leftOut: heldBack ? new Set() : excl.cutPlates, untracked, shapeOf, pending, manualOk: heldBack });
+    verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts: imported.counts, leftOut: heldBack ? new Set() : excl.cutPlates, untracked, shapeOf, pending, manualOk: heldBack, gradeRule });
     lots.push(lot);
     await breathe();
   }
@@ -2813,7 +2966,22 @@ export async function acceptNesting(db, c, orderLineId, plan = {}, { allowLeftOv
     const il = imported.lots.find((x) => Number(x.id) === Number(ad.lotId));
     if (!il) { problems.push(`Plate ${ad.lotNo ?? ad.lotId}: the plan adds pieces to it, but it is not an uploaded plate of this line any more. Nest the rest again.`); continue; }
     if (addByLot.has(il.id)) { problems.push(`Plate ${il.lotNo}: the plan adds to it twice.`); continue; }
-    addByLot.set(il.id, verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates, untracked, shapeOf, settingRows, pending }));
+    addByLot.set(il.id, verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts: imported.counts, leftOut: excl.cutPlates, untracked, shapeOf, settingRows, pending, gradeRule }));
+  }
+  // GRADE / IMPACT CLASS (item 22): every piece against its plate — a definite mismatch is refused, naming the pieces
+  // and the plates; a plate that states no impact class where the piece asks one is said (`gradeCheck`), not refused.
+  // (A grade that differs is refused piece by piece above, as it always was.)
+  const graded = gradeCheck([
+    ...lots.map((l) => ({ lotNo: l.lotNo, plateCode: nameOf(l.plate), plate: l.plate.steel, pieces: l.pieces.map((p) => { const cp = cpById.get(Number(p.cutPlateId)); return { cutPlateId: p.cutPlateId, code: cp ? nameOf(cp) : null, steel: cp?.steel ?? {} }; }) })),
+    ...[...addByLot].map(([lotId, pcs]) => {
+      const il = imported.lots.find((x) => Number(x.id) === Number(lotId));
+      const pl = plateById.get(Number(il?.full?.plateItemId));
+      return { lotNo: il?.lotNo, plateCode: il?.full?.plateCode ?? nameOf(pl ?? {}), plate: pl?.steel ?? { grade: il?.full?.grade }, pieces: (pcs ?? []).map((p) => { const cp = cpById.get(Number(p.cutPlateId)); return { cutPlateId: p.cutPlateId, code: cp ? nameOf(cp) : null, steel: cp?.steel ?? {} }; }) };
+    }),
+  ], gradeRule);
+  // 'warn' (the default): said in gradeCheck, never refused.
+  for (const m of blocksGrade(gradeRule) ? graded.mismatches.filter((x) => x.code === 'IMPACT') : []) {
+    problems.push(`Plate ${m.lotNo ?? '?'} (${m.plateCode}, ${m.plate}): ${plural(m.pieces, 'piece', 'pieces')} of ${m.cutPlateCode} need ${m.need} — ${m.why}. Nest ${m.pieces === 1 ? 'it' : 'them'} on a plate of that impact class${gradeRule === 'exact' ? '' : ' or better'} (${IMPACT_ORDER_WORDS}).`);
   }
   // Every plate laid out by true shape, checked on its outlines — together, off this thread.
   if (pending.length) {
@@ -2839,6 +3007,9 @@ export async function acceptNesting(db, c, orderLineId, plan = {}, { allowLeftOv
   assertNoProblems(problems, 'That layout cannot be accepted.');
 
   // ---- from here it only writes -------------------------------------------
+  // §90: the custom plate sizes become catalog plates FIRST (an identical one already there is used, never made twice),
+  // with the codes, HSN and GST the record-creation service gives a plate added from an upload.
+  const customMade = customs.length ? await catalogCustomPlates(db, c, customs, { lots, plates, plateById }) : null;
   // A left-out cut piece that sat on a lot this accept clears goes back to
   // "plate chosen at nesting" below — read before the lots go.
   const leftOutWasOn = await cutPlatesOnLots(db, companyId, orderLineId, [...excl.cutPlates], replaceImported ? null : 'auto');
@@ -2927,7 +3098,81 @@ export async function acceptNesting(db, c, orderLineId, plan = {}, { allowLeftOv
     offcuts: written.reduce((a, l) => a + l.offcuts, 0),
     quantities,
     caveatCleared: 'The plate quantity on each cut plate is now the nesting plan, not the area fraction.',
+    // §90: the custom plate sizes this accept added to the catalog (or found there already).
+    ...(customMade ? { customPlates: customMade } : {}),
+    // §90: grade / impact class — what was said but not refused (under 'warn' a mismatch too; a plate with no class; a better plate).
+    gradeCheck: { ok: graded.ok, rule: graded.rule, blocking: graded.blocking, mismatches: graded.mismatches, unknown: graded.unknown, substitutes: graded.substitutes, sentence: graded.sentence },
   };
+}
+
+/**
+ * §90 (item 20) — the plan's plates of a CUSTOM size (no catalog plate yet: `plateItemId` empty, `customPlate` set).
+ * The size and steel are NOT taken on trust: the steel is the pieces' on the plate (thickness, grade, material; the
+ * impact class the plan names when it holds every piece, else the strictest they ask), the size the plan's, and it
+ * must lie within the company's custom-plate limits (Setup › Cutting) — refused, in words, otherwise. Each such nest
+ * gets a STAND-IN plate (a negative id) in `plateById`, so the layout is checked exactly as on a catalog plate.
+ * Mutates `submitted` (copies of those nests, pointing at the stand-in). → [{ key, standIn, wanted }]
+ */
+function customStandIns(submitted, { line, cpById, plates, plateById, settingRows, gradeRule, problems }) {
+  const out = [];
+  const byKey = new Map();
+  submitted.forEach((n, i) => {
+    if (!(n && (n.plateItemId == null || n.plateItemId === '') && n.customPlate && typeof n.customPlate === 'object')) return;
+    const label = `Lot ${n.lotNo ?? i + 1}`;
+    if (line.nest_plates === 'standard') { problems.push(`${label}: it is on a custom plate size, and this line takes standard plates only (Nesting › Plates).`); return; }
+    const setting = settingRows.customPlates;
+    if (!setting) { problems.push(`${label}: it is on a custom plate size, and custom plate sizes are switched off in Setup › Cutting. Nest the line again.`); return; }
+    const cps = (Array.isArray(n.pieces) ? n.pieces : []).map((p) => cpById.get(Number(p.cutPlateId))).filter(Boolean);
+    if (!cps.length) return;                         // verifyLot says what is wrong with its pieces
+    const s0 = cps[0].steel;
+    const L = Math.max(Number(n.customPlate.length ?? n.length) || 0, Number(n.customPlate.width ?? n.width) || 0);
+    const W = Math.min(Number(n.customPlate.length ?? n.length) || 0, Number(n.customPlate.width ?? n.width) || 0);
+    const band = pickCutSettings(settingRows, s0.thickness);
+    const lim = customLimits(setting, plates, s0.thickness, band);
+    const tol = 0.5;
+    if (!(L > 0 && W > 0) || (lim.maxLength && L > lim.maxLength + tol) || (lim.maxWidth && W > lim.maxWidth + tol) || (lim.minLength && L + tol < lim.minLength) || (lim.minWidth && W + tol < lim.minWidth)) {
+      problems.push(`${label}: the custom plate ${fmt(L)} × ${fmt(W)} is outside the plate sizes the mill can roll (${fmt(lim.minLength)}–${fmt(lim.maxLength)} long, ${fmt(lim.minWidth)}–${fmt(lim.maxWidth)} wide; ${lim.basis}). Nest the line again.`);
+      return;
+    }
+    const asked = n.customPlate.impactClass;
+    const holdsAll = !blank(asked) && cps.every((cp) => { const v = gradeFits({ grade: s0.grade, impactClass: asked }, cp.steel, gradeRule); return v.ok && v.sure; });
+    const strictest = cps.map((cp) => cp.steel.impactClass).filter((v) => !blank(v)).sort((a, b) => (impactRankOf(b) ?? -1) - (impactRankOf(a) ?? -1))[0] ?? null;
+    const steel = { thickness: s0.thickness, length: L, width: W, grade: s0.grade, material: s0.material, density: s0.density ?? null, impactClass: holdsAll ? String(asked).trim() : strictest ?? (blank(asked) ? null : String(asked).trim()) };
+    const key = [fmt(steel.thickness), fmt(L), fmt(W), norm(steel.grade) ?? '', norm(steel.impactClass) ?? '', norm(steel.material) ?? ''].join('|');
+    let e = byKey.get(key);
+    if (!e) {
+      const standIn = { id: -(out.length + 1), code: customPlateCode(L, W), name: `Custom plate ${fmt(steel.thickness)} x ${fmt(W)} x ${fmt(L)}`, steel, kind: 'CUSTOM', standIn: true };
+      e = { key, standIn, wanted: { thickness: steel.thickness, length: L, width: W, grade: steel.grade, impactClass: steel.impactClass, material: steel.material, density: steel.density, kind: 'custom' } };
+      byKey.set(key, e); out.push(e);
+      plateById.set(standIn.id, standIn);
+    }
+    submitted[i] = { ...n, plateItemId: e.standIn.id };
+  });
+  return out;
+}
+
+/**
+ * §90 — the stand-ins become catalog plates (nestPlateCatalogService.ensureCatalogPlates: an identical plate is found
+ * and used; a new one is modelled on the nearest catalog plate of that thickness and grade, with its code, name,
+ * HSN / GST and rate), and every lot on a stand-in is moved onto its real plate. The catalog read of this scope is
+ * forgotten, so a later read in it (the plate-change sheet's "after") sees the new plate.
+ * → { created: [{ itemId, code, name }], reused: [{ itemId, code }] }
+ */
+async function catalogCustomPlates(db, c, customs, { lots, plates, plateById }) {
+  // `plates` may be the scope's memoised catalog: it is read, never added to.
+  const { ensureCatalogPlates } = await import('./nestPlateCatalogService.js');
+  const made = await ensureCatalogPlates(db, c, customs.map((e) => e.wanted), { plates: plates.filter((p) => !p.standIn) });
+  const real = new Map();
+  customs.forEach((e, i) => {
+    const m = made.plates[i];
+    const plate = { id: m.itemId, code: m.code, name: m.name, steel: { ...e.standIn.steel }, kind: 'CUSTOM' };
+    real.set(e.standIn.id, plate);
+    plateById.delete(e.standIn.id);
+    plateById.set(plate.id, plate);
+  });
+  for (const lot of lots) if (real.has(lot.plate.id)) lot.plate = real.get(lot.plate.id);
+  forget(db, 'candidatePlates:');
+  return { created: made.created, reused: made.reused };
 }
 
 /**
@@ -3096,7 +3341,7 @@ function freeProblem(label, pr, nameAt, k, plateWords) {
  * plate's steel, and a kerf clear of every other part and of the edge. Returns the pieces to store
  * (placed_by 'ours'); every failure is pushed.
  */
-function verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts, leftOut, untracked = new Map(), shapeOf, settingRows, pending }) {
+function verifyAddition(ad, il, { cpById, required, placed, problems, importedCounts, leftOut, untracked = new Map(), shapeOf, settingRows, pending, gradeRule = 'better' }) {
   const l = il.full;
   const label = `Plate ${l.lotNo} (already saved)`;
   if (l.layoutOrigin !== 'customer' || !l.pieces.length || l.pieces.some((p) => p.x == null)) {
@@ -3110,7 +3355,7 @@ function verifyAddition(ad, il, { cpById, required, placed, problems, importedCo
     const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut, untracked });
     if (!cp) continue;
     if (Math.abs(cp.steel.thickness - l.thickness) > EPS) { problems.push(`${at}: ${nameOf(cp)} is ${fmt(cp.steel.thickness)} mm and the plate is ${fmt(l.thickness)} mm.`); continue; }
-    if (!agrees(l.grade, cp.steel.grade) || !agrees(l.material, cp.steel.material)) { problems.push(`${at}: ${nameOf(cp)} is ${[cp.steel.grade, cp.steel.material].filter(Boolean).join(' ')} and the plate is ${[l.grade, l.material].filter(Boolean).join(' ')}. Grade is not something a layout may mix.`); continue; }
+    if (!gradeOk({ grade: l.grade }, cp.steel, gradeRule) || !agrees(l.material, cp.steel.material)) { problems.push(`${at}: ${nameOf(cp)} is ${[cp.steel.grade, cp.steel.material].filter(Boolean).join(' ')} and the plate is ${[l.grade, l.material].filter(Boolean).join(' ')}. Grade is not something a layout may mix.`); continue; }
     pieces.push({ ...freePiece(p, cp, shapeOf), placedBy: 'ours' });
     placed.set(cp.id, (placed.get(cp.id) ?? 0) + 1);
   }
@@ -3154,7 +3399,7 @@ function pieceCutPlate(p, at, { cpById, required, problems, importedCounts = new
   return cp;
 }
 
-function verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts = new Map(), leftOut = new Set(), untracked = new Map(), shapeOf = null, pending = [], manualOk = false }) {
+function verifyLot(lot, n, { label, cpById, required, placed, problems, importedCounts = new Map(), leftOut = new Set(), untracked = new Map(), shapeOf = null, pending = [], manualOk = false, gradeRule = 'better' }) {
   const { plate, settings } = lot;
   const k = settings.kerfMm;
   const raw = Array.isArray(n.pieces) ? n.pieces : [];
@@ -3177,7 +3422,7 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
       const cp = pieceCutPlate(p, at, { cpById, required, problems, importedCounts, leftOut, untracked, manualOk });
       if (!cp) continue;
       if (Math.abs(cp.steel.thickness - plate.steel.thickness) > EPS) problems.push(`${at}: ${nameOf(cp)} is ${fmt(cp.steel.thickness)} mm and ${nameOf(plate)} is ${fmt(plate.steel.thickness)} mm.`);
-      if (!agrees(plate.steel.grade, cp.steel.grade)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.grade} and ${nameOf(plate)} is ${plate.steel.grade}. Grade is not something a layout may mix.`);
+      if (!gradeOk(plate.steel, cp.steel, gradeRule)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.grade} and ${nameOf(plate)} is ${plate.steel.grade}. Grade is not something a layout may mix.`);
       if (!agrees(plate.steel.material, cp.steel.material)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.material} and ${nameOf(plate)} is ${plate.steel.material}.`);
       pieces.push(freePiece(p, cp, shapeOf));
       placed.set(cp.id, (placed.get(cp.id) ?? 0) + 1);
@@ -3207,7 +3452,7 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
     if (Math.abs(cp.steel.thickness - plate.steel.thickness) > EPS) {
       problems.push(`${at}: ${nameOf(cp)} is ${fmt(cp.steel.thickness)} mm and ${nameOf(plate)} is ${fmt(plate.steel.thickness)} mm.`);
     }
-    if (!agrees(plate.steel.grade, cp.steel.grade)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.grade} and ${nameOf(plate)} is ${plate.steel.grade}. Grade is not something a layout may mix.`);
+    if (!gradeOk(plate.steel, cp.steel, gradeRule)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.grade} and ${nameOf(plate)} is ${plate.steel.grade}. Grade is not something a layout may mix.`);
     if (!agrees(plate.steel.material, cp.steel.material)) problems.push(`${at}: ${nameOf(cp)} is ${cp.steel.material} and ${nameOf(plate)} is ${plate.steel.material}.`);
 
     const rotated = !!p.rotated;
