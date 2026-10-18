@@ -6913,3 +6913,60 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = D
       AND (SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL
              AND name IN ('cf_erp_accounts_view', 'cf_erp_accounts_manage')) >= 2,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §75  AI NESTING — THE SHOP'S CUTTING HABITS as a company setting per plate thickness (2026-10-18)
+-- The same text as TM/s75.sql. Additive and guarded: safe to re-run. Learned from the shop's ProNest
+-- job files (TM/nest_learning/LEARNINGS.md). Services: shopRules.js (the setting, its defaults, the
+-- spacing laid over the cut settings), aiCutPlan.js (part in part, shared-line blocks, leads, pierce,
+-- kerf side, cut order), aiNestDxf.js (one DXF per plate that ProNest opens).
+--
+--   cf_company_settings.nest_shop_spacing   1 = the AI nesting lays parts out with the shop's spacing (edge
+--                                           margin, gap between shared-line blocks). 0 (default) = as before:
+--                                           one kerf at the plate edge, 5-8 mm between sequences.
+--   cf_nest_shop_rules                      one row per company and thickness; every value NULL = what the
+--                                           files say for that thickness (kerf 3 / 4 / 5 mm for 10-16 / 20-25 /
+--                                           36-45, edge 5, part gap 5, block gap 13, leads 6 in / 2 out, hole arc
+--                                           6 mm, common line 6.35 / 1.27, pierce 6 mm off the part). A thickness
+--                                           with no row takes the nearest row that sets the value.
+--                                           kerf_mm here is what the files used; the kerf NESTED with stays
+--                                           cf_cut_settings.kerf_mm (its one owner).
+-- No row is seeded: the defaults live in code (shopRules.SHOP_DEFAULTS) and the code reads nothing when
+-- this section is missing (the setting is then off).
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'nest_shop_spacing');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN nest_shop_spacing TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_nest_shop_rules (
+  id                      INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id              INT            NOT NULL,
+  thickness_mm            DECIMAL(10,3)  NOT NULL,
+  kerf_mm                 DECIMAL(10,3)  NULL,
+  edge_margin_mm          DECIMAL(10,3)  NULL,
+  part_gap_mm             DECIMAL(10,3)  NULL,
+  group_gap_mm            DECIMAL(10,3)  NULL,
+  lead_in_mm              DECIMAL(10,3)  NULL,
+  lead_out_mm             DECIMAL(10,3)  NULL,
+  hole_lead_radius_mm     DECIMAL(10,3)  NULL,
+  hole_lead_out_mm        DECIMAL(10,3)  NULL,
+  shared_lead_in_mm       DECIMAL(10,3)  NULL,
+  shared_lead_out_mm      DECIMAL(10,3)  NULL,
+  pierce_offset_mm        DECIMAL(10,3)  NULL,
+  free_rotation_step_deg  DECIMAL(6,2)   NULL,           -- NULL = only 0 / 90 / 180 / 270
+  notes                   VARCHAR(500)   NULL,
+  deleted_at              DATETIME       DEFAULT NULL,
+  created_at              TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at              TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by              INT            NULL,
+  UNIQUE KEY uq_cnsr_thickness (company_id, thickness_mm),
+  CONSTRAINT fk_cnsr_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_nest_shop_rules') = 1
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'nest_shop_spacing') = 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

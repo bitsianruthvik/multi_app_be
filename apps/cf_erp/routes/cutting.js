@@ -15,6 +15,10 @@
  *                             reads "x" and "×" alike, so "75x75x8" finds ISA 75 × 75 × 8 in every stock length.
  *   GET  /flows/cut-sections  { flow } — the flow a new cut section takes (production view)
  *   PUT  /flows/cut-sections  { flowId } — null clears it (production manage)
+ *   GET  /nest-shop-rules     the AI nesting's shop habits (init.sql §75, services/shopRules.js): { on, schema, defaults,
+ *                             rows: [{ thicknessMm, kerfMm, edgeMarginMm, partGapMm, groupGapMm, leadInMm, … }], resolved }
+ *   PUT  /nest-shop-rules     { on?, rows? } — the switch (shop spacing in the AI nesting) and the per-thickness rows
+ *                             (rows replace the saved ones; a blank value = what the shop's files say). Catalog manage.
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
@@ -23,6 +27,7 @@ import { invalid, assertNoProblems } from '../lib/errors.js';
 import { cutPlaces, CUT_KINDS } from '../lib/cutPlaces.js';
 import { sectionSteelOf } from '../lib/cutFrom.js';
 import { getCutPlateFlow, getCutSectionFlow, setCutSectionFlow, requireUsableFlow } from '../services/flowService.js';
+import { getShopRules, saveShopRules } from '../services/shopRules.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -240,6 +245,11 @@ router.get('/cut-places', guard(PERM.view), handle((req) => placesView(pool, ctx
 router.put('/cut-places', guard(PERM.catalog), handle((req) => tx(req, (db, c) => {
   if (req.body == null || typeof req.body !== 'object') throw invalid('INVALID', 'Send the places to change.');
   return savePlaces(db, c, req.body);
+})));
+router.get('/nest-shop-rules', guard(PERM.view), handle((req) => getShopRules(pool, ctx(req).companyId)));
+router.put('/nest-shop-rules', guard(PERM.catalog), handle((req) => tx(req, (db, c) => {
+  if (req.body == null || typeof req.body !== 'object') throw invalid('INVALID', 'Send { on, rows }.');
+  return saveShopRules(db, c, req.body);
 })));
 router.get('/section-stock', guard(PERM.view), handle((req) => sectionStock(pool, ctx(req).companyId, req.query)));
 router.get('/flows/cut-sections', guard(PERM.productionView), handle((req) => getCutSectionFlow(pool, ctx(req).companyId)));

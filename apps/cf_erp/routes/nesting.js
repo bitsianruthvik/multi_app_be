@@ -36,6 +36,8 @@
  *   POST   /orders/:orderId/lines/:lineId/nesting/compare/accept { side: 'uploaded' | 'auto', runId } — take one side
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc/:lotId   one nest's DXF
+ *        …/nesting/cnc[/:lotId]?style=ai[&leads=1][&order=1]  the "AI" ProNest DXF (services/aiNestDxf.js); the zip adds each nest's cut plan
+ *   GET  /orders/:orderId/lines/:lineId/nesting/cut-plan/:lotId  the AI cut plan of one nest as data (services/aiCutPlan.js)
  *
  *   GET    /orders/:orderId/lines/:lineId/nesting/plate-changes  the line's plate-change gate and requests (routes/plateChanges.js)
  *
@@ -86,7 +88,7 @@ import { getUntracked, markUntracked, unmarkUntracked } from '../services/nestUn
 // The uploaded nesting beside our automatic one, and taking one of them.
 import { getCompare, startCompare, acceptCompare, scheduleAutoCompare } from '../services/nestCompareService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
-import { lotDxf, lineCncZip } from '../services/cncExportService.js';
+import { lotDxf, lineCncZip, lotAiPlan } from '../services/cncExportService.js';
 // Plate changes after a purchase order (init.sql §62): every plate write below goes through the gate.
 import { plateChangeGate } from '../services/plateChangeService.js';
 // Drawings on an order line's rows (init.sql §51): DXF or PDF, matched by drawing mark; a plate part's DXF is its shape.
@@ -292,8 +294,15 @@ const sendFile = (res, out, type) => {
   res.send(out.buffer);
 };
 
+/** ?style=ai[&leads=1][&order=1] — the AI (ProNest) DXF of aiNestDxf.js; anything else — the plain one, as before. */
+const dxfOpts = (q) => (q?.style === 'ai' ? { style: 'ai', leads: q.leads === '1' || q.leads === 'true', order: q.order === '1' || q.order === 'true' } : {});
+
+// The AI cut plan of one nest, as data: part in part, shared-line blocks, leads, pierce, kerf side, cut order.
+router.get('/orders/:orderId/lines/:lineId/nesting/cut-plan/:lotId', view,
+  handle((req) => read(req, (db, companyId, id) => lotAiPlan(db, companyId, id, intParam(req.params.lotId, 'lotId')))));
+
 router.get('/orders/:orderId/lines/:lineId/nesting/cnc', view, handle(async (req, res) => {
-  const out = await read(req, (db, companyId, id) => lineCncZip(db, companyId, id));
+  const out = await read(req, (db, companyId, id) => lineCncZip(db, companyId, id, dxfOpts(req.query)));
   sendFile(res, out, 'application/zip');
 }));
 
@@ -301,7 +310,7 @@ router.get('/orders/:orderId/lines/:lineId/nesting/cnc', view, handle(async (req
 // NO_LAYOUT (422), which handle() passes through as it is.
 router.get('/orders/:orderId/lines/:lineId/nesting/cnc/:lotId', view, handle(async (req, res) => {
   const lotId = intParam(req.params.lotId, 'lotId');
-  const out = await read(req, (db, companyId, id) => lotDxf(db, companyId, id, lotId));
+  const out = await read(req, (db, companyId, id) => lotDxf(db, companyId, id, lotId, dxfOpts(req.query)));
   sendFile(res, out, 'application/dxf');
 }));
 

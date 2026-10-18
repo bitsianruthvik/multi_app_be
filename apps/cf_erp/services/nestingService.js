@@ -112,6 +112,10 @@ import {
 import { shapeJobsAvailable, shapeCapMs, checkpointOf } from './packJob.js';
 // Exact polygon work on laid-out plates, off this thread (the worker pool) when there is much of it.
 import { measurePlates } from './nestMeasure.js';
+// The shop's cutting habits (init.sql §75): spacing over the cut settings, the rim and rotations the packers get.
+import { shopRuleRows, withShopSpacing, shopRimOf, rotationsOf } from './shopRules.js';
+// Exact outline checks for two parts whose BOXES conflict (pairVerdict): one rule for the proposal and the accept.
+import { toPolygon, polygonsOverlap, polygonsDistance } from '../lib/polyGeom.js';
 
 export { rimOf };
 
@@ -331,15 +335,24 @@ export async function resolveCutSettings(db, companyId, thicknessMm) {
 }
 
 export async function cutSettingRows(db, companyId) {
-  const [rows] = await db.query(
-    `SELECT id, thickness_min_mm, thickness_max_mm, kerf_mm, seq_gap_min_mm, seq_gap_max_mm,
+  const sql = (shop) => `SELECT id, thickness_min_mm, thickness_max_mm, kerf_mm, seq_gap_min_mm, seq_gap_max_mm,
             order_margin_length_mm, order_margin_width_mm, order_step_mm, guillotine,
-            offcut_min_area_mm2, offcut_min_side_mm, notes
+            offcut_min_area_mm2, offcut_min_side_mm, notes${shop ? `,
+            (SELECT cs.nest_shop_spacing FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS shop_on` : ''}
        FROM cf_cut_settings
       WHERE company_id = ? AND deleted_at IS NULL
-      ORDER BY id`,
-    [companyId],
-  );
+      ORDER BY id`;
+  // THE SHOP'S SPACING (init.sql §75, shopRules.js) rides on the same read: the company's switch is a
+  // column of this query, and only when it is ON is one more read made for the per-thickness rows. A
+  // database without §75 answers the old query (one failed statement, then the old one).
+  let rows;
+  try { [rows] = await db.query(sql(true), [companyId]); } catch (e) {
+    if (!(e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054 || e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146)) throw e;
+    [rows] = await db.query(sql(false), [companyId]);
+  }
+  const on = rows.some((r) => Number(r.shop_on) === 1);
+  const shop = on ? { on: true, rows: await shopRuleRows(db, companyId), schema: true } : { on: false, rows: [], schema: true };
+  Object.defineProperty(rows, 'shop', { value: shop, enumerable: false });
   return rows;
 }
 
@@ -358,6 +371,12 @@ const shapeSettings = (r, basis) => ({
 });
 
 export function pickCutSettings(rows, thicknessMm) {
+  // With the company's shop spacing switched on (shopRules.withShopSpacing): the edge margin and the gap
+  // between blocks laid over the band — the kerf stays the band's. Off (the default): the band as it is.
+  return withShopSpacing(pickCutBand(rows, thicknessMm), rows?.shop, thicknessMm);
+}
+
+function pickCutBand(rows, thicknessMm) {
   const t = num(thicknessMm);
   const isDefault = (r) => r.thickness_min_mm == null && r.thickness_max_mm == null;
   const covers = (r) => !isDefault(r)
@@ -1279,6 +1298,38 @@ export const KERF_BAND_MM = Object.freeze({ min: 2.5, max: 5 });
  * sharedLengthMm, checks: [{ key, ok, label, detail }] }. 'none' = no layout
  * to check (an imported nest our packer could not fit).
  */
+/**
+ * TWO PARTS ON A PLATE: overlap, closer than the kerf, a shared cut (exactly one kerf along a common
+ * edge), or apart. THE ONE RULE nestRules (the proposal's badge) and verifyLot (the accept) both use,
+ * so the two can never disagree (2026-10-18, SO260014 N-002: the accept tested BOXES while the packer
+ * had laid TRUE SHAPES interlocked, and refused "overlap" on pairs the proposal had passed).
+ *
+ * Boxes first — they decide whenever they are a kerf apart or more, or when a piece has no outline.
+ * When the boxes conflict and BOTH pieces carry their outline on the plate (`placedRings` or `rings`:
+ * a drawing, or a turned shape), the outlines decide: shared steel = overlap; nearer than the kerf
+ * (touching included) = too close; exactly one kerf = a shared cut; otherwise apart. A part sitting in
+ * another's cut-out is not an overlap. The exact test is lib/polyGeom's, the one shapePacker.verifyLayout
+ * (and so nestShapes.verifyPlate) uses.
+ * → { kind: 'overlap' | 'close' | 'shared' | 'ok', sep, sharedLen, exact }
+ */
+export function pairVerdict(p, q, k, tol = 0.005) {
+  const sepX = Math.max(q.x - (p.x + p.length), p.x - (q.x + q.length));
+  const sepY = Math.max(q.y - (p.y + p.width), p.y - (q.y + q.width));
+  const sep = Math.max(sepX, sepY);
+  if (sep >= k - EPS) {
+    if (Math.abs(sepX - k) <= 1e-3 && sepY < -EPS) return { kind: 'shared', sep, sharedLen: -sepY, exact: false };
+    if (Math.abs(sepY - k) <= 1e-3 && sepX < -EPS) return { kind: 'shared', sep, sharedLen: -sepX, exact: false };
+    return { kind: 'ok', sep, sharedLen: 0, exact: false };
+  }
+  const ra = ringsObject(p.placedRings ?? p.rings); const rb = ringsObject(q.placedRings ?? q.rings);
+  const A = ra ? toPolygon(ra) : null; const B = rb ? toPolygon(rb) : null;
+  if (!A || !B) return { kind: sep < -EPS ? 'overlap' : 'close', sep, sharedLen: 0, exact: false };
+  if (polygonsOverlap(A, B, tol)) return { kind: 'overlap', sep: -1, sharedLen: 0, exact: true };
+  const d = polygonsDistance(A, B, k + 1);
+  if (d < k - tol) return { kind: 'close', sep: d, sharedLen: 0, exact: true };
+  return { kind: Math.abs(d - k) <= Math.max(tol, 1e-3) ? 'shared' : 'ok', sep: d, sharedLen: 0, exact: true };
+}
+
 export function nestRules(nest, settings) {
   const k = Number(settings?.kerfMm) || 0;
   const gapMin = Number(settings?.seqGapMinMm) || 0;
@@ -1322,13 +1373,10 @@ export function nestRules(nest, settings) {
     for (let j = i + 1; j < byX.length; j++) {
       const q = byX[j];
       if (q.x - (p.x + p.length) > k + 1e-3) break;   // sorted by x: every later one is further still
-      const sepX = Math.max(q.x - (p.x + p.length), p.x - (q.x + q.length));
-      const sepY = Math.max(q.y - (p.y + p.width), p.y - (q.y + q.width));
-      const sep = Math.max(sepX, sepY);
-      if (sep < -EPS) { overlaps += 1; firstBad ??= [p, q, 'overlap']; continue; }
-      if (sep < k - EPS) { tooClose += 1; firstBad ??= [p, q, 'close']; continue; }
-      if (Math.abs(sepX - k) <= 1e-3 && sepY < -EPS) { shared += 1; sharedLen += -sepY; }
-      else if (Math.abs(sepY - k) <= 1e-3 && sepX < -EPS) { shared += 1; sharedLen += -sepX; }
+      const v = pairVerdict(p, q, k);
+      if (v.kind === 'overlap') { overlaps += 1; firstBad ??= [p, q, 'overlap']; continue; }
+      if (v.kind === 'close') { tooClose += 1; firstBad ??= [p, q, 'close']; continue; }
+      if (v.kind === 'shared') { shared += 1; sharedLen += v.sharedLen; }
     }
   }
   add('spacing', !overlaps && !tooClose,
@@ -1677,7 +1725,8 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     // nestingPacker charges the rim cut itself and takes `margin` as a trim on
     // top of it; shapePacker takes `margin` as the whole clearance. Both are
     // handed the figure that makes them leave the SAME clearance at the edge.
-    const rim = rimOf(settings.kerfMm);
+    // With the shop's spacing on (shopRules.js), the clearance at the edge is the shop's edge margin.
+    const rim = shopRimOf(settings, rimOf);
     //
     // THE KERF HANDED IN HERE IS THE ONLY ONE THAT COUNTS. The packer carries
     // its own thickness table as a fallback for callers that pass none; this
@@ -1723,7 +1772,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       pieces: pieces.map((p) => { const sh = shapeOf(p.cutPlate); return { key: p.key, qty: p.qty, rings: sh?.drawn ? sh.rings : null, length: p.length, width: p.width, grain: 'any', allowMirror: false }; }),
       sheets: packInput.sheets,
       // A kerf between parts; at the plate edge the clearance the rectangle packer leaves (rimOf).
-      kerf: settings.kerfMm, margin: rim.shapeMargin, rotations: [0, 90, 180, 270], partInPart: true,
+      kerf: settings.kerfMm, margin: rim.shapeMargin, rotations: rotationsOf(settings), partInPart: true,
       effort: input.effort ?? 'standard', seed: input.seed ?? 1,
     } : null;
     // A saved plate is owned already: free, one of it, its parts fixed where they are. The job
@@ -2166,7 +2215,9 @@ export function demandOf({ nestable, settingRows, plates, excl, line, facts, gui
   const pieces = nestable.slice().sort((a, b) => a.id - b.id)
     .map((cp) => [cp.id, cp.pieces, cp.steel.length, cp.steel.width, cp.steel.thickness, norm(cp.steel.grade), norm(cp.steel.material)]);
   const thicknesses = [...new Set(nestable.map((cp) => cp.steel.thickness))].sort((a, b) => a - b);
-  const settings = thicknesses.map((t) => { const st = pickCutSettings(settingRows, t); return [t, st.kerfMm, st.seqGapMinMm, guillotine == null ? !!st.guillotine : !!guillotine]; });
+  // The shop's spacing adds its edge margin (and a free rotation step) to the fingerprint ONLY when it is on, so
+  // every run made before it — and every run of a company that leaves it off — keeps its hash.
+  const settings = thicknesses.map((t) => { const st = pickCutSettings(settingRows, t); return [t, st.kerfMm, st.seqGapMinMm, guillotine == null ? !!st.guillotine : !!guillotine, ...(st.shopSpacing ? [st.edgeMarginMm, st.freeRotationStepDeg ?? 0] : [])]; });
   const groups = [...new Map(nestable.map((cp) => [groupKey(cp.steel), cp.steel])).values()];
   const offered = [...new Map(groups.flatMap((g) => sheetsFor(plates, g)).filter((p) => !excl.plates.has(p.id)).map((p) => [p.id, p])).values()]
     .sort((a, b) => a.id - b.id).map((p) => [p.id, p.steel.length, p.steel.width, p.steel.thickness]);
@@ -3009,7 +3060,12 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
   // flipped — has no rows to hold it to. It is verified on the outlines themselves: every part
   // (the DB's shape for its cut plate, placed where the plan says) a kerf from the next and from
   // the plate edge. A plate of rectangles lying square in rows is verified below, as it always was.
-  const free = !!shapeOf && (n.layout === 'free' || raw.some((p) => !isPlainPlacement(num(p.rotationDeg) ?? (p.rotated ? 90 : 0), !!p.mirrored)));
+  // ALSO FREE: a plate with a part whose DRAWING is not its rectangle ("shape from drawing"). Such a
+  // part may sit interlocked with its neighbour, boxes overlapping, and only its outline can say
+  // whether that is legal — a plan that does not say `layout` must not turn a true-shape plate into
+  // a rectangle check (SO260014 N-002, 2026-10-18: every interlocked pair refused as "overlap").
+  const drawnShape = (p) => { const cp = cpById.get(Number(p.cutPlateId)); const sh = cp ? shapeOf(cp) : null; return !!sh?.drawn && !isPlainRect(ringsObject(sh.rings)); };
+  const free = !!shapeOf && (n.layout === 'free' || raw.some((p) => !isPlainPlacement(num(p.rotationDeg) ?? (p.rotated ? 90 : 0), !!p.mirrored)) || raw.some(drawnShape));
   if (free) {
     const pieces = [];
     for (const [j, p] of raw.entries()) {
@@ -3079,17 +3135,26 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
     placed.set(cp.id, (placed.get(cp.id) ?? 0) + 1);
   }
 
+  // A rectangle layout whose parts have drawings: each piece's true outline, placed — the plate is
+  // measured on it, and the pair check below (pairVerdict, the proposal's own rule) reads it.
+  if (shapeOf && pieces.some((p) => shapeOf(p.cutPlate)?.drawn)) {
+    for (const p of pieces) {
+      const sh = shapeOf(p.cutPlate);
+      p.area = sh.area;
+      p.placedRings = placeShape(sh.rings, { x: p.x, y: p.y, rotationDeg: p.rotated ? 90 : 0, mirrored: false });
+      p.shaped = true;
+    }
+  }
+
   // Two pieces either share a boundary — exactly one kerf apart, cut once — or
-  // stand apart. Either way they are at least one kerf apart on one axis, and
-  // they never overlap.
+  // stand apart. Either way they are at least one kerf apart, and they never overlap.
   for (let a = 0; a < pieces.length; a++) {
     for (let b = a + 1; b < pieces.length; b++) {
       const p = pieces[a];
       const q = pieces[b];
-      const sepX = Math.max(q.x - (p.x + p.length), p.x - (q.x + q.length));
-      const sepY = Math.max(q.y - (p.y + p.width), p.y - (q.y + q.width));
-      if (Math.max(sepX, sepY) < k - EPS) {
-        problems.push(Math.max(sepX, sepY) < -EPS
+      const v = pairVerdict(p, q, k, OUR_TOL_MM);
+      if (v.kind === 'overlap' || v.kind === 'close') {
+        problems.push(v.kind === 'overlap'
           ? `${label}: ${p.cutPlateCode} at (${fmt(p.x)}, ${fmt(p.y)}) and ${q.cutPlateCode} at (${fmt(q.x)}, ${fmt(q.y)}) overlap.`
           : `${label}: ${p.cutPlateCode} at (${fmt(p.x)}, ${fmt(p.y)}) and ${q.cutPlateCode} at (${fmt(q.x)}, ${fmt(q.y)}) are closer than the ${fmt(k)} mm kerf. Two parts may share a boundary — one kerf, cut once — but they cannot be nearer than that.`);
       }
@@ -3129,15 +3194,6 @@ function verifyLot(lot, n, { label, cpById, required, placed, problems, imported
           ? `${label}: sequences ${p.seqNo} and ${q.seqNo} overlap on the plate. A sequence is cut whole and in order, so two of them cannot share ground.`
           : `${label}: sequences ${p.seqNo} and ${q.seqNo} are ${fmt(sep)} mm apart and the gap between sequences is ${fmt(settings.seqGapMinMm)}–${fmt(settings.seqGapMaxMm)} mm.`);
       }
-    }
-  }
-  // A rectangle layout whose parts have drawings: the plate is still measured on the true outlines.
-  if (shapeOf && pieces.some((p) => shapeOf(p.cutPlate)?.drawn)) {
-    for (const p of pieces) {
-      const sh = shapeOf(p.cutPlate);
-      p.area = sh.area;
-      p.placedRings = placeShape(sh.rings, { x: p.x, y: p.y, rotationDeg: p.rotated ? 90 : 0, mirrored: false });
-      p.shaped = true;
     }
   }
   lot.pieces = pieces;
@@ -4055,3 +4111,6 @@ export async function relotMany(pairs, ctx) {
   const wastes = await wastesOf(parts.map((q) => [q.wasteLot, q.shaped]));
   return pairs.map(([lot], i) => relotDone(lot, parts[i], wastes[i]));
 }
+
+/** For the pure tests only (scripts/cf_kepl/nesting_learnings_test.mjs): the accept's per-plate check, no database. */
+export const __acceptInternals = Object.freeze({ verifyLot });

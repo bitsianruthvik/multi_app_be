@@ -22,6 +22,14 @@
  *
  * Tenant: every read is scoped by company_id AND the order line; a lot that is
  * not on that line is "not found", never another tenant's drawing.
+ *
+ * THE "AI" STYLE (2026-10-18, the shop's habits — services/aiCutPlan.js, aiNestDxf.js):
+ *   lotAiPlan(db, companyId, lineId, lotId)           -> { lot, shopSpacing, plan }  the cut plan as data
+ *   lotDxf(…, lotId, { style: 'ai', leads, order })    one nest as the ProNest DXF (PLATE / OUTLINES / HOLES /
+ *                                                      MARKING; LEADS and CUT_ORDER on request)
+ *   lineCncZip(…, { style: 'ai', leads, order })       every nest's AI DXF + its cut plan (<nest>.cutplan.json) + nests.csv
+ * Worked out from the SAVED layout on every call (pure and deterministic — nothing is stored); one or two
+ * more reads for the company's shop rules (shopRules.readShopRules).
  */
 import JSZip from 'jszip';
 import { notFound, invalid } from '../lib/errors.js';
@@ -29,6 +37,9 @@ import { drawingFactsOfLine } from './partDrawingService.js';
 import { analyseNest, nestToDxf } from './nestGeometry.js';
 import { ringsObject, placeShape, rotationOfRow, isPlainPlacement } from './nestShapes.js';
 import { rectRings } from '../lib/nestDxfReader.js';
+import { planCuts, aiRulesOf } from './aiCutPlan.js';
+import { aiPlanToDxf } from './aiNestDxf.js';
+import { readShopRules, shopRulesFor } from './shopRules.js';
 
 const DEFAULT_MIN_AREA = 90000;
 const DEFAULT_MIN_SIDE = 100;
@@ -110,6 +121,7 @@ async function loadLots(db, companyId, lineId, lotId = null) {
       width: Number(p.width_mm),
       seqNo: p.seq_no,
       rowNo: p.row_no,
+      posNo: p.pos_no ?? null,
       code: p.cut_plate_code ?? p.cut_plate_name ?? '',
     });
   }
@@ -242,11 +254,58 @@ function dxfFor(lot, pcs, offcuts) {
   });
 }
 
+/** The AI cut plan of one lot from its saved layout: the shop's leads and order, our kerf and sequences. */
+function aiPlanOf(lot, pcs, shop) {
+  const t = lot.thickness_mm != null ? Number(lot.thickness_mm) : null;
+  const sr = shopRulesFor(t, shop?.rows ?? []);
+  const kerfMm = lot.kerf_mm != null ? Number(lot.kerf_mm) : sr.kerfMm;
+  const rules = aiRulesOf({ kerfMm, edgeMarginMm: sr.edgeMarginMm, partGapMm: sr.partGapMm, groupGapMm: sr.groupGapMm, shopSpacing: !!shop?.on }, sr);
+  const pieces = pcs.map((p, i) => ({
+    key: i, code: p.code,
+    ...(Array.isArray(p.outline) && p.outline.length ? { rings: p.outline } : { x: p.x, y: p.y, length: p.length, width: p.width }),
+    seqNo: p.seqNo ?? null, rowNo: p.rowNo ?? null, posNo: p.posNo ?? null,
+  }));
+  return planCuts({ plate: { length: Number(lot.length_mm), width: Number(lot.width_mm) }, pieces, rules });
+}
+
+const aiDxfOf = (lot, plan, { leads = false, order = false } = {}) => aiPlanToDxf({
+  lot: { lotNo: lot.lot_no, plateCode: lot.plate_code ?? lot.plate_name ?? '', thickness: lot.thickness_mm != null ? Number(lot.thickness_mm) : null },
+  plan, leads: !!leads, order: !!order,
+});
+
 /**
- * One nest's DXF.
+ * One nest's AI cut plan, as data (GET …/nesting/cut-plan/:lotId).
+ * @returns {Promise<{ lot: object, shopSpacing: boolean, plan: object }>}
+ */
+export async function lotAiPlan(db, companyId, lineId, lotId) {
+  const line = await requireLine(db, companyId, lineId);
+  const { lots, pieces } = await loadLots(db, companyId, lineId, Number(lotId));
+  const lot = lots[0];
+  if (!lot) throw notFound('Plate lot');
+  const pcs = pieces.get(lot.id) ?? [];
+  if (!hasLayout(pcs)) throw invalid('NO_LAYOUT', `Nest ${lot.lot_no} has no layout of ours, so there is no cut plan to work out.`);
+  const shop = await readShopRules(db, companyId);
+  return {
+    lot: {
+      id: lot.id, lotNo: lot.lot_no, orderCode: line.order_code, lineNo: line.line_no, plateCode: lot.plate_code ?? lot.plate_name ?? '',
+      thicknessMm: lot.thickness_mm != null ? Number(lot.thickness_mm) : null, lengthMm: Number(lot.length_mm), widthMm: Number(lot.width_mm),
+      kerfMm: lot.kerf_mm != null ? Number(lot.kerf_mm) : null,
+    },
+    shopSpacing: !!shop.on,
+    plan: aiPlanOf(lot, pcs, shop),
+  };
+}
+
+/**
+ * One nest's DXF. `opts.style === 'ai'`: the ProNest file of the AI cut plan (aiNestDxf.js).
  * @returns {Promise<{ filename: string, buffer: Buffer }>}
  */
-export async function lotDxf(db, companyId, lineId, lotId) {
+export async function lotDxf(db, companyId, lineId, lotId, opts = {}) {
+  if (opts.style === 'ai') {
+    const { lot, plan } = await lotAiPlan(db, companyId, lineId, lotId);
+    const dxf = aiDxfOf({ lot_no: lot.lotNo, plate_code: lot.plateCode, thickness_mm: lot.thicknessMm }, plan, opts);
+    return { filename: `${baseName({ order_code: lot.orderCode, line_no: lot.lineNo }, { lot_no: lot.lotNo })}-AI.dxf`, buffer: Buffer.from(dxf, 'latin1') };
+  }
   const line = await requireLine(db, companyId, lineId);
   const { lots, pieces, offcuts } = await loadLots(db, companyId, lineId, Number(lotId));
   const lot = lots[0];
@@ -270,9 +329,11 @@ const csvCell = (v) => {
  * Every nest of a line: one DXF per lot that has a layout, plus nests.csv.
  * @returns {Promise<{ filename: string, buffer: Buffer }>}
  */
-export async function lineCncZip(db, companyId, lineId) {
+export async function lineCncZip(db, companyId, lineId, opts = {}) {
   const line = await requireLine(db, companyId, lineId);
   const { lots, pieces, offcuts } = await loadLots(db, companyId, lineId);
+  const ai = opts.style === 'ai';
+  const shop = ai ? await readShopRules(db, companyId) : null;
   const needsThresholds = lots.some((l) => !offcuts.get(l.id)?.length && hasLayout(pieces.get(l.id) ?? []));
   const thresholds = needsThresholds ? await offcutThresholds(db, companyId) : null;
 
@@ -289,7 +350,13 @@ export async function lineCncZip(db, companyId, lineId) {
     let file = '';
     let note = '';
     let oc = offcuts.get(lot.id) ?? [];
-    if (laid) {
+    if (laid && ai) {
+      const plan = aiPlanOf(lot, pcs, shop);
+      file = `${baseName(line, lot)}-AI.dxf`;
+      zip.file(file, Buffer.from(aiDxfOf(lot, plan, opts), 'latin1'));
+      zip.file(`${baseName(line, lot)}.cutplan.json`, JSON.stringify(plan));
+      if (!plan.check.ok) note = `cut plan: ${plan.check.problems.map((p) => p.kind).join(', ')}`;
+    } else if (laid) {
       oc = offcutsFor(lot, pcs, oc, thresholds);
       file = `${baseName(line, lot)}.dxf`;
       zip.file(file, Buffer.from(dxfFor(lot, pcs, oc), 'latin1'));
@@ -317,5 +384,5 @@ export async function lineCncZip(db, companyId, lineId) {
   // A BOM so Excel opens the dashes and codes as UTF-8.
   zip.file('nests.csv', `﻿${rows.map((r) => r.map(csvCell).join(',')).join('\r\n')}\r\n`);
   const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-  return { filename: `${safe(line.order_code)}-L${safe(line.line_no)}-nesting-cnc.zip`, buffer };
+  return { filename: `${safe(line.order_code)}-L${safe(line.line_no)}-nesting-${ai ? 'ai' : 'cnc'}.zip`, buffer };
 }
