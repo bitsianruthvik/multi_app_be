@@ -45,8 +45,13 @@ async function load(companyId, names) {
 // ── Small helpers ─────────────────────────────────────────────────────────
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const day = (v) => (v ? String(v).slice(0, 10) : null);
-const live = (d) => d.Cancelled !== 'tYES';
-const isOpen = (d) => d.DocumentStatus === 'bost_Open' && live(d);
+// The document API says tYES / bost_Open; line data read through $crossjoin carries SAP's raw codes (Y, C / O).
+const live = (d) => d.Cancelled !== 'tYES' && d.Cancelled !== 'Y' && d.Cancelled !== 'C';
+const lineOpen = (l) => l.LineStatus === 'bost_Open' || l.LineStatus === 'O';
+/** Inter-unit documents (Karni billing itself between units): left out of trade figures. */
+const interUnit = (x) => /^IBR/i.test(x.CardCode || '') || /^KARNI PACKAGING/i.test(x.CardName || '');
+const trade = (x) => live(x) && !interUnit(x);
+const isOpen = (d) => (d.DocumentStatus === 'bost_Open' || d.DocumentStatus === 'O') && live(d);
 const net = (d) => num(d.DocTotal) - num(d.VatSum);
 const balance = (d) => num(d.DocTotal) - num(d.PaidToDate);
 const round = (v) => Math.round(v * 100) / 100;
@@ -109,8 +114,9 @@ function masters(d) {
   const places = Object.fromEntries((d.businessPlaces || []).map((p) => [p.BPLID, p.BPLName]));
   const whs = new Map((d.warehouses || []).map((w) => [w.WarehouseCode, { name: w.WarehouseName, unit: places[w.BusinessPlaceID] || null }]));
   const people = Object.fromEntries((d.salesPersons || []).map((p) => [p.SalesEmployeeCode, p.SalesEmployeeName]));
+  const uomOf = (l) => (l.UoMCode && l.UoMCode !== 'Manual' ? l.UoMCode : items.get(l.ItemCode)?.InventoryUOM || '');
   const partners = new Map((d.businessPartners || []).map((b) => [b.CardCode, b]));
-  return { groups, items, itemGroup, whs, people, partners };
+  return { groups, items, itemGroup, whs, people, partners, uomOf };
 }
 const MASTER_SETS = ['items', 'itemGroups', 'warehouses', 'businessPlaces', 'salesPersons', 'businessPartners'];
 
@@ -139,8 +145,8 @@ export async function units(companyId) {
 function salesLines(d, unit) {
   const ok = unitOk(unit);
   return [
-    ...(d.invoiceLines || []).filter((l) => live(l) && ok(l.BPLName)).map((l) => ({ ...l, sign: 1 })),
-    ...(d.creditNoteLines || []).filter((l) => live(l) && ok(l.BPLName)).map((l) => ({ ...l, sign: -1 })),
+    ...(d.invoiceLines || []).filter((l) => trade(l) && ok(l.BPLName)).map((l) => ({ ...l, sign: 1 })),
+    ...(d.creditNoteLines || []).filter((l) => trade(l) && ok(l.BPLName)).map((l) => ({ ...l, sign: -1 })),
   ];
 }
 function salesDocs(d, unit) {
@@ -148,8 +154,8 @@ function salesDocs(d, unit) {
   const cu = unitMap(d.creditNoteLines);
   const ok = unitOk(unit);
   return [
-    ...(d.invoices || []).filter((x) => live(x) && ok(iu.get(x.DocEntry))).map((x) => ({ d: x, sign: 1, unit: iu.get(x.DocEntry) || null })),
-    ...(d.creditNotes || []).filter((x) => live(x) && ok(cu.get(x.DocEntry))).map((x) => ({ d: x, sign: -1, unit: cu.get(x.DocEntry) || null })),
+    ...(d.invoices || []).filter((x) => trade(x) && ok(iu.get(x.DocEntry))).map((x) => ({ d: x, sign: 1, unit: iu.get(x.DocEntry) || null })),
+    ...(d.creditNotes || []).filter((x) => trade(x) && ok(cu.get(x.DocEntry))).map((x) => ({ d: x, sign: -1, unit: cu.get(x.DocEntry) || null })),
   ];
 }
 function sumSales(docs, from, to) {
@@ -219,7 +225,7 @@ export async function status(companyId) {
        FROM kd_connectors WHERE company_id = ? ORDER BY created_at DESC`, [companyId]);
   const [datasets] = await pool.query(
     `SELECT dataset, since_date AS sinceDate, last_ok_at AS lastOkAt, last_error AS lastError, last_rows AS rowCount
-       FROM kd_dataset_state WHERE company_id = ? ORDER BY dataset`, [companyId]);
+       FROM kd_dataset_state WHERE company_id = ? AND dataset NOT LIKE 'probe:%' ORDER BY dataset`, [companyId]);
   const [runs] = await pool.query(
     `SELECT id, connector_id AS connectorId, started_at AS startedAt, finished_at AS finishedAt, ok, summary
        FROM kd_sync_runs WHERE company_id = ? ORDER BY started_at DESC LIMIT 20`, [companyId]);
@@ -262,19 +268,19 @@ export async function overview(companyId, q = {}) {
       const uk = u || 'Not split'; byUnit.set(uk, (byUnit.get(uk) || 0) + v);
     }
   }
-  const pays = (d.incomingPayments || []).filter((p) => payLive(p) && ok(p.BPLName));
-  const vpays = (d.vendorPayments || []).filter((p) => payLive(p) && ok(p.BPLName));
+  const pays = (d.incomingPayments || []).filter((p) => payLive(p) && !interUnit(p) && ok(p.BPLName));
+  const vpays = (d.vendorPayments || []).filter((p) => payLive(p) && !interUnit(p) && ok(p.BPLName));
   const collByMonth = Object.fromEntries(months.map((m) => [m, 0]));
   for (const p of pays) { const mk = monthKey(day(p.DocDate) || ''); if (mk in collByMonth) collByMonth[mk] += payTotal(p); }
 
   const iu = unitMap(d.invoiceLines);
   const pu = unitMap(d.purchaseInvoiceLines);
-  const rec = ageing((d.invoices || []).filter((x) => ok(iu.get(x.DocEntry))), today, iu);
-  const pay = ageing((d.purchaseInvoices || []).filter((x) => ok(pu.get(x.DocEntry))), today, pu);
-  const so = openDocs(d.orders || [], today, unitMap(d.orderLines), unit);
-  const po = openDocs(d.purchaseOrders || [], today, unitMap(d.purchaseOrderLines), unit);
+  const rec = ageing((d.invoices || []).filter((x) => !interUnit(x) && ok(iu.get(x.DocEntry))), today, iu);
+  const pay = ageing((d.purchaseInvoices || []).filter((x) => !interUnit(x) && ok(pu.get(x.DocEntry))), today, pu);
+  const so = openDocs((d.orders || []).filter((x) => !interUnit(x)), today, unitMap(d.orderLines), unit);
+  const po = openDocs((d.purchaseOrders || []).filter((x) => !interUnit(x)), today, unitMap(d.purchaseOrderLines), unit);
 
-  const todayLines = (list) => (list || []).filter((l) => live(l) && ok(l.BPLName) && day(l.DocDate) === today);
+  const todayLines = (list) => (list || []).filter((l) => trade(l) && ok(l.BPLName) && day(l.DocDate) === today);
   const ordersToday = todayLines(d.orderLines);
   const deliveriesToday = todayLines(d.deliveryLines);
   const grnToday = todayLines(d.grpoLines);
@@ -289,6 +295,9 @@ export async function overview(companyId, q = {}) {
     salesMonth: sumSales(docs, monthStart, today),
     salesPrevMonthSamePeriod: sumSales(docs, prevMonthStart, prevMonthSameDay),
     salesFy: sumSales(docs, fy, today),
+    interUnitFy: round(
+      sumBy((d.invoices || []).filter((x) => live(x) && interUnit(x) && day(x.DocDate) >= fy), net)
+      - sumBy((d.creditNotes || []).filter((x) => live(x) && interUnit(x) && day(x.DocDate) >= fy), net)),
     salesPrevFySamePeriod: sumSales(docs, prevFy, prevFyToday),
     collectionsMonth: round(sumBy(pays.filter((p) => day(p.DocDate) >= monthStart), payTotal)),
     paymentsMonth: round(sumBy(vpays.filter((p) => day(p.DocDate) >= monthStart), payTotal)),
@@ -334,7 +343,7 @@ export async function sales(companyId, q = {}) {
   const customers = group(docs, ({ d: x }) => x.CardCode, { sales: v }, ({ d: x }) => ({ cardName: x.CardName })).sort(desc('sales'));
   const persons = group(docs, ({ d: x }) => x.SalesPersonCode ?? -1, { sales: v })
     .map((p) => ({ ...p, name: M.people[p.key] || (p.key === -1 ? 'No sales employee' : `#${p.key}`) })).sort(desc('sales'));
-  const items = group(lines, (l) => l.ItemCode, { sales: lv, qty: lq }, (l) => ({ itemName: l.ItemDescription, uom: l.UoMCode, group: M.itemGroup(l.ItemCode) })).sort(desc('sales'));
+  const items = group(lines, (l) => l.ItemCode, { sales: lv, qty: lq }, (l) => ({ itemName: l.ItemDescription, uom: M.uomOf(l), group: M.itemGroup(l.ItemCode) })).sort(desc('sales'));
   const itemGroups = group(lines, (l) => M.itemGroup(l.ItemCode), { sales: lv, qty: lq }).sort(desc('sales'));
   const byUnit = group(lines, (l) => l.BPLName || 'Not split', { sales: lv, qty: lq }).sort(desc('sales'));
   const documents = docs.map(({ d: x, sign, unit: u }) => ({
@@ -342,8 +351,10 @@ export async function sales(companyId, q = {}) {
     cardCode: x.CardCode, cardName: x.CardName, net: round(sign * net(x)), tax: round(sign * num(x.VatSum)), total: round(sign * num(x.DocTotal)),
   })).sort((a, b) => (a.docDate < b.docDate ? 1 : a.docDate > b.docDate ? -1 : b.docNum - a.docNum));
   const total = round(sumBy(docs, v));
+  const iuSales = sumBy((d.invoices || []).filter((x) => live(x) && interUnit(x) && inRange(x.DocDate, range)), net)
+    - sumBy((d.creditNotes || []).filter((x) => live(x) && interUnit(x) && inRange(x.DocDate, range)), net);
   return {
-    asOf: await lastSync(companyId), ...range, unit, total,
+    asOf: await lastSync(companyId), ...range, unit, total, interUnit: round(iuSales),
     tax: round(sumBy(docs, ({ d: x, sign }) => sign * num(x.VatSum))),
     qty: round(sumBy(lines, lq)),
     documentCount: documents.length, customerCount: customers.length,
@@ -371,7 +382,7 @@ export async function salesCustomer(companyId, cardCode, q = {}) {
     ...range, cardCode, cardName: bp?.CardName || lines[0]?.CardName || cardCode,
     city: bp?.City || null, balance: num(bp?.CurrentAccountBalance), creditLimit: num(bp?.CreditLimit),
     total: round(sumBy(lines, lv)),
-    items: group(lines, (l) => l.ItemCode, { sales: lv, qty: (l) => l.sign * num(l.Quantity) }, (l) => ({ itemName: l.ItemDescription, uom: l.UoMCode }))
+    items: group(lines, (l) => l.ItemCode, { sales: lv, qty: (l) => l.sign * num(l.Quantity) }, (l) => ({ itemName: l.ItemDescription, uom: M.uomOf(l) }))
       .sort(desc('sales')).map((i) => ({ itemCode: i.key, itemName: i.itemName, uom: i.uom, qty: i.qty, sales: i.sales })),
     monthly: group(lines, (l) => monthKey(day(l.DocDate)), { sales: lv }).sort((a, b) => (a.key < b.key ? -1 : 1)).map((m) => ({ month: m.key, sales: m.sales })),
   };
@@ -384,7 +395,7 @@ export async function salesOrders(companyId, q = {}) {
   const d = await load(companyId, ['orders', 'orderLines', 'stock', ...MASTER_SETS]);
   const M = masters(d);
   const ok = unitOk(unit);
-  const head = openDocs(d.orders || [], today, unitMap(d.orderLines), unit, M.people);
+  const head = openDocs((d.orders || []).filter((x) => !interUnit(x)), today, unitMap(d.orderLines), unit, M.people);
 
   // Stock in hand per item (the unit's warehouses when a unit is chosen)
   const stockOf = new Map();
@@ -392,12 +403,12 @@ export async function salesOrders(companyId, q = {}) {
     if (unit && M.whs.get(s.WarehouseCode)?.unit !== unit) continue;
     stockOf.set(s.ItemCode, (stockOf.get(s.ItemCode) || 0) + num(s.InStock));
   }
-  const pending = (d.orderLines || []).filter((l) => live(l) && ok(l.BPLName) && l.LineStatus === 'bost_Open' && num(l.RemainingOpenQuantity) > 0)
+  const pending = (d.orderLines || []).filter((l) => trade(l) && ok(l.BPLName) && lineOpen(l) && num(l.RemainingOpenQuantity) > 0)
     .map((l) => {
       const price = num(l.Quantity) ? num(l.LineTotal) / num(l.Quantity) : 0;
       return {
         docEntry: l.DocEntry, docNum: l.DocNum, docDate: day(l.DocDate), lineNum: l.LineNum, unit: l.BPLName || null,
-        cardCode: l.CardCode, cardName: l.CardName, itemCode: l.ItemCode, itemName: l.ItemDescription, uom: l.UoMCode,
+        cardCode: l.CardCode, cardName: l.CardName, itemCode: l.ItemCode, itemName: l.ItemDescription, uom: M.uomOf(l),
         ordered: num(l.Quantity), open: num(l.RemainingOpenQuantity), value: round(num(l.RemainingOpenQuantity) * price),
         shipDate: day(l.ShipDate), late: day(l.ShipDate) ? day(l.ShipDate) < today : false,
       };
@@ -425,7 +436,7 @@ export async function dispatch(companyId, q = {}) {
   const d = await load(companyId, ['deliveryLines', ...MASTER_SETS]);
   const M = masters(d);
   const ok = unitOk(unit);
-  const lines = (d.deliveryLines || []).filter((l) => live(l) && ok(l.BPLName) && inRange(l.DocDate, range));
+  const lines = (d.deliveryLines || []).filter((l) => trade(l) && ok(l.BPLName) && inRange(l.DocDate, range));
   const qty = (l) => num(l.Quantity);
   const val = (l) => num(l.LineTotal);
   const byDayMap = Object.fromEntries(daysRange(range.from, range.to).map((x) => [x, { qty: 0, value: 0 }]));
@@ -439,7 +450,7 @@ export async function dispatch(companyId, q = {}) {
     daily: Object.entries(byDayMap).map(([date, x]) => ({ date, qty: round(x.qty), value: round(x.value) })),
     byCustomer: group(lines, (l) => l.CardCode, { qty, value: val }, (l) => ({ cardName: l.CardName })).sort(desc('value'))
       .map((g) => ({ cardCode: g.key, cardName: g.cardName, qty: g.qty, value: g.value, lines: g.count })),
-    byItem: group(lines, (l) => l.ItemCode, { qty, value: val }, (l) => ({ itemName: l.ItemDescription, uom: l.UoMCode, group: M.itemGroup(l.ItemCode) })).sort(desc('qty'))
+    byItem: group(lines, (l) => l.ItemCode, { qty, value: val }, (l) => ({ itemName: l.ItemDescription, uom: M.uomOf(l), group: M.itemGroup(l.ItemCode) })).sort(desc('qty'))
       .map((g) => ({ itemCode: g.key, itemName: g.itemName, group: g.group, uom: g.uom, qty: g.qty, value: g.value })).slice(0, 1000),
     byGroup: group(lines, (l) => M.itemGroup(l.ItemCode), { qty, value: val }).sort(desc('qty')).map((g) => ({ group: g.key, qty: g.qty, value: g.value })),
     documents: docs.slice(0, 1000).map((g) => ({ docEntry: g.key, docNum: g.docNum, docDate: g.docDate, cardName: g.cardName, unit: g.unit, qty: g.qty, value: g.value })),
@@ -458,10 +469,10 @@ async function partyBook(companyId, q, kind) {
   const units = unitMap(d[lineSet]);
   const ok = unitOk(unit);
   const bp = new Map((d.businessPartners || []).map((b) => [b.CardCode, b]));
-  const a = ageing((d[docSet] || []).filter((x) => ok(units.get(x.DocEntry))), today, units);
+  const a = ageing((d[docSet] || []).filter((x) => !interUnit(x) && ok(units.get(x.DocEntry))), today, units);
   if (sales) a.parties = a.parties.map((p) => ({ ...p, creditLimit: num(bp.get(p.cardCode)?.CreditLimit), accountBalance: num(bp.get(p.cardCode)?.CurrentAccountBalance) }));
 
-  const pays = (d[paySet] || []).filter((p) => payLive(p) && ok(p.BPLName));
+  const pays = (d[paySet] || []).filter((p) => payLive(p) && !interUnit(p) && ok(p.BPLName));
   const months = lastMonths(12, today);
   const byMonth = Object.fromEntries(months.map((m) => [m, 0]));
   for (const p of pays) { const mk = monthKey(day(p.DocDate) || ''); if (mk in byMonth) byMonth[mk] += payTotal(p); }
@@ -492,26 +503,26 @@ export async function purchase(companyId, q = {}) {
   const d = await load(companyId, ['purchaseInvoiceLines', 'purchaseOrders', 'purchaseOrderLines', 'grpoLines', ...MASTER_SETS]);
   const M = masters(d);
   const ok = unitOk(unit);
-  const inv = (d.purchaseInvoiceLines || []).filter((l) => live(l) && ok(l.BPLName) && inRange(l.DocDate, range));
+  const inv = (d.purchaseInvoiceLines || []).filter((l) => trade(l) && ok(l.BPLName) && inRange(l.DocDate, range));
   const val = (l) => num(l.LineTotal);
   const qty = (l) => num(l.Quantity);
 
-  const poLines = (d.purchaseOrderLines || []).filter((l) => live(l) && ok(l.BPLName) && inRange(l.DocDate, range)).map((l) => {
+  const poLines = (d.purchaseOrderLines || []).filter((l) => trade(l) && ok(l.BPLName) && inRange(l.DocDate, range)).map((l) => {
     const ordered = num(l.Quantity);
-    const pendingQ = l.LineStatus === 'bost_Open' ? num(l.RemainingOpenQuantity) : 0;
+    const pendingQ = lineOpen(l) ? num(l.RemainingOpenQuantity) : 0;
     const received = Math.max(0, ordered - num(l.RemainingOpenQuantity));
     return {
       docEntry: l.DocEntry, docNum: l.DocNum, docDate: day(l.DocDate), lineNum: l.LineNum, unit: l.BPLName || null,
-      cardCode: l.CardCode, cardName: l.CardName, itemCode: l.ItemCode, itemName: l.ItemDescription, uom: l.UoMCode,
+      cardCode: l.CardCode, cardName: l.CardName, itemCode: l.ItemCode, itemName: l.ItemDescription, uom: M.uomOf(l),
       ordered, received: round(received), pending: round(pendingQ), value: round(val(l)),
-      open: l.LineStatus === 'bost_Open', shipDate: day(l.ShipDate), late: l.LineStatus === 'bost_Open' && day(l.ShipDate) && day(l.ShipDate) < today,
+      open: lineOpen(l), shipDate: day(l.ShipDate), late: lineOpen(l) && day(l.ShipDate) && day(l.ShipDate) < today,
     };
   });
   const vendorFill = group(poLines, (l) => l.cardCode, { ordered: (l) => l.ordered, received: (l) => l.received, pending: (l) => l.pending, late: (l) => (l.late ? 1 : 0) },
     (l) => ({ cardName: l.cardName })).map((g) => ({ cardCode: g.key, cardName: g.cardName, lines: g.count, ordered: g.ordered, received: g.received, pending: g.pending, late: g.late,
     fill: g.ordered ? Math.round((g.received / g.ordered) * 1000) / 10 : null })).sort(desc('ordered'));
 
-  const grn30 = (d.grpoLines || []).filter((l) => live(l) && ok(l.BPLName) && day(l.DocDate) >= addDays(today, -29));
+  const grn30 = (d.grpoLines || []).filter((l) => trade(l) && ok(l.BPLName) && day(l.DocDate) >= addDays(today, -29));
   const grnDays = Object.fromEntries(daysRange(addDays(today, -29), today).map((x) => [x, 0]));
   for (const l of grn30) { const k = day(l.DocDate); if (k in grnDays) grnDays[k] += val(l); }
 
@@ -521,7 +532,7 @@ export async function purchase(companyId, q = {}) {
     monthly: group(inv, (l) => monthKey(day(l.DocDate)), { spend: val }).sort((a, b) => (a.key < b.key ? -1 : 1)).map((m) => ({ month: m.key, spend: m.spend })),
     byVendor: group(inv, (l) => l.CardCode, { spend: val, qty }, (l) => ({ cardName: l.CardName })).sort(desc('spend'))
       .map((g) => ({ cardCode: g.key, cardName: g.cardName, spend: g.spend, qty: g.qty, lines: g.count })),
-    byItem: group(inv, (l) => l.ItemCode, { spend: val, qty }, (l) => ({ itemName: l.ItemDescription, uom: l.UoMCode, group: M.itemGroup(l.ItemCode) })).sort(desc('spend'))
+    byItem: group(inv, (l) => l.ItemCode, { spend: val, qty }, (l) => ({ itemName: l.ItemDescription, uom: M.uomOf(l), group: M.itemGroup(l.ItemCode) })).sort(desc('spend'))
       .slice(0, 1000).map((g) => ({ itemCode: g.key, itemName: g.itemName, group: g.group, uom: g.uom, spend: g.spend, qty: g.qty, avgPrice: g.qty ? round(g.spend / g.qty) : null })),
     byGroup: group(inv, (l) => M.itemGroup(l.ItemCode), { spend: val, qty }).sort(desc('spend')).map((g) => ({ group: g.key, spend: g.spend, qty: g.qty })),
     poVsGrn: {
@@ -536,7 +547,7 @@ export async function purchase(companyId, q = {}) {
 
 export async function purchaseOrders(companyId, q = {}) {
   const d = await load(companyId, ['purchaseOrders', 'purchaseOrderLines']);
-  return { asOf: await lastSync(companyId), ...openDocs(d.purchaseOrders || [], todayIso(), unitMap(d.purchaseOrderLines), q.unit || null) };
+  return { asOf: await lastSync(companyId), ...openDocs((d.purchaseOrders || []).filter((x) => !interUnit(x)), todayIso(), unitMap(d.purchaseOrderLines), q.unit || null) };
 }
 
 // ── Production ───────────────────────────────────────────────────────────
@@ -555,28 +566,50 @@ export async function production(companyId, q = {}) {
   for (const l of [...(d.productionReceipts || []), ...(d.productionIssues || [])]) {
     if (l.BaseType === 202 && l.BPLName && !orderUnit.has(l.BaseEntry)) orderUnit.set(l.BaseEntry, l.BPLName);
   }
+  // Section of an order without U_SECTION: the routing stage most of its material was issued at.
+  const stageVotes = new Map();
+  for (const l of d.productionIssues || []) {
+    if (l.BaseType !== 202 || !l.StgDesc) continue;
+    const v = stageVotes.get(l.BaseEntry) || {}; v[l.StgDesc] = (v[l.StgDesc] || 0) + 1; stageVotes.set(l.BaseEntry, v);
+  }
+  const stageOf = (id) => { const v = stageVotes.get(id); return v ? Object.entries(v).sort((a, b) => b[1] - a[1])[0][0] : null; };
   const orders = (d.productionOrders || []).map((o) => ({
     id: o.AbsoluteEntry, docNum: o.DocumentNumber, itemCode: o.ItemNo, itemName: o.ProductDescription, uom: o.InventoryUOM,
     status: PO_STATUS[o.ProductionOrderStatus] || o.ProductionOrderStatus, planned: num(o.PlannedQuantity), completed: num(o.CompletedQuantity),
     rejected: num(o.RejectedQuantity), postingDate: day(o.PostingDate), dueDate: day(o.DueDate), closingDate: day(o.ClosingDate),
-    machine: o.U_MACHINE || 'Not set', section: o.U_SECTION || 'Not set', shift: o.U_UNE_Shift || null,
+    machine: o.U_MACHINE || 'Not set', section: o.U_SECTION || stageOf(o.AbsoluteEntry) || 'Not set', shift: o.U_UNE_Shift || null,
     unit: orderUnit.get(o.AbsoluteEntry) || o.U_Unit || null, salesOrder: o.ProductionOrderOriginNumber || null,
     customer: M.partners.get(o.CustomerCode)?.CardName || o.CustomerCode || null,
   })).filter((o) => o.status !== 'Cancelled' && ok(o.unit));
-  const open = orders.filter((o) => o.status === 'Planned' || o.status === 'Released').map((o) => ({
+  // Orders are re-read for 120 days after posting; older open ones may have been closed in SAP since.
+  const recentFrom = addDays(today, -120);
+  const isOpenStatus = (o) => o.status === 'Planned' || o.status === 'Released';
+  const olderOpen = orders.filter((o) => isOpenStatus(o) && o.postingDate < recentFrom).length;
+  const open = orders.filter((o) => isOpenStatus(o) && o.postingDate >= recentFrom).map((o) => ({
     ...o, progress: o.planned ? Math.round((o.completed / o.planned) * 1000) / 10 : 0, late: !!o.dueDate && o.dueDate < today,
   }));
   const machineSection = new Map();
   for (const o of orders) if (o.machine !== 'Not set' && !machineSection.has(o.machine)) machineSection.set(o.machine, o.section);
 
   const receipts = (d.productionReceipts || []).filter((l) => l.BaseType === 202 && ok(l.BPLName));
-  const issues = (d.productionIssues || []).filter((l) => l.BaseType === 202 && ok(l.BPLName));
+  // Resources (machine / labour time posted as items) are not material.
+  const isResource = (code) => /resource/i.test(M.itemGroup(code));
+  const issues = (d.productionIssues || []).filter((l) => l.BaseType === 202 && ok(l.BPLName) && !isResource(l.ItemCode));
+  // Yield compares kg with kg: orders whose product is counted in pieces are left out of it.
+  const kg = new Set(orders.filter((o) => /^kgs?$/i.test(o.uom || '')).map((o) => o.id));
+  const kgItem = (code) => /^kgs?$/i.test(M.items.get(code)?.InventoryUOM || '');
+  const kgLine = (l) => kg.has(l.BaseEntry) && kgItem(l.ItemCode);
   const rIn = receipts.filter((l) => inRange(l.DocDate, range));
   const iIn = issues.filter((l) => inRange(l.DocDate, range));
   const qty = (l) => num(l.Quantity);
   const val = (l) => num(l.LineTotal);
-  const machineOf = (l) => l.U_EVT_MACHINE || 'Not set';
-  const sectionOf = (l) => machineSection.get(machineOf(l)) || 'Other';
+  const orderById = new Map(orders.map((o) => [o.id, o]));
+  const machineOf = (l) => l.U_EVT_MACHINE || orderById.get(l.BaseEntry)?.machine || 'Not set';
+  const sectionOf = (l) => {
+    const o = orderById.get(l.BaseEntry);
+    if (o && o.section !== 'Not set') return o.section;
+    return machineSection.get(machineOf(l)) || 'Not set';
+  };
 
   // Output by day, split by section (stacked chart)
   const sections = [...new Set(rIn.map(sectionOf))].sort();
@@ -585,10 +618,11 @@ export async function production(companyId, q = {}) {
 
   // Yield per order: output ÷ material issued (same unit of measure in this plant: KG)
   const issuedBy = new Map();
-  for (const l of issues) issuedBy.set(l.BaseEntry, (issuedBy.get(l.BaseEntry) || 0) + qty(l));
+  for (const l of issues) if (kgLine(l)) issuedBy.set(l.BaseEntry, (issuedBy.get(l.BaseEntry) || 0) + qty(l));
   const outBy = new Map();
-  for (const l of receipts) outBy.set(l.BaseEntry, (outBy.get(l.BaseEntry) || 0) + qty(l));
-  const yieldRows = orders.filter((o) => issuedBy.get(o.id) > 0 && outBy.get(o.id) > 0 && (o.status === 'Closed' ? inRange(o.closingDate || o.postingDate, range) : true))
+  for (const l of receipts) if (kgLine(l)) outBy.set(l.BaseEntry, (outBy.get(l.BaseEntry) || 0) + qty(l));
+  // Yield on finished work only: a closed kg order, closed in this period, with material and output.
+  const yieldRows = orders.filter((o) => kg.has(o.id) && o.status === 'Closed' && inRange(o.closingDate || o.postingDate, range) && issuedBy.get(o.id) > 0 && outBy.get(o.id) > 0)
     .map((o) => {
       const input = issuedBy.get(o.id); const output = outBy.get(o.id);
       return { id: o.id, docNum: o.docNum, itemName: o.itemName, machine: o.machine, section: o.section, status: o.status, input: round(input), output: round(output),
@@ -613,7 +647,8 @@ export async function production(companyId, q = {}) {
       lateOrders: open.filter((o) => o.late).length,
       output: round(sumBy(rIn, qty)), outputValue: round(sumBy(rIn, val)), issued: round(sumBy(iIn, qty)),
       outputToday: round(sumBy(receipts.filter((l) => day(l.DocDate) === today), qty)),
-      yield: sumBy(iIn, qty) ? Math.round((sumBy(rIn, qty) / sumBy(iIn, qty)) * 1000) / 10 : null,
+      yield: (() => { const i = sumBy(yieldRows, (r) => r.input); return i ? Math.round((sumBy(yieldRows, (r) => r.output) / i) * 1000) / 10 : null; })(),
+      olderOpen,
       closedInRange: orders.filter((o) => o.status === 'Closed' && inRange(o.closingDate, range)).length,
     },
     statusCounts: group(orders.filter((o) => inRange(o.postingDate, range) || o.status === 'Released' || o.status === 'Planned'), (o) => o.status, {}).map((g) => ({ status: g.key, count: g.count })),
@@ -652,7 +687,7 @@ export async function inventory(companyId, q = {}) {
     itemCode: g.key, itemName: g.itemName, group: g.group, uom: g.uom, onHand: g.onHand, committed: g.committed, onOrder: g.onOrder, value: g.value,
     warehouses: g.count, available: round(g.onHand - g.committed + g.onOrder), short: g.committed > g.onHand + g.onOrder,
   })).sort(desc('value'));
-  const consumption = (d.productionIssues || []).filter((l) => l.BaseType === 202 && (!unit || l.BPLName === unit) && day(l.DocDate) >= addDays(today, -29));
+  const consumption = (d.productionIssues || []).filter((l) => l.BaseType === 202 && !/resource/i.test(M.itemGroup(l.ItemCode)) && (!unit || l.BPLName === unit) && day(l.DocDate) >= addDays(today, -29));
   return {
     asOf: await lastSync(companyId), unit,
     value: round(sumBy(stock, (s) => s.value)), qty: round(sumBy(stock, (s) => s.onHand)),

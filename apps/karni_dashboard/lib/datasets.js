@@ -134,10 +134,7 @@ export const DATASETS = [
  * against the fields THIS Service Layer actually has. Plain GETs with $top; the
  * rows land in kd_rows as `probe:<name>`. Remove a probe once it has been read.
  */
-const PROBES = {
-  downtime: 'U_EVT_BRK1?$top=2',
-  breakdowns: 'U_EVT_BRKD?$top=2',
-};
+const PROBES = {};
 for (const [name, path] of Object.entries(PROBES)) {
   DATASETS.push({ key: `probe:${name}`, path, full: true, keyField: (r) => String(r.Code ?? r.DocEntry ?? 'sample') });
 }
