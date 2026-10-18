@@ -101,7 +101,7 @@ export const DATASETS = [
   {
     key: 'stock', entity: 'Items', full: true, everyMinutes: 60, keyField: (r) => `${r.ItemCode}|${r.WarehouseCode}`,
     cross: {
-      lines: 'ItemWarehouseInfoCollection', head: 'ItemCode', line: 'WarehouseCode,InStock,Committed,Ordered',
+      lines: 'ItemWarehouseInfoCollection', head: 'ItemCode', line: 'WarehouseCode,InStock,Committed,Ordered,StandardAveragePrice',
       join: 'ItemCode', lineFilter: '(InStock ne 0 or Committed ne 0 or Ordered ne 0)',
     },
   },
