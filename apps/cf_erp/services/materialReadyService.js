@@ -280,12 +280,13 @@ export async function loadSupply(db, companyId, itemIds, { needs = new Map(), to
     // Live purchase lines with something still to come, each with its allocations (one row per allocation, or one with none).
     db.query(
       `SELECT l.id, l.item_id, l.quantity, l.qty_received, COALESCE(l.expected_date, p.expected_date) AS due, p.status, p.code, p.id AS po_id,
-              a.id AS a_id, a.quantity AS a_quantity, a.qty_received AS a_received, o.code AS order_code, prl.order_line_id
+              a.id AS a_id, a.quantity AS a_quantity, a.qty_received AS a_received, o.code AS order_code, prl.order_line_id, rq.for_type
          FROM cf_purchase_order_lines l
          JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
          LEFT JOIN cf_purchase_line_orders a ON a.company_id = l.company_id AND a.purchase_line_id = l.id AND a.deleted_at IS NULL
          LEFT JOIN cf_sales_orders o ON o.id = a.order_id AND o.deleted_at IS NULL
          LEFT JOIN cf_requisition_lines prl ON prl.id = a.pr_line_id AND prl.deleted_at IS NULL
+         LEFT JOIN cf_requisitions rq ON rq.id = prl.requisition_id
         WHERE l.company_id = ? AND l.item_id IN (?) AND l.deleted_at IS NULL AND p.status IN (?) AND l.quantity > l.qty_received
         ORDER BY l.id, a.id`,
       [companyId, ids, LIVE_PO_STATUSES],
@@ -344,6 +345,8 @@ export async function loadSupply(db, companyId, itemIds, { needs = new Map(), to
   for (const r of poRows) {
     if (!lines.has(r.id)) lines.set(r.id, { row: r, allocated: 0, received: 0 });
     if (r.a_id == null) continue;
+    // §79: a share bought for a STOCK MR is for stock — anybody's, like a PO line allocated to no order (pooled).
+    if (r.for_type === 'stock') continue;
     const t = lines.get(r.id);
     t.allocated += Number(r.a_quantity);
     t.received += Number(r.a_received);
@@ -377,12 +380,13 @@ export async function loadSupply(db, companyId, itemIds, { needs = new Map(), to
 }
 
 const PO_LINES_SQL = `SELECT l.id, l.item_id, l.quantity, l.qty_received, COALESCE(l.expected_date, p.expected_date) AS due, p.status, p.code, p.id AS po_id,
-              a.id AS a_id, a.quantity AS a_quantity, a.qty_received AS a_received, o.code AS order_code, prl.order_line_id
+              a.id AS a_id, a.quantity AS a_quantity, a.qty_received AS a_received, o.code AS order_code, prl.order_line_id, rq.for_type
          FROM cf_purchase_order_lines l
          JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
          LEFT JOIN cf_purchase_line_orders a ON a.company_id = l.company_id AND a.purchase_line_id = l.id AND a.deleted_at IS NULL
          LEFT JOIN cf_sales_orders o ON o.id = a.order_id AND o.deleted_at IS NULL
          LEFT JOIN cf_requisition_lines prl ON prl.id = a.pr_line_id AND prl.deleted_at IS NULL
+         LEFT JOIN cf_requisitions rq ON rq.id = prl.requisition_id
         WHERE l.company_id = ? AND l.item_id IN (?) AND l.deleted_at IS NULL AND p.status IN (?) AND l.quantity > l.qty_received
         ORDER BY l.id, a.id`;
 

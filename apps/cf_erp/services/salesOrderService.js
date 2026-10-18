@@ -519,6 +519,11 @@ export async function createOrder(db, c, input = {}) {
     [c.companyId, code, orderType, body.title, customerId, body.customer_reference, FIRST_STATUS[orderType],
       body.received_on, body.committed_date, body.delivery_address, body.notes, processId, body.material_supply, c.userId],
   );
+  // The order values given in the New order dialog (§65 values, saved with the order — drawingLineService, 2026-10-18).
+  if (Array.isArray(input.specDefaults) && input.specDefaults.length) {
+    const { applyNewOrderDefaults } = await import('./drawingLineService.js');
+    await applyNewOrderDefaults(db, c, r.insertId, input.specDefaults);
+  }
   return getOrder(db, c.companyId, r.insertId);
 }
 

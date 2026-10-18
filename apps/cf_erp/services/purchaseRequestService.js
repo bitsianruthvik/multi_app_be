@@ -30,7 +30,7 @@ import { likeOf } from '../lib/listing.js';
 import { availability } from './rollOutService.js';
 import { lineReadiness, openLines, today as clockToday, OPEN_ORDER_STATUSES } from './materialReadyService.js';
 import {
-  readRequisitions, syncLines, claimRows, askCustomer, supplyOf, requireOrderRow, SUPPLY_LABEL, heldMessage,
+  readRequisitions, syncLines, claimRows, askCustomer, supplyOf, requireOrderRow, SUPPLY_LABEL, heldMessage, forTypeOf, FOR_LABEL,
 } from './requisitionService.js';
 import { getPurchaseOrder, poStage, PO_STAGE_LABEL, askPoApproval } from './purchaseService.js';
 import { CURRENCY } from './priceService.js';
@@ -61,7 +61,8 @@ async function stockHoldRows(db, companyId, prLineIds, { lock = false } = {}) {
   if (!prLineIds.length) return out;
   const [rows] = await db.query(
     `SELECT id, pr_line_id, quantity FROM cf_stock_reservations
-      WHERE company_id = ? AND pr_line_id IN (?) AND status = 'active' AND deleted_at IS NULL AND purchase_line_id IS NULL AND held_for_order_id IS NOT NULL
+      WHERE company_id = ? AND pr_line_id IN (?) AND status = 'active' AND deleted_at IS NULL AND purchase_line_id IS NULL
+        AND (held_for_order_id IS NOT NULL OR (requirement_id IS NULL AND order_line_id IS NULL))
       ORDER BY id DESC${lock ? ' FOR UPDATE' : ''}`,
     [companyId, prLineIds],
   );
@@ -115,33 +116,39 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
   const [v] = await readRequisitions(db, companyId, { id }, { R });
   if (!v) throw notFound('Material request');
   const customer = v.supply === 'customer';
+  // §79: an MR raised by hand holds stock for ITSELF (not for an order); a STOCK MR takes nothing from stock — it refills it.
+  const forStock = v.manual && v.forType === 'stock';
   const itemIds = [...new Set(v.lines.map((l) => Number(l.item.id)))];
   const [held, av, prOf] = await Promise.all([
     stockHoldRows(db, companyId, v.lines.map((l) => l.id)),
-    itemIds.length ? availability(db, companyId, itemIds, { orderId: v.order.id, holds: 'none' }) : new Map(),
+    itemIds.length ? availability(db, companyId, itemIds, { orderId: v.manual ? null : v.order?.id ?? null, holds: 'none' }) : new Map(),
     prsOfRequisitions(db, companyId, [v.id]),
   ]);
   const lines = v.lines.map((l) => {
     const a = av.get(Number(l.item.id));
-    return screenLine(l, { free: (customer ? a?.theirsFree : a?.free) ?? 0, held: held.get(l.id) ?? [], customer });
+    const free = (customer ? a?.theirsFree : a?.free) ?? 0;
+    const s = screenLine(l, { free: forStock ? 0 : free, held: held.get(l.id) ?? [], customer });
+    return forStock ? { ...s, inStock: round6(free), takeMax: 0, proposedTake: null } : s;
   });
   const pos = new Map();
   for (const l of v.lines) for (const p of l.purchase) if (p.purchaseOrder.status !== 'cancelled') pos.set(p.purchaseOrder.id, { ...p.purchaseOrder, supplier: p.supplier });
-  const open = OPEN_ORDER_STATUSES.includes(v.order.status);
+  const open = v.manual || OPEN_ORDER_STATUSES.includes(v.order?.status);
   // §73: an MR raised before the customer accepted is shared, not released — nothing is taken or bought until approval.
   const heldMr = !!v.heldForAcceptance;
   return {
     id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel,
+    forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes, raisedAt: v.raisedAt, raisedBy: v.raisedBy,
     order: v.order, line: v.line, status: v.status, statusLabel: v.statusLabel, stale: v.stale, needKnown: v.needKnown, needComplete: v.needComplete,
     heldForAcceptance: heldMr,
     canEdit: open && !heldMr,
-    reason: heldMr ? heldMessage(v.code) : open ? null : `${v.order.code} is ${v.order.status} — its material request no longer changes.`,
+    reason: heldMr ? heldMessage(v.code) : open ? null : `${v.order?.code} is ${v.order?.status} — its material request no longer changes.`,
     lines,
     purchaseRequest: prOf.get(v.id) ?? null,
     purchaseOrders: [...pos.values()],
     sentence: customer
       ? 'The customer supplies this material. What is not in their stock here is asked of them on a purchase order (₹0).'
-      : 'Take what you can from stock; the rest goes on the purchase request.',
+      : forStock ? 'An MR for stock: everything on it is bought — save to put it on the purchase request.'
+        : 'Take what you can from stock; the rest goes on the purchase request.',
   };
 }
 
@@ -151,14 +158,23 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
  */
 export async function listMrs(db, companyId, q = {}) {
   const onlyOpen = !(q.open === false || q.open === 'false' || q.open === '0');
-  const views = await readRequisitions(db, companyId, { open: onlyOpen, orderId: blank(q.orderId) ? null : Number(q.orderId), search: q.search });
+  // §79: Stores' MR inbox filters by "For" (sales_order | maintenance_order | stock | general).
+  const views = await readRequisitions(db, companyId, {
+    open: onlyOpen, orderId: blank(q.orderId) ? null : Number(q.orderId), search: q.search,
+    forType: blank(q.for ?? q.forType) ? null : String(q.for ?? q.forType),
+    maintenanceOrderId: blank(q.maintenanceOrderId) ? null : Number(q.maintenanceOrderId),
+  });
   const prOf = await prsOfRequisitions(db, companyId, views.map((v) => v.id));
+  const counts = { all: views.length, sales_order: 0, maintenance_order: 0, stock: 0, general: 0 };
+  for (const v of views) counts[v.forType] += 1;
   return {
+    counts,
     rows: views.map((v) => {
       const live = v.lines.filter((l) => l.status !== 'not_needed');
       const lockedLines = live.filter((l) => (l.cover.earmarked ?? 0) + EPS >= l.need).length;
       return {
         id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel, order: v.order, line: v.line,
+        forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes,
         status: v.status, statusLabel: v.statusLabel, materials: live.length, lockedLines, heldForAcceptance: !!v.heldForAcceptance,
         lockedWords: live.length ? `${lockedLines} of ${live.length} locked` : 'Nothing to buy',
         purchaseRequest: prOf.get(v.id) ?? null, raisedAt: v.raisedAt,
@@ -178,18 +194,27 @@ export async function listMrs(db, companyId, q = {}) {
  */
 export async function saveMr(db, c, id, input = {}) {
   const [[head]] = await db.query(
-    `SELECT r.id, r.code, r.order_id, r.order_line_id, r.supply, r.held_for_acceptance, o.code AS order_code, o.status AS order_status
-       FROM cf_requisitions r JOIN cf_sales_orders o ON o.id = r.order_id WHERE r.company_id = ? AND r.id = ? AND r.deleted_at IS NULL FOR UPDATE`,
+    `SELECT r.id, r.code, r.order_id, r.order_line_id, r.supply, r.held_for_acceptance, r.for_type, o.code AS order_code, o.status AS order_status
+       FROM cf_requisitions r LEFT JOIN cf_sales_orders o ON o.id = r.order_id WHERE r.company_id = ? AND r.id = ? AND r.deleted_at IS NULL FOR UPDATE`,
     [c.companyId, Number(id)],
   );
   if (!head) throw notFound('Material request');
+  // §79: an MR raised by hand has no order line — its lines are typed (no engine, no sync) and its holds are its own.
+  const manual = head.order_line_id == null;
+  const forStock = manual && head.for_type === 'stock';
   if (Number(head.held_for_acceptance)) throw invalid('HELD_FOR_ACCEPTANCE', heldMessage(head.code));
-  if (!OPEN_ORDER_STATUSES.includes(head.order_status)) throw invalid('NOT_OPEN', `${head.order_code} is ${head.order_status} — its material request no longer changes.`);
-  let R = await lineReadiness(db, c.companyId, { full: true });
-  const s = await syncLines(db, c, [head], R.needs);
-  if (s.added || s.changed || s.retired) R = await lineReadiness(db, c.companyId, { full: true });
+  if (!manual && !OPEN_ORDER_STATUSES.includes(head.order_status)) throw invalid('NOT_OPEN', `${head.order_code} is ${head.order_status} — its material request no longer changes.`);
+  let R = null;
+  if (!manual) {
+    R = await lineReadiness(db, c.companyId, { full: true });
+    const s = await syncLines(db, c, [head], R.needs);
+    if (s.added || s.changed || s.retired) R = await lineReadiness(db, c.companyId, { full: true });
+  }
   const screen = await mrScreen(db, c.companyId, head.id, { R });
   const customer = screen.supply === 'customer';
+  // The holds of an MR raised by hand are held for nobody else — not for "the order as a whole" (the order's own MRs
+  // would count them twice).
+  const holdOrderId = manual ? null : head.order_id;
   const byId = new Map(screen.lines.map((l) => [l.id, l]));
   const rows = Array.isArray(input.lines) ? input.lines : [];
   const problems = [];
@@ -200,12 +225,13 @@ export async function saveMr(db, c, id, input = {}) {
     const t = Number(r?.takeFromStock);
     if (blank(r?.takeFromStock) || !Number.isFinite(t) || t < 0) { problems.push(`${nameOf(l.item)}: take from stock is a number, zero or more.`); continue; }
     if (t > l.required + EPS) { problems.push(`${nameOf(l.item)}: the line needs ${fmt(l.required)}${unitOf(l.item)} — take at most that.`); continue; }
+    if (forStock && t > EPS) { problems.push(`${nameOf(l.item)}: an MR for stock refills stock — nothing is taken from it.`); continue; }
     want.set(l.id, round6(t));
   }
   const itemIds = [...new Set(screen.lines.filter((l) => want.has(l.id)).map((l) => Number(l.item.id)))].sort((a, b) => a - b);
   if (itemIds.length) await db.query('SELECT master_id FROM cf_item_details WHERE company_id = ? AND master_id IN (?) ORDER BY master_id FOR UPDATE', [c.companyId, itemIds]);
   const [av, held] = await Promise.all([
-    itemIds.length ? availability(db, c.companyId, itemIds, { orderId: head.order_id, holds: 'none' }) : new Map(),
+    itemIds.length ? availability(db, c.companyId, itemIds, { orderId: holdOrderId, holds: 'none' }) : new Map(),
     stockHoldRows(db, c.companyId, [...want.keys()], { lock: true }),
   ]);
   const holdRows = [];
@@ -235,7 +261,7 @@ export async function saveMr(db, c, id, input = {}) {
         if (lot) lot.free = round6(lot.free - x.quantity);
         if (lot?.owner === 'theirs') a.theirsFree = round6(a.theirsFree - x.quantity);
         a.free = round6(a.free - x.quantity);
-        holdRows.push([c.companyId, head.order_id, l.id, l.item.id, x.batchId, x.quantity, c.userId ?? null]);
+        holdRows.push([c.companyId, holdOrderId, l.id, l.item.id, x.batchId, x.quantity, c.userId ?? null]);
       }
     } else if (delta < -EPS) {
       let give = round6(-delta);
@@ -274,7 +300,7 @@ export async function saveMr(db, c, id, input = {}) {
     const toBuy = new Map(screen.lines.map((l) => [l.id, round6(Math.max(0, l.required - (want.get(l.id) ?? l.takeFromStock)))]));
     await upsertPr(db, c, head, screen.lines, toBuy);
   }
-  const out = await mrScreen(db, c.companyId, head.id);
+  const out = await mrScreen(db, c.companyId, head.id, manual ? { R: null } : {});
   return { ...out, saved: { held: holdRows.length, released: releaseAll.length + releasePart.length }, customerPurchaseOrders };
 }
 
@@ -325,12 +351,12 @@ export async function readPrs(db, companyId, filter = {}) {
   const like = likeOf(filter.search);
   if (like) { where.push('(br.code LIKE ? OR r.code LIKE ? OR o.code LIKE ? OR cu.name LIKE ?)'); args.push(like, like, like, like); }
   const [heads] = await db.query(
-    `SELECT br.id, br.code, br.requisition_id, br.order_id, br.notes, br.created_at, r.code AS mr_code, r.order_line_id, sl.line_no,
+    `SELECT br.id, br.code, br.requisition_id, br.order_id, br.notes, br.created_at, r.code AS mr_code, r.order_line_id, sl.line_no, r.for_type,
             o.code AS order_code, o.status AS order_status, o.customer_id, cu.name AS customer_name, m.code AS line_item_code, m.name AS line_item_name, sl.description
        FROM cf_buy_requests br
        JOIN cf_requisitions r ON r.id = br.requisition_id
-       JOIN cf_sales_orders o ON o.id = br.order_id
-       JOIN cf_sales_order_lines sl ON sl.id = r.order_line_id
+       LEFT JOIN cf_sales_orders o ON o.id = br.order_id
+       LEFT JOIN cf_sales_order_lines sl ON sl.id = r.order_line_id
        LEFT JOIN cf_master_records m ON m.id = sl.item_id
        LEFT JOIN cf_parties cu ON cu.id = o.customer_id
       WHERE ${where.join(' AND ')}
@@ -409,10 +435,12 @@ export async function readPrs(db, companyId, filter = {}) {
     });
     return {
       id: h.id, code: h.code, status, statusLabel: PR_STATUS_LABEL[status], today,
-      requisition: { id: h.requisition_id, code: h.mr_code },
-      order: { id: h.order_id, code: h.order_code, status: h.order_status, customer: h.customer_id ? { id: h.customer_id, name: h.customer_name } : null },
-      line: { id: h.order_line_id, lineNo: h.line_no, name: h.line_item_name ?? h.description ?? `Line ${h.line_no}` },
-      canEdit: BUYABLE_ORDER_STATUSES.includes(h.order_status),
+      // §79: the MR's "For"; an MR raised by hand has no order line (and may have no order).
+      requisition: { id: h.requisition_id, code: h.mr_code, forType: forTypeOf(h.for_type), forLabel: FOR_LABEL[forTypeOf(h.for_type)] },
+      manual: h.order_line_id == null,
+      order: h.order_id == null ? null : { id: h.order_id, code: h.order_code, status: h.order_status, customer: h.customer_id ? { id: h.customer_id, name: h.customer_name } : null },
+      line: h.order_line_id == null ? null : { id: h.order_line_id, lineNo: h.line_no, name: h.line_item_name ?? h.description ?? `Line ${h.line_no}` },
+      canEdit: h.order_line_id == null || BUYABLE_ORDER_STATUSES.includes(h.order_status),
       createdAt: h.created_at, notes: h.notes ?? null,
       lines: shaped, vendors: cols, purchaseOrders: [...pos.values()],
       counts: { lines: counted.length, open: counted.filter((l) => l.open > EPS).length, vendors: cols.length },
@@ -445,13 +473,14 @@ export async function listPrs(db, companyId, q = {}) {
 
 async function requirePrRow(db, companyId, id, { lock = false } = {}) {
   const [[p]] = await db.query(
-    `SELECT br.id, br.code, br.order_id, o.code AS order_code, o.status AS order_status
-       FROM cf_buy_requests br JOIN cf_sales_orders o ON o.id = br.order_id
+    `SELECT br.id, br.code, br.order_id, o.code AS order_code, o.status AS order_status, r.order_line_id
+       FROM cf_buy_requests br JOIN cf_requisitions r ON r.id = br.requisition_id LEFT JOIN cf_sales_orders o ON o.id = br.order_id
       WHERE br.company_id = ? AND br.id = ? AND br.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
     [companyId, Number(id)],
   );
   if (!p) throw notFound('Purchase request');
-  if (lock && !BUYABLE_ORDER_STATUSES.includes(p.order_status)) throw invalid('NOT_OPEN', `${p.order_code} is ${p.order_status} — nothing more is bought for it.`);
+  // §79: the PR of an MR raised by hand is bought whatever the order (if any) is doing.
+  if (lock && p.order_line_id != null && !BUYABLE_ORDER_STATUSES.includes(p.order_status)) throw invalid('NOT_OPEN', `${p.order_code} is ${p.order_status} — nothing more is bought for it.`);
   return p;
 }
 async function requireVendorRow(db, companyId, vendorId, { lock = false } = {}) {
@@ -652,6 +681,9 @@ export async function raisePo(db, c, vendorId, input = {}) {
   }
   assertNoProblems(problems, 'The purchase order cannot be raised.');
 
+  // §79: a PR of an MR raised by hand buys for that MR alone — its PO shares (and the PO's header) name no order, so the
+  // order's own MRs never count them (a maintenance / general MR's sales order is on the MR, for its cost).
+  const shareOrderId = pr.manual ? null : pr.order?.id ?? null;
   let poId = target?.id ?? null;
   if (!poId) {
     const notes = blank(input.notes) ? `Raised from ${pr.code} (${pr.requisition.code}).` : String(input.notes).slice(0, 2000);
@@ -661,11 +693,11 @@ export async function raisePo(db, c, vendorId, input = {}) {
     const [ins] = await db.query(
       `INSERT INTO cf_purchase_orders (company_id, code, supplier_id, status, suggested, expected_date, notes, for_order_id, supplied_by_customer, po_type, approval_status, created_by)
        VALUES (?, NULL, ?, 'requested', 0, ?, ?, ?, 0, 'material', 'pending', ?)`,
-      [c.companyId, v.supplier_id, poDate, notes, pr.order.id, c.userId ?? null],
+      [c.companyId, v.supplier_id, poDate, notes, shareOrderId, c.userId ?? null],
     );
     poId = ins.insertId;
     await db.query("UPDATE cf_purchase_orders SET code = CONCAT('PO-', LPAD(id, 6, '0')) WHERE company_id = ? AND id = ?", [c.companyId, poId]);
-  } else if (target.for_order_id != null && Number(target.for_order_id) !== Number(pr.order.id)) {
+  } else if (target.for_order_id != null && Number(target.for_order_id) !== Number(shareOrderId)) {
     // It serves more than one order now: the header names none (each line's shares say which).
     await db.query('UPDATE cf_purchase_orders SET for_order_id = NULL, notes = CONCAT(COALESCE(notes, \'\'), ?) WHERE company_id = ? AND id = ?',
       [`\nAlso for ${pr.code} (${pr.requisition.code}).`, c.companyId, poId]);
@@ -704,7 +736,7 @@ export async function raisePo(db, c, vendorId, input = {}) {
     const plId = lineOfItem.get(Number(x.l.item.id));
     const k = `${plId}:${x.l.mrLineId}`;
     if (shareOf.has(k)) shareGrow.push([shareOf.get(k), x.q]);
-    else shareNew.push([c.companyId, plId, pr.order.id, x.l.mrLineId, x.q, c.userId ?? null]);
+    else shareNew.push([c.companyId, plId, shareOrderId, x.l.mrLineId, x.q, c.userId ?? null]);
   }
   await insertRows(db, 'cf_purchase_line_orders', ['company_id', 'purchase_line_id', 'order_id', 'pr_line_id', 'quantity', 'created_by'], shareNew);
   if (shareGrow.length) {

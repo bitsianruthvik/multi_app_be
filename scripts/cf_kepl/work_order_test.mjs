@@ -20,6 +20,7 @@ import { attachNodeCache, detachNodeCache } from '../../apps/cf_erp/lib/db.js';
 import { lockLine } from '../../apps/cf_erp/services/lockService.js';
 import { releaseLine, getRelease } from '../../apps/cf_erp/services/releaseService.js';
 import { reviseOrder } from '../../apps/cf_erp/services/revisionService.js';
+import { saveExecutionPlan } from '../../apps/cf_erp/services/executionPlanService.js';
 import {
   getAssignment, assignCells, listWorkOrders, getWorkOrder, updateWorkOrder, setWorkOrderStatus,
 } from '../../apps/cf_erp/services/workOrderService.js';
@@ -230,6 +231,9 @@ try {
   // The local KEPL copy has an old top coding rule that reads item.code; the
   // copied line item has none yet, so give it one (production rules do not need it).
   await conn.query("UPDATE cf_master_records m JOIN cf_sales_order_lines l ON l.item_id = m.id JOIN cf_master_records o ON o.id = (SELECT item_id FROM cf_sales_order_lines WHERE id = ?) SET m.code = CONCAT(o.code, '-R2') WHERE l.id = ? AND m.code IS NULL", [LINE, newLine.id]);
+  // Freeze design waits for a saved execution plan (§72): save the prefilled one, as a person would.
+  const [[{ revOrder }]] = await conn.query('SELECT order_id AS revOrder FROM cf_sales_order_lines WHERE id = ?', [newLine.id]);
+  await saveExecutionPlan(conn, c, revOrder, {});
   await lockLine(conn, c, newLine.id);
   const [[{ liveCells }]] = await conn.query('SELECT COUNT(*) AS liveCells FROM cf_work_order_cells WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [COMPANY, LINE]);
   ok('locking rev 2 retires rev 1\'s pieces AND their work-order cells', Number(liveCells) === 0);

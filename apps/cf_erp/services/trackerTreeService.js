@@ -85,15 +85,26 @@ async function releasedLines(db, companyId) {
   return rows;
 }
 
-function pickerOf(lines) {
+function pickerOf(lines, productionOrders = []) {
   const orders = new Map();
   for (const r of lines) {
     if (!orders.has(r.order_id)) {
-      orders.set(r.order_id, { id: r.order_id, code: r.order_code, title: r.order_title ?? null, customer: r.customer_name ?? null, status: r.order_status, open: r.order_status === 'confirmed', lines: [] });
+      orders.set(r.order_id, { id: r.order_id, code: r.order_code, title: r.order_title ?? null, customer: r.customer_name ?? null, status: r.order_status, open: r.order_status === 'confirmed', lines: [], productionOrders: [] });
     }
     orders.get(r.order_id).lines.push({ id: r.order_line_id, lineNo: r.line_no, releaseId: r.release_id, itemName: r.item_name });
   }
+  // §76: the released production orders of each order — the Tracker scopes to one ("w<id>").
+  for (const p of productionOrders) orders.get(p.order_id)?.productionOrders.push({ id: p.id, code: p.code, label: p.label });
   return [...orders.values()];
+}
+
+/** §76: the released production orders (for the picker) — one read. */
+async function releasedProductionOrders(db, companyId) {
+  const [rows] = await db.query(
+    "SELECT id, order_id, code, label, lines_json FROM cf_production_orders WHERE company_id = ? AND deleted_at IS NULL AND status <> 'yet_to_plan' ORDER BY order_id, seq",
+    [companyId],
+  );
+  return rows;
 }
 
 /** The live sessions of the steps in progress, and which of them ever had one. Skipped when nothing is in progress. */
@@ -287,6 +298,7 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
       id: `p${it.id}`, parentId: it.parent_id ? `p${it.parent_id}` : `l${l.order_line_id}`, kind: 'piece',
       code: it.code ?? it._label, name: it.item_name, qty: quantity, pieceNo: it.piece_no ?? null,
       basis: quantity > 1 ? 'row' : 'piece', itemId: it.item_id, lineId: l.order_line_id, orderId: l.order_id, releaseId: it.release_id,
+      productionOrderId: it.production_order_id ?? null,
       kids: [], agg: emptyAgg(),
       ops: (data.stepsOf.get(it.id) ?? []).map((s) => ({ s, op: operationOf(s, ctx) })),
     };
@@ -344,7 +356,7 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
       minutes: n.agg.minKnown ? round6(n.agg.minT) : null,
       minutesDone: n.agg.minKnown ? round6(n.agg.minD) : null,
     };
-    if (n.kind === 'piece') { out.pieceNo = n.pieceNo; out.basis = n.basis; out.itemId = n.itemId; }
+    if (n.kind === 'piece') { out.pieceNo = n.pieceNo; out.basis = n.basis; out.itemId = n.itemId; out.productionOrderId = n.productionOrderId ?? null; }
     if (n.kind !== 'order') { out.lineId = n.lineId; out.releaseId = n.releaseId; }
     out.orderId = n.orderId;
     if (n.kids.length) {
@@ -411,13 +423,20 @@ const intOr = (v, d) => (blank(v) ? d : Math.max(1, Math.min(50, Math.floor(Numb
  *   to every level. Both cap at FILTER_CAP nodes.
  */
 export async function trackerTree(db, companyId, q = {}) {
-  const all = await releasedLines(db, companyId);
+  const [all, pos] = await Promise.all([releasedLines(db, companyId), releasedProductionOrders(db, companyId)]);
   const orderId = blank(q.orderId) ? null : Number(q.orderId);
   const lineId = blank(q.lineId) ? null : Number(q.lineId);
-  if ((orderId != null && !Number.isInteger(orderId)) || (lineId != null && !Number.isInteger(lineId))) throw invalid('orderId and lineId are numbers.');
+  const productionOrderId = blank(q.productionOrderId) ? null : Number(q.productionOrderId);
+  if ((orderId != null && !Number.isInteger(orderId)) || (lineId != null && !Number.isInteger(lineId)) || (productionOrderId != null && !Number.isInteger(productionOrderId))) {
+    throw invalid('orderId, lineId and productionOrderId are numbers.');
+  }
   const includeClosed = String(q.includeClosed) === '1';
   let lines = all;
-  if (lineId != null) lines = all.filter((l) => l.order_line_id === lineId);
+  const po = productionOrderId != null ? pos.find((p) => Number(p.id) === productionOrderId) ?? null : null;
+  if (productionOrderId != null) {
+    const ids = new Set((typeof po?.lines_json === 'string' ? JSON.parse(po.lines_json) : po?.lines_json ?? []).map(Number));
+    lines = all.filter((l) => ids.has(Number(l.order_line_id)));
+  } else if (lineId != null) lines = all.filter((l) => l.order_line_id === lineId);
   else if (orderId != null) lines = all.filter((l) => l.order_id === orderId);
   else if (!includeClosed) lines = all.filter((l) => l.order_status === 'confirmed');
   const tree = await buildTree(db, companyId, lines);
@@ -428,8 +447,20 @@ export async function trackerTree(db, companyId, q = {}) {
   let list;
   let truncated = false;
   let matches = null;
+  // §76: one production order — its pieces and what they sit in, to `depth` levels below its top piece.
+  let poKeep = null;
+  if (productionOrderId != null) {
+    poKeep = new Set();
+    let top = Infinity;
+    for (const n of tree.nodes) if (n.kind === 'piece' && n.productionOrderId === productionOrderId) top = Math.min(top, n.level);
+    for (const n of tree.nodes) {
+      if (n.kind !== 'piece' || n.productionOrderId !== productionOrderId || n.level >= top + depth - 2) continue;
+      let x = n;
+      while (x && !poKeep.has(x.id)) { poKeep.add(x.id); x = x.parentId ? tree.byId.get(x.parentId) : null; }
+    }
+  }
   if (!term && !onlyBlocked) {
-    list = tree.nodes.filter((n) => n.level < depth);
+    list = poKeep ? tree.nodes.filter((n) => poKeep.has(n.id)) : tree.nodes.filter((n) => n.level < depth);
   } else {
     const keep = new Set();
     const addWithAncestors = (n) => {
@@ -460,8 +491,9 @@ export async function trackerTree(db, companyId, q = {}) {
   const shape = shapeFor(q);
   const out = finish(list.map(shape), tree.childrenOf).map((n) => (matchSet.has(n.id) ? { ...n, match: true } : n));
   return {
-    scope: { orderId, lineId, includeClosed },
-    orders: pickerOf(all),
+    scope: { orderId, lineId, productionOrderId, includeClosed },
+    productionOrder: po ? { id: po.id, code: po.code, label: po.label } : null,
+    orders: pickerOf(all, pos),
     summary: summaryOf(tree),
     depth,
     search: term || null,

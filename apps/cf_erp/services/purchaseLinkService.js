@@ -51,8 +51,8 @@ export async function allocationsOf(db, companyId, lineIds) {
   if (!lineIds.length) return out;
   const [rows] = await db.query(
     `SELECT a.id, a.purchase_line_id, a.order_id, o.code AS order_code, a.quantity, a.qty_received, a.pr_line_id,
-            rq.id AS requisition_id, rq.code AS requisition_code, sl.line_no AS requisition_line_no
-       FROM cf_purchase_line_orders a JOIN cf_sales_orders o ON o.id = a.order_id
+            rq.id AS requisition_id, rq.code AS requisition_code, sl.line_no AS requisition_line_no, rq.for_type
+       FROM cf_purchase_line_orders a LEFT JOIN cf_sales_orders o ON o.id = a.order_id
        JOIN cf_purchase_order_lines pol ON pol.id = a.purchase_line_id
        JOIN cf_purchase_orders po ON po.id = pol.purchase_order_id
        LEFT JOIN cf_requisition_lines prl ON prl.id = a.pr_line_id
@@ -69,6 +69,8 @@ export async function allocationsOf(db, companyId, lineIds) {
     if (r.pr_line_id != null) {
       row.prLineId = r.pr_line_id;
       row.requisition = r.requisition_id ? { id: r.requisition_id, code: r.requisition_code, lineNo: r.requisition_line_no ?? null } : null;
+      // §79: a share of an MR with no order line (stock / general / maintenance) says what it was bought for.
+      if (r.for_type && r.for_type !== 'sales_order') row.forType = r.for_type;
     }
     out.get(r.purchase_line_id).push(row);
   }
@@ -236,6 +238,8 @@ export async function holdOnReceipt(db, c, line, quantity, batchId) {
     const take = round6(Math.min(left, Math.max(0, a.quantity - a.received)));
     if (take <= EPS) continue;
     await db.query('UPDATE cf_purchase_line_orders SET qty_received = qty_received + ? WHERE company_id = ? AND id = ?', [take, c.companyId, a.id]);
+    // §79: a share of a STOCK MR is bought for stock — what arrives is free stock, held for nobody.
+    if (a.forType === 'stock') { left = round6(left - take); continue; }
     held.push({ orderId: a.orderId, orderCode: a.orderCode, quantity: take, ...(a.prLineId != null ? { prLineId: a.prLineId } : {}) });
     left = round6(left - take);
   }

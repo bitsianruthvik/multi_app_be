@@ -70,7 +70,7 @@ export async function orderBoard(db, companyId, q = {}) {
       [companyId, ids]),
     acceptanceStates(db, companyId, ids),
     postStagesOf(db, companyId, ids),
-    readRequisitions(db, companyId, { open: true }),
+    readRequisitions(db, companyId, { open: true, lineBound: true }),
     orderBilling(db, companyId, ids),
   ]);
   const lineOf = new Map(lines.map((l) => [Number(l.order_id), l]));

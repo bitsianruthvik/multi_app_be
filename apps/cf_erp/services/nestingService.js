@@ -591,7 +591,11 @@ export async function requireLine(db, companyId, lineId, { lock = false } = {}) 
   const [[l]] = await db.query(
     `SELECT l.*, o.id AS order_id, o.code AS order_code, o.status AS order_status,
             o.revision AS order_revision, ${latestRevisionSql('o')} AS order_latest_revision,
-            rel.id AS release_id
+            rel.id AS release_id,
+            -- §76: a production order of the line freezes its nesting.
+            (SELECT po.code FROM cf_production_orders po
+              WHERE po.company_id = l.company_id AND po.order_id = l.order_id AND po.deleted_at IS NULL
+                AND JSON_CONTAINS(po.lines_json, CAST(l.id AS CHAR)) LIMIT 1) AS production_order_code
        FROM cf_sales_order_lines l
        JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL
        LEFT JOIN cf_production_releases rel ON rel.order_line_id = l.id AND rel.deleted_at IS NULL
@@ -608,6 +612,9 @@ export function assertOpen(line) {
   if (LOCKED_ORDER_STATUSES.has(line.order_status)) {
     throw invalid('ORDER_LOCKED', line.order_status === 'revised' ? revisedOrderMessage(line.order_code, line.order_revision, line.order_latest_revision)
       : `Order ${line.order_code} is ${line.order_status} — its structure can no longer change, so its nesting cannot either.`);
+  }
+  if (line.production_order_code) {
+    throw invalid('PRODUCTION_ORDER', `Line ${line.line_no} of ${line.order_code} has production orders (${line.production_order_code}…) — its nesting is frozen.`);
   }
   if (line.release_id) {
     throw invalid('RELEASED', `Line ${line.line_no} of ${line.order_code} is released to production — its structure is fixed. Take the release back (while nothing has started) before re-nesting it.`);

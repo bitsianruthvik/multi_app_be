@@ -521,7 +521,7 @@ export async function observeMaterial(db, c, facts) {
   if (!watch.length) return 0;
   const { readRequisitions } = await import('./requisitionService.js');
   const ids = new Set(watch.map((F) => F.order.id));
-  const views = (await readRequisitions(db, c.companyId, { open: true })).filter((v) => ids.has(Number(v.order.id)));
+  const views = (await readRequisitions(db, c.companyId, { open: true, lineBound: true })).filter((v) => ids.has(Number(v.order.id)));
   const by = new Map();
   for (const v of views) {
     const e = by.get(Number(v.order.id)) ?? { materials: 0, locked: 0, held: false };

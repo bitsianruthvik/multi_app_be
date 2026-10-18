@@ -26,6 +26,11 @@ export const PERM = {
   accountsView: 'cf_erp_accounts_view',     // §74: Accounts — the Billing board, invoices, receipts, order costing
   accounts: 'cf_erp_accounts_manage',       // §74: raise invoices from due cards, record and remove receipts
   floor: 'cf_erp_floor',                    // the machine log: read the floor screens and record work and stops (init.sql §32)
+  // §79: the roles of the stores chain (Need → MR → Stores → Purchase → Management → GRN). Each screen also takes the
+  // older inventory tags, so nobody loses a screen they had.
+  stores: 'cf_erp_stores',                  // Stores: the MR inbox (take from stock, raise the PR), New MR, To reorder, stock
+  purchase: 'cf_erp_purchase',              // Purchase: purchase requests (quotes, vendors), purchase orders
+  maintenance: 'cf_erp_maintenance',        // Maintenance (§82): machines board, faults, maintenance orders and their MRs
 };
 
 /** The tenant and user of a request. The company always comes from the token, never the URL. */

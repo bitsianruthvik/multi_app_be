@@ -551,7 +551,7 @@ export async function machinesDashboard(dbIn, companyId, q = {}) {
           if (kg == null) acc.unweighed += 1; else dayTonnes += (good * kg) / 1000;
           if (x.est_work_minutes != null) {
             acc.estSessions += 1;
-            acc.earned += good * Number(x.est_work_minutes) + (x.end_kind === 'done' ? Number(x.est_setup_minutes ?? 0) : 0);
+            acc.earned += good * (Number(x.est_work_minutes) + Number(x.est_setup_minutes ?? 0));   // §76: setup per quantity
           }
         }
       }

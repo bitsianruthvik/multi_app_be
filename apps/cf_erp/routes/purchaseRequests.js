@@ -17,12 +17,13 @@
  *   GET    /purchase-request-vendors/:id/pending-pos           that vendor's POs still waiting for Management approval (to add to)
  *   POST   /purchase-request-vendors/:id/purchase-orders { lines: [{ lineId, quantity }], addToPoId?, notes? }
  *                                                              → { purchaseOrder (pending Management approval), purchaseRequest }
- * Reading needs inventory view; changing needs inventory manage (the purchase routes' own grants).
+ * Reading needs inventory view, Stores or Purchase; saving an MR needs inventory manage or Stores (§79: MRs go to STORES);
+ * the PR routes need inventory manage or Purchase.
  * The MD's approval and the close are on routes/purchase.js (POST /purchase-orders/:id/approve | /close).
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
   listMrs, mrScreen, saveMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
 } from '../services/purchaseRequestService.js';
@@ -30,14 +31,16 @@ import {
 const router = Router();
 const id = (req) => intParam(req.params.id);
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
-const view = guard(PERM.inventoryView);
-const manage = guard(PERM.inventory);
+// §79: MRs are Stores' (cf_erp_stores), PRs are Purchase's (cf_erp_purchase); the inventory tags still open both.
+const view = guardAny(PERM.inventoryView, PERM.stores, PERM.purchase);
+const mrManage = guardAny(PERM.inventory, PERM.stores);
+const manage = guardAny(PERM.inventory, PERM.purchase);
 const body = (req) => req.body ?? {};
 const company = (req) => ctx(req).companyId;
 
 router.get('/material-requests', view, handle((req) => listMrs(pool, company(req), req.query)));
 router.get('/material-requests/:id', view, handle((req) => mrScreen(pool, company(req), id(req))));
-router.put('/material-requests/:id', manage, handle((req) => tx(req, (db, c) => saveMr(db, c, id(req), body(req)))));
+router.put('/material-requests/:id', mrManage, handle((req) => tx(req, (db, c) => saveMr(db, c, id(req), body(req)))));
 
 router.get('/purchase-requests', view, handle((req) => listPrs(pool, company(req), req.query)));
 router.get('/purchase-requests/:id', view, handle((req) => getPr(pool, company(req), id(req))));

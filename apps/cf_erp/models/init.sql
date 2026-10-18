@@ -6970,3 +6970,771 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = D
       AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
              AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'nest_shop_spacing') = 1,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §76  PRODUCTION ORDERS, TIMES PER QUANTITY, THE ORDER'S TIME OVERRIDE (2026-10-18)
+-- The same text as TM/s76.sql. Additive and guarded: safe to re-run. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md
+-- "2026-10-18 — Step 4". Services: productionOrderService.js (create from the execution plan, release, take back,
+-- dispatch, list / read), timeEstimateService.js (setup per quantity, the order override).
+--
+--   cf_sales_orders.time_override_seconds   "Override all times to N seconds" (testing). NULL = off. When set, every
+--                                           operation's setup AND time per quantity on the order's lines is N s; the
+--                                           formulas are not changed.
+--   cf_production_orders                    one row per production order made from the order's execution plan
+--                                           (per order / line / unit / sub-assembly). status is the stored anchor:
+--                                           yet_to_plan (created) · planned (released) · closed (dispatched); "in
+--                                           production" and "dispatch" are worked out from its steps on every read.
+--   cf_production_items.production_order_id / cf_production_steps.production_order_id
+--                                           which production order a piece and a step belong to (stamped at release).
+--                                           NULL = released before production orders.
+--   Data: setup time is PER QUANTITY now — a step's minutes = (setup + work) × quantity. Steps not started yet are
+--   re-timed (standard and machine time); started and done steps keep their numbers.
+-- TiDB: one CREATE TABLE IF NOT EXISTS; guarded ALTERs; set-based UPDATEs.
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_orders' AND COLUMN_NAME = 'time_override_seconds');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_orders ADD COLUMN time_override_seconds DECIMAL(12,4) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_production_orders (
+  id                 INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT            NOT NULL,
+  order_id           INT            NOT NULL,
+  seq                INT            NOT NULL,
+  code               VARCHAR(80)    NOT NULL,
+  label              VARCHAR(400)   NOT NULL,
+  level              ENUM('order','line','unit','assembly') NOT NULL,
+  level_id           INT            NULL,
+  order_line_id      INT            NULL,
+  unit_no            INT            NULL,
+  scope_key          VARCHAR(400)   NOT NULL,
+  lines_json         JSON           NULL,
+  dispatch_level     ENUM('same','line','unit','assembly') NOT NULL DEFAULT 'same',
+  dispatch_level_id  INT            NULL,
+  status             ENUM('yet_to_plan','planned','closed') NOT NULL DEFAULT 'yet_to_plan',
+  released_at        DATETIME       NULL,
+  released_by        INT            NULL,
+  dispatched_at      DATETIME       NULL,
+  dispatched_by      INT            NULL,
+  shipped_json       JSON           NULL,
+  created_by         INT            NULL,
+  deleted_at         DATETIME       DEFAULT NULL,
+  created_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  seq_live           INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, seq, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cprdo_tenant (company_id, id),
+  UNIQUE KEY uq_cprdo_seq    (company_id, order_id, seq_live),
+  KEY idx_cprdo_order  (company_id, order_id),
+  KEY idx_cprdo_line   (company_id, order_line_id),
+  KEY idx_cprdo_status (company_id, status),
+
+  CONSTRAINT fk_cprdo_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cprdo_order   FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cprdo_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines(company_id, id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND COLUMN_NAME = 'production_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_items ADD COLUMN production_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- TiDB: a column and an index on it cannot be added in one statement.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND INDEX_NAME = 'idx_cpri_po');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_production_items ADD KEY idx_cpri_po (company_id, production_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'production_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN production_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- TiDB: a column and an index on it cannot be added in one statement.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND INDEX_NAME = 'idx_cprs_po');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_production_steps ADD KEY idx_cprs_po (company_id, production_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- Setup per quantity: steps not started yet are re-timed. The same formula every run, so re-running changes nothing.
+UPDATE cf_production_steps
+   SET est_minutes = ROUND((COALESCE(est_setup_minutes, 0) + est_work_minutes) * quantity, 3)
+ WHERE deleted_at IS NULL AND state = 'pending' AND started_at IS NULL AND est_work_minutes IS NOT NULL;
+UPDATE cf_production_steps
+   SET mach_minutes = ROUND((COALESCE(mach_setup_minutes, 0) + mach_work_minutes) * quantity, 3)
+ WHERE deleted_at IS NULL AND state = 'pending' AND started_at IS NULL AND mach_work_minutes IS NOT NULL;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_production_orders'
+             AND COLUMN_NAME IN ('order_id','seq','code','label','level','level_id','order_line_id','unit_no','scope_key','lines_json',
+                                 'dispatch_level','dispatch_level_id','status','released_at','dispatched_at','shipped_json','seq_live')) = 17
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND ((TABLE_NAME = 'cf_production_items' AND COLUMN_NAME = 'production_order_id')
+               OR (TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'production_order_id')
+               OR (TABLE_NAME = 'cf_sales_orders' AND COLUMN_NAME = 'time_override_seconds'))) = 3,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §77  ADD LINE › FROM A NEW DRAWING (by AI) — what was read, from which file (2026-10-18)
+-- The same text as TM/s77.sql. Additive and guarded: safe to re-run.
+--   cf_line_drawing_imports  one row per line built from an uploaded DWG/DXF by the rules engine
+--                            (services/drawingLineService.js): file, counts, rows to check, the engine's report.
+--   The flags themselves live on the rows' BOM lines ("Check (by AI): …" in cf_bom_lines.notes) — no column here.
+-- Code tolerates the table missing (the line is still built; no record kept).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS cf_line_drawing_imports (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT            NOT NULL,
+  order_id       INT            NOT NULL,
+  order_line_id  INT            NOT NULL,
+  file_name      VARCHAR(255)   NOT NULL,
+  file_kind      ENUM('dxf','dwg') NOT NULL,
+  file_bytes     INT            NULL,
+  parts          INT            NOT NULL DEFAULT 0,
+  rows_count     INT            NOT NULL DEFAULT 0,
+  flagged        INT            NOT NULL DEFAULT 0,
+  weight_kg      DECIMAL(14,3)  NULL,
+  report_json    LONGTEXT       NULL,
+  created_by     INT            NULL,
+  deleted_at     DATETIME       DEFAULT NULL,
+  created_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cldi_tenant (company_id, id),
+  KEY idx_cldi_line  (company_id, order_line_id),
+  KEY idx_cldi_order (company_id, order_id),
+  CONSTRAINT fk_cldi_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cldi_line    FOREIGN KEY (order_line_id) REFERENCES cf_sales_order_lines(id)
+);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_line_drawing_imports'
+             AND COLUMN_NAME IN ('company_id','order_id','order_line_id','file_name','file_kind','file_bytes','parts','rows_count','flagged','weight_kg','report_json')) = 11,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+
+-- ============================================================================
+-- §80  GRN MONEY CAPTURE — supplier bill per GRN, per-line price / discount / GST split, freight, landed cost (2026-10-18)
+-- The same text as TM/s80.sql. Additive and guarded: safe to re-run. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md
+-- "2026-10-18 — GRN money capture". Service: grnService.js (receiveGrn, listBills, getBill, completeInvoice).
+--
+-- User, 2026-10-18: at GRN capture the money fully — per line unit price (prefilled from the PO line), MRP, discount (% or
+-- amount), taxable value, HSN/SAC, GST rate and the split CGST+SGST (supplier in the company state) or IGST (other
+-- state); per GRN the supplier invoice number + date (or "invoice to follow"), freight / other charges (taxable or not)
+-- and the total. The GRN landed cost feeds stock valuation: cost per unit = taxable value + freight/other charges
+-- allocated by taxable value; the GST input credit is NOT in the cost.
+--
+--   cf_grn_bills       ONE per GRN document (a PO may take several): the supplier invoice (no + date, or invoice_pending = 1
+--                      "invoice to follow" — a flag Accounts chases), where the tax was decided (company_state vs
+--                      supplier_state -> supply_type 'intra' = CGST+SGST, 'inter' = IGST, 'none' = a supplier who
+--                      charges no GST; state_picked = 1 when a state was picked on the screen because the master had
+--                      none), the freight and other charges (amount, taxable?, GST rate, tax), the totals and the total.
+--                      money_captured = 0 for a receipt booked through the old call with no money (kept so Accounts sees it).
+--   cf_grn_bill_lines  one per PO line received on the GRN: quantity, unit price, MRP, discount (as typed: discount_mode
+--                      pct|amt + discount_value; computed discount_amount), gross, taxable_value, HSN/SAC, GST rate, the
+--                      CGST / SGST / IGST, line total, the freight/other share, landed_value and landed_unit_cost (what the
+--                      stock ledger carries as the receipt unit cost) and the stock movement it posted.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS cf_grn_bills (
+  id                 INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT            NOT NULL,
+  purchase_order_id  INT            NOT NULL,
+  supplier_id        INT            NULL,
+  grn_date           DATE           NOT NULL,
+  invoice_no         VARCHAR(40)    NULL,
+  invoice_date       DATE           NULL,
+  invoice_pending    TINYINT(1)     NOT NULL DEFAULT 0,
+  money_captured     TINYINT(1)     NOT NULL DEFAULT 1,
+  company_state      CHAR(2)        NULL,
+  supplier_state     CHAR(2)        NULL,
+  supply_type        VARCHAR(8)     NULL,
+  state_picked       TINYINT(1)     NOT NULL DEFAULT 0,
+  reverse_charge     TINYINT(1)     NOT NULL DEFAULT 0,
+  freight_amount     DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  freight_taxable    TINYINT(1)     NOT NULL DEFAULT 0,
+  freight_gst_rate   DECIMAL(6,3)   NULL,
+  freight_tax        DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  other_amount       DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  other_taxable      TINYINT(1)     NOT NULL DEFAULT 0,
+  other_gst_rate     DECIMAL(6,3)   NULL,
+  other_tax          DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  taxable_total      DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  charges_total      DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  cgst               DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  sgst               DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  igst               DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  total              DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  notes              TEXT           NULL,
+  deleted_at         DATETIME       DEFAULT NULL,
+  created_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT            NULL,
+
+  UNIQUE KEY uq_cgb_tenant (company_id, id),
+  KEY idx_cgb_po       (company_id, purchase_order_id),
+  KEY idx_cgb_supplier (company_id, supplier_id, invoice_no),
+  KEY idx_cgb_pending  (company_id, invoice_pending),
+  CONSTRAINT fk_cgb_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_grn_bill_lines (
+  id                 INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT            NOT NULL,
+  bill_id            INT            NOT NULL,
+  line_no            INT            NOT NULL,
+  purchase_line_id   INT            NULL,
+  movement_id        INT            NULL,
+  item_id            INT            NOT NULL,
+  quantity           DECIMAL(18,6)  NOT NULL,
+  uom                VARCHAR(20)    NULL,
+  unit_price         DECIMAL(18,4)  NULL,
+  mrp                DECIMAL(18,4)  NULL,
+  discount_mode      VARCHAR(3)     NULL,
+  discount_value     DECIMAL(18,4)  NULL,
+  discount_amount    DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  gross_amount       DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  taxable_value      DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  hsn_code           VARCHAR(12)    NULL,
+  gst_rate           DECIMAL(6,3)   NULL,
+  cgst               DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  sgst               DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  igst               DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  line_total         DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  freight_alloc      DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  landed_value       DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  landed_unit_cost   DECIMAL(18,4)  NULL,
+  deleted_at         DATETIME       DEFAULT NULL,
+  created_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cgbl_tenant (company_id, id),
+  KEY idx_cgbl_bill     (company_id, bill_id, line_no),
+  KEY idx_cgbl_movement (company_id, movement_id),
+  KEY idx_cgbl_pline    (company_id, purchase_line_id),
+  CONSTRAINT fk_cgbl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cgbl_bill    FOREIGN KEY (company_id, bill_id) REFERENCES cf_grn_bills(company_id, id)
+);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_grn_bills'
+             AND COLUMN_NAME IN ('purchase_order_id','invoice_no','invoice_date','invoice_pending','supply_type','freight_amount','other_amount','taxable_total','cgst','sgst','igst','total')) = 12
+       AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_grn_bill_lines'
+             AND COLUMN_NAME IN ('bill_id','purchase_line_id','movement_id','unit_price','mrp','discount_amount','taxable_value','hsn_code','gst_rate','freight_alloc','landed_value','landed_unit_cost')) = 12,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §81  TOOLS, SPARES AND CONSUMABLES AS STOCK ITEMS + EACH MACHINE RESOURCE LIST (2026-10-18)
+-- The same text as TM/s81.sql. Additive, guarded and idempotent: safe to re-run. Services:
+-- machineResourceService.js (the list + machineResources()), toolLifeService.js (tool life).
+--
+--   cf_classification_nodes.resource_kind   'tool' | 'spare' | 'consumable' on a FAMILY (depth 0): every item below it is that kind.
+--                                           Families "Tools", "Spares", "Consumables" are made per company when missing (an
+--                                           existing item-side family of that name is adopted instead).
+--   cf_item_details.life_unit / life_limit  optional tool life per item: uses | hours | metres, and how many.
+--   cf_tool_life                            one row per tool piece ISSUED from stock (counted by whole units): its life limit,
+--                                           what it has used, in_use | worn_out | retired | void (the issue was reversed).
+--   cf_tool_usage                           each recording of use against a tool piece (amount, day, machine, order).
+--   cf_machine_resources                    the machine list: which tools / spares / consumables it needs, typical qty.
+--   MIGRATION                               every machine of the asset register that is a tool (machine type code like
+--                                           %TOOL% / %HANDCUT%) and has no catalog item gets one "TL-<machine code>" under
+--                                           Tools, and cf_machines.catalog_item_id points at it. The machine row is untouched
+--                                           (still readable by the time formulas, the register and the floor).
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_classification_nodes' AND COLUMN_NAME = 'resource_kind');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_classification_nodes ADD COLUMN resource_kind VARCHAR(12) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'life_unit');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_item_details ADD COLUMN life_unit ENUM(''uses'',''hours'',''metres'') NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'life_limit');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_item_details ADD COLUMN life_limit DECIMAL(14,3) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_tool_life (
+  id             INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT            NOT NULL,
+  item_id        INT            NOT NULL,
+  movement_id    INT            NULL,                  -- the issue that took it out of stock
+  unit_no        INT            NOT NULL DEFAULT 1,    -- 1.. within that issue line
+  issued_on      DATE           NULL,
+  order_id       INT            NULL,                  -- "Used for" of the issue (NULL = General)
+  order_line_id  INT            NULL,
+  machine_id     INT            NULL,                  -- where it is mounted, when known
+  life_unit      ENUM('uses','hours','metres') NOT NULL DEFAULT 'uses',
+  life_limit     DECIMAL(14,3)  NULL,                  -- NULL = no limit set
+  life_used      DECIMAL(14,3)  NOT NULL DEFAULT 0,
+  status         ENUM('in_use','worn_out','retired','void') NOT NULL DEFAULT 'in_use',
+  closed_at      DATETIME       NULL,
+  notes          VARCHAR(255)   NULL,
+  deleted_at     DATETIME       DEFAULT NULL,
+  created_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT            NULL,
+  UNIQUE KEY uq_ctl_tenant (company_id, id),
+  KEY idx_ctl_item (company_id, item_id, status),
+  KEY idx_ctl_movement (company_id, movement_id),
+  KEY idx_ctl_machine (company_id, machine_id),
+  CONSTRAINT fk_ctl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_ctl_item    FOREIGN KEY (company_id, item_id) REFERENCES cf_item_details(company_id, master_id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_tool_usage (
+  id             INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT            NOT NULL,
+  tool_life_id   INT            NOT NULL,
+  amount         DECIMAL(14,3)  NOT NULL,
+  used_on        DATE           NULL,
+  machine_id     INT            NULL,
+  order_id       INT            NULL,
+  note           VARCHAR(255)   NULL,
+  created_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  created_by     INT            NULL,
+  UNIQUE KEY uq_ctu_tenant (company_id, id),
+  KEY idx_ctu_tool (company_id, tool_life_id),
+  CONSTRAINT fk_ctu_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_ctu_tool    FOREIGN KEY (company_id, tool_life_id) REFERENCES cf_tool_life(company_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_machine_resources (
+  id           INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT            NOT NULL,
+  machine_id   INT            NOT NULL,
+  item_id      INT            NOT NULL,
+  kind         ENUM('tool','spare','consumable') NOT NULL,
+  qty          DECIMAL(14,3)  NOT NULL DEFAULT 1,
+  notes        VARCHAR(255)   NULL,
+  sort_order   INT            NOT NULL DEFAULT 0,
+  deleted_at   DATETIME       DEFAULT NULL,
+  created_at   TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT            NULL,
+  live_item    INT            GENERATED ALWAYS AS (IF(deleted_at IS NULL, item_id, NULL)) VIRTUAL,
+  UNIQUE KEY uq_cmres_tenant (company_id, id),
+  UNIQUE KEY uq_cmres_live   (company_id, machine_id, live_item),
+  KEY idx_cmres_item (company_id, item_id),
+  CONSTRAINT fk_cmres_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cmres_machine FOREIGN KEY (company_id, machine_id) REFERENCES cf_machines(company_id, id),
+  CONSTRAINT fk_cmres_item    FOREIGN KEY (company_id, item_id)    REFERENCES cf_item_details(company_id, master_id)
+);
+
+-- ----- Classification: Tools / Spares / Consumables (an item-side family of that name is adopted) -----
+UPDATE cf_classification_nodes
+   SET resource_kind = CASE WHEN LOWER(name) IN ('tools', 'tool') THEN 'tool'
+                            WHEN LOWER(name) IN ('spares', 'spare parts', 'spare') THEN 'spare'
+                            ELSE 'consumable' END
+ WHERE depth = 0 AND deleted_at IS NULL AND resource_kind IS NULL AND scope IN ('item', 'both')
+   AND LOWER(name) IN ('tools', 'tool', 'spares', 'spare parts', 'spare', 'consumables', 'consumable');
+
+INSERT INTO cf_classification_nodes (company_id, parent_id, depth, scope, code, name, description, sort_order, resource_kind)
+SELECT c.company_id, NULL, 0, 'item', k.code, k.name, k.descr, k.sort_order, k.kind
+  FROM (SELECT DISTINCT company_id FROM cf_classification_nodes) c
+  CROSS JOIN (SELECT 'tool' AS kind, 'RES-TOOLS' AS code, 'Tools' AS name, 'Cutting tools, dies, jigs, gauges and hand tools kept in stock and issued with a life.' AS descr, 900 AS sort_order
+              UNION ALL SELECT 'spare', 'RES-SPARES', 'Spares', 'Machine spare parts kept for maintenance.', 910
+              UNION ALL SELECT 'consumable', 'RES-CONSUMABLES', 'Consumables', 'Things used up while working: electrodes, gases, discs, nozzles.', 920) k
+ WHERE NOT EXISTS (SELECT 1 FROM cf_classification_nodes x
+                    WHERE x.company_id = c.company_id AND x.deleted_at IS NULL
+                      AND ((x.depth = 0 AND x.resource_kind = k.kind)
+                        OR LOWER(x.code) = LOWER(k.code)
+                        OR (x.parent_id IS NULL AND LOWER(x.name) = LOWER(k.name))));
+
+INSERT INTO cf_classification_nodes (company_id, parent_id, depth, scope, code, name, sort_order)
+SELECT f.company_id, f.id, 1, 'item', CONCAT(f.code, '-GEN'), 'General', 0
+  FROM cf_classification_nodes f
+ WHERE f.depth = 0 AND f.deleted_at IS NULL AND f.resource_kind IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM cf_classification_nodes s WHERE s.company_id = f.company_id AND s.parent_id = f.id AND s.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM cf_classification_nodes x WHERE x.company_id = f.company_id AND LOWER(x.code) = LOWER(CONCAT(f.code, '-GEN')) AND x.deleted_at IS NULL);
+
+INSERT INTO cf_classification_nodes (company_id, parent_id, depth, scope, code, name, sort_order)
+SELECT s.company_id, s.id, 2, 'item', CONCAT(s.code, '-V'), 'General', 0
+  FROM cf_classification_nodes s
+  JOIN cf_classification_nodes f ON f.company_id = s.company_id AND f.id = s.parent_id AND f.depth = 0 AND f.resource_kind IS NOT NULL AND f.deleted_at IS NULL
+ WHERE s.depth = 1 AND s.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM cf_classification_nodes v WHERE v.company_id = s.company_id AND v.parent_id = s.id AND v.deleted_at IS NULL)
+   AND NOT EXISTS (SELECT 1 FROM cf_classification_nodes x WHERE x.company_id = s.company_id AND LOWER(x.code) = LOWER(CONCAT(s.code, '-V')) AND x.deleted_at IS NULL);
+
+-- ----- MIGRATE-BEGIN: machines that are tools become catalog tool items (idempotent) -----
+INSERT INTO cf_master_records (company_id, record_kind, code, name, description, classification_id, status)
+SELECT m.company_id, 'item', CONCAT('TL-', m.code), m.name, CONCAT('Tool, from the machine register (', m.code, ')'), tv.id, 'active'
+  FROM cf_machines m
+  JOIN cf_classification_nodes t ON t.company_id = m.company_id AND t.id = m.classification_id
+  LEFT JOIN cf_classification_nodes tp ON tp.company_id = t.company_id AND tp.id = t.parent_id
+  JOIN (SELECT v.company_id, MIN(v.id) AS id
+          FROM cf_classification_nodes v
+          JOIN cf_classification_nodes s ON s.company_id = v.company_id AND s.id = v.parent_id
+          JOIN cf_classification_nodes f ON f.company_id = s.company_id AND f.id = s.parent_id AND f.depth = 0 AND f.resource_kind = 'tool'
+         WHERE v.depth = 2 AND v.deleted_at IS NULL AND s.deleted_at IS NULL AND f.deleted_at IS NULL
+         GROUP BY v.company_id) tv ON tv.company_id = m.company_id
+ WHERE m.deleted_at IS NULL AND m.catalog_item_id IS NULL AND t.scope = 'machine'
+   AND (t.code LIKE '%TOOL%' OR t.code LIKE '%HANDCUT%' OR tp.code LIKE '%TOOL%')
+   AND NOT EXISTS (SELECT 1 FROM cf_master_records r WHERE r.company_id = m.company_id AND r.deleted_at IS NULL AND LOWER(r.code) = LOWER(CONCAT('TL-', m.code)));
+
+INSERT INTO cf_item_details (master_id, company_id, item_type, tracked_by, uom, sourcing)
+SELECT r.id, r.company_id, 'catalog', 'quantity', 'nos', 'stock'
+  FROM cf_master_records r
+  JOIN cf_machines m ON m.company_id = r.company_id AND m.deleted_at IS NULL AND LOWER(CONCAT('TL-', m.code)) = LOWER(r.code)
+ WHERE r.record_kind = 'item' AND r.deleted_at IS NULL AND m.catalog_item_id IS NULL AND r.description LIKE 'Tool, from the machine register%'
+   AND NOT EXISTS (SELECT 1 FROM cf_item_details d WHERE d.company_id = r.company_id AND d.master_id = r.id);
+
+UPDATE cf_machines m
+  JOIN cf_master_records r ON r.company_id = m.company_id AND r.deleted_at IS NULL AND r.record_kind = 'item' AND LOWER(r.code) = LOWER(CONCAT('TL-', m.code)) AND r.description LIKE 'Tool, from the machine register%'
+  JOIN cf_item_details d ON d.company_id = r.company_id AND d.master_id = r.id
+   SET m.catalog_item_id = r.id
+ WHERE m.deleted_at IS NULL AND m.catalog_item_id IS NULL;
+-- ----- MIGRATE-END -----
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME IN ('cf_tool_life', 'cf_tool_usage', 'cf_machine_resources')) = 3
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND ((TABLE_NAME = 'cf_classification_nodes' AND COLUMN_NAME = 'resource_kind')
+               OR (TABLE_NAME = 'cf_item_details' AND COLUMN_NAME IN ('life_unit', 'life_limit')))) = 3,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §79  STORES CHAIN — a general MR ("For"), MRs go to Stores, how each item is procured, the reorder list,
+--      permission tags Stores / Purchase / Maintenance (2026-10-18)
+-- The same text as TM/s79.sql. Additive, guarded and idempotent: safe to re-run. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md
+-- "2026-10-18 — Stores chain (S1 S2 S3 S7)". Services: requisitionService.createRequisition (the general MR),
+-- purchaseRequestService (Stores' MR screen, the PR), procurementMethodService.js (methods + the reorder engine).
+--
+-- User, 2026-10-18: Need → MR → STORES (take from stock, raise the PR for the rest) → Purchase (quotes → PO) →
+-- Management approval → Stores GRN → stock. Every MR has a "For": a sales order, a maintenance order, stock, or general.
+-- Stores may raise an MR with no order. Cost follows the "For" (the order's cost sheet; a maintenance order / stock /
+-- general = overhead — stored here, Accounts reads it later).
+--
+--   cf_requisitions.for_type              'sales_order' (default; every MR before §79) | 'maintenance_order' | 'stock' |
+--                                         'general'.
+--   cf_requisitions.maintenance_order_id  the maintenance order an MR is for (no FK yet: the maintenance work makes that
+--                                         table, §82). A maintenance / general MR may ALSO name a sales order (order_id,
+--                                         no line): its cost then belongs to that order (coordinator, 2026-10-18).
+--   cf_requisitions.order_id / order_line_id        NULL allowed: an MR raised by hand (no order line) has no line; a stock /
+--   cf_requisition_lines.order_line_id              general / maintenance MR has no order. A sales order's own MR keeps both.
+--   cf_buy_requests.order_id              NULL allowed: the PR of an MR with no order.
+--   cf_purchase_line_orders.order_id      NULL allowed: a PO line's share bought for an MR with no order line. A share of a
+--                                         STOCK MR is for stock (anybody's once received); any other such share is held for
+--                                         its MR line on receipt.
+--   cf_procurement_settings               HOW AN ITEM IS PROCURED — one row per catalog item, temporary item or DEFINITION
+--                                         (cf_master_records). method NULL = not set here: a temporary item takes its
+--                                         definition's, else the default (template definition / made item = make; selection
+--                                         definition / bought item = buy on requirement). min / max (buy_min_max),
+--                                         period_days (buy_periodic; periodic_from = the start of the period being counted),
+--                                         lead time, order multiple, minimum order quantity, preferred vendors (party ids).
+--   Tags cf_erp_stores (the Stores tab: MR inbox, to reorder, stock), cf_erp_purchase (purchase requests, quotes, POs),
+--   cf_erp_maintenance (the Maintenance tab, §82) — granted to every company's admin role for cf_erp and to company
+--   30005's "tester" and "MD" roles (ids looked up, never assumed).
+-- ============================================================================
+
+-- cf_requisitions: the "For" and the maintenance order.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'for_type');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_requisitions ADD COLUMN for_type ENUM('sales_order','maintenance_order','stock','general') NOT NULL DEFAULT 'sales_order'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'maintenance_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_requisitions ADD COLUMN maintenance_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND INDEX_NAME = 'idx_crq_for');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_requisitions ADD INDEX idx_crq_for (company_id, for_type)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND INDEX_NAME = 'idx_crq_maint');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_requisitions ADD INDEX idx_crq_maint (company_id, maintenance_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The order columns may be empty (an MR with no order / no order line). Only NOT NULL → NULL; nothing else changes.
+SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'order_id' AND IS_NULLABLE = 'NO');
+SET @sql = IF(@nn = 1, 'ALTER TABLE cf_requisitions MODIFY COLUMN order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- TiDB cannot change a column a generated column reads: take line_live (and uq_crq_line) off around the change and
+-- put them back exactly as they were. They are VIRTUAL — nothing stored is lost. Re-running changes nothing.
+SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'order_line_id' AND IS_NULLABLE = 'NO');
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND INDEX_NAME = 'uq_crq_line');
+SET @sql = IF(@nn = 1 AND @ix > 0, 'ALTER TABLE cf_requisitions DROP INDEX uq_crq_line', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @gc = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'line_live');
+SET @sql = IF(@nn = 1 AND @gc > 0, 'ALTER TABLE cf_requisitions DROP COLUMN line_live', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@nn = 1, 'ALTER TABLE cf_requisitions MODIFY COLUMN order_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @gc = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'line_live');
+SET @sql = IF(@gc = 0, 'ALTER TABLE cf_requisitions ADD COLUMN line_live INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, order_line_id, NULL)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND INDEX_NAME = 'uq_crq_line');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_requisitions ADD UNIQUE KEY uq_crq_line (company_id, line_live)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisition_lines' AND COLUMN_NAME = 'order_line_id' AND IS_NULLABLE = 'NO');
+SET @sql = IF(@nn = 1, 'ALTER TABLE cf_requisition_lines MODIFY COLUMN order_line_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND COLUMN_NAME = 'order_id' AND IS_NULLABLE = 'NO');
+SET @sql = IF(@nn = 1, 'ALTER TABLE cf_buy_requests MODIFY COLUMN order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- TiDB cannot change a column a generated column reads: take order_live (and uq_cplo_line_order_pr) off around the change and
+-- put them back exactly as they were. They are VIRTUAL — nothing stored is lost. Re-running changes nothing.
+SET @nn = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND COLUMN_NAME = 'order_id' AND IS_NULLABLE = 'NO');
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND INDEX_NAME = 'uq_cplo_line_order_pr');
+SET @sql = IF(@nn = 1 AND @ix > 0, 'ALTER TABLE cf_purchase_line_orders DROP INDEX uq_cplo_line_order_pr', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @gc = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND COLUMN_NAME = 'order_live');
+SET @sql = IF(@nn = 1 AND @gc > 0, 'ALTER TABLE cf_purchase_line_orders DROP COLUMN order_live', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @sql = IF(@nn = 1, 'ALTER TABLE cf_purchase_line_orders MODIFY COLUMN order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @gc = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND COLUMN_NAME = 'order_live');
+SET @sql = IF(@gc = 0, 'ALTER TABLE cf_purchase_line_orders ADD COLUMN order_live INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, order_id, NULL)) VIRTUAL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_line_orders' AND INDEX_NAME = 'uq_cplo_line_order_pr');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_purchase_line_orders ADD UNIQUE KEY uq_cplo_line_order_pr (purchase_line_id, order_live, pr_key)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- How each item / definition is procured.
+CREATE TABLE IF NOT EXISTS cf_procurement_settings (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  company_id INT NOT NULL,
+  master_id INT NOT NULL,
+  method ENUM('make','buy_on_requirement','buy_min_max','buy_periodic','customer_supplies','subcontract') NULL,
+  min_qty DECIMAL(18,6) NULL,
+  max_qty DECIMAL(18,6) NULL,
+  period_days INT NULL,
+  periodic_from DATE NULL,
+  lead_time_days INT NULL,
+  order_multiple DECIMAL(18,6) NULL,
+  min_order_qty DECIMAL(18,6) NULL,
+  preferred_vendor_ids VARCHAR(500) NULL,
+  updated_by INT NULL,
+  created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cpmt_master (company_id, master_id),
+  KEY idx_cpmt_method (company_id, method),
+  CONSTRAINT fk_cpmt_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpmt_master FOREIGN KEY (company_id, master_id) REFERENCES cf_master_records(company_id, id)
+);
+
+-- A MACHINE STORE (coordinator, 2026-10-18; S8 builds on it later): a stocking area may be a machine's own location.
+--   cf_stocking_areas.location_kind  'store' (default, every area before §79) | 'machine' (machine_id names the machine;
+--                                    one live machine store per machine — stockingAreaService.machineStore finds / makes it).
+-- How machine stock is consumed (issue / backflush / count) and its cost ledger are S8 — not built here.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stocking_areas' AND COLUMN_NAME = 'location_kind');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_stocking_areas ADD COLUMN location_kind ENUM('store','machine') NOT NULL DEFAULT 'store'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stocking_areas' AND INDEX_NAME = 'idx_csar_kind');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_stocking_areas ADD INDEX idx_csar_kind (company_id, location_kind, machine_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The three permissions: a feature and a capability each.
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT t.name, t.tag, t.kind
+  FROM (SELECT 'CF ERP: Stores (MR inbox, reorder, stock, GRN)' AS name, 'cf_erp_stores' AS tag, 'frontend' AS kind
+        UNION ALL SELECT 'CF ERP: Purchase (purchase requests, quotes, POs)', 'cf_erp_purchase', 'frontend'
+        UNION ALL SELECT 'CF ERP: Maintenance (machines, faults, maintenance orders)', 'cf_erp_maintenance', 'frontend') t
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = t.tag AND f.deleted_at IS NULL);
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag IN ('cf_erp_stores', 'cf_erp_purchase', 'cf_erp_maintenance')
+   AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+-- Granted to every company's ADMIN role for cf_erp, and to Placebo's (30005) "tester" and "MD" roles — scoped, never global.
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND r.id IS NOT NULL AND fc.capability_id IS NOT NULL
+   AND (LOWER(r.name) = 'admin' OR (a.company_id = 30005 AND LOWER(r.name) IN ('tester', 'md')))
+   AND fc.name IN ('cf_erp_stores', 'cf_erp_purchase', 'cf_erp_maintenance')
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME IN ('for_type', 'maintenance_order_id')) = 2
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND IS_NULLABLE = 'YES'
+             AND ((TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME IN ('order_id', 'order_line_id'))
+               OR (TABLE_NAME = 'cf_requisition_lines' AND COLUMN_NAME = 'order_line_id')
+               OR (TABLE_NAME = 'cf_buy_requests' AND COLUMN_NAME = 'order_id')
+               OR (TABLE_NAME = 'cf_purchase_line_orders' AND COLUMN_NAME = 'order_id'))) = 5
+      AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_procurement_settings') = 1
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_stocking_areas' AND COLUMN_NAME = 'location_kind') = 1
+      AND (SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL
+             AND name IN ('cf_erp_stores', 'cf_erp_purchase', 'cf_erp_maintenance')) >= 3,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §82  MAINTENANCE — planned downtime, faults, maintenance orders, preventive plans (2026-10-18)
+-- The same text as TM/s82.sql. Additive and guarded: safe to re-run. Service: maintenanceService.js,
+-- routes/maintenance.js. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md "2026-10-18 — Maintenance (S6)".
+--
+--   cf_planned_downtimes        one rule per machine: once (a window of any length) / weekly (days, every N
+--                               weeks) / monthly (day N, or the 1st-4th / last <weekday>, every N months), from a
+--                               start date to an optional end, a start time and a length, a reason.
+--   cf_machine_calendar_exceptions.downtime_id
+--                               a rule is WRITTEN INTO the machine calendar the planner already reads: each
+--                               occurrence becomes 'closed' timed exceptions (one per calendar day it touches),
+--                               stamped with its rule. Expanded ~2 years ahead (expanded_to on the rule), topped up
+--                               when Maintenance is opened; an edit rewrites the rule's rows from today on.
+--   cf_maintenance_orders       MO-000123: a machine's repair / service job. source fault (a stop on the floor,
+--                               stop_id) / preventive (plan_id) / manual. open → in_progress → waiting_parts → done,
+--                               or cancelled (false_alarm = 1 when a fault was not one). Closing ends the machine's
+--                               stop and records downtime_minutes and the cost (parts_cost + other_cost).
+--                               open_plan: one open MO per preventive plan.
+--   cf_maintenance_plans        preventive: every N days / N run hours / N tonnes since baseline_at (plant clock;
+--                               moves to the close of each MO). Hours and tonnes come from the machine log
+--                               (cf_work_sessions; tonnes = good count x the piece's WEIGHT).
+--   cf_maintenance_events       the MO's history (status changes, notes, MRs raised).
+--   feature cf_erp_maintenance  the Maintenance tab (guarded: the Stores section may create it first), granted to
+--                               the admin roles and to every role holding cf_erp_production_manage.
+-- An OPEN STOP named by an open MO is a FAULT: the planner (shiftService.machinesCalendar) gives that machine no
+-- capacity from the stop's start until it is closed. The code tolerates this section missing (no faults, no rules).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS cf_planned_downtimes (
+  id                INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  machine_id        INT            NOT NULL,
+  kind              ENUM('once','weekly','monthly') NOT NULL,
+  reason            VARCHAR(255)   NOT NULL,
+  starts_on         DATE           NOT NULL,
+  ends_on           DATE           NULL,               -- NULL = no end (recurring)
+  start_time        TIME           NOT NULL,           -- plant clock
+  duration_minutes  INT            NOT NULL,
+  weekdays          VARCHAR(40)    NULL,               -- weekly: 'mon,sun'
+  every_n           INT            NOT NULL DEFAULT 1, -- weekly: weeks, monthly: months
+  month_day         TINYINT        NULL,               -- monthly: 1-31 (a shorter month: its last day)
+  month_week        TINYINT        NULL,               -- monthly: 1-4, 5 = last
+  month_weekday     VARCHAR(3)     NULL,               -- monthly: mon … sun (with month_week)
+  expanded_to       DATE           NULL,               -- written into the calendar up to here
+  notes             VARCHAR(500)   NULL,
+  deleted_at        DATETIME       DEFAULT NULL,
+  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by        INT            NULL,
+  UNIQUE KEY uq_cpdt_tenant (company_id, id),
+  KEY idx_cpdt_machine (company_id, machine_id),
+  CONSTRAINT fk_cpdt_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpdt_machine FOREIGN KEY (company_id, machine_id) REFERENCES cf_machines(company_id, id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machine_calendar_exceptions' AND COLUMN_NAME = 'downtime_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_machine_calendar_exceptions ADD COLUMN downtime_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machine_calendar_exceptions' AND INDEX_NAME = 'idx_cmce_downtime');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_machine_calendar_exceptions ADD INDEX idx_cmce_downtime (company_id, downtime_id, exception_date)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_maintenance_plans (
+  id                INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  machine_id        INT            NOT NULL,
+  title             VARCHAR(255)   NOT NULL,
+  every_days        INT            NULL,
+  every_run_hours   DECIMAL(12,2)  NULL,
+  every_tonnes      DECIMAL(14,3)  NULL,
+  baseline_at       DATETIME       NOT NULL,           -- plant clock: counted from here (the last service)
+  status            ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  notes             VARCHAR(500)   NULL,
+  deleted_at        DATETIME       DEFAULT NULL,
+  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by        INT            NULL,
+  UNIQUE KEY uq_cmpl_tenant (company_id, id),
+  KEY idx_cmpl_machine (company_id, machine_id),
+  CONSTRAINT fk_cmpl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cmpl_machine FOREIGN KEY (company_id, machine_id) REFERENCES cf_machines(company_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_maintenance_orders (
+  id                INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  code              VARCHAR(40)    NULL,
+  machine_id        INT            NOT NULL,
+  source            ENUM('fault','preventive','manual') NOT NULL,
+  plan_id           INT            NULL,
+  stop_id           INT            NULL,               -- the machine stop this MO holds open
+  reason_id         INT            NULL,               -- cf_stop_reasons (a fault's reason)
+  title             VARCHAR(255)   NOT NULL,
+  note              VARCHAR(1000)  NULL,
+  status            ENUM('open','in_progress','waiting_parts','done','cancelled') NOT NULL DEFAULT 'open',
+  raised_at         DATETIME       NOT NULL,           -- plant clock
+  operator_id       INT            NULL,
+  started_at        DATETIME       NULL,
+  done_at           DATETIME       NULL,
+  cancelled_at      DATETIME       NULL,
+  false_alarm       TINYINT(1)     NOT NULL DEFAULT 0,
+  work_done         VARCHAR(1000)  NULL,
+  downtime_minutes  INT            NULL,
+  parts_cost        DECIMAL(18,2)  NULL,
+  other_cost        DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  cost_note         VARCHAR(500)   NULL,
+  deleted_at        DATETIME       DEFAULT NULL,
+  created_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by        INT            NULL,
+  open_plan         INT GENERATED ALWAYS AS (IF(deleted_at IS NULL AND status IN ('open','in_progress','waiting_parts'), plan_id, NULL)) VIRTUAL,
+  UNIQUE KEY uq_cmo_tenant (company_id, id),
+  UNIQUE KEY uq_cmo_open_plan (company_id, open_plan),
+  KEY idx_cmo_machine (company_id, machine_id, status),
+  KEY idx_cmo_status (company_id, status),
+  KEY idx_cmo_stop (company_id, stop_id),
+  CONSTRAINT fk_cmo_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cmo_machine FOREIGN KEY (company_id, machine_id) REFERENCES cf_machines(company_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_maintenance_events (
+  id                    INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id            INT            NOT NULL,
+  maintenance_order_id  INT            NOT NULL,
+  event                 VARCHAR(30)    NOT NULL,       -- raised / status / false_alarm / mr / done / cancelled / note
+  from_status           VARCHAR(20)    NULL,
+  to_status             VARCHAR(20)    NULL,
+  note                  VARCHAR(1000)  NULL,
+  created_by            INT            NULL,
+  created_at            TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_cme_mo (company_id, maintenance_order_id),
+  CONSTRAINT fk_cme_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+-- The Maintenance permission (the Stores section may already have made it).
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: maintenance (machines board, maintenance orders, preventive plans, planned downtime)', 'cf_erp_maintenance', 'frontend'
+  FROM DUAL
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_maintenance' AND f.deleted_at IS NULL);
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag = 'cf_erp_maintenance' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = 'cf_erp_maintenance' AND fc.deleted_at IS NULL);
+-- Granted to every company's ADMIN role for cf_erp and to every role that manages production.
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.deleted_at IS NULL AND fc.name = 'cf_erp_maintenance'
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND (LOWER(r.name) = 'admin' OR EXISTS (
+         SELECT 1 FROM role_capability rc JOIN features_capability pc ON pc.capability_id = rc.capability_id AND pc.deleted_at IS NULL
+          WHERE rc.role_id = r.id AND rc.app_id = a.id AND rc.deleted_at IS NULL AND pc.name = 'cf_erp_production_manage'))
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME IN ('cf_planned_downtimes', 'cf_maintenance_plans', 'cf_maintenance_orders', 'cf_maintenance_events')) = 4
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_machine_calendar_exceptions' AND COLUMN_NAME = 'downtime_id') = 1
+      AND (SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL AND name = 'cf_erp_maintenance') >= 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §78  APPROVALS — a company may let a person decide what they asked for themselves (2026-10-18)
+-- The same text as TM/s78.sql. Additive and guarded: safe to re-run.
+--   cf_company_settings.approve_own_requests  0 (default) = requester ≠ approver (four-eyes; admins excepted).
+--                                             1 = TEMPORARY testing / early-adoption switch (Placebo): whoever holds
+--                                             the type's tag may decide their own request. Turn it off afterwards.
+-- No company is switched on here: that is a separate, scoped script (TM/placebo-self-approval.sql).
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'approve_own_requests');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN approve_own_requests TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT 'SCHEMA-OK' AS result;

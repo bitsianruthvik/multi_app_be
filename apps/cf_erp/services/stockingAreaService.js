@@ -5,7 +5,7 @@
  * finished and waiting to leave.
  */
 import { conflict, notFound, assertNoProblems } from '../lib/errors.js';
-import { loadMachine } from './records.js';
+import { loadMachine, requireMachine } from './records.js';
 
 export const PURPOSES = ['storage', 'wip', 'quarantine', 'dispatch', 'scrap'];   // scrap: §67
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
@@ -24,6 +24,8 @@ export function shapeArea(a) {
     name: a.name,
     purpose: a.purpose,
     machine: a.machine_id && a.machine_code ? { id: a.machine_id, code: a.machine_code, name: a.machine_name } : null,
+    // §79: 'machine' = a machine's own store (machineStore); every other area is 'store'.
+    locationKind: a.location_kind ?? 'store',
     status: a.status,
     notes: a.notes,
     itemCount: a.item_count == null ? undefined : Number(a.item_count),
@@ -112,4 +114,26 @@ export async function deleteArea(db, c, id) {
   if (Number(n)) throw conflict('IN_USE', `${a.code} has stock history (${n} ledger row${Number(n) === 1 ? '' : 's'}) — mark it inactive instead.`);
   await db.query('UPDATE cf_stocking_areas SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   return { ok: true };
+}
+
+/**
+ * A MACHINE'S OWN STORE (init.sql §79, coordinator 2026-10-18 — the ground for S8, machine consumables): the stocking
+ * area with location_kind 'machine' for that machine, made the first time it is asked for (code MS-<machine code>,
+ * purpose 'wip' — stock at the machine is in process, not on the Stores shelf). How machine stock is consumed and costed
+ * (issue to order / backflush / count) is S8 and not built here. 1 read, or 1 read + 1 insert + 1 read.
+ * → shapeArea row.
+ */
+export async function machineStore(db, c, machineId) {
+  const mid = Number(machineId);
+  const [[have]] = await db.query(
+    `${SELECT} WHERE a.company_id = ? AND a.machine_id = ? AND a.location_kind = 'machine' AND a.deleted_at IS NULL ORDER BY a.id LIMIT 1`,
+    [c.companyId, mid],
+  );
+  if (have) return shapeArea(have);
+  const m = await requireMachine(db, c.companyId, mid);
+  const [r] = await db.query(
+    "INSERT INTO cf_stocking_areas (company_id, code, name, purpose, machine_id, location_kind, notes, created_by) VALUES (?, ?, ?, 'wip', ?, 'machine', ?, ?)",
+    [c.companyId, `MS-${m.code}`.slice(0, 50), `${m.name ?? m.code} — machine store`.slice(0, 255), mid, 'The machine\'s own store (consumables, tools and spares kept at the machine).', c.userId ?? null],
+  );
+  return shapeArea(await requireArea(db, c.companyId, r.insertId));
 }

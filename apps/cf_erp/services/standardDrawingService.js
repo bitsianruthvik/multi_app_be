@@ -359,6 +359,16 @@ async function copyVersionToLine(db, c, version, lineId) {
   );
   const ids = [...idMap.values()];
   const names = new Map([...idMap].map(([src, fresh]) => [fresh, snap.items.get(src)?.name ?? null]));
+  const settled = await settleLineRows(db, c, lineId, newRoot, ids, names);
+  return { rootId: newRoot, rows: ids.length, cutPieces: settled.cutPieces };
+}
+
+/**
+ * Everything a line works out for rows just written onto it (a standard's copy, a drawing read by AI —
+ * drawingLineService): flow rules, values in the line's context (order values included), names, cut lengths, the
+ * drawings' facts, cut pieces. Set-based: a fixed number of statements, whatever the number of rows.
+ */
+export async function settleLineRows(db, c, lineId, newRoot, ids, names) {
   const { syncFlowSpecs } = await import('./flowSpecService.js');
   const { materializeLineRecords } = await import('./orderValuesService.js');
   const { nameNewItems } = await import('./codeRangeService.js');
@@ -371,7 +381,7 @@ async function copyVersionToLine(db, c, version, lineId) {
   await refreshPlateCuts(db, c, lineId);
   await refreshDrawingValues(db, c, lineId, { force: true });
   const cut = await refreshCutPieces(db, c, lineId);
-  return { rootId: newRoot, rows: ids.length, cutPieces: { made: cut.made, reason: cut.reason ?? null, message: cut.message ?? null } };
+  return { cutPieces: { made: cut.made, reason: cut.reason ?? null, message: cut.message ?? null } };
 }
 
 /**

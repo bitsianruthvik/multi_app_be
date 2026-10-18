@@ -1346,7 +1346,8 @@ async function writeSteps(db, c, releaseId, plan, estimate, owners) {
     const t = estimate(node.bomLineId, node.itemId, s.operationId);
     const work = t?.work ?? null;
     const setup = work != null ? t.setup ?? 0 : t?.setup ?? null;
-    const total = work != null ? Number(((setup ?? 0) + work * Number(s.quantity)).toFixed(3)) : null;
+    // §76: setup is per quantity — (setup + work) × the step's quantity.
+    const total = stepMinutes(setup, work, s.quantity);
     const workOrderId = node.lockedPieceId != null ? owners.get(`${node.lockedPieceId}:${s.operationId}`) ?? null : null;
     // §58 — the STANDARD time above is the machine type's. Where one machine alone can do the
     // operation it IS the machine: the step is on it from the start, with that machine's own time
@@ -1622,7 +1623,8 @@ async function readTracker(db, companyId, releaseIds) {
     ),
     db.query(
       `SELECT s.*, o.code AS op_code, o.name AS op_name, mc.code AS machine_code, mc.name AS machine_name,
-              wo.code AS wo_code, wo.status AS wo_status, wo.contractor_id AS wo_contractor_id, wp.name AS wo_contractor_name
+              wo.code AS wo_code, wo.status AS wo_status, wo.contractor_id AS wo_contractor_id, wp.name AS wo_contractor_name,
+              po.status AS po_status, po.code AS po_code, po.label AS po_label
          FROM cf_production_steps s
          JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
          JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
@@ -1630,6 +1632,7 @@ async function readTracker(db, companyId, releaseIds) {
          LEFT JOIN cf_machines mc ON mc.id = s.machine_id
          LEFT JOIN cf_work_orders wo ON wo.id = s.work_order_id
          LEFT JOIN cf_parties wp ON wp.id = wo.contractor_id
+         LEFT JOIN cf_production_orders po ON po.id = s.production_order_id
         WHERE s.company_id = ? AND pi.company_id = ? AND pi.release_id IN (?) AND s.deleted_at IS NULL
         ORDER BY s.production_item_id, s.sequence, s.id`,
       [companyId, companyId, releaseIds],
@@ -1790,6 +1793,10 @@ function evaluate(data) {
       waits.push({ origin: d.origin, met, text: `Waits for ${text}.` });
       if (!met) blockers.push({ kind: 'wait', text: `Waiting for ${text}.` });
     }
+    // §76: a step of a production order that is not released yet cannot start — on any screen.
+    if (s.production_order_id != null && s.po_status === 'yet_to_plan') {
+      blockers.unshift({ kind: 'production_order', text: `Production order ${s.po_code} is not released yet.` });
+    }
     const materials = reqsByStep.get(s.id) ?? [];
     for (const q of materials) {
       if (q._covered) continue;
@@ -1847,6 +1854,8 @@ export const shapeStep = (s, pieceLabel) => ({
   waits: s._waits,
   blockers: s._blockers,
   requirementIds: s._requirementIds,
+  // §76: the production order the step belongs to (null = released before production orders).
+  productionOrder: s.production_order_id != null ? { id: s.production_order_id, code: s.po_code ?? null, label: s.po_label ?? null, status: s.po_status ?? null } : null,
 });
 
 function shapeRequirement(q, data, ev) {
@@ -2092,6 +2101,8 @@ export async function listTrackerSteps(db, companyId, q = {}) {
   // The Tracker's one "In-house only" filter: steps on no contractor work order.
   if (String(q.inHouse) === '1') rows = rows.filter((s) => !s.workOrder);
   if (!blank(q.workOrderId)) rows = rows.filter((s) => s.workOrder?.id === Number(q.workOrderId));
+  // §76: one production order's steps.
+  if (!blank(q.productionOrderId)) rows = rows.filter((s) => s.productionOrder?.id === Number(q.productionOrderId));
   if (!blank(q.search)) {
     const term = String(q.search).trim().toLowerCase();
     rows = rows.filter((s) => contains(term, s.piece.label, s.order.code, s.operation.code, s.operation.name, s.machine?.code, s.workOrder?.code, s.workOrder?.contractorName));
@@ -2241,6 +2252,9 @@ export async function startStep(db, c, stepId, input = {}) {
   const step = await requireStep(db, c.companyId, stepId);
   const at = readAt(input.at, step.release_epoch);
   const { s } = await evaluatedStep(db, c.companyId, step);
+  // §76: never before its production order is released — not even the machine log's "it really was done".
+  const poBlock = s.blockers.find((b) => b.kind === 'production_order');
+  if (poBlock && s.status === 'not_ready') throw invalid('NOT_RELEASED', `${s.label} cannot start yet.`, { problems: [poBlock.text] });
   const beforeReady = s.status === 'not_ready' && !!input.allowNotReady;
   if (s.status !== 'ready' && !beforeReady) {
     const why = s.status === 'not_ready' ? s.blockers.map((b) => b.text) : [`It is ${s.status.replace('_', ' ')}.`];

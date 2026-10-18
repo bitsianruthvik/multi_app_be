@@ -209,18 +209,18 @@ try {
   }
   ok(`EDGEP = item.${itemCode} / 10 + 1 on every plate part that has it (${formulaChecked} cells)`, formulaChecked > 0 && formulaWrong === 0, `${formulaWrong} wrong`);
   ok('EDGEP rows without the value say which input is missing', formulaChecked + missingNamed === edgeRows.length, `${formulaChecked}+${missingNamed} of ${edgeRows.length}`);
-  // Totals are Σ (setup + work × total quantity) × passes over the rows.
+  // Totals are Σ (setup + work) × total quantity × passes over the rows (setup per quantity since §76).
   let all = 0;
   const byOp = {};
   for (const r of view.rows) {
     for (const [k, cl] of Object.entries(r.cells)) {
       if (cl.work == null) continue;
-      const m = ((cl.setup ?? 0) + cl.work * r.totalQty) * cl.passes;
+      const m = ((cl.setup ?? 0) + cl.work) * r.totalQty * cl.passes;
       byOp[k] = (byOp[k] ?? 0) + m;
       all += m;
     }
   }
-  ok('totals.all = Σ (setup + work × total qty) × passes', Math.abs(view.totals.all - all) < 0.01, `${view.totals.all} vs ${all}`);
+  ok('totals.all = Σ (setup + work) × total qty × passes', Math.abs(view.totals.all - all) < 0.01, `${view.totals.all} vs ${all}`);
   ok('totals.byOperation per column', Object.entries(byOp).every(([k, v]) => Math.abs(view.totals.byOperation[k] - v) < 0.01));
   ok('a column with no number has no total', view.totals.byOperation[opByCode.get('FQC')?.id] === undefined);
 

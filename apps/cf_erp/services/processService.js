@@ -659,7 +659,7 @@ export const STAGE_CATALOGUE = [
   {
     key: 'production',
     label: 'Production',
-    description: 'Releasing to the shop what the order makes rather than buys. Needs a confirmed order and a frozen design; the steps wait for their material.',
+    description: 'The times of every operation, then the production orders (from the execution plan) released to the shop. Needs a confirmed order and a frozen design; the steps wait for their material.',
     /** Something under the line is made: a temporary item, or a catalog item sourced 'make'. */
     applies: (ctx) => ctx.made.length > 0,
     state(ctx) {
@@ -678,7 +678,8 @@ export const STAGE_CATALOGUE = [
                 : null,
           state: 'todo',
           detail: `${n(ctx.made.length, 'row')} to make — not released yet`,
-          blockers: [{ count: 0, message: `Line ${ctx.line.line_no} is not released to production, so nothing of it is on the floor.` }],
+          // §76: production goes by production orders — made from the execution plan here, then released.
+          blockers: [{ count: 0, message: `Line ${ctx.line.line_no} is not on the floor yet: create the production orders and release them.` }],
         };
       }
       const { steps, doneSteps } = release;

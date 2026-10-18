@@ -226,8 +226,9 @@ try {
   if (kg1 != null && kg3 != null) ok('tonnes = 2 × piece WEIGHT + 1 × piece WEIGHT', near(m1.output.tonnes, (2 * kg1 + kg3) / 1000, 0.002), `${m1.output.tonnes} vs ${(2 * kg1 + kg3) / 1000}`);
   else ok('a piece with no WEIGHT is counted as not weighed, never as 0 t', m1.output.unweighedSessions > 0, JSON.stringify(m1.output));
   if (s1.est_work_minutes != null && s3.est_work_minutes != null) {
-    const earned = 2 * Number(s1.est_work_minutes) + Number(s1.est_setup_minutes ?? 0) + Number(s3.est_work_minutes);
-    ok('standard minutes = good × work time (+ setup when the job finished)', Math.abs(m1.standard.earnedMin - Math.round(earned)) <= 1, `${m1.standard.earnedMin} vs ${earned}`);
+    // §76: setup is per quantity — each good piece earns (setup + work).
+    const earned = 2 * (Number(s1.est_work_minutes) + Number(s1.est_setup_minutes ?? 0)) + (Number(s3.est_work_minutes) + Number(s3.est_setup_minutes ?? 0));
+    ok('standard minutes = good × (setup + work time)', Math.abs(m1.standard.earnedMin - Math.round(earned)) <= 1, `${m1.standard.earnedMin} vs ${earned}`);
     ok('performance = standard ÷ run', m1.standard.performancePct === Math.round((earned / 300) * 1000) / 10, String(m1.standard.performancePct));
   }
   ok('now: M runs a job (named), M2 is stopped for the crane', m1.now.state === 'running' && m1.now.running[0]?.operation && m2.now.state === 'stopped' && /crane/i.test(m2.now.stop?.reason ?? ''),

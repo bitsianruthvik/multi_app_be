@@ -190,7 +190,7 @@ try {
   section('3. The execution plan');
   let plan = await EP.getExecutionPlan(conn, COMPANY, order.id);
   eq('nothing saved: the default is one production order per line, dispatched the same way', [plan.saved, plan.plan], [null, { production: { level: 'line', levelId: null }, dispatch: { level: 'same', levelId: null } }]);
-  ok('editable, with the note that nesting will run per production order later', plan.editable === true && /nesting will then run per production order/.test(plan.note));
+  ok('editable, with the note that the Production step makes the production orders (§76)', plan.editable === true && /makes the production orders from this plan/.test(plan.note));
   eq('the stock item makes nothing: no production order for it', plan.lines.map((l) => [l.lineNo, l.made, l.productionCount]), [[1, true, 1], [2, true, 1], [3, false, 0]]);
   eq('preview: 2 production orders, one per span line', [plan.preview.production.count, plan.preview.production.items], [2, [`${RUN} · Line 1 · Bridge span ×3`, `${RUN} · Line 2 · Bridge span ×1`]]);
   ok('…in a plain sentence', plan.preview.production.sentence === `This order will make 2 production orders: ${RUN} · Line 1 · Bridge span ×3, ${RUN} · Line 2 · Bridge span ×1.`, plan.preview.production.sentence);

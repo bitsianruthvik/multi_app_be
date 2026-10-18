@@ -38,6 +38,7 @@ import { APPROVAL_PERMS, decide, pendingOf } from '../services/approvalService.j
 import { approverOf } from './approvals.js';
 import { CfError } from '../lib/errors.js';
 import { releaseHold } from '../services/purchaseLinkService.js';
+import { noteLegacyReceipt } from '../services/grnService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -73,7 +74,12 @@ router.post('/purchase-orders/:id/lines', manage, handle((req) => tx(req, (db, c
 
 router.put('/purchase-lines/:id', manage, handle((req) => tx(req, (db, c) => updatePurchaseLine(db, c, id(req), req.body ?? {}))));
 router.delete('/purchase-lines/:id', manage, handle((req) => tx(req, (db, c) => removePurchaseLine(db, c, id(req)))));
-router.post('/purchase-lines/:id/receive', manage, handle((req) => tx(req, (db, c) => receiveLine(db, c, id(req), req.body ?? {}))));
+// §80: a receipt booked through this older call (no money) still leaves a flagged supplier-bill row for Accounts; the GRN screen uses POST /purchase-orders/:id/grn.
+router.post('/purchase-lines/:id/receive', manage, handle((req) => tx(req, async (db, c) => {
+  const r = await receiveLine(db, c, id(req), req.body ?? {});
+  await noteLegacyReceipt(db, c, id(req), r);
+  return r;
+})));
 router.put('/purchase-lines/:id/orders', manage, handle((req) => tx(req, (db, c) => setPurchaseLineOrders(db, c, id(req), req.body ?? {}))));
 router.post('/stock/holds/:id/release', manage, handle((req) => tx(req, (db, c) => releaseHold(db, c, id(req)))));
 

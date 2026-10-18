@@ -44,6 +44,17 @@ import approvalRoutes from './approvals.js';
 import acceptanceRoutes from './acceptance.js';
 // Accounts: the Billing board, milestone invoices, receipts, order costing (init.sql §74).
 import accountsRoutes from './accounts.js';
+import grnRoutes from './grn.js';
+// Production orders: made from the execution plan, released, tracked and dispatched (init.sql §76).
+import productionOrderRoutes from './productionOrders.js';
+// Add line › from a new drawing (by AI), the New order dialog's order values (init.sql §77).
+import addLineRoutes from './addLine.js';
+// Tools, spares and consumables as stock items; each machine's resource list (init.sql §81).
+import toolsResourcesRoutes from './toolsResources.js';
+// Maintenance: machines board, faults, maintenance orders, preventive plans, planned downtime (init.sql §82).
+import maintenanceRoutes from './maintenance.js';
+// The stores chain: the general MR, To reorder, how items are procured, a machine's store (init.sql §79).
+import storesRoutes from './stores.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -146,5 +157,11 @@ router.use(standardRoutes);
 router.use(approvalRoutes);
 router.use(acceptanceRoutes);
 router.use(accountsRoutes);
+router.use(grnRoutes);
+router.use(productionOrderRoutes);
+router.use(addLineRoutes);
+router.use(toolsResourcesRoutes);
+router.use(maintenanceRoutes);
+router.use(storesRoutes);
 
 export default router;

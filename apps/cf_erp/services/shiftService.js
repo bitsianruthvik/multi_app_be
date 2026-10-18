@@ -389,6 +389,47 @@ export async function machineCalendar(db, companyId, machineId, q = {}) {
   };
 }
 
+/**
+ * MAINTENANCE (init.sql §82, user 2026-10-18: "the machine counts as DOWN for planning AT ONCE — open stop = no capacity
+ * until closed"). A FAULT is an open machine stop named by an open maintenance order (or by the stop that edited it).
+ * One read, in the same parallel stage as the shifts; a database without §82 has no faults.
+ */
+async function openFaults(db, companyId, ids) {
+  try {
+    const [rows] = await db.query(
+      `SELECT st.machine_id, MIN(st.started_at) AS started_at
+         FROM cf_machine_stops st
+         JOIN cf_maintenance_orders mo ON mo.company_id = st.company_id AND mo.deleted_at IS NULL
+              AND mo.status IN ('open', 'in_progress', 'waiting_parts') AND (mo.stop_id = st.id OR mo.stop_id = st.replaces_id)
+        WHERE st.company_id = ? AND st.machine_id IN (?) AND st.ended_at IS NULL AND st.deleted_at IS NULL
+        GROUP BY st.machine_id`,
+      [companyId, ids],
+    );
+    return rows;
+  } catch (e) {
+    if (e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146) return [];
+    throw e;
+  }
+}
+
+/**
+ * An open fault as calendar 'closed' rows (the same shape calendarDays reads): from the stop's start to midnight, then
+ * every day after cut whole (00:00-00:00 = 24 h, which also cuts a night shift that started the evening before).
+ * Exported for the maintenance suite.
+ */
+export function faultCuts(machineId, startedAt, day0S, toS) {
+  const wall = startedAt instanceof Date ? startedAt.toISOString().slice(0, 16) : String(startedAt).replace(' ', 'T').slice(0, 16);
+  const startDay = wall.slice(0, 10);
+  const rows = [];
+  let d = parseDate(startDay < day0S ? day0S : startDay);
+  const last = parseDate(toS);
+  for (; d <= last; d = addDays(d, 1)) {
+    const ds = dateText(d);
+    rows.push({ machine_id: machineId, exception_date: ds, kind: 'closed', shift_id: null, start_time: ds === startDay ? wall.slice(11, 16) : '00:00', end_time: '00:00', reason: 'Fault' });
+  }
+  return rows;
+}
+
 /** The planner's horizon is a quarter plus a little; a year is the most anyone asks for at once. */
 const MAX_BULK_DAYS = 400;
 
@@ -409,7 +450,7 @@ export async function machinesCalendar(db, companyId, q = {}) {
   }
   const out = new Map();
   if (!ids.length) return out;
-  const [[shiftRows], [exRows]] = await Promise.all([
+  const [[shiftRows], [exRows], faultRows] = await Promise.all([
     db.query(
       'SELECT * FROM cf_machine_shifts WHERE company_id = ? AND machine_id IN (?) AND deleted_at IS NULL ORDER BY machine_id, sort_order, start_time, id',
       [companyId, ids],
@@ -419,6 +460,7 @@ export async function machinesCalendar(db, companyId, q = {}) {
         WHERE company_id = ? AND machine_id IN (?) AND deleted_at IS NULL AND exception_date BETWEEN ? AND ?`,
       [companyId, ids, day0S, toS],
     ),
+    openFaults(db, companyId, ids),
   ]);
   const group = (rows) => {
     const m = new Map();
@@ -426,7 +468,7 @@ export async function machinesCalendar(db, companyId, q = {}) {
     return m;
   };
   const shiftsOf = group(shiftRows);
-  const exOf = group(exRows);
+  const exOf = group([...exRows, ...faultRows.flatMap((f) => faultCuts(f.machine_id, f.started_at, day0S, toS))]);
   for (const id of ids) {
     const shifts = shiftsOf.get(id) ?? [];
     const days = calendarDays(shifts, exOf.get(id) ?? [], fromS, toS).map((d) => ({ date: d.date, minutes: d.minutes }));

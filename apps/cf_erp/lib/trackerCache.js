@@ -130,8 +130,11 @@ export async function trackerStamp(db, companyId, releaseIds) {
           FROM cf_stock_reservations v WHERE v.company_id = ?) AS reservations,
        (SELECT COALESCE(MAX(k.id), 0) FROM cf_stock_ledger k WHERE k.company_id = ?) AS ledger,
        (SELECT CONCAT(COUNT(*), '/', COALESCE(MAX(w.updated_at), '')) FROM cf_work_orders w WHERE w.company_id = ?) AS work_orders,
-       (SELECT CONCAT(COUNT(*), '/', COALESCE(MAX(ws.updated_at), '')) FROM cf_work_sessions ws WHERE ws.company_id = ?) AS sessions`,
-    [companyId, companyId, ids, companyId, ids, companyId, ids, companyId, ids, companyId, ids, companyId, companyId, companyId, companyId],
+       (SELECT CONCAT(COUNT(*), '/', COALESCE(MAX(ws.updated_at), '')) FROM cf_work_sessions ws WHERE ws.company_id = ?) AS sessions,
+       -- §76: a production order released or taken back changes what may start.
+       (SELECT CONCAT(COUNT(*), '/', COALESCE(SUM(po.status = 'planned'), 0), '/', COALESCE(SUM(po.status = 'closed'), 0), '/', COALESCE(MAX(po.updated_at), ''))
+          FROM cf_production_orders po WHERE po.company_id = ?) AS production_orders`,
+    [companyId, companyId, ids, companyId, ids, companyId, ids, companyId, ids, companyId, ids, companyId, companyId, companyId, companyId, companyId],
   );
   return Object.values(row).map((v) => (v instanceof Date ? v.toISOString() : String(v ?? ''))).join('|');
 }

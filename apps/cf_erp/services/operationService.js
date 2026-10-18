@@ -7,8 +7,8 @@
  * on the machine beats its Variant, which beats its Subfamily, which beats its
  * Family. eligible = 0 on a deeper rule takes a type or a machine out.
  *
- * Each time is a constant or a formula, in minutes; setup is per run and work
- * per piece. Timing formulas read item.<SPEC> and machine.<SPEC>, so a single
+ * Each time is a constant or a formula, in minutes; setup and work are both per
+ * piece (setup per quantity since §76). Timing formulas read item.<SPEC> and machine.<SPEC>, so a single
  * rule — "work = item.CUT_LENGTH / machine.CUTTING_SPEED" on the Cutting family —
  * gives every cutting machine its own time from its own speed.
  */
@@ -581,7 +581,7 @@ function parsedOf(expression) {
 }
 
 /**
- * THE time computation: a rule's setup (per run) and work (per piece), each a
+ * THE time computation: a rule's setup and work (both per piece, §76), each a
  * constant or a formula fed the item's and the machine's values. No setup on
  * the rule means none; no work time means the rule is not finished. Missing
  * inputs are named, never guessed. Used by timingPreview and by the bulk
@@ -659,8 +659,8 @@ export async function loadTimingSetup(db, companyId, operationIds, date = today(
 }
 
 /**
- * How long a machine takes to do an operation on an item: setup (per run) plus
- * work (per piece) × quantity, from the rule that applies, with its formulas
+ * How long a machine takes to do an operation on an item: (setup + work) per
+ * piece × quantity (§76: setup per quantity), from the rule that applies, with its formulas
  * fed the item's and the machine's own values. Missing inputs are named.
  */
 export async function timingPreview(db, companyId, operationId, input = {}) {
@@ -689,7 +689,7 @@ export async function timingPreview(db, companyId, operationId, input = {}) {
     item: itemResolution ? valueReaders(effectiveByCode(itemResolution), levelsOfResolution(itemResolution)) : null,
     machine: valueReaders(effectiveByCode(machineResolution)),
   });
-  const total = setup.minutes != null && work.minutes != null ? Number((setup.minutes + work.minutes * quantity).toFixed(4)) : null;
+  const total = setup.minutes != null && work.minutes != null ? Number(((setup.minutes + work.minutes) * quantity).toFixed(4)) : null;
   return {
     ...base,
     item: item ? { id: item.id, code: item.code, name: item.name } : null,

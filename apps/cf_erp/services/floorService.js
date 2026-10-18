@@ -201,14 +201,16 @@ async function eligibleOperations(db, companyId, machine) {
 
 const STEP_SQL = `SELECT s.*, pi.release_id, pi.parent_id AS item_parent_id, pi.stocked_qty AS item_stocked_qty, pi.code AS piece_code, m.name AS piece_name,
          UNIX_TIMESTAMP(r.created_at) AS release_epoch, r.order_id, o.code AS order_code, o.status AS order_status,
-         op.code AS op_code, op.name AS op_name, mc.code AS step_machine_code
+         op.code AS op_code, op.name AS op_name, mc.code AS step_machine_code,
+         po.status AS po_status, po.code AS po_code, po.label AS po_label
     FROM cf_production_steps s
     JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
     JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
     JOIN cf_sales_orders o ON o.id = r.order_id
     JOIN cf_master_records m ON m.id = pi.item_id
     JOIN cf_operations op ON op.id = s.operation_id
-    LEFT JOIN cf_machines mc ON mc.id = s.machine_id`;
+    LEFT JOIN cf_machines mc ON mc.id = s.machine_id
+    LEFT JOIN cf_production_orders po ON po.id = s.production_order_id`;
 
 /** The steps a write touches, row-locked, all in one read. Missing ids are a 404. */
 async function lockSteps(db, companyId, ids) {
@@ -232,6 +234,8 @@ function stepProblem(s, machine, eligible) {
   const name = `${s.piece_code ?? s.piece_name} · ${s.op_name}`;
   if (LOCKED_ORDER_STATUSES.has(s.order_status)) return `${name}: order ${s.order_code} is ${s.order_status} — nothing more is recorded on it.`;
   if (s.work_order_id) return `${name} is on a contractor work order — it is not done in-house.`;
+  // §76: work is recorded only on a RELEASED production order.
+  if (s.production_order_id != null && s.po_status === 'yet_to_plan') return `${name}: production order ${s.po_code} is not released yet.`;
   if (s.state === 'on_hold') return `${name} is on hold — resume it first.`;
   if (eligible && !eligible.has(s.operation_id)) return `${machine.code} is not set up to do ${s.op_name} (${s.op_code}).`;
   return null;
@@ -538,6 +542,8 @@ function shapeFloorStep(s, it, rel, extra = {}) {
     itemId: it?.item_id ?? null,
     sequence: s.sequence,
     state: s.state,
+    // §76: the production order the step belongs to ("SO260014-P02 · Span 2 of 3"); null on an older release.
+    productionOrder: s.production_order_id != null ? { id: s.production_order_id, code: s.po_code ?? null, label: s.po_label ?? null } : null,
     ...extra,
   };
 }
@@ -607,6 +613,7 @@ export async function machineQueue(db, companyId, machineId, q = {}) {
   const rows = [];
   for (const s of data.steps) {
     if (s.state === 'done' || s.work_order_id || !eligible.has(s.operation_id) || openByStep.has(s.id)) continue;
+    if (s.production_order_id != null && s.po_status === 'yet_to_plan') continue;   // §76: not released yet — not on the floor
     const it = itemById.get(s.production_item_id);
     const rel = relById.get(it.release_id);
     const shaped = shapeFloorStep(s, it, rel);
@@ -914,7 +921,37 @@ async function insertSessions(db, c, rows) {
 }
 
 /** Ends the machine's open stop at `wall` (starting work means it is back to work). */
+/**
+ * A machine stop held open by an open MAINTENANCE ORDER (§82: a fault) is not ended by starting work, nor by "Back to
+ * work": the machine is down until the maintenance order is done or cancelled (the planner gives it no capacity until
+ * then). Refused in words naming the order. One read; a database without §82 has no such stops.
+ */
+export const MAINTENANCE_OPEN = 'MAINTENANCE_OPEN';
+async function assertNoOpenMaintenance(db, companyId, { machineIds = null, stopId = null }) {
+  const ids = machineIds ? [...new Set(machineIds.map(Number))] : null;
+  if (ids && !ids.length) return;
+  let rows = [];
+  try {
+    [rows] = await db.query(
+      `SELECT mo.id, mo.code, mc.code AS machine_code FROM cf_machine_stops st
+         JOIN cf_maintenance_orders mo ON mo.company_id = st.company_id AND mo.stop_id = st.id AND mo.deleted_at IS NULL
+                                       AND mo.status NOT IN ('done', 'cancelled')
+         JOIN cf_machines mc ON mc.id = st.machine_id
+        WHERE st.company_id = ? AND st.ended_at IS NULL AND st.deleted_at IS NULL AND ${stopId != null ? 'st.id = ?' : 'st.machine_id IN (?)'}`,
+      [companyId, stopId != null ? Number(stopId) : ids],
+    );
+  } catch (e) {
+    if (e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146) return;
+    throw e;
+  }
+  if (!rows.length) return;
+  const mo = rows[0];
+  throw conflict(MAINTENANCE_OPEN, `${mo.machine_code} is down for maintenance (${mo.code ?? `maintenance order ${mo.id}`}) — close the maintenance order first.`,
+    { maintenanceOrderId: mo.id });
+}
+
 async function endOpenStop(db, c, machineId, wall) {
+  await assertNoOpenMaintenance(db, c.companyId, { machineIds: [machineId] });
   const [r] = await db.query(
     'UPDATE cf_machine_stops SET ended_at = GREATEST(started_at, ?) WHERE company_id = ? AND machine_id = ? AND ended_at IS NULL AND deleted_at IS NULL',
     [wall, c.companyId, machineId],
@@ -1139,6 +1176,7 @@ export async function endStop(db, c, stopId) {
   const [[st]] = await db.query('SELECT * FROM cf_machine_stops WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, Number(stopId)]);
   if (!st) throw notFound('Stop');
   if (st.ended_at != null) throw invalid('NOT_RUNNING', 'That stop has already ended.');
+  await assertNoOpenMaintenance(db, c.companyId, { stopId: st.id });
   await db.query('UPDATE cf_machine_stops SET ended_at = GREATEST(started_at, ?) WHERE company_id = ? AND id = ?', [wallOf(Date.now(), tz), c.companyId, st.id]);
   return { now: await machineNow(db, c.companyId, st.machine_id) };
 }

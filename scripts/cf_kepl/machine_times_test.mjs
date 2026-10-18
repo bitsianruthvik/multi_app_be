@@ -89,7 +89,8 @@ try {
   let slowRate = 30;
   const std = (kind) => 60 / 60 + typeChart[kind];
   const onSlow = (kind) => 60 / slowRate + (slowChart ? slowChart[kind] : typeChart[kind]);
-  const total = (work, qty) => SETUP + work * Number(qty);
+  // §76: setup is per quantity — a step's minutes = (setup + work) × quantity.
+  const total = (work, qty) => (SETUP + work) * Number(qty);
 
   const stepsOf = async (lineId) => {
     const [rows] = await db.query(
@@ -192,7 +193,7 @@ try {
   ok('three part steps to start', parts.length >= 3, String(parts.length));
   await F.startWork(db, c, { machineId: SLOW, stepIds: [A.id] });
   let a = await stepRow(A.id);
-  ok('live start on SLOW: in progress, on SLOW, machine time = 5 + 3 × quantity', a.state === 'in_progress' && a.machine_id === SLOW && near(a.mach_work_minutes, 3) && near(a.mach_minutes, total(3, a.quantity)) && near(a.eff_minutes, a.mach_minutes), j([a.mach_work_minutes, a.mach_minutes]));
+  ok('live start on SLOW: in progress, on SLOW, machine time = (5 + 3) × quantity', a.state === 'in_progress' && a.machine_id === SLOW && near(a.mach_work_minutes, 3) && near(a.mach_minutes, total(3, a.quantity)) && near(a.eff_minutes, a.mach_minutes), j([a.mach_work_minutes, a.mach_minutes]));
   await REL.startStep(db, c, B.id, { machineId: SLOW, allowNotReady: true, view: 'none' });
   let b = await stepRow(B.id);
   ok('the tracker\'s own start on SLOW: the same machine time', b.state === 'in_progress' && b.machine_id === SLOW && near(b.mach_minutes, total(3, b.quantity)) && near(b.eff_minutes, b.mach_minutes));
@@ -332,7 +333,8 @@ try {
   // Before release a ROW's setup is counted once for the row (the Times tab's total, as always);
   // a released step carries its own. So: the same work minutes, and one setup a row.
   const rowsOf4 = new Set(s4.map((s) => s.bom_line_id ?? 0)).size;
-  const planExpect = s4.reduce((t, s) => t + (s.machine_id === SLOW ? onSlow(s.kind) : std(s.kind)) * Number(s.quantity), 0) + SETUP * rowsOf4;
+  void rowsOf4;
+  const planExpect = s4.reduce((t, s) => t + ((s.machine_id === SLOW ? onSlow(s.kind) : std(s.kind)) + SETUP) * Number(s.quantity), 0);
   ok('the plan BEFORE release already used the own times of the only machine for what SLOW alone can do', near(planBefore, planExpect), `${planBefore} vs ${planExpect}`);
   ok('…and the planner reads the released steps\' effective minutes', near((await PL.getPlanner(db, COMPANY, { from: '2026-10-01' })).units.find((u) => u.key === O4.lineKey)?.work?.[fnKey], effSum));
 

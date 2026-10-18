@@ -88,7 +88,7 @@ export async function flaggedSpecs(db, companyId) {
 }
 
 /** How one stored value reads: { input, display } — `input` as a field edits it (an option's id). */
-function shownValue(row, spec) {
+export function shownValue(row, spec) {
   const shape = { dataType: spec.dataType, unit: spec.unit, decimals: spec.decimals };
   const raw = rawOf(row, spec.dataType);
   if (raw === null || raw === undefined) return null;

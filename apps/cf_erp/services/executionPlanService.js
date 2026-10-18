@@ -121,7 +121,8 @@ export function linePlanStates(rows, lines, trees, defOf) {
   return out;
 }
 
-async function loadAll(db, companyId, orderId, { lock = false } = {}) {
+/** The order, its lines, the plan rows, each line's tree and the definitions — productionOrderService (§76) reads it too. */
+export async function loadAll(db, companyId, orderId, { lock = false } = {}) {
   const [[[order]], [lines], rows] = await Promise.all([
     db.query(`SELECT id, code, status, order_type FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`, [companyId, orderId]),
     db.query(
@@ -150,7 +151,7 @@ const frozenOf = (l) => !!l.locked_at || Number(l.releases) > 0;
  * of a stock order (that order is what puts it in stock — rollOutService.madeRule). A line taken from stock as it
  * is has no production order.
  */
-const madeOf = (order, l) => order.order_type === 'stock' || l.line_type === 'custom' || (!!l.item_id && l.sourcing !== 'stock');
+export const madeOf = (order, l) => order.order_type === 'stock' || l.line_type === 'custom' || (!!l.item_id && l.sourcing !== 'stock');
 
 /** The answer GET and PUT both give. `rows` may be the rows a dry run WOULD write. */
 function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [], dryRun = false } = {}) {
@@ -207,7 +208,7 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
     templates: templatesFor(shaped.filter((l) => l.made)),
     preview: { production: preview.production, dispatch: preview.dispatch, limit: PREVIEW_LIMIT },
     problems,
-    note: 'Nothing is built from this plan yet. Production orders are made from it in a later step, and nesting will then run per production order.',
+    note: 'The Production step makes the production orders from this plan (Create production orders). A line is nested until it has one; then its nesting is frozen.',
   };
 }
 

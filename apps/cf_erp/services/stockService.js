@@ -24,6 +24,8 @@ import {
 import { syncUnits, checkUnits } from './unitService.js';
 import { unitKgOf } from './valuationService.js';
 import { hasV67, missingV67 } from '../lib/schemaV67.js';
+// Tools with a life (§81): each piece issued gets a tool-life row.
+import { trackIssuedTools, voidIssuedTools } from './toolLifeService.js';
 
 export const MOVEMENT_TYPES = ['receipt', 'issue', 'transfer', 'adjustment', 'scrap', 'return'];
 const PREFIX = { receipt: 'GRN', issue: 'ISS', transfer: 'TRF', adjustment: 'ADJ', scrap: 'SCR', return: 'RET' };
@@ -603,6 +605,7 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   }
   await savePools(db, c.companyId, pools, movementId);
   await afterMovement(db, c, movementId, type, moving, order);
+  if (type === 'issue') await trackIssuedTools(db, c, movementId, moving);
   return getMovement(db, c.companyId, movementId);
 }
 
@@ -873,6 +876,7 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
   }
   await savePools(db, c.companyId, pools, revId);
   await db.query('UPDATE cf_stock_movements SET reversed_by_id = ? WHERE company_id = ? AND id = ?', [revId, c.companyId, m.id]);
+  if (m.movement_type === 'issue') await voidIssuedTools(db, c, m.id);
   // §67: its losses undone; offcuts back on a shelf are available again; pieces follow their lots.
   if (hasV67()) {
     try {

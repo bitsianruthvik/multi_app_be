@@ -8,10 +8,16 @@
  *                                      columns = the operations of the rows' flows
  *   PUT /orders/:o/lines/:l/times   { cells: [{ bomLineId|null, operationId, work?, setup?, note? }] }
  *
- * A TIME IS WORK MINUTES PER PIECE (the user took this, 2026-09-29). Setup is
- * once per run and stays with the formula; it can be typed over only in the
- * grid's "Show setup" view. null clears an override and the formula's number
- * comes back.
+ * A TIME IS WORK MINUTES PER PIECE (the user took this, 2026-09-29). SETUP IS PER
+ * QUANTITY TOO (user, 2026-10-18, init.sql §76): a step of q pieces takes
+ * (setup + work) × q minutes — setup is no longer once per run. Both can be typed
+ * over (the grid's Setup time / Operation time toggle). null clears an override
+ * and the formula's number comes back.
+ *
+ * THE ORDER'S OVERRIDE (§76, testing): cf_sales_orders.time_override_seconds = N
+ * makes every cell of the order's lines setup = work = N seconds (N / 60 min),
+ * over the formula and any typed time; the formulas are not changed. Cells say
+ * orderOverride: true. orderOverrideOfLines reads it (one read).
  *
  * WHICH MACHINE AN ESTIMATE READS (decision 3). Before release nobody has
  * picked a machine, so the estimate uses the machine TYPE's rate chart: the
@@ -383,6 +389,20 @@ export function opsOfFlow(steps) {
   return ops;
 }
 
+/** §76: line id -> the order's override in MINUTES (null = off). One read. */
+export async function orderOverrideOfLines(db, companyId, lineIds) {
+  const out = new Map();
+  const ids = [...new Set((lineIds ?? []).map(Number).filter(Boolean))];
+  if (!ids.length) return out;
+  const [rows] = await db.query(
+    `SELECT l.id, o.time_override_seconds AS s FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id
+      WHERE l.company_id = ? AND l.id IN (?)`,
+    [companyId, ids],
+  );
+  for (const r of rows) out.set(Number(r.id), r.s == null ? null : Number(r.s) / 60);
+  return out;
+}
+
 async function loadOverrides(db, companyId, lineId, { lock = false } = {}) {
   const [rows] = await db.query(
     `SELECT id, bom_line_id, operation_id, work_minutes, setup_minutes, note FROM cf_time_overrides
@@ -431,6 +451,7 @@ export async function estimatorForLine(db, companyId, lineId, pairs, { date, ove
   }
   const over = overrides ?? await loadOverrides(db, companyId, lineId);
   if (!pairs.length) return () => null;
+  const orderMinutes = (await orderOverrideOfLines(db, companyId, [lineId])).get(Number(lineId)) ?? null;
   const itemReaders = await itemReadersOf(db, companyId, lineId);
   const side = await loadMachineSide(db, companyId, ops, date);
   const { estimate, estimateOn } = side;
@@ -440,6 +461,12 @@ export async function estimatorForLine(db, companyId, lineId, pairs, { date, ove
     if (!memo.has(mk)) memo.set(mk, estimate(operationId, itemReaders(itemId)));
     const f = memo.get(mk);
     const o = over.get(`${bomLineId ?? 0}:${operationId}`) ?? null;
+    if (orderMinutes != null) {
+      return {
+        work: orderMinutes, setup: orderMinutes, formulaWork: f.work, formulaSetup: f.setup, overridden: false, setupOverridden: false,
+        orderOverride: true, machine: f.machine, machineInfo: f.machineInfo, missing: null, note: o?.note ?? null,
+      };
+    }
     return {
       work: o?.work != null ? o.work : f.work,
       setup: o?.setup != null ? o.setup : f.setup,
@@ -464,6 +491,7 @@ export async function estimatorForLine(db, companyId, lineId, pairs, { date, ove
     if (!memoOn.has(mk)) memoOn.set(mk, estimateOn(operationId, itemReaders(itemId), machineId));
     const m = memoOn.get(mk);
     if (!m.ok && m.kind === 'not_eligible') return m;
+    if (orderMinutes != null) return { ok: true, work: orderMinutes, setup: orderMinutes, overridden: true, machine: m.machine, own: !!m.own };
     const o = over.get(`${bomLineId ?? 0}:${operationId}`) ?? null;
     if (o?.work != null) {
       const std = cell(bomLineId, itemId, operationId);
@@ -482,8 +510,8 @@ export async function estimatorForLine(db, companyId, lineId, pairs, { date, ove
  * §58 — MACHINE TIMES: the one writer of a step's machine and its machine time
  * ======================================================================== */
 
-/** minutes of a step = setup once + work a piece × its quantity (as release writes est_minutes). */
-export const stepMinutes = (setup, work, quantity) => (work == null ? null : Number(((setup ?? 0) + work * Number(quantity)).toFixed(3)));
+/** minutes of a step = (setup + work) a piece × its quantity — both PER QUANTITY since §76 (as release writes est_minutes). */
+export const stepMinutes = (setup, work, quantity) => (work == null ? null : Number((((setup ?? 0) + work) * Number(quantity)).toFixed(3)));
 const num = (v) => (v == null ? null : Number(v));
 const NOT_STARTED_SQL = "(s.state = 'pending' OR (s.state = 'on_hold' AND s.held_from = 'pending'))";
 export const MACHINE_CANNOT = 'MACHINE_CANNOT';
@@ -568,9 +596,10 @@ export async function estimateOnMachine(db, c, stepIds, machineId, opts = {}) {
     const operations = new Map();
     for (const { s } of needed) if (!operations.has(s.operation_id)) operations.set(s.operation_id, { id: s.operation_id, code: s.op_code, name: s.op_name });
     const lineIds = [...new Set(needed.map((w) => w.s.order_line_id))];
-    const [side, [overRows], ...readersByLine] = await Promise.all([
+    const [side, [overRows], orderOver, ...readersByLine] = await Promise.all([
       loadMachineSide(db, companyId, operations, date),
       db.query('SELECT order_line_id, bom_line_id, operation_id, work_minutes, setup_minutes FROM cf_time_overrides WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [companyId, lineIds]),
+      orderOverrideOfLines(db, companyId, lineIds),
       ...lineIds.map((lineId) => itemReadersOf(db, companyId, lineId)),
     ]);
     const readersOfLine = new Map(lineIds.map((id, i) => [id, readersByLine[i]]));
@@ -586,7 +615,9 @@ export async function estimateOnMachine(db, c, stepIds, machineId, opts = {}) {
       if (!m.ok && m.kind === 'not_eligible') return { machine: null, cannot: `${piece}: ${m.reason}`, own: false, notEligible: true };
       let workMin = null;
       let setupMin = null;
-      if (o?.work != null) { workMin = o.work; setupMin = o.setup != null ? o.setup : (m.ok ? m.setup : num(s.est_setup_minutes) ?? 0); }
+      const om = orderOver.get(Number(s.order_line_id)) ?? null;
+      if (om != null) { workMin = om; setupMin = om; }
+      else if (o?.work != null) { workMin = o.work; setupMin = o.setup != null ? o.setup : (m.ok ? m.setup : num(s.est_setup_minutes) ?? 0); }
       else if (m.ok) { workMin = m.work; setupMin = o?.setup != null ? o.setup : m.setup; }
       // No answer on this machine. With a standard time that is a refusal; with none, the step simply has no time yet.
       if (workMin == null) return { machine: null, cannot: s.est_minutes != null ? `${piece}: ${m.reason}` : null, own: !!m.own };
@@ -694,7 +725,9 @@ async function loadTimesContext(db, companyId, orderId, lineId, { lock = false, 
   const line = await lineOnOrder(db, companyId, orderId, lineId, { lock });
   const closedWhy = orderClosedWhy(line);
   const why = line.release_id ? RELEASED_WHY : closedWhy ?? (!line.item_id ? 'This line has no item yet.' : null);
-  const ctx = { line, why, rows: [], overrides: new Map(), flowOps: new Map(), cellAt: () => null };
+  const ctx = { line, why, rows: [], overrides: new Map(), flowOps: new Map(), cellAt: () => null, orderOverrideSeconds: null };
+  ctx.orderOverrideSeconds = ((await orderOverrideOfLines(db, companyId, [line.id])).get(Number(line.id)) ?? null);
+  if (ctx.orderOverrideSeconds != null) ctx.orderOverrideSeconds = Number((ctx.orderOverrideSeconds * 60).toFixed(4));
   if (!line.item_id) return ctx;
 
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity), maxDepth: 15 });
@@ -732,6 +765,8 @@ function buildTimesView(ctx) {
   const released = !!line.release_id;
   const out = {
     line: { id: line.id, lineNo: line.line_no, released, editable: !ctx.why },
+    // §76: the order's "all times = N s" (null = off) — every cell then shows N s, the formulas untouched.
+    orderOverrideSeconds: ctx.orderOverrideSeconds ?? null,
     operations: [],
     rows: [],
     totals: { byOperation: {}, all: 0 },
@@ -765,7 +800,7 @@ function buildTimesView(ctx) {
       const c = ctx.estimator(node.lineId, node.id, o.id);
       cells[o.id] = { ...c, passes: o.passes };
       if (c.work != null) {
-        const minutes = ((c.setup ?? 0) + c.work * Number(node.total)) * o.passes;
+        const minutes = ((c.setup ?? 0) + c.work) * Number(node.total) * o.passes;
         byOp[o.id] = (byOp[o.id] ?? 0) + minutes;
         all += minutes;
       }

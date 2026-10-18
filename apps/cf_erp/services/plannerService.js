@@ -50,9 +50,9 @@
  * WORK per function (a function = a machine TYPE, the classification node the
  * machine a timing rule resolves to is filed under). The numbers are the Times
  * tab's (timeEstimateService: formula or typed override, the machine type's
- * chart else its slowest machine). A row's SETUP is once per row in the Times
- * total, so each piece carries setup × its share of the row — every level then
- * sums to the same line total as GET …/times. Released lines use the steps:
+ * chart else its slowest machine). SETUP is per quantity like work (§76): each
+ * piece carries (setup + work) × its quantity — every level then sums to the same
+ * line total as GET …/times. The order's time override (§76) wins over both. Released lines use the steps:
  * est_minutes × (1 − qty_good / quantity); a done step is 0. Contractor cells
  * (cf_work_order_cells, or a released step's work_order_id) go to the
  * pseudo-function `contractor` — unconstrained (decision 3).
@@ -223,7 +223,7 @@ export function horizonOf(fromInput = null) {
 async function loadOrderLines(db, companyId) {
   const [rows] = await db.query(
     `SELECT o.id AS order_id, o.code AS order_code, o.order_type, o.status AS order_status, o.committed_date AS order_committed,
-            o.plan_priority, o.customer_id, p.name AS customer_name,
+            o.plan_priority, o.customer_id, p.name AS customer_name, o.time_override_seconds,
             ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity, ol.made_qty, ol.delivered_qty, ol.committed_date,
             ol.locked_at, ol.plan_level, ol.description, m.name AS item_name, m.code AS item_code,
             (SELECT r.id FROM cf_production_releases r
@@ -470,16 +470,12 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
       own[k].seq.push({ seq: Number(seq) || 0, fn: key, minutes });
       usedFunctions.add(key);
     };
-    // Σ of each design's laid-out quantity — a row's setup is shared over its pieces by it.
-    const designQty = new Map();
-    for (const n of nodes) designQty.set(n.design, (designQty.get(n.design) ?? 0) + Number(n.quantity));
 
     if (!released) {
       for (const n of nodes) {
         const ops = opsOfFlowId.get(n.design.flow?.id);
         if (!ops) continue;
         const q = Number(n.quantity);
-        const share = q / (designQty.get(n.design) || q || 1);
         for (const o of ops.values()) {
           const f = machineSide.estimate(o.id, readersOf(n.itemId));
           const ov = over.get(`${n.bomLineId ?? 0}:${o.id}`) ?? null;
@@ -488,10 +484,13 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
           const sole = f.work != null ? machineSide.soleMachine(o.id) : null;
           const onSole = sole != null ? machineSide.estimateOn(o.id, readersOf(n.itemId), sole) : null;
           const t = onSole?.ok ? onSole : f;
-          const work = ov?.work != null ? ov.work : t.work;
-          const setup = ov?.setup != null ? ov.setup : t.setup;
+          // §76: the order's "all times = N s" wins over the formula and any typed time.
+          const om = line.time_override_seconds == null ? null : Number(line.time_override_seconds) / 60;
+          const work = om != null ? om : ov?.work != null ? ov.work : t.work;
+          const setup = om != null ? om : ov?.setup != null ? ov.setup : t.setup;
           if (work == null) { own[n.k].noRate.add(`${n.bomLineId ?? 0}:${o.id}`); continue; }
-          const minutes = ((setup ?? 0) * share + work * q) * o.passes;
+          // §76: setup is per quantity, like work — no more sharing one setup over the row.
+          const minutes = ((setup ?? 0) + work) * q * o.passes;
           const onContract = n.lockedPieceId != null && contractorCells.has(`${n.lockedPieceId}:${o.id}`);
           addWork(n.k, onContract ? CONTRACTOR : functionOfEstimate(f) ?? UNASSIGNED, minutes, o.seq);
         }

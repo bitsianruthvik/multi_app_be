@@ -34,7 +34,7 @@ async function documentData(db, companyId, orderId) {
   );
   if (!o) throw notFound('Sales order');
   const [[co]] = await db.query('SELECT name FROM companies WHERE id = ?', [companyId]);
-  const views = await readRequisitions(db, companyId, { orderId: o.id });
+  const views = await readRequisitions(db, companyId, { orderId: o.id, lineBound: true });
   if (!views.length) throw invalid('NO_MR', `${o.code} has no material request yet — raise it first.`);
   const rows = [];
   for (const v of views) {
