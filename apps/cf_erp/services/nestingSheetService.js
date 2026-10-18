@@ -169,7 +169,7 @@ function nestRows(model) {
     const verdict = n.origin === 'imported' ? (VERDICT_WORD[n.verdict] ?? '') : 'Fits';
     const notes = n.origin === 'imported'
       ? [...(n.reasons ?? []), n.forced ? 'Saved anyway.' : null].filter(Boolean).join(' ') || 'Imported.'
-      : 'Automatic — laid out by our packer.';
+      : 'Automatic — laid out by AI.';
     let first = true;
     for (const cp of byCp.values()) {
       rows.push({
@@ -198,7 +198,7 @@ const INSTRUCTIONS = (model) => [
   ['Cut plate', 'Our cut plate code (see the Needed tab), or its size as thickness x length x width.'],
   ['Grade', 'Optional. Tells two cut plates of the same size but different steel apart.'],
   ['Qty', 'How many of that cut plate are on that nest. A whole number.'],
-  ['Verdict / Notes', 'Written by us, never read back. Fits = our own layout fits it too. Tight = the area is enough'],
+  ['Verdict / Notes', 'Written by AI, never read back. Fits = AI\'s own layout fits it too. Tight = the area is enough'],
   ['', 'but our row-by-row layout could not do it (your program may have). Won\'t fit = it cannot work.'],
   ['', 'You may save a nest that is Tight or Won\'t fit ("Save anyway"); it is marked so.'],
   [],
@@ -488,7 +488,7 @@ export async function importSheet(db, c, orderLineId, input = {}) {
   const say = [];
   if (problems.length) say.push(`${plural(problems.length, 'cell needs', 'cells need')} fixing before this can be saved`);
   say.push(`${plural(checked.length, 'nest', 'nests')} read`);
-  if (notFits) say.push(`${notFits} not fitting our rules`);
+  if (notFits) say.push(`${notFits} not fitting AI's rules`);
   if (over.length) say.push(`${plural(over.length, 'cut plate is', 'cut plates are')} over what the line needs`);
   if (short.length) say.push(`${plural(short.length, 'cut plate is', 'cut plates are')} short — nest the rest afterwards`);
 
@@ -506,7 +506,7 @@ export async function importSheet(db, c, orderLineId, input = {}) {
   };
   if (dryRun || !canSave) return out;
   if (needsForce && !force) {
-    return { ...out, message: `${out.message} Not saved: ${notFits ? 'a nest does not fit our rules' : 'a cut plate is over-covered'} — save anyway to keep it.` };
+    return { ...out, message: `${out.message} Not saved: ${notFits ? 'a nest does not fit AI\'s rules' : 'a cut plate is over-covered'} — save anyway to keep it.` };
   }
 
   const saved = await saveImportedNests(db, c, orderLineId, ctx, checked);

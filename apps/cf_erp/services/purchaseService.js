@@ -80,6 +80,42 @@ export const PO_STATUS_LABEL = {
   requested: 'Requested', quoting: 'Quoting', draft: 'Requested', ordered: 'Ordered', partially_received: 'Part received', received: 'Received', cancelled: 'Cancelled',
 };
 
+/*
+ * PURCHASE FLOW v3 (init.sql §71, 2026-10-18). A purchase order has a TYPE — material (default) or contractor (contractor
+ * POs come in a later step) — and a STAGE worked out from its status, its approval and its close:
+ *   pending_approval  every PO to a vendor starts here (status 'requested', approval_status 'pending'): the MD approves it
+ *                     (permission cf_erp_plate_change_approve, labelled "MD approval"). Nothing can be received yet.
+ *   waiting           approved (status 'ordered'): waiting for goods. The customer's ₹0 PO starts here — no approval.
+ *   part_received     some goods in (several GRNs per PO, from Inventory › Receive against PO).
+ *   closed            everything received — the PO closes by itself (status 'received').
+ *   closed_short      closed by a person with a reason: what was pending is released (qty_closed) and the PR line's
+ *                     "PO raised" goes down by it (the shares are cut to what arrived).
+ *   requested         an older PO that was never placed (before §71).   cancelled.
+ */
+export const PO_TYPES = ['material', 'contractor'];
+export const PO_TYPE_LABEL = { material: 'Material', contractor: 'Contractor' };
+export const PO_STAGES = ['pending_approval', 'requested', 'waiting', 'part_received', 'closed', 'closed_short', 'cancelled'];
+export const PO_STAGE_LABEL = {
+  pending_approval: 'Pending MD approval', requested: 'Not placed', waiting: 'Waiting for goods', part_received: 'Part received',
+  closed: 'Closed', closed_short: 'Closed short', cancelled: 'Cancelled',
+};
+/** The stage of a PO row (status, approval_status, closed_at). */
+export function poStage(p) {
+  if (p.status === 'cancelled') return 'cancelled';
+  if (PRE_ORDER_STATUSES.includes(p.status)) return p.approval_status === 'pending' ? 'pending_approval' : 'requested';
+  if (p.status === 'ordered') return 'waiting';
+  if (p.status === 'partially_received') return 'part_received';
+  return p.closed_at ? 'closed_short' : 'closed';
+}
+/** The same, as SQL over a row aliased `p` — for the list's filter and its counts. */
+export const PO_STAGE_SQL = `CASE WHEN p.status = 'cancelled' THEN 'cancelled'
+  WHEN p.status IN ('requested','quoting','draft') AND p.approval_status = 'pending' THEN 'pending_approval'
+  WHEN p.status IN ('requested','quoting','draft') THEN 'requested'
+  WHEN p.status = 'ordered' THEN 'waiting'
+  WHEN p.status = 'partially_received' THEN 'part_received'
+  WHEN p.closed_at IS NOT NULL THEN 'closed_short' ELSE 'closed' END`;
+export const poTypeOf = (v) => (v === 'contractor' ? 'contractor' : 'material');
+
 const readDate = (v, label, problems) => {
   if (blank(v)) return null;
   const s = String(v).trim();
@@ -387,17 +423,6 @@ function withEstimate(row, est) {
   };
 }
 
-/** The buy list's estimated total: what can be priced, and how many short items cannot. */
-export function buyListTotal(rows) {
-  const priced = rows.filter((r) => r.estCost != null);
-  return {
-    estCost: round2(priced.reduce((t, r) => t + r.estCost, 0)),
-    currency: CURRENCY,
-    items: rows.length,
-    unpricedItems: rows.filter((r) => r.estCost == null && r.toBuy > EPS).length,
-  };
-}
-
 // --- the document ----------------------------------------------------------
 
 async function requireOrder(db, companyId, id) {
@@ -408,7 +433,7 @@ async function requireOrder(db, companyId, id) {
 
 async function requireLine(db, companyId, id) {
   const [[l]] = await db.query(
-    `SELECT l.*, p.status AS po_status, p.code AS po_code, p.supplier_id, p.supplied_by_customer, p.for_order_id
+    `SELECT l.*, p.status AS po_status, p.code AS po_code, p.supplier_id, p.supplied_by_customer, p.for_order_id, p.approval_status, p.closed_at
        FROM cf_purchase_order_lines l JOIN cf_purchase_orders p ON p.id = l.purchase_order_id AND p.deleted_at IS NULL
       WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL`,
     [companyId, Number(id)],
@@ -456,10 +481,23 @@ async function plannedUnitsAfter(db, companyId, orderIds, change, stamp) {
   return { change, orderIds, ...(await plannedUnitsOfOrders(db, companyId, orderIds, { stamp })) };
 }
 
+/**
+ * EXPECTED DELIVERY DATES (user, 2026-10-18, for the planner): the PO's own date and a line's override; every change of
+ * either is recorded (cf_purchase_date_changes, §71) with who and when. rows: [{ poId, lineId|null, from, to }]. 1 write.
+ */
+async function recordDateChanges(db, c, rows) {
+  const real = rows.filter((r) => (r.from ?? null) !== (r.to ?? null));
+  if (!real.length) return;
+  await db.query(
+    `INSERT INTO cf_purchase_date_changes (company_id, purchase_order_id, purchase_line_id, from_date, to_date, changed_by) VALUES ${real.map(() => '(?, ?, ?, ?, ?, ?)').join(', ')}`,
+    real.flatMap((r) => [c.companyId, r.poId, r.lineId ?? null, r.from ?? null, r.to ?? null, c.userId ?? null]),
+  );
+}
+
 /** A cancelled or fully received order is history. */
 function assertOpen(p, what = 'change') {
   if (p.status === 'cancelled') throw invalid('CANCELLED', `${p.code} was cancelled — nothing more can ${what}.`);
-  if (p.status === 'received') throw invalid('CLOSED', `${p.code} is fully received — nothing more can ${what}.`);
+  if (p.status === 'received') throw invalid('CLOSED', `${p.code} is closed — nothing more can ${what}.`);
 }
 
 /** What a line still expects. */
@@ -468,7 +506,8 @@ const outstandingOf = (l) => round6(Math.max(0, Number(l.quantity) - Number(l.qt
 /** Recomputes the order's status from its lines, after a receipt or a line change. */
 async function restate(db, companyId, poId) {
   const p = await requireOrder(db, companyId, poId);
-  if (PRE_ORDER_STATUSES.includes(p.status) || p.status === 'cancelled') return p.status;
+  // A PO closed short by a person stays closed (§71): nothing more is coming on it.
+  if (PRE_ORDER_STATUSES.includes(p.status) || p.status === 'cancelled' || p.closed_at) return p.status;
   const [lines] = await db.query(
     'SELECT quantity, qty_received FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL',
     [companyId, poId],
@@ -487,10 +526,13 @@ const shapeLastPaid = (p) => (p
 export async function getPurchaseOrder(db, companyId, id) {
   // The header with its supplier and the sales order it is for: one read (they were three).
   const [[p]] = await db.query(
-    `SELECT p.*, s.id AS sup_id, s.code AS sup_code, s.name AS sup_name, fo.id AS for_id, fo.code AS for_code
+    `SELECT p.*, s.id AS sup_id, s.code AS sup_code, s.name AS sup_name, fo.id AS for_id, fo.code AS for_code,
+            au.name AS approved_by_name, cu.name AS closed_by_name
        FROM cf_purchase_orders p
        LEFT JOIN cf_parties s ON s.company_id = p.company_id AND s.id = p.supplier_id
        LEFT JOIN cf_sales_orders fo ON fo.company_id = p.company_id AND fo.id = p.for_order_id
+       LEFT JOIN users au ON au.id = p.approved_by
+       LEFT JOIN users cu ON cu.id = p.closed_by
       WHERE p.company_id = ? AND p.id = ? AND p.deleted_at IS NULL`,
     [companyId, Number(id)],
   );
@@ -514,6 +556,13 @@ export async function getPurchaseOrder(db, companyId, id) {
       GROUP BY v.id, v.code, v.movement_date, v.purchase_line_id ORDER BY v.id`,
     [companyId, companyId, p.id],
   );
+  // Every change of the PO's or a line's expected date, newest first (§71). Tolerates a database without the table.
+  const [dateRows] = await db.query(
+    `SELECT d.id, d.purchase_line_id, d.from_date, d.to_date, d.changed_at, d.changed_by, u.name AS changed_by_name
+       FROM cf_purchase_date_changes d LEFT JOIN users u ON u.id = d.changed_by
+      WHERE d.company_id = ? AND d.purchase_order_id = ? AND d.deleted_at IS NULL ORDER BY d.id DESC LIMIT 100`,
+    [companyId, p.id],
+  ).catch(() => [[]]);
   const ordered = round6(lines.reduce((t, l) => t + Number(l.quantity), 0));
   const received = round6(lines.reduce((t, l) => t + Number(l.qty_received), 0));
   // Bought for which sales orders (init.sql §43): the header default, and each line's allocations.
@@ -526,15 +575,27 @@ export async function getPurchaseOrder(db, companyId, id) {
   // Input GST (init.sql §37): per line and in total; reverse charge keeps it out of the supplier total.
   const { lineTax, poTax } = await purchaseOrderTax(db, companyId, [p],
     lines.map((l) => ({ id: l.id, purchase_order_id: p.id, item_id: l.item_id, amount: l.unit_price == null ? null : round2(Number(l.unit_price) * Number(l.quantity)) })));
+  const stage = poStage(p);
   return {
     id: p.id,
     code: p.code,
     status: p.status,
+    // §71: type, stage, the MD's approval and the close.
+    type: poTypeOf(p.po_type), typeLabel: PO_TYPE_LABEL[poTypeOf(p.po_type)],
+    stage, stageLabel: PO_STAGE_LABEL[stage],
+    approval: p.approval_status ? { status: p.approval_status, by: p.approved_by ? { id: p.approved_by, name: p.approved_by_name ?? null } : null, at: p.approved_at ?? null } : null,
+    closed: p.closed_at ? { at: p.closed_at, by: p.closed_by ? { id: p.closed_by, name: p.closed_by_name ?? null } : null, reason: p.close_reason ?? null } : null,
     suggested: !!p.suggested,
     supplier: sup ? { id: sup.id, code: sup.code, name: sup.name } : null,
     // §66: the customer's own material, asked of the customer as vendor (₹0); its receipt is their lot.
     suppliedByCustomer: !!Number(p.supplied_by_customer ?? 0),
+    // The PO's own expected delivery date; each line may override it (lines[].expectedDate), lines[].effectiveDate is the
+    // one that counts (the line's, else the PO's) — what the planner allocates incoming material by.
     expectedDate: p.expected_date,
+    dateChanges: dateRows.map((d) => ({
+      id: d.id, lineId: d.purchase_line_id ?? null, from: planDate(d.from_date), to: planDate(d.to_date),
+      by: d.changed_by ? { id: d.changed_by, name: d.changed_by_name ?? null } : null, at: d.changed_at,
+    })),
     orderedAt: p.ordered_at,
     notes: p.notes,
     reverseCharge: !!Number(p.reverse_charge ?? 0),
@@ -555,12 +616,17 @@ export async function getPurchaseOrder(db, companyId, id) {
       quantity: Number(l.quantity),
       received: Number(l.qty_received),
       outstanding: outstandingOf(l),
+      // §71: ordered / received / pending; what a close short released is not pending any more.
+      closedQty: Number(l.qty_closed ?? 0),
+      pending: stage === 'cancelled' || stage === 'closed' || stage === 'closed_short' ? 0 : outstandingOf(l),
       unitPrice: num(l.unit_price),
       currency: l.currency ?? CURRENCY,
       amount: l.unit_price == null ? null : round2(Number(l.unit_price) * Number(l.quantity)),
       lastPaid: shapeLastPaid(lastPaid.get(l.item_id)),
       ...lineTax.get(l.id),
       expectedDate: l.expected_date,
+      effectiveDate: planDate(l.expected_date) ?? planDate(p.expected_date),
+      dateSource: l.expected_date ? 'line' : p.expected_date ? 'po' : null,
       note: l.note,
       orders: alloc.get(l.id) ?? [],
       unlinked: round6(Math.max(0, Number(l.quantity) - (alloc.get(l.id) ?? []).reduce((t, a) => t + a.quantity, 0))),
@@ -599,8 +665,11 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
   if (!blank(q.supplierId)) { base.push('p.supplier_id = ?'); args.push(Number(q.supplierId)); }
   const like = likeOf(q.search);
   if (like) { base.push('(p.code LIKE ? OR s.name LIKE ? OR s.code LIKE ?)'); args.push(like, like, like); }
+  if (!blank(q.type) && q.type !== 'all') { base.push('p.po_type = ?'); args.push(poTypeOf(q.type)); }
   const where = [...base];
   const rowArgs = [...args];
+  // §71: a STAGE filter (pending_approval, waiting, part_received, closed, closed_short, cancelled, requested) beside the old status one.
+  if (!blank(q.stage) && q.stage !== 'all') { where.push(`(${PO_STAGE_SQL}) = ?`); rowArgs.push(String(q.stage)); }
   if (status === 'open') { where.push('p.status IN (?)'); rowArgs.push(OPEN_STATUSES); }
   else if (status !== 'all') { where.push('p.status = ?'); rowArgs.push(status); }
   const paged = wantsPage(q);
@@ -614,7 +683,7 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
   const [[rows], counted] = await Promise.all([
     paged ? db.query(`${rowSql} LIMIT ? OFFSET ?`, [...rowArgs, page.limit, page.offset]) : db.query(rowSql, rowArgs),
     paged ? Promise.all([
-      db.query(`SELECT p.status AS k, COUNT(*) AS n ${from} WHERE ${base.join(' AND ')} GROUP BY p.status`, args),
+      db.query(`SELECT p.status AS k, ${PO_STAGE_SQL} AS g, COUNT(*) AS n ${from} WHERE ${base.join(' AND ')} GROUP BY p.status, g`, args),
       db.query(
         `SELECT COUNT(*) AS n, COALESCE(SUM(t.amount), 0) AS amount, COALESCE(SUM(GREATEST(t.ordered - t.received, 0)), 0) AS outstanding,
                 COALESCE(SUM(t.unpriced), 0) AS unpriced
@@ -648,6 +717,8 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
     id: p.id,
     code: p.code,
     status: p.status,
+    type: poTypeOf(p.po_type), typeLabel: PO_TYPE_LABEL[poTypeOf(p.po_type)],
+    stage: poStage(p), stageLabel: PO_STAGE_LABEL[poStage(p)],
     suggested: !!p.suggested,
     supplier: p.supplier_id ? { id: p.supplier_id, code: p.supplier_code, name: p.supplier_name } : null,
     suppliedByCustomer: !!Number(p.supplied_by_customer ?? 0),
@@ -667,13 +738,15 @@ export async function listPurchaseOrders(db, companyId, q = {}) {
     orderCodes: codesOf.get(p.id) ?? [],
   }));
   if (!paged) return out;
-  const [[byStatus], [[sum]]] = counted;
-  const statusCounts = countsBy(byStatus, PO_STATUSES);
+  const [[byStatusStage], [[sum]]] = counted;
+  const merge = (key) => { const m = new Map(); for (const r of byStatusStage) m.set(r[key], (m.get(r[key]) ?? 0) + Number(r.n)); return [...m].map(([k, n]) => ({ k, n })); };
+  const statusCounts = countsBy(merge('k'), PO_STATUSES);
+  const stageCounts = countsBy(merge('g'), PO_STAGES);
   const all = Object.values(statusCounts).reduce((t, n) => t + n, 0);
   const open = OPEN_STATUSES.reduce((t, k) => t + (statusCounts[k] ?? 0), 0);
   return pageOf(out, sum.n, page, {
     counts: {
-      status: statusCounts, open, all,
+      status: statusCounts, stage: stageCounts, open, all,
       sum: { amount: round2(sum.amount), outstanding: round6(sum.outstanding), unpriced: Number(sum.unpriced) },
     },
   });
@@ -746,6 +819,7 @@ export async function updatePurchaseOrder(db, c, id, input = {}) {
     await db.query(`UPDATE cf_purchase_orders SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, p.id]);
   }
+  if (sets.expected_date !== undefined) await recordDateChanges(db, c, [{ poId: p.id, lineId: null, from: planDate(p.expected_date), to: sets.expected_date ?? null }]);
   return getPurchaseOrder(db, c.companyId, p.id);
 }
 
@@ -839,6 +913,7 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
     await db.query(`UPDATE cf_purchase_order_lines SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, l.id]);
   }
+  if (sets.expected_date !== undefined) await recordDateChanges(db, c, [{ poId: l.purchase_order_id, lineId: l.id, from: planDate(l.expected_date), to: sets.expected_date ?? null }]);
   let po = await getPurchaseOrder(db, c.companyId, l.purchase_order_id);
   // The order's status follows its lines — only a quantity can move it, and the lines were just read for the answer.
   if (sets.quantity !== undefined && !PRE_ORDER_STATUSES.includes(po.status) && po.status !== 'cancelled') {
@@ -885,10 +960,15 @@ export async function setPurchaseLineOrders(db, c, lineId, input = {}) {
 
 // --- suggest, send, receive, cancel ----------------------------------------
 
-/** Requested / quoting → ordered: the buyer has named the supplier and placed it (without an RFQ, or after one). */
+/**
+ * Requested → SENT FOR MD APPROVAL (§71, 2026-10-18): the buyer has named the supplier; the PO waits for the MD
+ * (approval_status 'pending', status stays 'requested' — nothing can be received). approvePurchaseOrder places it.
+ * Before §71 this placed it at once.
+ */
 export async function markOrdered(db, c, id, input = {}) {
   const p = await requireOrder(db, c.companyId, id);
   if (!PRE_ORDER_STATUSES.includes(p.status)) throw invalid('NOT_DRAFT', `${p.code} is already ${PO_STATUS_LABEL[p.status].toLowerCase()}.`);
+  if (p.approval_status === 'pending') throw invalid('PENDING_APPROVAL', `${p.code} is already waiting for MD approval.`);
   const problems = [];
   let supplierId = p.supplier_id;
   if (!blank(input.supplierId)) { const s = await requireSupplier(db, c.companyId, input.supplierId, problems); supplierId = s?.id ?? supplierId; }
@@ -897,10 +977,102 @@ export async function markOrdered(db, c, id, input = {}) {
   if (!Number(n)) problems.push('Add at least one line first.');
   assertNoProblems(problems, `${p.code} cannot be sent yet.`);
   await db.query(
-    "UPDATE cf_purchase_orders SET status = 'ordered', supplier_id = ?, suggested = 0, ordered_at = NOW() WHERE company_id = ? AND id = ?",
+    "UPDATE cf_purchase_orders SET supplier_id = ?, suggested = 0, approval_status = 'pending', approved_by = NULL, approved_at = NULL WHERE company_id = ? AND id = ?",
     [supplierId, c.companyId, p.id],
   );
   return getPurchaseOrder(db, c.companyId, p.id);
+}
+
+/**
+ * POST /purchase-orders/:id/approve — THE MD APPROVES a purchase order to a vendor (§71; permission
+ * cf_erp_plate_change_approve, labelled "MD approval"). Pending → placed: status 'ordered' (waiting for goods),
+ * ordered_at now. A PO not waiting for approval is refused in words.
+ */
+export async function approvePurchaseOrder(db, c, id, input = {}) {
+  const [[p]] = await db.query('SELECT * FROM cf_purchase_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, Number(id)]);
+  if (!p) throw notFound('Purchase order');
+  if (p.approval_status !== 'pending' || !PRE_ORDER_STATUSES.includes(p.status)) {
+    throw invalid('NOT_PENDING', p.status === 'cancelled' ? `${p.code} was cancelled.` : `${p.code} is not waiting for MD approval.`);
+  }
+  if (!p.supplier_id) throw invalid('INVALID', `${p.code} has no vendor — it cannot be placed.`);
+  const note = blank(input.note) ? p.notes : `${p.notes ? `${p.notes}\n` : ''}MD approval: ${String(input.note).slice(0, 255)}`;
+  await db.query(
+    "UPDATE cf_purchase_orders SET status = 'ordered', approval_status = 'approved', approved_by = ?, approved_at = NOW(), ordered_at = NOW(), notes = ? WHERE company_id = ? AND id = ?",
+    [c.userId ?? null, note, c.companyId, p.id],
+  );
+  return getPurchaseOrder(db, c.companyId, p.id);
+}
+
+/**
+ * POST /purchase-orders/:id/close { reason } — CLOSE SHORT (§71). The vendor will not send the rest: what is still
+ * pending on each line is RELEASED (qty_closed), every share bought for an order / MR line is cut to what arrived for it
+ * (so the PR line's "PO raised" goes down by the unfilled quantity and a new PO can be raised for it), and the PO is
+ * closed (status 'received', closed_at, reason). Set-based: 1 read + 3 writes whatever the number of lines.
+ */
+export async function closePurchaseOrder(db, c, id, input = {}) {
+  const [[p]] = await db.query('SELECT * FROM cf_purchase_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, Number(id)]);
+  if (!p) throw notFound('Purchase order');
+  if (blank(input.reason)) throw invalid('REASON', 'Say why the purchase order is closed short.');
+  if (!['ordered', 'partially_received'].includes(p.status) || p.closed_at) {
+    throw invalid('NOT_OPEN', p.status === 'received' ? `${p.code} is already closed.` : p.status === 'cancelled' ? `${p.code} was cancelled.`
+      : `${p.code} is not placed yet — cancel it instead.`);
+  }
+  const reason = String(input.reason).trim().slice(0, 500);
+  await db.query(
+    `UPDATE cf_purchase_order_lines SET qty_closed = GREATEST(quantity - qty_received, 0)
+      WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL`,
+    [c.companyId, p.id],
+  );
+  await db.query(
+    `UPDATE cf_purchase_line_orders a JOIN cf_purchase_order_lines l ON l.id = a.purchase_line_id
+        SET a.quantity = a.qty_received
+      WHERE a.company_id = ? AND l.purchase_order_id = ? AND a.deleted_at IS NULL AND a.quantity > a.qty_received`,
+    [c.companyId, p.id],
+  );
+  await db.query(
+    "UPDATE cf_purchase_orders SET status = 'received', closed_at = NOW(), closed_by = ?, close_reason = ?, notes = ? WHERE company_id = ? AND id = ?",
+    [c.userId ?? null, reason, `${p.notes ? `${p.notes}\n` : ''}Closed short: ${reason}`, c.companyId, p.id],
+  );
+  return getPurchaseOrder(db, c.companyId, p.id);
+}
+
+/**
+ * GET /purchase-orders/pending-lines?search=&supplierId= — Inventory › Receive against PO: every line still pending
+ * on a PO waiting for goods (approved, or the customer's), with what it is for. 1 read.
+ */
+export async function pendingLines(db, companyId, q = {}) {
+  const where = ['p.company_id = ?', 'p.deleted_at IS NULL', "p.status IN ('ordered','partially_received')", 'p.closed_at IS NULL', 'l.quantity > l.qty_received'];
+  const args = [companyId];
+  if (!blank(q.supplierId)) { where.push('p.supplier_id = ?'); args.push(Number(q.supplierId)); }
+  const like = likeOf(q.search);
+  if (like) { where.push('(p.code LIKE ? OR s.name LIKE ? OR m.code LIKE ? OR m.name LIKE ?)'); args.push(like, like, like, like); }
+  const [rows] = await db.query(
+    `SELECT p.id AS po_id, p.code AS po_code, p.status, p.supplied_by_customer, p.po_type, s.id AS supplier_id, s.name AS supplier_name,
+            l.id, l.line_no, l.item_id, m.code AS item_code, m.name AS item_name, l.uom, i.tracked_by, l.quantity, l.qty_received,
+            COALESCE(l.expected_date, p.expected_date) AS due,
+            (SELECT GROUP_CONCAT(DISTINCT o.code ORDER BY o.code SEPARATOR ', ') FROM cf_purchase_line_orders a JOIN cf_sales_orders o ON o.id = a.order_id
+              WHERE a.purchase_line_id = l.id AND a.deleted_at IS NULL) AS for_orders
+       FROM cf_purchase_orders p
+       JOIN cf_purchase_order_lines l ON l.purchase_order_id = p.id AND l.deleted_at IS NULL
+       JOIN cf_master_records m ON m.id = l.item_id
+       LEFT JOIN cf_item_details i ON i.master_id = l.item_id AND i.deleted_at IS NULL
+       LEFT JOIN cf_parties s ON s.id = p.supplier_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY COALESCE(l.expected_date, p.expected_date) IS NULL, COALESCE(l.expected_date, p.expected_date), p.id, l.line_no
+      LIMIT 500`,
+    args,
+  );
+  return {
+    rows: rows.map((r) => ({
+      purchaseOrder: { id: r.po_id, code: r.po_code, status: r.status, suppliedByCustomer: !!Number(r.supplied_by_customer ?? 0), type: poTypeOf(r.po_type) },
+      supplier: r.supplier_id ? { id: r.supplier_id, name: r.supplier_name } : null,
+      line: { id: r.id, lineNo: r.line_no },
+      item: { id: r.item_id, code: r.item_code, name: r.item_name, uom: r.uom, trackedBy: r.tracked_by ?? null },
+      ordered: Number(r.quantity), received: Number(r.qty_received), pending: outstandingOf(r),
+      expectedDate: r.due ? String(r.due instanceof Date ? planDate(r.due) : r.due).slice(0, 10) : null,
+      forOrders: r.for_orders ? String(r.for_orders).split(', ') : [],
+    })),
+  };
 }
 
 export async function cancelPurchaseOrder(db, c, id, input = {}) {
@@ -941,7 +1113,9 @@ export async function cancelPurchaseOrder(db, c, id, input = {}) {
  */
 export async function receiveLine(db, c, lineId, input = {}) {
   const l = await requireLine(db, c.companyId, lineId);
-  if (PRE_ORDER_STATUSES.includes(l.po_status)) throw invalid('NOT_ORDERED', `${l.po_code} has not been placed yet — place it with a supplier first.`);
+  if (PRE_ORDER_STATUSES.includes(l.po_status)) {
+    throw invalid('NOT_ORDERED', l.approval_status === 'pending' ? `${l.po_code} is waiting for MD approval — goods are received once the MD approves it.` : `${l.po_code} has not been placed yet — send it for MD approval first.`);
+  }
   assertOpen({ status: l.po_status, code: l.po_code }, 'be received');
   const problems = [];
   const left = outstandingOf(l);
@@ -1011,5 +1185,7 @@ export async function purchaseCounts(db, companyId) {
   const short = new Set((await buyList(db, companyId, { show: 'short' })).map((r) => r.item.id)).size;
   const [[{ drafts }]] = await db.query("SELECT COUNT(*) AS drafts FROM cf_purchase_orders WHERE company_id = ? AND status IN ('requested','quoting','draft') AND deleted_at IS NULL", [companyId]);
   const [[{ awaiting }]] = await db.query("SELECT COUNT(*) AS awaiting FROM cf_purchase_orders WHERE company_id = ? AND status IN ('ordered','partially_received') AND deleted_at IS NULL", [companyId]);
-  return { toBuy: short, draftOrders: Number(drafts), awaitingDelivery: Number(awaiting) };
+  // §71: POs waiting for the MD.
+  const [[{ pending }]] = await db.query("SELECT COUNT(*) AS pending FROM cf_purchase_orders WHERE company_id = ? AND status IN ('requested','quoting','draft') AND approval_status = 'pending' AND deleted_at IS NULL", [companyId]);
+  return { toBuy: short, draftOrders: Number(drafts), awaitingDelivery: Number(awaiting), pendingApproval: Number(pending) };
 }

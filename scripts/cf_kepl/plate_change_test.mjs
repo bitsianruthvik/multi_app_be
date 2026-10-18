@@ -4,6 +4,7 @@
  * checklist). Local only.
  *
  *   cd multi_app_be && node scripts/cf_kepl/plate_change_test.mjs
+ *   §71: the gate is OFF by default since 2026-10-18; this suite turns it on (setPlateChangeGate) to test it.
  *   CF_NEST_COMPANY (2) · CF_PLATE_CHANGE_SHOW=1 prints the impact sheet and the checklist of section 3 / 5
  *
  * ONE TRANSACTION, ROLLED BACK, and every cf_ table is re-counted at the end. It owns its fixture
@@ -38,6 +39,7 @@ const RQ = await imp('apps/cf_erp/services/requisitionService.js');
 const PC = await imp('apps/cf_erp/services/plateChangeService.js');
 const R = await imp('apps/cf_erp/services/nestRunService.js');
 const F = await imp('scripts/cf_kepl/lib/nestV2Fixture.mjs');
+const { buyThroughPr } = await imp('scripts/cf_kepl/lib/buyingFixture.mjs');
 
 const COMPANY = Number(process.env.CF_NEST_COMPANY ?? 2);
 const EPS = 1e-6;
@@ -96,6 +98,10 @@ async function rollOut(fx) {
 try {
   await conn.beginTransaction();
   attachNodeCache(conn);
+  // §71 (2026-10-18): the gate is OFF by default ("remove nesting approval from MD for now"). This suite tests the
+  // gate itself, so it switches it on for its run (the code is kept for when it comes back).
+  ok('the gate is off by default', PC.plateChangeGateOn() === false);
+  PC.setPlateChangeGate(true);
 
   section('Fixture');
   const fx = await F.buildFixture(conn, { company: COMPANY, tagPrefix: 'PC' });
@@ -130,7 +136,8 @@ try {
   const plateLines = pr.lines.filter((l) => Object.values(fx.plates).includes(Number(l.item.id)));
   const needA = plateCount(lotsA);
   ok('the requisition asks for one plate per lot of set A', plateLines.length === needA.size && plateLines.every((l) => near(l.need, needA.get(Number(l.item.id)) ?? -1, EPS)), J(plateLines.map((l) => [l.item.code, l.need])));
-  const made = await RQ.makePurchaseOrders(conn, asker, { orders: [{ lines: plateLines.map((l) => ({ prLineId: l.id })) }] });
+  // §71: through the PR; not approved (pending MD approval is cover too).
+  const made = await buyThroughPr(conn, asker, { place: false, lines: plateLines.map((l) => ({ prLineId: l.id })) });
   const po = made.purchaseOrders[0];
   ok(`a purchase order (${po.code}, ${po.status}) covers every plate`, po.lines.length === plateLines.length, J(po.lines.map((l) => [l.item.code, l.quantity])));
   st = (await PC.lineStates(conn, COMPANY, [fx.lineId])).get(fx.lineId);

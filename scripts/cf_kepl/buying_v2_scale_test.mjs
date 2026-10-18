@@ -24,12 +24,12 @@ import '../../apps/cf_erp/services/codegenProvider.js';
 import { attachNodeCache, detachNodeCache } from '../../apps/cf_erp/lib/db.js';
 import * as MR from '../../apps/cf_erp/services/materialReadyService.js';
 import * as RQ from '../../apps/cf_erp/services/requisitionService.js';
-import * as PF from '../../apps/cf_erp/services/purchaseFlowService.js';
+import * as PRS from '../../apps/cf_erp/services/purchaseRequestService.js';
 import * as PS from '../../apps/cf_erp/services/purchaseService.js';
 import * as PL from '../../apps/cf_erp/services/plannerService.js';
 import { migrate } from './buying-pr-migrate.mjs';
 import { unownedShares } from './buying-unowned-shares.mjs';
-import { harness, simple, girder, quietCodes, addDays, PER_GIRDER } from './lib/buyingFixture.mjs';
+import { harness, simple, girder, quietCodes, addDays, PER_GIRDER, buyThroughPr } from './lib/buyingFixture.mjs';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
 const COMPANY = Number(process.env.CF_BUY_COMPANY ?? 2);
@@ -69,17 +69,18 @@ try {
     const pr = read.requisitions[0];
     out.needA = prLine(pr, G.A).need;
     await G.receive(G.C, PER_GIRDER.C * n);
-    await m('stockDry', (q) => RQ.stockCheck(q, c, pr.id, {}));
-    const held = await m('stockApply', (q) => RQ.stockCheck(q, c, pr.id, { apply: true }));
-    out.heldC = prLine(held.requisition, G.C).cover.held;
+    // §71: the MR screen (what the stock check's dry run was) and saving it (take C from stock; the PR for the rest).
+    await m('stockDry', (q) => PRS.mrScreen(q, COMPANY, pr.id));
+    const saved = await m('stockApply', (q) => PRS.saveMr(q, c, pr.id, { lines: [{ lineId: prLine(pr, G.C).id, takeFromStock: PER_GIRDER.C * n }] }));
+    out.heldC = prLine(await RQ.getRequisition(db, COMPANY, pr.id), G.C).cover.held;
+    await m('prRead', (q) => PRS.getPr(q, COMPANY, saved.purchaseRequest.id));
     // A's need split over `pos` purchase orders (each with its own date), B on one.
     const share = (PER_GIRDER.A * n) / pos;
-    const made = await m('makePos', (q) => RQ.makePurchaseOrders(q, c, {
-      orders: [
-        ...Array.from({ length: pos }, (_, i) => ({ supplierId: G.SUP, place: true, lines: [{ prLineId: prLine(pr, G.A).id, quantity: share, expectedDate: D(7 * (i + 1)) }] })),
-        { supplierId: G.SUP, place: true, lines: [{ prLineId: prLine(pr, G.B).id, expectedDate: D(10) }] },
-      ],
-    }));
+    // §71: every vendor PO is raised from the PR (quote, Raise PO, MD approval). A's POs first; B's one is measured.
+    const aPos = [];
+    for (let i = 0; i < pos; i += 1) aPos.push(...(await buyThroughPr(db, c, { supplierId: G.SUP, lines: [{ prLineId: prLine(pr, G.A).id, quantity: share, expectedDate: D(7 * (i + 1)) }] })).purchaseOrders);
+    const bPo = await m('makePos', (q) => buyThroughPr(q, c, { supplierId: G.SUP, lines: [{ prLineId: prLine(pr, G.B).id, expectedDate: D(10) }] }));
+    const made = { purchaseOrders: [...aPos, ...bPo.purchaseOrders] };
     out.pos = made.purchaseOrders.length;
     const R = await m('engineLines', (q) => MR.lineReadiness(q, COMPANY, { full: true }));
     out.lineState = `${R.byLine.get(O.lineId).state} ${R.byLine.get(O.lineId).readyDate}`;
@@ -142,9 +143,10 @@ try {
   ok(`the big line's need was split over 8 purchase orders (+1), the small one's over 1 (+1)`, small.pos === 2 && big.pos === 9);
   for (const [name, what] of [
     ['read', 'the requisition read (GET /orders/:id/requisitions)'],
-    ['stockDry', 'the stock check, dry run'],
-    ['stockApply', 'the stock check, apply'],
-    ['makePos', 'making purchase orders (2 at once against 9 at once)'],
+    ['stockDry', 'the MR screen (In stock, take from stock, to buy)'],
+    ['stockApply', 'saving the MR (earmark + the PR)'],
+    ['prRead', 'the PR with its vendor columns'],
+    ['makePos', 'raising one PO from the PR (MR saved, quote, Raise PO, MD approval)'],
     ['engineLines', 'the line-level engine (lineReadiness)'],
     ['snapshot', 'the planner snapshot (the engine over every unit)'],
     ['save', 'a planner save with its material check'],
@@ -159,13 +161,13 @@ try {
   ok(`GOLDEN, ${SMALL} units: the lean answer equals the whole way's byte for byte after a date edit, a quantity cut and a cancel (and so does the first, un-kept edit)`, small.goldenDate && small.goldenQty && small.goldenCancel && small.goldenCold, j([small.goldenCold, small.goldenDate, small.goldenQty, small.goldenCancel]));
   ok(`GOLDEN, ${BIG} units: the same (${big.bytes} bytes compared for the date edit)`, big.goldenDate && big.goldenQty && big.goldenCancel && big.goldenCold, j([big.goldenCold, big.goldenDate, big.goldenQty, big.goldenCancel]));
   ok(`…and the answers are not empty: the date edit made ${big.poDateLate} planned cards late, the cut hit ${big.poQtyHit}, the cancel ${big.poCancelHit}`, small.poDateLate === 3 && big.poDateLate === 3 && big.poQtyHit >= 1 && big.poCancelHit === 3, j([small.poDateLate, big.poDateLate, big.poQtyHit, big.poCancelHit]));
-  ok(`a PO line DATE edit is ≤ 15 round trips: ${big.poDate} (it was ${big.poDateCold} the whole way)`, big.poDate <= 15, String(big.poDate));
-  ok(`a PO CANCEL is ≤ 15 round trips: ${big.poCancel}`, big.poCancel <= 15, String(big.poCancel));
-  ok(`a PO line QUANTITY cut is ≤ 17: ${big.poQty} (it also reads and trims the line's shares, and may restate the order)`, big.poQty <= 17, String(big.poQty));
+  ok(`a PO line DATE edit is ≤ 17 round trips (§71: +1 the date change recorded, +1 the history read with the PO): ${big.poDate} (it was ${big.poDateCold} the whole way)`, big.poDate <= 17, String(big.poDate));
+  ok(`a PO CANCEL is ≤ 16 round trips (§71: +1 the date history read with the PO): ${big.poCancel}`, big.poCancel <= 16, String(big.poCancel));
+  ok(`a PO line QUANTITY cut is ≤ 18 (§71: +1 the date history read): ${big.poQty} (it also reads and trims the line's shares, and may restate the order)`, big.poQty <= 18, String(big.poQty));
   ok('getPurchaseOrder still names the supplier and the sales order (now read with the header)', small.poHeader && big.poHeader);
   ok(`the engine itself is ≤ 10 reads (lines 1, needs ≤ 4, supply 5): ${big.engineLines}`, big.engineLines <= 10, String(big.engineLines));
   ok(`the requisition read is the engine + 5: ${big.read}`, big.read <= big.engineLines + 5, String(big.read));
-  console.log(`        times at ${BIG} units: read ${big.readMs} ms, stock check ${big.stockDryMs} / ${big.stockApplyMs} ms, snapshot ${big.snapshotMs} ms (payload ${big.payloadKb} kB, of which material ${big.materialKb} kB), save ${big.saveMs} ms`);
+  console.log(`        times at ${BIG} units: read ${big.readMs} ms, MR screen ${big.stockDryMs} / save ${big.stockApplyMs} ms, snapshot ${big.snapshotMs} ms (payload ${big.payloadKb} kB, of which material ${big.materialKb} kB), save ${big.saveMs} ms`);
 
   /* ============================================================================================ */
   section('19. The migration: orders left in the OLD shape get their requisitions, and no answer changes');
@@ -174,21 +176,25 @@ try {
   // M1: two lines needing X (4 and 6). Old flow: request from the order → an old stock check holds 3 for the ORDER → placed with a date.
   const M1 = await F.order('M1', [[[X, 4]], [[X, 6]]]);
   await F.receive(X, 3);
-  let po1 = await PF.requestFromOrder(db, c, M1.id, { lines: [{ itemId: X, quantity: 10 }] });
-  const sc = await PF.stockCheck(db, c, po1.id);
-  await PF.applyStockCheck(db, c, po1.id, { lines: sc.lines.map((l) => ({ lineId: l.lineId, hold: l.proposeHold })) });
-  po1 = await PS.markOrdered(db, c, po1.id, { supplierId: F.S1 });
+  // (The §46 routes that wrote this shape are gone since §71: the same rows are written here — a requested PO for the
+  // ORDER of 10, an old stock check that held 3 for the ORDER and cut the PO to 7, placed.)
+  let po1 = await PS.createPurchaseOrder(db, c, { forOrderId: M1.id });
+  po1 = await PS.addPurchaseLine(db, c, po1.id, { itemId: X, quantity: 7 });
+  await db.query('INSERT INTO cf_stock_reservations (company_id, held_for_order_id, item_id, quantity, created_by) VALUES (?, ?, ?, 3, ?)', [COMPANY, M1.id, X, c.userId]);
+  await PS.markOrdered(db, c, po1.id, { supplierId: F.S1 });
+  po1 = await PS.approvePurchaseOrder(db, c, po1.id, {});
   await PS.updatePurchaseLine(db, c, po1.lines[0].id, { expectedDate: D(12) });
   // M2: one line needing Y 5: a PO placed for the order, 2 received (held for the order), 3 to come.
   const M2 = await F.order('M2', [[[Y, 5]]]);
   let po2 = await PS.createPurchaseOrder(db, c, { supplierId: F.S1, forOrderId: M2.id, expectedDate: D(20) });
   po2 = await PS.addPurchaseLine(db, c, po2.id, { itemId: Y, quantity: 5 });
   await PS.markOrdered(db, c, po2.id, {});
+  await PS.approvePurchaseOrder(db, c, po2.id, {});
   await PS.receiveLine(db, c, po2.lines[0].id, { quantity: 2, stockingAreaId: F.store });
   // M3: nothing bought, nothing in stock. M4: only requested (no date).
   const M3 = await F.order('M3', [[[Z, 2]]]);
   const M4 = await F.order('M4', [[[Z, 1]]]);
-  await PF.requestFromOrder(db, c, M4.id, {});
+  { const p4 = await PS.createPurchaseOrder(db, c, { forOrderId: M4.id }); await PS.addPurchaseLine(db, c, p4.id, { itemId: Z, quantity: 1 }); }
   const mine = [...M1.lines, ...M2.lines, ...M3.lines, ...M4.lines].map((l) => l.id);
   const answers = async () => { const R = await MR.lineReadiness(db, COMPANY, { full: true }); return j(mine.map((id) => [R.byLine.get(id).state, R.byLine.get(id).readyDate])); };
   const shape = async () => j([

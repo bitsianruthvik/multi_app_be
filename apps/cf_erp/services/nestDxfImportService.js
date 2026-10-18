@@ -1766,7 +1766,7 @@ function assertNoRunWorking(companyId, lineId, what) {
   const run = memoryRun(companyId, lineId);
   // A comparison of a fixed set of pieces (the automatic one after an upload) reads no saved plate: not held (2026-10-16).
   if (blocksLineWrites(run)) {
-    throw invalid('RUN_BUSY', `A nesting run is working on this line${run.purpose === 'compare' ? ' (the comparison with our automatic nesting)' : ''} — it is laying out the line as it is now. Wait for it to finish, then ${what}.`);
+    throw invalid('RUN_BUSY', `A nesting run is working on this line${run.purpose === 'compare' ? ' (the comparison with AI\'s nesting)' : ''} — it is laying out the line as it is now. Wait for it to finish, then ${what}.`);
   }
 }
 

@@ -21,12 +21,10 @@ import { createItem } from '../../apps/cf_erp/services/masterRecordService.js';
 import { createOrder, addOrderLine, setOrderStatus } from '../../apps/cf_erp/services/salesOrderService.js';
 import {
   buyList, createPurchaseOrder, addPurchaseLine, updatePurchaseLine, setPurchaseLineOrders,
-  markOrdered, receiveLine, getPurchaseOrder, listPurchaseOrders,
+  markOrdered, approvePurchaseOrder, receiveLine, getPurchaseOrder, listPurchaseOrders,
 } from '../../apps/cf_erp/services/purchaseService.js';
-import { releaseHold } from '../../apps/cf_erp/services/purchaseLinkService.js';
-import { splitTo } from '../../apps/cf_erp/services/procurementService.js';
+import { releaseHold, heldForOrder, linkedPoIds } from '../../apps/cf_erp/services/purchaseLinkService.js';
 import { availability, reserveRelease } from '../../apps/cf_erp/services/releaseService.js';
-import { orderPurchase } from '../../apps/cf_erp/services/purchaseFlowService.js';
 import { itemStock } from '../../apps/cf_erp/services/stockService.js';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
@@ -130,6 +128,8 @@ try {
 
   section('6. Receiving holds each order\'s share');
   po = await markOrdered(db, c, po.id, { supplierId: SUP });
+  ok('sent: it waits for MD approval (§71)', po.stage === 'pending_approval', po.stage);
+  po = await approvePurchaseOrder(db, c, po.id, {});
   la = po.lines.find((l) => l.item.id === A);
   const got = await receiveLine(db, c, la.id, { quantity: 12, stockingAreaId: area });
   ok('12 received: held SO1 10, SO2 2', j(got.held.map((h) => [h.orderId, h.quantity])) === j([[SO1.id, 10], [SO2.id, 2]]), j(got.held));
@@ -155,14 +155,13 @@ try {
   const avAfter = (await availability(db, COMPANY, [A])).get(A);
   ok('nothing reserved twice: 12 reserved of 12', avAfter.reserved === 12 && avAfter.free === 0, j(avAfter));
 
-  section('8. The order\'s Buying stage sees its POs and holds');
-  const b2 = await orderPurchase(db, COMPANY, SO2.id);
-  const poIds = b2.lanes.flatMap((l) => l.cards).map((x) => x.id);
+  section('8. The order sees its POs and holds');
+  const poIds = await linkedPoIds(db, COMPANY, SO2.id);
   ok('SO2 sees the shared PO (ordered, part received)', poIds.includes(po.id), j(poIds));
   ok('SO2 does not see the hand PO (its SO2 share was trimmed)', !poIds.includes(hp.id), j(poIds));
-  ok('SO2 held: one row, 2 of A, from the shared PO', b2.held?.total === 1 && b2.held.rows[0].quantity === 2 && b2.held.rows[0].purchaseOrder?.id === po.id, j(b2.held));
-  const b1 = await orderPurchase(db, COMPANY, SO1.id);
-  ok('SO1 sees the hand PO (bought for SO1 by hand)', b1.lanes.flatMap((l) => l.cards).some((x) => x.id === hp.id));
+  const b2held = await heldForOrder(db, COMPANY, SO2.id);
+  ok('SO2 held: one row, 2 of A, from the shared PO', b2held.total === 1 && b2held.rows[0].quantity === 2 && b2held.rows[0].purchaseOrder?.id === po.id, j(b2held));
+  ok('SO1 sees the hand PO (bought for SO1 by hand)', (await linkedPoIds(db, COMPANY, SO1.id)).includes(hp.id));
   const st = await itemStock(db, COMPANY, A);
   const held = st.reservations.filter((v) => v.kind === 'held');
   ok('item stock lists the hold: SO2, from the PO, no line', held.length === 1 && held[0].order.id === SO2.id && held[0].purchaseOrder?.id === po.id && held[0].lineNo === null, j(held));
@@ -179,11 +178,6 @@ try {
   ok('closing SO2 lets its hold go', Number(h2.n) === 0);
   e = await refusal(() => createPurchaseOrder(db, c, { forOrderId: SO2.id }));
   ok('a closed order cannot be bought for', !!e);
-
-  section('10. Request → RFQ → PO carries the split (pure)');
-  ok('splitTo cuts to the quantity, first orders first',
-    j(splitTo([{ orderId: 1, orderCode: 'A', toBuy: 5 }, { orderId: 2, orderCode: 'B', toBuy: 4 }, { orderId: 1, orderCode: 'A', toBuy: 1 }], 7))
-      === j([{ orderId: 1, orderCode: 'A', quantity: 6 }, { orderId: 2, orderCode: 'B', quantity: 1 }]));
 
   const fresh = await getPurchaseOrder(db, COMPANY, po.id);
   ok('the PO reads back with its allocations', fresh.lines.find((l) => l.item.id === A).orders.length === 2);

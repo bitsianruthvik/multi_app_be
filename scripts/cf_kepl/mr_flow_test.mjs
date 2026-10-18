@@ -41,6 +41,7 @@ await imp('apps/cf_erp/services/codegenProvider.js');
 const { attachNodeCache, detachNodeCache } = await imp('apps/cf_erp/lib/db.js');
 const MRS = await imp('apps/cf_erp/services/materialReadyService.js');
 const RQ = await imp('apps/cf_erp/services/requisitionService.js');
+const PRS = await imp('apps/cf_erp/services/purchaseRequestService.js');
 const PS = await imp('apps/cf_erp/services/purchaseService.js');
 const REL = await imp('apps/cf_erp/services/releaseService.js');
 const SO = await imp('apps/cf_erp/services/salesOrderService.js');
@@ -51,7 +52,7 @@ const VAL = await imp('apps/cf_erp/services/valuationService.js');
 const UT = await imp('apps/cf_erp/services/nestUntrackedService.js');
 const NU = await imp('apps/cf_erp/services/nestDxfImportService.js');
 const { availability } = await imp('apps/cf_erp/services/rollOutService.js');
-const { harness, girder, quietCodes, addDays } = await imp('scripts/cf_kepl/lib/buyingFixture.mjs');
+const { harness, girder, quietCodes, addDays, buyThroughPr } = await imp('scripts/cf_kepl/lib/buyingFixture.mjs');
 const NF = await imp('scripts/cf_kepl/lib/nestV2Fixture.mjs');
 
 const COMPANY = Number(process.env.CF_MR_COMPANY ?? 2);
@@ -192,9 +193,10 @@ try {
   await stockByOwner();
 
   step('A2. Two purchase orders to match what is open — PO 1 serves BOTH MRs');
-  const po1 = (await RQ.makePurchaseOrders(db, c, { orders: [{ supplierId: S1, place: true, expectedDate: D(10), lines: [
-    { prLineId: mrLine(W2, G.A).id, quantity: 3 }, { prLineId: mrLine(W1, G.B).id, quantity: 6 }, { prLineId: mrLine(W2, G.B).id, quantity: 4 }] }] })).purchaseOrders[0];
-  const po2 = (await RQ.makePurchaseOrders(db, c, { orders: [{ supplierId: S2, place: true, expectedDate: D(20), lines: [{ prLineId: mrLine(W2, G.B).id, quantity: 2 }] }] })).purchaseOrders[0];
+  // §71: a vendor's PO is raised from the PR (buyThroughPr: quote, Raise PO, MD approval); PO 1 serves both MRs (added to it).
+  const po1 = (await buyThroughPr(db, c, { supplierId: S1, place: true, expectedDate: D(10), lines: [
+    { prLineId: mrLine(W2, G.A).id, quantity: 3 }, { prLineId: mrLine(W1, G.B).id, quantity: 6 }, { prLineId: mrLine(W2, G.B).id, quantity: 4 }] })).purchaseOrders[0];
+  const po2 = (await buyThroughPr(db, c, { supplierId: S2, place: true, expectedDate: D(20), lines: [{ prLineId: mrLine(W2, G.B).id, quantity: 2 }] })).purchaseOrders[0];
   poTable([po1, po2]);
   s = await stateOf(W.id);
   ok('nothing is open on either MR now', s.every((r) => r.lines.every((l) => l.cover.open === 0)), j(s.map((r) => r.lines.map((l) => l.cover.open))));
@@ -222,7 +224,7 @@ try {
   ok('…put back, MR 2 · B is open 2 again (what PO 2 had)', mrLine(s[1], G.B).cover.open === 2, j(mrLine(s[1], G.B).cover));
 
   step('A4. A new PO covers what the cancelled one had');
-  const po3 = (await RQ.makePurchaseOrders(db, c, { orders: [{ supplierId: S2, place: true, expectedDate: D(25), lines: [{ prLineId: mrLine(W2, G.B).id }] }] })).purchaseOrders[0];
+  const po3 = (await buyThroughPr(db, c, { supplierId: S2, place: true, expectedDate: D(25), lines: [{ prLineId: mrLine(W2, G.B).id }] })).purchaseOrders[0];
   poTable([po3]);
   s = await stateOf(W.id);
   ok('the new PO takes exactly what was open (2 kg)', poLineOf(po3, G.B).quantity === 2 && s.every((r) => r.lines.every((l) => l.cover.open === 0)));
@@ -345,9 +347,10 @@ try {
   e = await refusal(() => SO.setLineSupply(db, c, X.lines[0].id, { supply: 'we_buy' }));
   ok('nor the line', !!e && /is raised/.test(j(e.problems ?? e.message)), j(e?.problems ?? e?.message));
   say(`Line 1 → "We buy": refused — ${(e.problems ?? [e.message]).join(' ')}`);
-  e = await refusal(() => RQ.makePurchaseOrders(db, c, { orders: [{ supplierId: S1, place: true, lines: [{ prLineId: mrLine(mrX, G.B).id, quantity: 1 }] }] }));
-  ok('a supplier PO for the customer MR is refused', !!e && /supplied by the customer/.test(j(e.problems)), j(e?.problems));
-  say(`A PO to a supplier for it: refused — ${e.problems.join(' ')}`);
+  // §71: a customer-supplied MR has no purchase request, so nothing can be bought for it from a vendor.
+  const custSaved = await PRS.mrScreen(db, COMPANY, mrX.id);
+  ok('a customer MR has no purchase request (nothing to buy from a vendor)', custSaved.purchaseRequest === null);
+  say('A PO to a supplier for it: there is no purchase request to raise one from.');
   const Z = await makeOrder('LINEOVR', [1]);
   const lo = await SO.setLineSupply(db, c, Z.lines[0].id, { supply: 'customer' });
   ok('before its MR, a line of a "We buy" order may say "Customer supplies"', lo.supply === 'customer' && lo.materialSupply === 'customer');
@@ -391,13 +394,14 @@ try {
   step('C5. Another order does not see the customer\'s material');
   const O2 = await makeOrder('OTHER', [1], { customer: CUS_Y });
   const r2o = await RQ.raiseRequisitions(db, c, O2.id, {});
-  const dry = await RQ.stockCheck(db, c, r2o.requisitions[0].id, {});
+  // §71: the MR screen's "In stock" is what the old stock check called free for the order.
+  const dry = await PRS.mrScreen(db, COMPANY, r2o.requisitions[0].id);
   const bRow = dry.lines.find((l) => Number(l.item.id) === G.B);
-  ok("another customer's order: its stock check finds NO B free — customer X's 3 kg lot is invisible to it", bRow.freeInStock === 0, j(bRow));
+  ok("another customer's order: its MR screen finds NO B in stock — customer X's 3 kg lot is invisible to it", bRow.inStock === 0, j(bRow));
   ok("…and our own stock check (no order) counts only ours", (await availability(db, COMPANY, [G.B])).get(G.B).free === 0);
   const eo = (await MRS.lineReadiness(db, COMPANY, { full: true })).byLine.get(O2.lines[0].id);
   ok("the engine: the other order's B waits — X's lot is not free for it", eo.reasons.find((r) => Number(r.item.id) === G.B)?.short === 6, j(eo.reasons.find((r) => Number(r.item.id) === G.B)));
-  table(['Order', 'Material', 'Free for it in stock (stock check)'], [[O2.code, 'B', n(bRow.freeInStock)], [O2.code, 'A (ours, free)', n(dry.lines.find((l) => Number(l.item.id) === G.A).freeInStock)]]);
+  table(['Order', 'Material', 'In stock for it (MR screen)'], [[O2.code, 'B', n(bRow.inStock)], [O2.code, 'A (ours, free)', n(dry.lines.find((l) => Number(l.item.id) === G.A).inStock)]]);
 
   step('C6. Release the customer-supplied line — reservations = the MR\'s earmarks (their lots only)');
   const oursBefore = (await availability(db, COMPANY, [G.A, G.B, G.C]));
@@ -443,8 +447,9 @@ try {
   ok("giving the customer's promised date on the PO dates the MR lines", ndMr.lines.every((l) => l.status === 'covered' && l.cover.lastDate === D(14)), j(ndMr.lines.map((l) => [l.status, l.cover.lastDate])));
   await stateOf(ND.id, `After the promised date ${D(14)} is given:`);
 
-  step('D2. A plate change on a line covered by a CUSTOMER PO needs the MD, like any PO');
+  step('D2. A plate change on a line covered by a CUSTOMER PO needs the MD, like any PO', 'The nesting plate-change gate is OFF since 2026-10-18 (§71); it is switched on for this check, to show a customer PO counts as cover when it comes back.');
   const PC = await imp('apps/cf_erp/services/plateChangeService.js');
+  PC.setPlateChangeGate(true);
   const SB = await makeOrder('SUB', [1], { customer: CUS_X, materialSupply: 'customer' });
   const rsb = await RQ.raiseRequisitions(db, c, SB.id, {});
   const sbPo = rsb.customerPurchaseOrders[0];
@@ -470,7 +475,7 @@ try {
   const C12 = await sized('C12', 12);
   const B12 = await sized('B12', 12);
   ITEM[C12] = 'C 12 mm'; ITEM[B12] = 'B 12 mm'; TRACK.push(C12, B12);
-  const poO2 = (await RQ.makePurchaseOrders(db, c, { orders: [{ supplierId: S1, place: true, expectedDate: D(9), lines: [{ prLineId: mrLine(r2o.requisitions[0], G.B).id, quantity: 1 }] }] })).purchaseOrders[0];
+  const poO2 = (await buyThroughPr(db, c, { supplierId: S1, place: true, expectedDate: D(9), lines: [{ prLineId: mrLine(r2o.requisitions[0], G.B).id, quantity: 1 }] })).purchaseOrders[0];
   e2 = await refusal(() => PS.receiveLine(db, c, poLineOf(poO2, G.B).id, { quantity: 1, stockingAreaId: G.store, substituteItemId: C12, substituteReason: 'x' }));
   ok("a SUPPLIER's PO still refuses a different item", !!e2 && /only the item ordered/.test(j(e2.problems ?? e2.message)), j(e2?.problems ?? e2?.message));
   e2 = await refusal(() => PS.receiveLine(db, c, poLineOf(sbPo, G.C).id, { stockingAreaId: G.store, substituteItemId: C12 }));
@@ -487,6 +492,7 @@ try {
   ok('the MR line for C still shows C open — what came is not C until the MD says so', mrLine(sbMr, G.C).cover.open === 5 && mrLine(sbMr, G.C).cover.received === 5 && mrLine(sbMr, G.C).cover.earmarked === 0, j(mrLine(sbMr, G.C).cover));
   e2 = await refusal(() => PC.plateChangeGate(db, c, SB.lines[0].id, 'nest_plates', { plates: 'standard', reason: 'r' }));
   ok('while it waits, the line is held for any other plate change', e2?.code === 'PLATE_CHANGE_PENDING', j([e2?.code, e2?.message]));
+  PC.setPlateChangeGate(false);
   await stockByOwner('Stock by owner (the substitute lot is held: earmarked, not free)');
 
   const mdUser = { ...c, canApprove: true, isAdmin: true };

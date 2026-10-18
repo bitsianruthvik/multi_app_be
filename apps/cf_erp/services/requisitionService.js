@@ -7,8 +7,8 @@
  * .lineNeeds, the source the buy list and release use, nest plates included).
  *
  * A requisition line is COVERED by any mix of
- *   stock     holds made by the STOCK CHECK — and only by it: raising a
- *             requisition earmarks nothing (user decision, 2026-10-10)
+ *   stock     holds on the MR line: taken from stock on the MR screen (§71,
+ *             purchaseRequestService.saveMr), or received on its POs
  *   purchase  allocations of purchase-order lines, each with its own quantity
  *             and receiving date; one requisition line may be split over
  *             several POs, one PO may serve several requisition lines / orders
@@ -159,6 +159,8 @@ function shapeLine(pl, { n, reason, holds, allocs, todayText, customer = false }
   }[status];
   return {
     id: pl.id, item, need, needRaised: Number(pl.quantity), needKnown: known,
+    // §71: what the person chose to take from stock on the MR screen (null = not chosen yet).
+    stockTake: pl.stock_take == null ? null : Number(pl.stock_take),
     status, statusLabel: LINE_STATUS_LABEL[status], resolved: RESOLVED.has(status), sentence,
     skipped: skipped ? { by: pl.skipped_by ? { id: pl.skipped_by, name: pl.skipped_by_name ?? null } : null, at: pl.skipped_at ?? null, note: pl.skip_note ?? null } : null,
     cover: {
@@ -240,7 +242,7 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
   const [[lines], [holds], [allocs]] = await Promise.all([
     db.query(
       `SELECT pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, COALESCE(pl.uom, i.uom) AS uom, i.tracked_by,
-              pl.skipped, pl.skipped_by, pl.skipped_at, pl.skip_note, su.name AS skipped_by_name, m.code AS item_code, m.name AS item_name
+              pl.skipped, pl.skipped_by, pl.skipped_at, pl.skip_note, pl.stock_take, su.name AS skipped_by_name, m.code AS item_code, m.name AS item_name
          FROM cf_requisition_lines pl
          JOIN cf_master_records m ON m.id = pl.item_id
          LEFT JOIN cf_item_details i ON i.master_id = pl.item_id AND i.deleted_at IS NULL
@@ -313,7 +315,7 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
   });
 }
 
-async function requireOrderRow(db, companyId, orderId, { lock = false } = {}) {
+export async function requireOrderRow(db, companyId, orderId, { lock = false } = {}) {
   const [[o]] = await db.query(`SELECT id, code, status, customer_id, material_supply FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`, [companyId, Number(orderId)]);
   if (!o) throw notFound('Sales order');
   return o;
@@ -553,7 +555,7 @@ async function earmarkOnRaise(db, c, o, prIds, { ours = false } = {}) {
  * ₹0. Its receipt is the customer's own lot, earmarked to the MR line (purchaseService.receiveLine).
  * Nothing open → nothing made. Returns the purchase orders made (purchaseOrdersBrief).
  */
-async function askCustomer(db, c, o, prIds, { date = null, lines = [] } = {}) {
+export async function askCustomer(db, c, o, prIds, { date = null, lines = [] } = {}) {
   if (!o.customer_id) return [];
   const views = await readRequisitions(db, c.companyId, { ids: prIds });
   const asked = views.map((v) => ({ v, lines: v.lines.filter((l) => l.status !== 'not_needed' && l.cover.open > EPS && l.item.trackedBy !== 'individual') }))
@@ -734,25 +736,11 @@ export async function adoptOrderCover(db, c, orderIds, { needs = null } = {}) {
 
 // --- the stock check ------------------------------------------------------------------------
 
-async function requireRequisitionRow(db, companyId, id, { lock = false } = {}) {
-  const [[r]] = await db.query(
-    `SELECT r.id, r.code, r.order_id, r.order_line_id, o.code AS order_code, o.status AS order_status, l.line_no
-       FROM cf_requisitions r JOIN cf_sales_orders o ON o.id = r.order_id JOIN cf_sales_order_lines l ON l.id = r.order_line_id
-      WHERE r.company_id = ? AND r.id = ? AND r.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
-    [companyId, Number(id)],
-  );
-  if (!r) throw notFound('Requisition');
-  return r;
-}
-function assertOrderOpen(r, what) {
-  if (!OPEN_ORDER_STATUSES.includes(r.order_status)) throw invalid('NOT_OPEN', `${r.order_code} is ${r.order_status} — ${what}.`);
-}
-
 /**
  * What to claim of `qty` from an availability() entry: the customer's own lots first, then ours (lots for an
  * item kept by batch, else loose). `theirsOnly` (§66, a line the customer supplies): their lots and nothing else.
  */
-function claimRows(av, trackedBy, qty, { theirsOnly = false } = {}) {
+export function claimRows(av, trackedBy, qty, { theirsOnly = false } = {}) {
   const rows = [];
   let left = round6(qty);
   const lots = (av?.batches ?? []).filter((b) => b.status === 'available' && b.free > EPS && (!theirsOnly || b.owner === 'theirs'));
@@ -771,147 +759,15 @@ function claimRows(av, trackedBy, qty, { theirsOnly = false } = {}) {
   return { rows, left };
 }
 
-/**
- * POST /requisitions/:id/stock-check { apply?, lineIds?, lines?: [{ lineId, hold }] }
- *
- * DRY RUN (default): per requisition line, what is FREE in stock for this
- * order right now — never stock held or reserved for anybody (this order's own
- * holds included: they are cover already) — and how much the check proposes to
- * hold: the uncovered part, up to what is free.
- * APPLY: holds that (or the quantities sent) for the requisition LINE. This is
- * the only thing that earmarks free stock for an order.
- */
-export async function stockCheck(db, c, id, input = {}) {
-  const apply = input.apply === true || input.apply === 'true';
-  const pr = await requireRequisitionRow(db, c.companyId, id, { lock: apply });
-  if (apply) assertOrderOpen(pr, 'stock is held only for an open order');
-  let R = await lineReadiness(db, c.companyId, { full: true });
-  if (apply) {
-    const s = await syncLines(db, c, [pr], R.needs);
-    if (s.added || s.changed || s.retired) R = await lineReadiness(db, c.companyId, { full: true });
-  }
-  const view = await getRequisition(db, c.companyId, pr.id, { R });
-  // One row's "Check stock": lineIds (alias prLineIds) = requisition LINE ids; the dry run and the apply both keep to them.
-  const only = Array.isArray(input.lineIds) ? input.lineIds : Array.isArray(input.prLineIds) ? input.prLineIds : null;
-  const named = only ? new Set(only.map(Number)) : null;
-  const problems = [];
-  if (named) for (const lid of named) if (!view.lines.some((l) => l.id === lid)) problems.push(`Requisition line ${lid} is not a line of ${view.code}.`);
-  const lines = view.lines.filter((l) => l.status !== 'not_needed' && (!named || named.has(l.id)));
-  const itemIds = [...new Set(lines.map((l) => Number(l.item.id)))].sort((a, b) => a - b);
-  if (apply && itemIds.length) await db.query('SELECT master_id FROM cf_item_details WHERE company_id = ? AND master_id IN (?) ORDER BY master_id FOR UPDATE', [c.companyId, itemIds]);
-  const av = itemIds.length ? await availability(db, c.companyId, itemIds, { orderId: pr.order_id, holds: 'none' }) : new Map();
-  // A line the customer supplies (§66) is covered by their lots only — never by our stock.
-  const theirsOnly = view.supply === 'customer';
-  const rows = lines.map((l) => {
-    const a = av.get(Number(l.item.id));
-    const free = round6((theirsOnly ? a?.theirsFree : a?.free) ?? 0);
-    // Room: what stock could still cover — the need less what is already here for it.
-    const room = round6(Math.max(0, l.need - l.cover.stock));
-    return {
-      lineId: l.id, item: l.item, need: l.need, covered: l.cover.total, open: l.cover.open, status: l.status,
-      freeInStock: free, room, proposeHold: round6(Math.min(free, l.cover.open)),
-    };
-  });
-  if (!apply) {
-    assertNoProblems(problems, 'The stock check cannot be run.');
-    const k = rows.filter((r) => r.proposeHold > EPS).length;
-    return {
-      applied: false, requisition: { id: view.id, code: view.code, status: view.status }, order: view.order, line: view.line,
-      canApply: k > 0, lines: rows,
-      supply: view.supply,
-      sentence: k ? `${plural(k, 'material')} can be held from ${theirsOnly ? "the customer's own stock" : 'stock'} for ${view.order.code} line ${view.line.lineNo}.`
-        : theirsOnly ? "Nothing that is still open is in the customer's own stock — it comes on their purchase order." : 'Nothing that is still open is free in stock.',
-    };
-  }
-  const want = Array.isArray(input.lines)
-    ? new Map(input.lines.map((x) => [Number(x?.lineId), Number(x?.hold)]))
-    : new Map(rows.map((r) => [r.lineId, r.proposeHold]));
-  if (Array.isArray(input.lines)) {
-    for (const [lid, q] of want) {
-      if (!rows.some((r) => r.lineId === lid)) problems.push(`Requisition line ${lid} is not a line of ${view.code}.`);
-      else if (!Number.isFinite(q) || q < 0) problems.push(`${nameOfItem(rows.find((r) => r.lineId === lid).item)}: the quantity to hold is a number, zero or more.`);
-    }
-  }
-  const claims = [];
-  for (const r of rows) {
-    const q = round6(want.get(r.lineId) ?? 0);
-    if (!(q > EPS)) continue;
-    const u = r.item.uom ? ` ${r.item.uom}` : '';
-    if (q > r.freeInStock + EPS) { problems.push(`${view.order.code} · ${nameOfItem(r.item)}: only ${fmt(r.freeInStock)}${u} is free in stock — ${fmt(q)} cannot be held.`); continue; }
-    if (q > r.room + EPS) { problems.push(`${view.order.code} · ${nameOfItem(r.item)}: line ${view.line.lineNo} needs ${fmt(r.need)}${u} and ${fmt(round6(r.need - r.room))} is already here for it — hold at most ${fmt(r.room)}.`); continue; }
-    const took = claimRows(av.get(Number(r.item.id)), r.item.trackedBy, q, { theirsOnly });
-    if (took.left > EPS) { problems.push(`${view.order.code} · ${nameOfItem(r.item)}: ${fmt(took.left)}${u} of it sits in lots that cannot be held (on hold, or not in a storage area).`); continue; }
-    claims.push({ r, q, rows: took.rows });
-  }
-  assertNoProblems(problems, 'The stock cannot be held.');
-  await insertRows(db, 'cf_stock_reservations', ['company_id', 'held_for_order_id', 'pr_line_id', 'item_id', 'batch_id', 'quantity', 'created_by'],
-    claims.flatMap(({ r, rows: got }) => got.map((x) => [c.companyId, pr.order_id, r.lineId, r.item.id, x.batchId, x.quantity, c.userId ?? null])));
-  return {
-    applied: true,
-    held: claims.map(({ r, q }) => ({ lineId: r.lineId, item: r.item, quantity: q })),
-    requisition: await getRequisition(db, c.companyId, pr.id),
-  };
-}
-
-// --- skip -------------------------------------------------------------------------------------
-
-/**
- * POST /requisitions/:id/skip { lineIds? | all: true, note? } and …/unskip.
- * Skip: "do not buy this material for this line — it waits for stock". `all`
- * skips every line that still has something uncovered. Recorded with who, when
- * and the note; unskip clears it (who and when of the undo stay on the line).
- */
-export async function setSkip(db, c, id, input = {}, skip = true) {
-  const pr = await requireRequisitionRow(db, c.companyId, id, { lock: true });
-  assertOrderOpen(pr, skip ? 'nothing is skipped on an order that is not open' : 'its requisition no longer changes');
-  let R = await lineReadiness(db, c.companyId, { full: true });
-  const s = await syncLines(db, c, [pr], R.needs);
-  if (s.added || s.changed || s.retired) R = await lineReadiness(db, c.companyId, { full: true });
-  const view = await getRequisition(db, c.companyId, pr.id, { R });
-  const all = input.all === true || input.all === 'true';
-  const problems = [];
-  let targets;
-  if (all) targets = skip ? view.lines.filter((l) => !l.skipped && l.cover.open > EPS && l.status !== 'not_needed') : view.lines.filter((l) => l.skipped);
-  else {
-    const ids = Array.isArray(input.lineIds) ? input.lineIds.map(Number) : [];
-    if (!ids.length) throw invalid('INVALID', 'Say which materials: { lineIds: [...] }, or { all: true }.');
-    targets = [];
-    for (const lid of ids) {
-      const l = view.lines.find((x) => x.id === lid);
-      if (!l) { problems.push(`Requisition line ${lid} is not a line of ${view.code}.`); continue; }
-      if (skip && l.skipped) continue;               // already skipped: nothing to do, not a problem
-      if (!skip && !l.skipped) continue;
-      if (skip && !(l.cover.open > EPS)) { problems.push(`${view.order.code} · ${nameOfItem(l.item)}: it is already covered (${l.statusLabel.toLowerCase()}) — there is nothing to skip.`); continue; }
-      targets.push(l);
-    }
-  }
-  assertNoProblems(problems, skip ? 'Buying cannot be skipped for those.' : 'The skip cannot be undone for those.');
-  if (targets.length) {
-    await db.query(
-      `UPDATE cf_requisition_lines SET skipped = ?, skipped_by = ?, skipped_at = NOW(), skip_note = ? WHERE company_id = ? AND id IN (?)`,
-      [skip ? 1 : 0, c.userId ?? null, skip && !blank(input.note) ? String(input.note).slice(0, 500) : null, c.companyId, targets.map((l) => l.id)],
-    );
-  }
-  return { changed: targets.length, lineIds: targets.map((l) => l.id), requisition: await getRequisition(db, c.companyId, pr.id) };
-}
-
 // --- purchase orders from requisition lines ----------------------------------------------------
 
 /**
- * POST /requisitions/purchase-orders
- *   { orders: [{ supplierId?, expectedDate?, place?, notes?, lines: [{ prLineId, quantity?, expectedDate?, unitPrice? }] }] }
- * One purchase order per entry — so one requisition line can be split over
- * several POs (each with its own quantity and date), and one PO can serve
- * several requisition lines and orders. quantity left out = what is still
- * open on the requisition line. A PO holds one line per item: two requisition
- * lines of one item on one PO share the PO line (and must share its date).
- * place: true places it with the supplier at once (status ordered); otherwise
- * it is a REQUESTED PO that goes through RFQ → quotes → place as before, its
- * requisition links travelling with its lines.
- * Every problem is collected and said at once, naming order, item and PO.
- * Round trips: fixed — 3 statements make any number of POs.
+ * THE CUSTOMER'S ₹0 PURCHASE ORDER from MR lines the customer supplies — askCustomer's only writer. §71 (2026-10-18): not
+ * exported and refuses anything else (a vendor's PO is raised from the PR, purchaseRequestService.raisePo, and waits for
+ * the MD). { orders: [{ supplierId?, expectedDate?, place?, notes?, lines: [{ prLineId, quantity?, expectedDate? }] }] };
+ * quantity left out = what is still open on the MR line. Every problem is said at once. Fixed round trips.
  */
-export async function makePurchaseOrders(db, c, input = {}) {
+async function makePurchaseOrders(db, c, input = {}) {
   const list = Array.isArray(input.orders) ? input.orders : null;
   if (!list?.length) throw invalid('INVALID', 'Send the purchase orders to make: { orders: [{ supplierId?, expectedDate?, place?, lines: [{ prLineId, quantity?, expectedDate? }] }] }.');
   if (list.length > 50) throw invalid('TOO_MANY', 'At most 50 purchase orders in one go.');
@@ -959,6 +815,9 @@ export async function makePurchaseOrders(db, c, input = {}) {
         supplier = supOf.get(Number(customers[0])) ?? { id: customers[0], name: 'the customer', status: 'active', is_customer: 1 };
       }
     }
+    // §71 (2026-10-18): this makes the CUSTOMER's ₹0 PO only (askCustomer). A PO to a vendor is raised from the PR
+    // (purchaseRequestService.raisePo) and waits for the MD — any other use is refused here.
+    if (!customerSupplied) { problems.push(`${at}: only the customer's own purchase order is made here — a vendor's PO is raised from the purchase request.`); return; }
     if (!blank(o?.supplierId) && !customerSupplied) {
       if (!supplier) problems.push(`${at}: that supplier does not exist.`);
       else if (!Number(supplier.is_supplier)) problems.push(`${at}: ${supplier.name} is not marked as a supplier.`);
@@ -1077,116 +936,6 @@ export async function purchaseOrdersBrief(db, companyId, poIds) {
       lines: [...mine.values()],
     };
   });
-}
-
-// --- letting an excess go -----------------------------------------------------------------------
-
-/**
- * POST /requisition-lines/:id/release-excess { apply? } — a requisition line
- * that has MORE held or coming than its line needs (the design was frozen
- * again with less, or a material went away). Nothing is ever dropped by
- * itself: this says what would be let go (dry run, default) and does it on
- * apply. What is still coming goes first, newest first, a request before an
- * order (its share of the PO line becomes bought for nobody — the PO line
- * itself is not cut); then holds, newest first (the stock is free again).
- */
-export async function releaseExcess(db, c, prLineId, input = {}) {
-  const apply = input.apply === true || input.apply === 'true';
-  const [[row]] = await db.query(
-    `SELECT pl.id, pl.requisition_id FROM cf_requisition_lines pl JOIN cf_requisitions r ON r.id = pl.requisition_id AND r.deleted_at IS NULL
-      WHERE pl.company_id = ? AND pl.id = ? AND pl.deleted_at IS NULL${apply ? ' FOR UPDATE' : ''}`,
-    [c.companyId, Number(prLineId)],
-  );
-  if (!row) throw notFound('Requisition line');
-  const view = await getRequisition(db, c.companyId, row.requisition_id);
-  const line = view.lines.find((l) => l.id === row.id);
-  let over = line.cover.over;
-  const plan = [];
-  const rank = { asked: 0, undated: 1, dated: 2 };
-  for (const p of [...line.purchase].filter((x) => x.outstanding > EPS).sort((a, b) => rank[a.state] - rank[b.state] || b.allocationId - a.allocationId)) {
-    if (over <= EPS) break;
-    const t = round6(Math.min(over, p.outstanding));
-    plan.push({ kind: 'allocation', id: p.allocationId, quantity: t, purchaseOrder: p.purchaseOrder, leaves: round6(p.quantity - t), text: `${fmt(t)} of ${p.purchaseOrder.code} stops being for this line (the purchase order line keeps its quantity — it is then bought for stock).` });
-    over = round6(over - t);
-  }
-  for (const h of [...line.holds].sort((a, b) => b.id - a.id)) {
-    if (over <= EPS) break;
-    const t = round6(Math.min(over, h.quantity));
-    plan.push({ kind: 'hold', id: h.id, quantity: t, leaves: round6(h.quantity - t), text: `${fmt(t)} held in stock${h.batch ? ` (lot ${h.batch.code})` : ''} is free again.` });
-    over = round6(over - t);
-  }
-  const head = { requisitionLineId: line.id, item: line.item, need: line.need, excess: line.cover.over };
-  if (!apply) return { applied: false, ...head, plan };
-  for (const p of plan) {
-    if (p.kind === 'hold') {
-      if (p.leaves <= EPS) await db.query("UPDATE cf_stock_reservations SET status = 'released', closed_at = NOW() WHERE company_id = ? AND id = ? AND status = 'active'", [c.companyId, p.id]);
-      else await db.query('UPDATE cf_stock_reservations SET quantity = ? WHERE company_id = ? AND id = ?', [p.leaves, c.companyId, p.id]);
-    } else if (p.leaves <= EPS) await db.query('UPDATE cf_purchase_line_orders SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, p.id]);
-    else await db.query('UPDATE cf_purchase_line_orders SET quantity = ? WHERE company_id = ? AND id = ?', [p.leaves, c.companyId, p.id]);
-  }
-  return { applied: true, ...head, plan, requisition: await getRequisition(db, c.companyId, row.requisition_id) };
-}
-
-// --- the Buying board ----------------------------------------------------------------------------
-
-export const BOARD_COLUMNS = [
-  { key: 'open', label: 'Open', hint: 'Nothing decided: check stock, order, or skip.' },
-  { key: 'partly_covered', label: 'Partly covered', hint: 'Some materials decided; some asked for with no date yet.' },
-  { key: 'covered', label: 'Covered', hint: 'Every material is held or on order with a date.' },
-  { key: 'mixed', label: 'Covered, some skipped', hint: 'Every material decided; the skipped ones wait for stock.' },
-  { key: 'skipped', label: 'Skipped', hint: 'Buying skipped: production waits for stock.' },
-  { key: 'fulfilled_from_stock', label: 'From stock', hint: 'Met wholly from stock held for the line.' },
-];
-
-/**
- * GET /buying/board?orderId=&search= — every requisition of an open order in
- * the column of its status, with its material-ready state, and the lines that
- * could have a requisition and do not (`notRaised`).
- */
-export async function buyingBoard(db, companyId, q = {}) {
-  const R = await lineReadiness(db, companyId, { full: true });
-  const prs = await readRequisitions(db, companyId, { open: true, orderId: blank(q.orderId) ? null : Number(q.orderId), search: q.search }, { R });
-  const cards = prs.map((r) => {
-    const pos = new Map();
-    for (const l of r.lines) for (const p of l.purchase) if (p.state !== 'closed') pos.set(p.purchaseOrder.id, p.purchaseOrder);
-    const dates = r.lines.map((l) => l.cover.lastDate).filter(Boolean).sort();
-    return {
-      id: r.id, code: r.code, order: r.order, line: r.line, status: r.status, statusLabel: r.statusLabel, done: r.done, sentence: r.sentence,
-      counts: r.counts, stale: r.stale, materialReady: r.materialReady, lastDate: dates.at(-1) ?? null,
-      late: r.lines.some((l) => l.cover.late), purchaseOrders: [...pos.values()],
-    };
-  });
-  const have = new Set(prs.map((r) => r.line.id));
-  const term = blank(q.search) ? null : String(q.search).trim().toLowerCase();
-  const notRaised = R.lines.filter((l) => !have.has(Number(l.id)) && (blank(q.orderId) || Number(l.order_id) === Number(q.orderId))
-    && (R.needs.get(Number(l.id))?.items.size ?? 0) > 0 && (!term || String(l.order_code).toLowerCase().includes(term)))
-    .map((l) => {
-      const res = R.byLine.get(Number(l.id));
-      return {
-        order: { id: l.order_id, code: l.order_code, status: l.order_status },
-        line: { id: Number(l.id), lineNo: l.line_no, name: l.item_name ?? l.description ?? `Line ${l.line_no}` },
-        materials: R.needs.get(Number(l.id)).items.size,
-        materialReady: res ? { state: res.state, readyDate: res.readyDate, soft: !!res.soft, text: res.text } : null,
-      };
-    });
-  return {
-    today: R.today,
-    columns: [...BOARD_COLUMNS, { key: 'empty', label: 'Nothing to buy', hint: 'The line no longer buys anything.' }]
-      .map((col) => { const mine = cards.filter((x) => x.status === col.key); return { ...col, count: mine.length, cards: mine }; })
-      .filter((col) => col.key !== 'empty' || col.count > 0),
-    /*
-     * WAITING FOR STOCK (skipped): requisitions with a skipped material that is not in stock right now — the
-     * work behind them cannot be planned. Same card shape as the columns; a card here is ALSO in its status
-     * column (skipped / mixed / partly_covered), so this group is beside the columns, never added to their counts.
-     * Each card also says which materials: waitingLines [{ id, item, short, need }].
-     */
-    waitingForStock: (() => {
-      const mine = cards.map((x, i) => ({ x, r: prs[i] })).filter(({ r }) => r.lines.some((l) => l.status === 'skipped' && l.ready?.state === 'waiting'))
-        .map(({ x, r }) => ({ ...x, waitingLines: r.lines.filter((l) => l.status === 'skipped' && l.ready?.state === 'waiting').map((l) => ({ id: l.id, item: l.item, need: l.need, short: round6(l.cover.open - l.cover.freeNow) })) }));
-      return { key: 'waiting_for_stock', label: 'Waiting for stock', hint: 'Buying was skipped and the material is not in stock yet — the work cannot be planned.', count: mine.length, cards: mine };
-    })(),
-    notRaised,
-  };
 }
 
 export { clockToday as today };

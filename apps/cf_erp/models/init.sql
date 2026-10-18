@@ -6218,3 +6218,202 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
              AND ((TABLE_NAME = 'cf_work_sessions' AND COLUMN_NAME = 'unplanned')
                OR (TABLE_NAME = 'cf_step_events' AND COLUMN_NAME = 'unplanned'))) = 2,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §71  PURCHASE FLOW v3 (2026-10-18): MR → PR (the RFQ, vendor columns) → PO with MD approval — the same text as TM/s71.sql
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_BUYING_V2.md "2026-10-18 — Purchase flow v3".
+-- Services: purchaseRequestService.js (MR screen, PR grid, raise PO), purchaseService.js (approve, close short).
+--
+-- User, 2026-10-18: the MR is raised from the sales order; from then on everything happens in Purchase.
+--   cf_requisition_lines.stock_take    what the person chose to TAKE FROM STOCK for this MR line (NULL = not
+--                                      chosen yet: the screen shows what is held from stock now). To buy = need − it.
+--   cf_buy_requests                    ONE purchase request (PR) per MR (uq_cbr_req), made / updated when the MR is
+--                                      saved. The PR IS the RFQ: no RFQ object. Its status is never stored — worked
+--                                      out from its lines: open → partly ordered → ordered → closed.
+--   cf_buy_request_lines               one line per MR line: quantity = what to buy (need − take from stock).
+--                                      "PO raised" is NOT stored: it is the live PO shares of the MR line
+--                                      (cf_purchase_line_orders.pr_line_id = requisition_line_id), so a PO closed short
+--                                      (its shares cut to what arrived) gives the rest back by itself.
+--   cf_buy_request_vendors             the vendor COLUMNS of the grid, in order; one supplier once per PR.
+--   cf_buy_request_quotes              one cell: that vendor's rate for that line (₹ per the line's unit), delivery
+--                                      days, remark. No row = no quote.
+--   cf_purchase_orders.po_type         'material' (default) | 'contractor' (contractor POs come in a later step).
+--   cf_purchase_orders.approval_status NULL = no approval asked (old POs, the customer's ₹0 PO) · 'pending' = waiting
+--                                      for the MD (status stays 'requested': not placed, nothing can be received) ·
+--                                      'approved' (status 'ordered' = waiting for goods). approved_by / approved_at.
+--   cf_purchase_date_changes          every change of a PO's or a PO line's EXPECTED date, with who / when (for the planner).
+--   cf_purchase_orders.closed_at / closed_by / close_reason   CLOSED SHORT by a person: what was still pending is
+--                                      released (cf_purchase_order_lines.qty_closed), status 'received'.
+-- The approve permission keeps its tag cf_erp_plate_change_approve (grants survive); its LABEL becomes "MD approval".
+-- TiDB: each ADD COLUMN on its own guarded statement; an index on a new column in a statement of its own.
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisition_lines' AND COLUMN_NAME = 'stock_take');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_requisition_lines ADD COLUMN stock_take DECIMAL(18,6) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'po_type');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_purchase_orders ADD COLUMN po_type ENUM('material','contractor') NOT NULL DEFAULT 'material'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'approval_status');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN approval_status VARCHAR(10) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'approved_by');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN approved_by INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'approved_at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN approved_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'closed_at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN closed_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'closed_by');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN closed_by INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME = 'close_reason');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_orders ADD COLUMN close_reason VARCHAR(500) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @key = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_orders' AND INDEX_NAME = 'idx_cpo_approval');
+SET @sql = IF(@key = 0, 'ALTER TABLE cf_purchase_orders ADD KEY idx_cpo_approval (company_id, approval_status)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_order_lines' AND COLUMN_NAME = 'qty_closed');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_order_lines ADD COLUMN qty_closed DECIMAL(18,6) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_buy_requests (
+  id             INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT          NOT NULL,
+  code           VARCHAR(40)  NULL,                -- PR-000123 (its own id), stamped right after the insert
+  requisition_id INT          NOT NULL,
+  order_id       INT          NOT NULL,
+  notes          VARCHAR(500) NULL,
+
+  deleted_at     DATETIME     DEFAULT NULL,
+  created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT          NULL,
+  req_live       INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, requisition_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cbr_tenant (company_id, id),
+  UNIQUE KEY uq_cbr_req    (company_id, req_live),
+  KEY idx_cbr_order (company_id, order_id),
+
+  CONSTRAINT fk_cbr_company     FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cbr_requisition FOREIGN KEY (company_id, requisition_id) REFERENCES cf_requisitions(company_id, id),
+  CONSTRAINT fk_cbr_order       FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cbr_creator     FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_buy_request_lines (
+  id                  INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT           NOT NULL,
+  request_id          INT           NOT NULL,
+  requisition_line_id INT           NOT NULL,
+  item_id             INT           NOT NULL,
+  quantity            DECIMAL(18,6) NOT NULL DEFAULT 0,   -- to buy = the MR line's need − take from stock
+  uom                 VARCHAR(20)   NULL,
+
+  deleted_at          DATETIME      DEFAULT NULL,
+  created_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by          INT           NULL,
+  rl_live             INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, requisition_line_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cbrl_tenant (company_id, id),
+  UNIQUE KEY uq_cbrl_line   (request_id, rl_live),
+  KEY idx_cbrl_rl (company_id, requisition_line_id),
+
+  CONSTRAINT fk_cbrl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cbrl_request FOREIGN KEY (company_id, request_id) REFERENCES cf_buy_requests(company_id, id),
+  CONSTRAINT fk_cbrl_rl      FOREIGN KEY (company_id, requisition_line_id) REFERENCES cf_requisition_lines(company_id, id),
+  CONSTRAINT fk_cbrl_item    FOREIGN KEY (company_id, item_id) REFERENCES cf_item_details(company_id, master_id),
+  CONSTRAINT fk_cbrl_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_buy_request_vendors (
+  id           INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT          NOT NULL,
+  request_id   INT          NOT NULL,
+  position     INT          NOT NULL DEFAULT 1,
+  supplier_id  INT          NOT NULL,
+
+  deleted_at   DATETIME     DEFAULT NULL,
+  created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT          NULL,
+  sup_live     INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, supplier_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cbrv_tenant   (company_id, id),
+  UNIQUE KEY uq_cbrv_supplier (request_id, sup_live),
+  KEY idx_cbrv_request (company_id, request_id, position),
+
+  CONSTRAINT fk_cbrv_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cbrv_request  FOREIGN KEY (company_id, request_id) REFERENCES cf_buy_requests(company_id, id),
+  CONSTRAINT fk_cbrv_supplier FOREIGN KEY (company_id, supplier_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_cbrv_creator  FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_buy_request_quotes (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  request_id     INT           NOT NULL,
+  vendor_id      INT           NOT NULL,
+  line_id        INT           NOT NULL,
+  rate           DECIMAL(18,4) NOT NULL,              -- ₹ per the line's unit, net of tax
+  delivery_days  INT           NULL,
+  remark         VARCHAR(500)  NULL,
+
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT           NULL,
+  cell_live      TINYINT GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cbrq_tenant (company_id, id),
+  UNIQUE KEY uq_cbrq_cell   (vendor_id, line_id, cell_live),
+  KEY idx_cbrq_request (company_id, request_id),
+
+  CONSTRAINT fk_cbrq_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cbrq_request FOREIGN KEY (company_id, request_id) REFERENCES cf_buy_requests(company_id, id),
+  CONSTRAINT fk_cbrq_vendor  FOREIGN KEY (company_id, vendor_id) REFERENCES cf_buy_request_vendors(company_id, id),
+  CONSTRAINT fk_cbrq_line    FOREIGN KEY (company_id, line_id) REFERENCES cf_buy_request_lines(company_id, id),
+  CONSTRAINT fk_cbrq_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+-- EXPECTED DELIVERY DATES (user, 2026-10-18, for the planner): a PO has one expected date for the whole PO
+-- (cf_purchase_orders.expected_date) and a line may have its own (cf_purchase_order_lines.expected_date; blank = the PO's).
+-- Every change of either is recorded here with who and when. GRNs keep their own actual receipt date (the movement's).
+CREATE TABLE IF NOT EXISTS cf_purchase_date_changes (
+  id                 INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT          NOT NULL,
+  purchase_order_id  INT          NOT NULL,
+  purchase_line_id   INT          NULL,               -- NULL = the PO's own date
+  from_date          DATE         NULL,
+  to_date            DATE         NULL,
+  changed_by         INT          NULL,
+  changed_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  deleted_at         DATETIME     DEFAULT NULL,
+  created_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cpdc_tenant (company_id, id),
+  KEY idx_cpdc_po (company_id, purchase_order_id, id),
+
+  CONSTRAINT fk_cpdc_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cpdc_po      FOREIGN KEY (company_id, purchase_order_id) REFERENCES cf_purchase_orders(company_id, id),
+  CONSTRAINT fk_cpdc_line    FOREIGN KEY (company_id, purchase_line_id) REFERENCES cf_purchase_order_lines(company_id, id),
+  CONSTRAINT fk_cpdc_user    FOREIGN KEY (changed_by) REFERENCES users(id)
+);
+
+-- The approve permission: same tag (grants survive), its label now says what it approves.
+UPDATE features SET feature_name = 'CF ERP: MD approval'
+ WHERE feature_tag = 'cf_erp_plate_change_approve' AND deleted_at IS NULL AND feature_name <> 'CF ERP: MD approval';
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND ((TABLE_NAME = 'cf_requisition_lines' AND COLUMN_NAME = 'stock_take')
+               OR (TABLE_NAME = 'cf_purchase_orders' AND COLUMN_NAME IN ('po_type','approval_status','approved_by','approved_at','closed_at','closed_by','close_reason'))
+               OR (TABLE_NAME = 'cf_purchase_order_lines' AND COLUMN_NAME = 'qty_closed'))) = 9
+      AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME IN ('cf_buy_requests','cf_buy_request_lines','cf_buy_request_vendors','cf_buy_request_quotes','cf_purchase_date_changes')) = 5,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

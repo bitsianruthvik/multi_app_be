@@ -432,7 +432,7 @@ export async function linkedPoIds(db, companyId, orderId) {
  */
 export async function unreceive(db, c, movement, legs) {
   const [[line]] = await db.query(
-    `SELECT l.id, l.purchase_order_id, l.quantity, l.qty_received, l.uom, p.code AS po_code, p.status AS po_status
+    `SELECT l.id, l.purchase_order_id, l.quantity, l.qty_received, l.uom, p.code AS po_code, p.status AS po_status, p.closed_at
        FROM cf_purchase_order_lines l JOIN cf_purchase_orders p ON p.id = l.purchase_order_id
       WHERE l.company_id = ? AND l.id = ? FOR UPDATE`,
     [c.companyId, movement.purchase_line_id],
@@ -518,7 +518,8 @@ export async function unreceive(db, c, movement, legs) {
     await db.query('UPDATE cf_purchase_line_orders SET qty_received = ? WHERE company_id = ? AND id = ?', [round6(Number(a.qty_received) - t), c.companyId, a.id]);
     over = round6(over - t);
   }
-  if (['ordered', 'partially_received', 'received'].includes(line.po_status)) {
+  // A PO closed short (§71) stays closed: a reversal does not re-open it.
+  if (['ordered', 'partially_received', 'received'].includes(line.po_status) && !line.closed_at) {
     const [rows] = await db.query('SELECT quantity, qty_received FROM cf_purchase_order_lines WHERE company_id = ? AND purchase_order_id = ? AND deleted_at IS NULL', [c.companyId, line.purchase_order_id]);
     const any = rows.some((r) => Number(r.qty_received) > EPS);
     const full = rows.length > 0 && rows.every((r) => Number(r.qty_received) >= Number(r.quantity) - EPS);

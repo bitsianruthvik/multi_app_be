@@ -40,6 +40,7 @@ const R = await imp('apps/cf_erp/services/nestRunService.js');
 const C = await imp('apps/cf_erp/services/nestCompareService.js');
 const RQ = await imp('apps/cf_erp/services/requisitionService.js');
 const F = await imp('scripts/cf_kepl/lib/nestV2Fixture.mjs');
+const FX = await imp('scripts/cf_kepl/lib/buyingFixture.mjs');
 const { signToken } = await imp('core/utils/jwt.js');
 const { default: cfApp } = await imp('apps/cf_erp/app.js');
 
@@ -234,7 +235,7 @@ try {
   ok('byThickness: one row per thickness, each side\'s plates and steel add up', Array.isArray(cmp.byThickness) && cmp.byThickness.length >= 1
     && sum(cmp.byThickness, (t) => t.uploaded?.plates ?? 0) === um.plates && sum(cmp.byThickness, (t) => t.auto?.plates ?? 0) === am.plates
     && near(sum(cmp.byThickness, (t) => t.uploaded?.tonnesBought ?? 0), um.tonnesBought, 0.003), J(cmp.byThickness));
-  ok('a one-line headline ("Ours uses …")', typeof cmp.headline === 'string' && /^Ours (uses|and the customer)/.test(cmp.headline), cmp.headline);
+  ok('a one-line headline ("AI\'s nesting uses …")', typeof cmp.headline === 'string' && /^AI's nesting (uses|and the customer)/.test(cmp.headline), cmp.headline);
   console.log(`    headline: ${cmp.headline}`);
   console.log(`    verdict:  ${cmp.verdict}`);
   const left = pieceTotal - partPieces;
@@ -356,7 +357,7 @@ try {
   await R.settleRuns();
 
   /* ───────────── 12 ───────────── */
-  section('12. With a purchase order: a request queues nothing; the approval does');
+  section('12. With a purchase order: the upload is SAVED directly (§71: the plate-change gate is off) and our comparison runs');
   {
     const conn = await pool.getConnection();
     try {
@@ -367,19 +368,15 @@ try {
       const raised = await RQ.raiseRequisitions(conn, asker, fx.orderId, { lineIds: [fx.lineId] });
       const pr = raised.requisitions.find((x) => x.line.id === fx.lineId);
       const plateLines = pr.lines.filter((l) => Object.values(fx.plates).includes(Number(l.item.id)));
-      await RQ.makePurchaseOrders(conn, asker, { orders: [{ lines: plateLines.map((l) => ({ prLineId: l.id })) }] });
+      await FX.buyThroughPr(conn, asker, { place: false, lines: plateLines.map((l) => ({ prLineId: l.id })) });
       await conn.commit();
     } catch (e) { try { await conn.rollback(); } catch { /* first error */ } throw e; } finally { detachNodeCache(conn); conn.release(); }
   }
   await R.settleRuns();
   const n12 = (await compareRows(fx.lineId)).length;
   r = await call('POST', `${base}/nesting/files`, { body: { files: asRequest(allFour), dryRun: false, mode: 'replace', reason: 'The customer sent one more plate.' } });
-  const req = r.json?.plateChange;
-  ok('the upload is a request (a PO covers the line), nothing saved, nothing queued', r.status === 200 && r.json?.requested === true && r.json.autoCompare === undefined && /^PC-/.test(req?.code ?? ''), `${r.status} ${r.text.slice(0, 300)}`);
-  await C.settleAutoCompares(); await R.settleRuns();
-  ok('…no run started', (await compareRows(fx.lineId)).length === n12);
-  r = await call('POST', `/plate-changes/${req.id}/approve`, { token: T_MD, body: { note: 'ok' } });
-  ok('the MD approves it: saved', r.status === 200 && ['approved', 'applied'].includes(r.json?.status), `${r.status} ${r.text.slice(0, 300)}`);
+  ok('a PO covers the line, yet the upload is SAVED at once — no request, no MD (§71)', r.status === 200 && r.json?.applied === true && !r.json?.requested && !r.json?.plateChange?.code, `${r.status} ${r.text.slice(0, 300)}`);
+  void n12;
   await C.settleAutoCompares();
   r = await pollCompare(base, (j) => ready(j) && j.auto.forThisUpload === true);
   ok('…and our nesting of the approved upload runs and answers (4 plates of pieces)', ready(r.json) && r.json.uploaded?.metrics?.plates === 4 && r.json.auto.trigger === 'upload', J([r.json?.auto?.status, r.json?.uploaded?.metrics?.plates, r.json?.auto?.trigger]));

@@ -284,7 +284,7 @@ export function startRun(companyId, c, lineId, input = {}, opts = {}) {
   if (existing?.status === 'running') {
     if ((existing.purpose ?? 'nest') === purpose) return snapshot(existing);
     throw invalid('RUN_BUSY', existing.purpose === 'compare'
-      ? 'A comparison is working out our automatic nesting for this line — wait for it to finish before starting a nesting run.'
+      ? 'A comparison is working out AI\'s nesting for this line — wait for it to finish before starting a nesting run.'
       : 'A nesting run is working on this line — wait for it to finish before comparing.');
   }
   const clean = { ...input };

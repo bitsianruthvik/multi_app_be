@@ -194,3 +194,43 @@ export async function unitsOf(db, companyId, lineId) {
 
 /** A plain receipt into a store (no order named), for a fixture that is already committed. */
 export const receiveInto = (db, c, storeId, itemId, quantity) => postMovement(db, c, { movementType: 'receipt', toAreaId: storeId, lines: [{ itemId, quantity, unitCost: 10 }] });
+
+/**
+ * §71: the suites' way to put MR lines on a purchase order now that the only way is the PR — save the MR (makes / updates
+ * its PR), a vendor column, a quote per line (delivery days = the date asked − today), Raise PO (several MRs → one PO
+ * through addToPoId), the PO's own date, then the MD's approval when `place`. Answers like the old makePurchaseOrders:
+ * { purchaseOrders: [purchaseOrdersBrief] }. No supplierId → a supplier party of the run is made.
+ * lines: [{ prLineId, quantity?, expectedDate?, unitPrice? }] (prLineId = the MR line).
+ */
+export async function buyThroughPr(db, c, { supplierId = null, expectedDate = null, place = true, lines = [] } = {}) {
+  const PRS = await import('../../../apps/cf_erp/services/purchaseRequestService.js');
+  const PS = await import('../../../apps/cf_erp/services/purchaseService.js');
+  const RQ = await import('../../../apps/cf_erp/services/requisitionService.js');
+  const { today } = await import('../../../apps/cf_erp/services/materialReadyService.js');
+  let sid = supplierId;
+  if (!sid) {
+    const [r] = await db.query("INSERT INTO cf_parties (company_id, code, name, is_supplier, status) VALUES (?, ?, ?, 1, 'active')", [c.companyId, `PRBUY-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`, 'PR buy test supplier']);
+    sid = r.insertId;
+  }
+  const [rows] = await db.query('SELECT id, requisition_id FROM cf_requisition_lines WHERE company_id = ? AND id IN (?)', [c.companyId, lines.map((l) => l.prLineId)]);
+  const reqOf = new Map(rows.map((r) => [Number(r.id), Number(r.requisition_id)]));
+  // Consecutive lines of one MR go in one Raise PO, in the order given (the PO lines' shares keep that order).
+  const groups = [];
+  for (const l of lines) { const k = reqOf.get(Number(l.prLineId)); const last = groups.at(-1); if (last && last[0] === k) last[1].push(l); else groups.push([k, [l]]); }
+  const t = today();
+  const days = (d) => { if (!d) return null; const a = Date.UTC(...t.split('-').map((x, i) => Number(x) - (i === 1 ? 1 : 0))); const b = Date.UTC(...String(d).slice(0, 10).split('-').map((x, i) => Number(x) - (i === 1 ? 1 : 0))); return Math.max(0, Math.round((b - a) / 86400000)); };
+  let poId = null;
+  for (const [reqId, group] of groups) {
+    await PRS.saveMr(db, c, reqId, { lines: [] });
+    let pr = (await PRS.readPrs(db, c.companyId, { requisitionIds: [reqId] }))[0];
+    if (!pr.vendors.some((v) => Number(v.supplier.id) === Number(sid))) pr = await PRS.addVendor(db, c, pr.id, { supplierId: sid });
+    const col = pr.vendors.find((v) => Number(v.supplier.id) === Number(sid));
+    const prLineOf = (l) => pr.lines.find((x) => Number(x.mrLineId) === Number(l.prLineId));
+    await PRS.setQuotes(db, c, col.id, { quotes: group.map((l) => ({ lineId: prLineOf(l).id, rate: l.unitPrice ?? 1, deliveryDays: days(l.expectedDate) })) });
+    const r = await PRS.raisePo(db, c, col.id, { lines: group.map((l) => ({ lineId: prLineOf(l).id, quantity: l.quantity ?? prLineOf(l).open })), addToPoId: poId });
+    poId = r.purchaseOrder.id;
+  }
+  if (expectedDate) await PS.updatePurchaseOrder(db, c, poId, { expectedDate });
+  if (place) await PS.approvePurchaseOrder(db, c, poId, {});
+  return { purchaseOrders: await RQ.purchaseOrdersBrief(db, c.companyId, [poId]) };
+}

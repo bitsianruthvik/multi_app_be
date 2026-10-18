@@ -27,7 +27,8 @@ import * as NEST from '../../apps/cf_erp/services/nestingService.js';
 import * as NSHEET from '../../apps/cf_erp/services/nestingSheetService.js';
 import * as SNEST from '../../apps/cf_erp/services/sectionNestingService.js';
 import * as SSHEET from '../../apps/cf_erp/services/sectionSheetService.js';
-import * as PF from '../../apps/cf_erp/services/purchaseFlowService.js';
+import * as RQ from '../../apps/cf_erp/services/requisitionService.js';
+import * as PRS from '../../apps/cf_erp/services/purchaseRequestService.js';
 import * as REL from '../../apps/cf_erp/services/releaseService.js';
 import { barLayout } from '../../apps/cf_erp/services/sectionPacker.js';
 import { cutPlaces } from '../../apps/cf_erp/lib/cutPlaces.js';
@@ -444,13 +445,16 @@ try {
 
   /* ---------------------------------------------------------------- 9. buying */
   section('9. Buying');
-  const short = await PF.orderShortfall(db, COMPANY, order.id);
-  const buy = new Map(short.map((r) => [r.item.code ?? r.item.id, r.toBuy]));
-  ok(`the buy list asks for the bars (${[...buy.keys()].filter((k) => /^IS[AM]/.test(String(k))).join(', ')})`, [...buy.keys()].some((k) => /^ISA-75X75X8/.test(String(k))) && [...buy.keys()].some((k) => /^ISMB-200/.test(String(k))), JSON.stringify([...buy]));
-  ok('…in whole bars', short.filter((r) => /^IS/.test(String(r.item.code))).every((r) => Number.isInteger(Number(r.toBuy))), JSON.stringify(short.map((r) => [r.item.code, r.toBuy])));
+  // §71: the MR is raised from the sales order; its screen in Purchase says what to buy, and saving it makes the PR.
+  const raised = await RQ.raiseRequisitions(db, c, order.id, { lineIds: [LINE] }).catch((e) => { ok('raise the material request', false, say(e)); return null; });
+  const mrId = raised?.requisitions?.find((x) => x.line.id === LINE)?.id;
+  const screen = mrId ? await PRS.mrScreen(db, COMPANY, mrId) : { lines: [] };
+  const buy = new Map(screen.lines.map((l) => [l.item.code ?? l.item.id, l.toBuy]));
+  ok(`the MR asks for the bars (${[...buy.keys()].filter((k) => /^IS[AM]/.test(String(k))).join(', ')})`, [...buy.keys()].some((k) => /^ISA-75X75X8/.test(String(k))) && [...buy.keys()].some((k) => /^ISMB-200/.test(String(k))), JSON.stringify([...buy]));
+  ok('…in whole bars', screen.lines.filter((l) => /^IS/.test(String(l.item.code))).every((l) => Number.isInteger(Number(l.required))), JSON.stringify(screen.lines.map((l) => [l.item.code, l.required])));
   ok('…and the plates', [...buy.keys()].some((k) => /^PL-/.test(String(k))), JSON.stringify([...buy.keys()]));
-  const po = await PF.requestFromOrder(db, c, order.id, {}).catch((e) => { ok('raise the purchase order', false, say(e)); return null; });
-  ok(`purchase order raised (${po?.code ?? po?.order?.code ?? '?'})`, !!po);
+  const saved = mrId ? await PRS.saveMr(db, c, mrId, { lines: screen.lines.map((l) => ({ lineId: l.id, takeFromStock: 0 })) }).catch((e) => { ok('save the MR', false, say(e)); return null; }) : null;
+  ok(`purchase request made (${saved?.purchaseRequest?.code ?? '?'})`, !!saved?.purchaseRequest);
 
   /* ---------------------------------------------------------------- 10. release */
   section('10. Release to production');

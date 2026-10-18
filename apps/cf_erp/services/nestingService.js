@@ -1295,7 +1295,7 @@ export function nestRules(nest, settings) {
   if (!pieces.length || laid.length < pieces.length) {
     return {
       status: 'none', utilisationPct, sharedCuts: 0, sharedLengthMm: 0,
-      checks: [{ key: 'layout', ok: null, label: 'No layout', detail: 'Our packer has no layout for this plate, so its rules cannot be checked on a drawing.' }],
+      checks: [{ key: 'layout', ok: null, label: 'No layout', detail: 'AI has no layout for this plate, so its rules cannot be checked on a drawing.' }],
     };
   }
   const checks = [];
@@ -3820,7 +3820,7 @@ export async function checkNest({ plate, items, settings, pack, shapes = false }
   const m2 = (a) => (a / 1e6).toFixed(3);
   const left = (out.unplaced ?? []).reduce((a, u) => a + Number(u.qty || 0), 0) || pcs;
   if (need <= have + EPS) {
-    reasons.push(`The ${pcs} pieces take ${m2(need)} m² with kerf and the plate has ${m2(have)} m² inside its rim, so there is room in principle, but our packer could not place ${left} of them. The program this nest came from may manage it; check its drawing before cutting.`);
+    reasons.push(`The ${pcs} pieces take ${m2(need)} m² with kerf and the plate has ${m2(have)} m² inside its rim, so there is room in principle, but AI could not place ${left} of them. The program this nest came from may manage it; check its drawing before cutting.`);
     return noLayout('tight');
   }
   reasons.push(`The ${pcs} pieces need ${m2(need)} m² with kerf and the plate has only ${m2(have)} m² inside its rim, so they cannot all fit, whatever the layout.`);

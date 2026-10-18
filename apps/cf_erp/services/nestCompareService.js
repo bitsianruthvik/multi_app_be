@@ -314,9 +314,9 @@ export function headlineOf(delta) {
   if (Math.abs(t) >= 0.0005) bits.push(`${Math.abs(t) >= 1 ? `${Math.abs(t).toFixed(1)} t` : `${Math.round(Math.abs(t) * 1000).toLocaleString('en-IN')} kg`} ${t < 0 ? 'less' : 'more'} steel`);
   if (delta.cost != null && Math.abs(delta.cost) >= 0.5) bits.push(`${money(delta.cost)} ${delta.cost < 0 ? 'less' : 'more'}`);
   const costWord = delta.cost == null ? ' Cost cannot be compared yet: a plate has no rate.' : '';
-  if (!bits.length) return `Ours and the customer's use the same plates and the same steel.${costWord}`;
+  if (!bits.length) return `AI's nesting and the customer's use the same plates and the same steel.${costWord}`;
   const list = bits.length === 1 ? bits[0] : `${bits.slice(0, -1).join(', ')} and ${bits.at(-1)}`;
-  return `Ours uses ${list}.${costWord}`;
+  return `AI's nesting uses ${list}.${costWord}`;
 }
 
 /**
@@ -365,8 +365,8 @@ export function willReplaceOf(saved, withPlan, cutPlates = [], excl = null) {
   const withPieces = nests ? nests.reduce((a, n) => a + (n.pieces ?? []).length, 0) : null;
   const notNested = withPlan ? cutPlates.filter((cp) => cp.pieces > 0 && (cp.manual || excl?.cutPlates?.has(cp.id))).reduce((a, cp) => a + cp.pieces, 0) : null;
   const bits = [
-    customer.length ? `${plural(customer.length, 'uploaded plate', 'uploaded plates')} (${plural(customerPieces, 'piece', 'pieces')} as the customer nested them${ourPiecesOnCustomerPlates ? `, and ${plural(ourPiecesOnCustomerPlates, 'piece', 'pieces')} we added to them` : ''})` : null,
-    ours.length ? `${plural(ours.length, 'plate', 'plates')} of our own (${plural(ourPieces, 'piece', 'pieces')})` : null,
+    customer.length ? `${plural(customer.length, 'uploaded plate', 'uploaded plates')} (${plural(customerPieces, 'piece', 'pieces')} as the customer nested them${ourPiecesOnCustomerPlates ? `, and ${plural(ourPiecesOnCustomerPlates, 'piece', 'pieces')} added by AI` : ''})` : null,
+    ours.length ? `${plural(ours.length, 'plate', 'plates')} nested by AI (${plural(ourPieces, 'piece', 'pieces')})` : null,
   ].filter(Boolean);
   return {
     side: 'auto',
@@ -377,7 +377,7 @@ export function willReplaceOf(saved, withPlan, cutPlates = [], excl = null) {
     // Why the three figures above are null, when they are.
     withReason: nests ? null : 'The automatic nesting of the whole line is not worked out yet — start the comparison (or run it again) and these are filled in.',
     message: !saved.length ? 'Nothing is saved on this line yet, so nothing would be replaced.'
-      : `Taking our automatic nesting replaces everything saved on this line: ${bits.join(' and ')}${files ? `; the ${plural(files, "customer's file", "customer's files")} ${files === 1 ? 'goes' : 'go'} with ${files === 1 ? 'its plate' : 'their plates'} (a copy of the uploaded nesting is kept with the run)` : ''}.${nests ? ` In their place: ${plural(nests.length, 'plate', 'plates')} holding ${plural(withPieces, 'piece', 'pieces')}${notNested ? `; ${plural(notNested, 'piece stays', 'pieces stay')} un-nested (held back by hand or left out)` : ''}.` : ' The automatic nesting of the whole line is not worked out yet.'}`,
+      : `Taking AI's nesting replaces everything saved on this line: ${bits.join(' and ')}${files ? `; the ${plural(files, "customer's file", "customer's files")} ${files === 1 ? 'goes' : 'go'} with ${files === 1 ? 'its plate' : 'their plates'} (a copy of the uploaded nesting is kept with the run)` : ''}.${nests ? ` In their place: ${plural(nests.length, 'plate', 'plates')} holding ${plural(withPieces, 'piece', 'pieces')}${notNested ? `; ${plural(notNested, 'piece stays', 'pieces stay')} un-nested (held back by hand or left out)` : ''}.` : ' The automatic nesting of the whole line is not worked out yet.'}`,
   };
 }
 
@@ -388,7 +388,7 @@ export function willReplaceOf(saved, withPlan, cutPlates = [], excl = null) {
  * `detail` adds the automatic side's proposal itself (`auto.plan`) so its plates can be drawn.
  */
 export async function getCompare(db, companyId, lineId, { with: other = 'auto', detail = false } = {}) {
-  if (other != null && String(other).toLowerCase() !== 'auto') throw invalid('INVALID', 'An uploaded nesting is compared with "auto" — our automatic nesting.');
+  if (other != null && String(other).toLowerCase() !== 'auto') throw invalid('INVALID', 'An uploaded nesting is compared with "auto" — AI\'s nesting.');
   const st = await compareState(db, companyId, lineId);
   const { ctx } = st;
   const sizeOf = new Map(ctx.cutPlates.map((cp) => [cp.id, cp.steel ?? {}]));
@@ -535,7 +535,7 @@ export async function startCompare(db, c, lineId, input = {}) {
     return out;
   }
   const st = await compareState(db, companyId, lineId);
-  if (!st.uploadedLots.length) throw invalid('NOTHING_UPLOADED', 'Nothing is uploaded on this line, so there is nothing to compare our automatic nesting with.');
+  if (!st.uploadedLots.length) throw invalid('NOTHING_UPLOADED', 'Nothing is uploaded on this line, so there is nothing to compare AI\'s nesting with.');
   if (st.demandError) throw invalid(st.demandError.code, st.demandError.message);
   if (st.mem?.status === 'running' && st.mem.purpose === 'compare') return { started: false, running: true, runId: st.mem.id, status: 'running', run: snapshot(st.mem) };
   const rerun = input.rerun === true || input.rerun === 'true';
@@ -587,11 +587,11 @@ export async function startAutoCompare(db, c, lineId, { trigger = 'upload', reru
   const mem = st.mem;
   if (mem?.status === 'running') {
     const forThese = (mem.purpose ?? 'nest') === 'compare' && mem.jobs?.length === 1 && sameOnly(mem.jobs[0].input?.only, st.only);
-    if (forThese) return { started: false, running: true, runId: mem.id, message: 'Our nesting of these pieces is already running.' };
+    if (forThese) return { started: false, running: true, runId: mem.id, message: 'AI\'s nesting of these pieces is already running.' };
     if ((mem.purpose ?? 'nest') === 'compare' && mem.jobs?.every((j) => j.input?.only)) cancelRun(companyId, lineId, { purpose: 'compare' });
-    else return { started: false, busy: true, message: 'A nesting run is working on this line. Our nesting of the upload starts when it is done.' };
+    else return { started: false, busy: true, message: 'A nesting run is working on this line. AI\'s nesting of the upload starts when it is done.' };
   }
-  if (st.rowSubset && !rerun) return { started: false, answered: true, runId: st.rowSubset.run_uid, message: 'Our nesting of these pieces is already done. It is shown again.' };
+  if (st.rowSubset && !rerun) return { started: false, answered: true, runId: st.rowSubset.run_uid, message: 'AI\'s nesting of these pieces is already done. It is shown again.' };
   const pieces = Object.values(st.only).reduce((a, q) => a + q, 0);
   const upload = { key: st.uploadKey, plates: st.uploadedLots.length, pieces };
   const base = { effort: AUTO_COMPARE_EFFORT, trigger };
@@ -730,7 +730,7 @@ export async function acceptCompare(db, c, lineId, input = {}) {
       customerFiles: willReplace.customerFiles, withPlates: accepted.lots, withPieces: accepted.pieces,
     },
     leftOver,
-    message: `Our automatic nesting is saved: ${plural(accepted.lots, 'plate', 'plates')} in place of ${plural(st.uploadedLots.length, 'uploaded plate', 'uploaded plates')}${willReplace.ourPlates ? ` and ${plural(willReplace.ourPlates, 'plate', 'plates')} of our own` : ''}.`,
+    message: `AI's nesting is saved: ${plural(accepted.lots, 'plate', 'plates')} in place of ${plural(st.uploadedLots.length, 'uploaded plate', 'uploaded plates')}${willReplace.ourPlates ? ` and ${plural(willReplace.ourPlates, 'plate', 'plates')} nested by AI` : ''}.`,
   };
 }
 

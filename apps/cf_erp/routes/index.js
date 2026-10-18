@@ -15,9 +15,10 @@ import stockMoneyRoutes from './stockMoney.js';
 import overviewRoutes from './overview.js';
 import trackerRoutes from './tracker.js';
 import purchaseRoutes from './purchase.js';
-import procurementRoutes from './procurement.js';
-// One PO, stage by stage (§46) — replaces the Buying board and purchase requests.
+// The MR of a sales order and material-ready (§56/§66). The §39 RFQ routes and the §46 PO-stage routes went in §71.
 import purchaseFlowRoutes from './purchaseFlow.js';
+// Purchase flow v3 (§71): the MR screen, the PR with vendor columns, raise PO.
+import purchaseRequestRoutes from './purchaseRequests.js';
 import processRoutes from './process.js';
 import drawingRoutes from './drawings.js';
 import orderValuesRoutes from './orderValues.js';
@@ -42,7 +43,8 @@ import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../ser
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
 import { MOVEMENT_TYPES } from '../services/stockService.js';
-import { PO_STATUSES } from '../services/purchaseService.js';
+import { PO_STATUSES, PO_STAGES, PO_STAGE_LABEL, PO_TYPES, PO_TYPE_LABEL } from '../services/purchaseService.js';
+import { plateChangeGateOn } from '../services/plateChangeService.js';
 import { PR_STATUSES, RFQ_STATUSES, RFQ_SUPPLIER_STATUSES } from '../services/procurementService.js';
 import { WEEKDAYS } from '../services/shiftService.js';
 import { ORDER_TYPES, TRANSITIONS } from '../services/salesOrderService.js';
@@ -93,6 +95,10 @@ router.get('/meta', guard(PERM.view), handle(async () => ({
   batchStatuses: BATCH_STATUSES,
   movementTypes: MOVEMENT_TYPES,
   purchaseStatuses: PO_STATUSES,
+  // §71: a PO's stage and type, and whether nesting plate changes need the MD (off since 2026-10-18).
+  purchaseStages: PO_STAGES.map((key) => ({ key, label: PO_STAGE_LABEL[key] })),
+  purchaseTypes: PO_TYPES.map((key) => ({ key, label: PO_TYPE_LABEL[key] })),
+  plateChangeGate: plateChangeGateOn(),
   purchaseRequestStatuses: PR_STATUSES,
   rfqStatuses: RFQ_STATUSES,
   rfqSupplierStatuses: RFQ_SUPPLIER_STATUSES,
@@ -114,8 +120,8 @@ router.use(stockMoneyRoutes);
 router.use(overviewRoutes);
 router.use(trackerRoutes);
 router.use(purchaseRoutes);
-router.use(procurementRoutes);
 router.use(purchaseFlowRoutes);
+router.use(purchaseRequestRoutes);
 router.use(processRoutes);
 router.use(drawingRoutes);
 router.use(orderValuesRoutes);

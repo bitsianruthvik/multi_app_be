@@ -22,7 +22,7 @@ SELECT x.feature_name, x.feature_tag, x.type
     SELECT 'CF ERP: manage stock, batches and movements',    'cf_erp_inventory_manage',          'backend'          UNION ALL
     SELECT 'CF ERP: record work on the shop floor',          'cf_erp_floor',                     'frontend'         UNION ALL
     SELECT 'CF ERP: approve purchase requests',              'cf_erp_purchase_approve',          'backend'          UNION ALL
-    SELECT 'CF ERP: approve plate changes',                  'cf_erp_plate_change_approve',      'backend'
+    SELECT 'CF ERP: MD approval',                             'cf_erp_plate_change_approve',      'backend'
   ) x
  WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = x.feature_tag AND f.deleted_at IS NULL);
 

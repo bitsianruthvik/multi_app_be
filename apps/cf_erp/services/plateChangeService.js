@@ -67,6 +67,17 @@ const MAX_REASON = 1000;
 
 export const PLATE_CHANGE_APPROVE = 'cf_erp_plate_change_approve';
 
+/*
+ * THE GATE IS OFF (§71, user 2026-10-18: "remove nesting approval from MD for now, will add back later if required").
+ * Off, every nesting plate save applies directly, as before §62 — no request, no reason asked, no line held — whether or
+ * not a purchase order covers the line. The code, the tables and the requests already made stay (it may come back):
+ * CF_PLATE_CHANGE_GATE=on in the backend's environment (or setPlateChangeGate(true), for a test) turns it on again.
+ * A customer's SUBSTITUTE (§68) still goes to the MD — it is not a nesting change.
+ */
+let gateOn = String(process.env.CF_PLATE_CHANGE_GATE ?? '').toLowerCase() === 'on';
+export const plateChangeGateOn = () => gateOn;
+export function setPlateChangeGate(on) { gateOn = !!on; }
+
 /** The kinds of change, in the words the screens use. */
 export const KINDS = Object.freeze({
   accept: { label: 'Save a new nesting' },
@@ -559,10 +570,11 @@ export async function plateChangeGate(db, c, lineId, kind, rawBody = {}, run = n
   const doIt = (b) => (run ? run(b) : RUNNERS[kind](db, c, lineId, b));
   if (isPreview(kind, body)) return doIt(body);
   const companyId = c.companyId;
-  // Two reads on a line with no PO: is a request holding it, and does any PO cover it.
-  const held = await holdingRequest(db, companyId, lineId, { lock: true });
+  // §71: the gate is off — the save applies directly, as on a line no PO covers.
+  const held = gateOn ? await holdingRequest(db, companyId, lineId, { lock: true }) : null;
   if (held) throw conflict('PLATE_CHANGE_PENDING', heldSentence(held, await requireLine(db, companyId, lineId)), { detail: { requestId: held.id, code: held.code } });
-  const pos = await coveringPos(db, companyId, lineId);
+  // Two reads on a line with no PO: is a request holding it, and does any PO cover it.
+  const pos = gateOn ? await coveringPos(db, companyId, lineId) : [];
   const wantImpact = truthy(rawBody?.impact);
 
   if (!pos.length) {
@@ -757,15 +769,17 @@ export async function lineChanges(db, viewer, lineId) {
   const [states, rows] = await Promise.all([lineStates(db, companyId, [line.id]), readRows(db, companyId, { lineId: line.id, limit: 50 })]);
   const st = states.get(Number(line.id));
   const requests = rows.map((r) => shapeRequest(r, { viewer, live: st.hash }));
-  const pending = requests.find((r) => HOLDING.includes(r.status) || r.status === 'pending') ?? null;
+  const pending = gateOn ? requests.find((r) => HOLDING.includes(r.status) || r.status === 'pending') ?? null : null;
   const pos = posOf(st);
+  const gated = gateOn && pos.length > 0;
   return {
     line: lineHead(line),
     gate: {
-      covered: pos.length > 0, purchaseOrders: pos, needsApproval: pos.length > 0, held: !!pending,
+      // §71: gateOn false → nothing needs approval and nothing is held, PO or not.
+      on: gateOn, covered: pos.length > 0, purchaseOrders: pos, needsApproval: gated, held: !!pending,
       pending: pending ? { id: pending.id, code: pending.code, kindLabel: pending.kindLabel, reason: pending.reason, requestedBy: pending.requestedBy, stale: pending.stale } : null,
       message: pending ? heldSentence({ code: pending.code, reason: pending.reason, requested_by_name: pending.requestedBy?.name ?? null }, line)
-        : pos.length ? coveredSentence(pos) : null,
+        : gated ? coveredSentence(pos) : null,
     },
     canApprove: !!viewer.canApprove,
     requests,

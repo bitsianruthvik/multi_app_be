@@ -15,9 +15,14 @@
  * PLANNER blocks accordingly (GET /planner's units[].material and
  * entries[].blocked; PUT /planner/entries refusing with MATERIAL_NOT_READY).
  *
+ * §71 (2026-10-18): the MR stock check, skip, the board, release-excess and the RFQ flow went with their screens.
+ * Taking from stock is the MR screen's "take from stock" (purchaseRequestService.saveMr) — the `stockCheck` shim asks it
+ * the way the old check did. A SKIP is set by no screen now; the engine still honours one an old MR has, so `skip`
+ * writes it as setSkip did, for those engine checks.
+ *
  *    1  a requisition served ENTIRELY from stock            11  A's PO never feeds B; an unallocated PO line is pooled
- *    2  one requisition split into THREE POs (3 dates)      12  requested / quoting = waiting; placed with dates = dated
- *    3  one PO whose LINES have different dates             13  RFQ → quotes → place, split over two suppliers
+ *    2  one requisition split into THREE POs (3 dates)      12  requested / pending approval = waiting; placed with dates = dated
+ *    3  one PO whose LINES have different dates             13  the PR's vendor columns → two POs, two suppliers (§71)
  *    4  a PO date moves later, then earlier                 14  one line: stock + PO + skipped
  *    5  partial receipt; over-receipt refused               15  a RELEASED line blocks the same; the step's refusal
  *    6  buying SKIPPED (one material, and all)              16  lifecycle
@@ -31,7 +36,7 @@ import '../../apps/cf_erp/services/codegenProvider.js';
 import { attachNodeCache, detachNodeCache } from '../../apps/cf_erp/lib/db.js';
 import * as MR from '../../apps/cf_erp/services/materialReadyService.js';
 import * as RQ from '../../apps/cf_erp/services/requisitionService.js';
-import * as PF from '../../apps/cf_erp/services/purchaseFlowService.js';
+import * as PRS from '../../apps/cf_erp/services/purchaseRequestService.js';
 import * as PS from '../../apps/cf_erp/services/purchaseService.js';
 import * as PL from '../../apps/cf_erp/services/plannerService.js';
 import * as REL from '../../apps/cf_erp/services/releaseService.js';
@@ -41,9 +46,9 @@ import * as LOCK from '../../apps/cf_erp/services/lockService.js';
 import * as OWN from '../../apps/cf_erp/services/ownershipService.js';
 import * as ST from '../../apps/cf_erp/services/stockService.js';
 import { orderProcess } from '../../apps/cf_erp/services/processService.js';
-import { releaseHold } from '../../apps/cf_erp/services/purchaseLinkService.js';
+import { releaseHold, linkedPoIds } from '../../apps/cf_erp/services/purchaseLinkService.js';
 import { availability } from '../../apps/cf_erp/services/rollOutService.js';
-import { harness, simple, girder, quietCodes, addDays, PER_GIRDER } from './lib/buyingFixture.mjs';
+import { harness, simple, girder, quietCodes, addDays, PER_GIRDER, buyThroughPr } from './lib/buyingFixture.mjs';
 
 if (!/^(localhost|127\.0\.0\.1|::1)$/.test(process.env.DB_HOST ?? 'localhost')) throw new Error('This suite is local only.');
 const COMPANY = Number(process.env.CF_BUY_COMPANY ?? 2);
@@ -81,12 +86,32 @@ try {
   const prLine = (pr, itemId) => pr.lines.find((l) => Number(l.item.id) === Number(itemId));
   const buyingStage = async (orderId, lineId) => (await orderProcess(db, COMPANY, orderId)).lines.find((l) => l.lineId === Number(lineId)).stages.find((s) => s.stageKey === 'buying');
   const activeHolds = async (itemId) => (await db.query("SELECT COUNT(*) AS n, COALESCE(SUM(quantity), 0) AS q FROM cf_stock_reservations WHERE company_id = ? AND item_id = ? AND status = 'active' AND deleted_at IS NULL", [COMPANY, itemId]))[0][0];
-  const posOfOrder = async (orderId) => (await PF.purchaseBoard(db, COMPANY, { orderId })).lanes.flatMap((l) => l.cards);
-  /** A purchase order made from requisition lines and placed with dates: lines [[prLineId, qty, date]]. */
-  const buy = (lines, { supplier = F.S1, place: placed = true, date = null } = {}) => RQ.makePurchaseOrders(db, c, {
-    orders: [{ supplierId: supplier, place: placed, expectedDate: date, lines: lines.map(([prLineId, quantity, expectedDate]) => ({ prLineId, quantity, expectedDate })) }],
+  const posOfOrder = (orderId) => linkedPoIds(db, COMPANY, orderId);
+  /** A purchase order for MR lines, through the PR (§71), approved by the MD unless place is false: lines [[prLineId, qty, date]]. */
+  const buy = (lines, { supplier = F.S1, place: placed = true, date = null } = {}) => buyThroughPr(db, c, {
+    supplierId: supplier, place: placed, expectedDate: date, lines: lines.map(([prLineId, quantity, expectedDate]) => ({ prLineId, quantity, expectedDate })),
   });
   const WEEK = (iso) => PL.periodFloor(iso);
+  const r6 = (x) => Math.round((Number(x) + Number.EPSILON) * 1e6) / 1e6;
+  /** The old MR stock check, on the MR screen: dry run = its In stock; apply = take what is free, up to what is open. */
+  const stockCheck = async (prId, { apply = false, lineIds = null, lines = null } = {}) => {
+    const scr = await PRS.mrScreen(db, COMPANY, prId);
+    if (lineIds && lineIds.some((x) => !scr.lines.some((l) => l.id === Number(x)))) { const e = new Error('Not a line of this MR.'); e.status = 422; throw e; }
+    const rows = scr.lines.filter((l) => l.status !== 'not_needed' && (!lineIds || lineIds.includes(l.id)))
+      .map((l) => ({ lineId: l.id, item: l.item, need: l.required, open: l.open, freeInStock: l.inStock, proposeHold: r6(Math.min(l.inStock, l.open)), take: l.takeFromStock }));
+    if (!apply) return { applied: false, canApply: rows.some((r) => r.proposeHold > 0), lines: rows };
+    const want = lines ? new Map(lines.map((x) => [Number(x.lineId), Number(x.hold)])) : new Map(rows.map((r) => [r.lineId, r.proposeHold]));
+    const body = rows.filter((r) => want.has(r.lineId)).map((r) => ({ lineId: r.lineId, takeFromStock: r6(r.take + want.get(r.lineId)) }));
+    await PRS.saveMr(db, c, prId, { lines: body });
+    return { applied: true, held: rows.filter((r) => (want.get(r.lineId) ?? 0) > 0).map((r) => ({ lineId: r.lineId, item: r.item, quantity: want.get(r.lineId) })), requisition: await RQ.getRequisition(db, COMPANY, prId) };
+  };
+  /** A skip as an old MR may carry one (no screen sets it since §71): written as setSkip did. */
+  const skip = async (prId, { lineIds = null, all = false, note = null } = {}, on = true) => {
+    const v = await RQ.getRequisition(db, COMPANY, prId);
+    const targets = all ? v.lines.filter((l) => (on ? !l.skipped && l.cover.open > 0 && l.status !== 'not_needed' : !!l.skipped)) : v.lines.filter((l) => (lineIds ?? []).includes(l.id) && (on ? !l.skipped : !!l.skipped));
+    if (targets.length) await db.query('UPDATE cf_requisition_lines SET skipped = ?, skipped_by = ?, skipped_at = NOW(), skip_note = ? WHERE company_id = ? AND id IN (?)', [on ? 1 : 0, user.id, on ? note : null, COMPANY, targets.map((l) => l.id)]);
+    return { changed: targets.length, lineIds: targets.map((l) => l.id), requisition: await RQ.getRequisition(db, COMPANY, prId) };
+  };
 
   /* ============================================================================================ */
   if (run(1)) {
@@ -103,9 +128,9 @@ try {
     let st = await buyingStage(O.id, O.line.id);
     ok('Buying is NOT done on unearmarked stock — it asks for a decision', st.state === 'todo' && /in stock but not held/.test(st.detail), st.detail);
     says(st.detail);
-    const dry = await RQ.stockCheck(db, c, pr.id, {});
+    const dry = await stockCheck(pr.id, {});
     ok('the stock check, dry run: proposes to hold A 10 and B 4, writes nothing', dry.applied === false && dry.canApply && j(dry.lines.map((l) => [l.item.id, l.freeInStock, l.proposeHold]).sort()) === j([[A, 10, 10], [B, 4, 4]].sort()) && Number((await activeHolds(A)).n) === 0, j(dry.lines));
-    const done = await RQ.stockCheck(db, c, pr.id, { apply: true });
+    const done = await stockCheck(pr.id, { apply: true });
     pr = done.requisition;
     const [holds] = await db.query("SELECT item_id, quantity, pr_line_id, held_for_order_id FROM cf_stock_reservations WHERE company_id = ? AND held_for_order_id = ? AND status = 'active' ORDER BY item_id", [COMPANY, O.id]);
     ok('apply: the holds are on the REQUISITION LINES (and still say the order)', done.applied && holds.length === 2 && holds.every((h) => h.pr_line_id != null && h.held_for_order_id === O.id)
@@ -122,7 +147,7 @@ try {
     ok('planner: the unit can be placed this week', !!(await place(O.line.unitKey, TODAY)).entries[O.line.unitKey]);
     st = await buyingStage(O.id, O.line.id);
     ok('Buying is DONE: 2 held in stock', st.state === 'done' && /2 held in stock/.test(st.detail) && st.summary.fromStock === 2, st.detail);
-    const again = await RQ.stockCheck(db, c, pr.id, {});
+    const again = await stockCheck(pr.id, {});
     ok('a second stock check proposes nothing (its own holds are cover, not stock to hold again)', again.canApply === false && again.lines.every((l) => l.proposeHold === 0 && l.freeInStock === 0), j(again.lines));
   }
 
@@ -225,9 +250,7 @@ try {
     const O2 = await F.order('O6B', [[[A, 2], [B, 3]]]);
     let pr = (await RQ.raiseRequisitions(db, c, O.id, {})).requisitions[0];
     ok('nothing in stock, nothing decided: the unit WAITS', pr.materialReady.state === 'waiting' && pr.status === 'open');
-    const none = await refusal(() => RQ.setSkip(db, c, pr.id, {}, true));
-    ok('a skip must say which materials', none?.status === 422);
-    const sk = await RQ.setSkip(db, c, pr.id, { lineIds: [prLine(pr, A).id], note: 'client supplies it later' }, true);
+    const sk = await skip(pr.id, { lineIds: [prLine(pr, A).id], note: 'client supplies it later' }, true);
     pr = sk.requisition;
     ok('skip one material: recorded with who, when and the note', sk.changed === 1 && prLine(pr, A).skipped?.by?.id === user.id && !!prLine(pr, A).skipped.at && prLine(pr, A).skipped.note === 'client supplies it later', j(prLine(pr, A).skipped));
     ok('the line is "skipped", the requisition "skipped", and it counts as decided', prLine(pr, A).status === 'skipped' && pr.status === 'skipped' && pr.done === true, pr.status);
@@ -240,14 +263,11 @@ try {
     let st = await buyingStage(O.id, O.line.id);
     ok('Buying is DONE and says "1 skipped (1 waiting for stock)"', st.state === 'done' && /1 skipped \(1 waiting for stock\)/.test(st.detail) && st.summary.skipped === 1 && st.summary.waiting === 1, st.detail);
     says(st.detail);
-    const boardW = (await RQ.buyingBoard(db, COMPANY, { orderId: O.id })).waitingForStock;
-    ok('the board\'s "Waiting for stock" group (from the server) holds the card, with the material and how much is short', boardW.key === 'waiting_for_stock' && boardW.count === 1 && boardW.cards[0].id === pr.id
-      && boardW.cards[0].status === 'skipped' && boardW.cards[0].waitingLines[0].item.id === A && boardW.cards[0].waitingLines[0].short === 5, j(boardW));
     let pr2 = (await RQ.raiseRequisitions(db, c, O2.id, {})).requisitions[0];
-    const all = await RQ.setSkip(db, c, pr2.id, { all: true }, true);
+    const all = await skip(pr2.id, { all: true }, true);
     pr2 = all.requisition;
     ok('SKIP ALL: every open material of the requisition in one call', all.changed === 2 && pr2.lines.every((l) => l.status === 'skipped') && pr2.status === 'skipped');
-    const un = await RQ.setSkip(db, c, pr2.id, { lineIds: [prLine(pr2, B).id] }, false);
+    const un = await skip(pr2.id, { lineIds: [prLine(pr2, B).id] }, false);
     ok('un-skip one: it is open again; the requisition is partly decided', un.changed === 1 && prLine(un.requisition, B).status === 'open' && prLine(un.requisition, B).skipped === null && un.requisition.status === 'partly_covered', un.requisition.status);
     skipCase = { A, B, O, O2, pr };
   }
@@ -263,7 +283,6 @@ try {
     ok('NOTHING is earmarked: no reservation or hold was written', Number(heldAfter.n) === Number(heldBefore.n) && (await availability(db, COMPANY, [A])).get(A).free === 5);
     const w = await place(O.line.unitKey, WEEK(D(7)));
     ok('planner accepts the placement at once', w.entries[O.line.unitKey]?.shipDate === WEEK(D(7)));
-    ok('…and it has left the board\'s "Waiting for stock" group', (await RQ.buyingBoard(db, COMPANY, { orderId: O.id })).waitingForStock.count === 0);
     const st = await buyingStage(O.id, O.line.id);
     ok('Buying now says "1 skipped (in stock now)"', st.state === 'done' && /1 skipped \(in stock now\)/.test(st.detail), st.detail);
     const pr = await prOf(O.id);
@@ -276,7 +295,7 @@ try {
       // X is ranked BEHIND O (a later order): it does not win the free stock by itself…
       ok('before any earmark the first order still has it (it is ahead in claim order)', (await lineState(O.line.id)).state === 'ready' && (await lineState(X.line.id)).state === 'waiting');
       // …until its stock check earmarks it.
-      const held = await RQ.stockCheck(db, c, prX.id, { apply: true });
+      const held = await stockCheck(prX.id, { apply: true });
       ok('the other order\'s stock check holds the 5', held.held.length === 1 && held.held[0].quantity === 5);
       let res2 = await lineState(O.line.id);
       ok('the first unit is WAITING again', res2.state === 'waiting' && res2.readyDate === null, res2.text);
@@ -307,7 +326,7 @@ try {
     const Dm = await F.item('S9D');
     const P1 = await F.order('O9A', [[[Dm, 5]]]);
     const P2 = await F.order('O9B', [[[Dm, 5]]]);
-    for (const o of [P1, P2]) { const pr = (await RQ.raiseRequisitions(db, c, o.id, {})).requisitions[0]; await RQ.setSkip(db, c, pr.id, { all: true }, true); }
+    for (const o of [P1, P2]) { const pr = (await RQ.raiseRequisitions(db, c, o.id, {})).requisitions[0]; await skip(pr.id, { all: true }, true); }
     await F.receive(Dm, 5);
     await PL.putPriorities(db, c, { orderIds: [P1.id, P2.id] });
     let a = await lineState(P1.line.id); let b = await lineState(P2.line.id);
@@ -340,14 +359,11 @@ try {
     section('10. EARMARK INVISIBILITY — stock earmarked for A is invisible to B, reader by reader');
     const check = async (label, item, Aord, Bord, qtyHeld) => {
       const prB = await prOf(Bord.id);
-      const dryB = await RQ.stockCheck(db, c, prB.id, {});
+      const dryB = await stockCheck(prB.id, {});
       ok(`${label} · B's requisition availability: 0 free now`, prLine(prB, item).cover.freeNow === 0 && prLine(prB, item).ready.state === 'waiting', j(prLine(prB, item).cover));
-      ok(`${label} · B's stock check: 0 free, proposes nothing`, dryB.lines[0].freeInStock === 0 && dryB.canApply === false, j(dryB.lines));
-      const e = await refusal(() => RQ.stockCheck(db, c, prB.id, { apply: true, lines: [{ lineId: prLine(prB, item).id, hold: 1 }] }));
+      ok(`${label} · B's MR screen: 0 in stock, proposes nothing`, dryB.lines[0].freeInStock === 0 && dryB.canApply === false, j(dryB.lines));
+      const e = await refusal(() => stockCheck(prB.id, { apply: true, lines: [{ lineId: prLine(prB, item).id, hold: 1 }] }));
       ok(`${label} · B cannot hold it by asking either`, !!e && /only 0 .*is free in stock/.test(JSON.stringify(e.problems)), j(e?.problems));
-      const board = await RQ.buyingBoard(db, COMPANY, { orderId: Bord.id });
-      const cardB = board.columns.flatMap((x) => x.cards).find((x) => x.order.id === Bord.id);
-      ok(`${label} · Buying board: B's card is waiting`, cardB?.materialReady.state === 'waiting', j(cardB?.materialReady));
       const rows = await PS.buyList(db, COMPANY, { show: 'all', search: tag });
       const row = rows.find((x) => x.item.id === item && !x.planned);
       ok(`${label} · buy list: none of it is free; B still has to buy`, row.free === 0 && row.split.some((s) => s.orderId === Bord.id && s.toBuy > 0) && !row.split.some((s) => s.orderId === Aord.id), j([row.free, row.split]));
@@ -362,7 +378,7 @@ try {
     { const it = await F.item('S10A'); await F.receive(it, 4);
       const Ao = await F.order('O10A', [[[it, 4]]]); const Bo = await F.order('O10B', [[[it, 4]]]);
       const prA = (await RQ.raiseRequisitions(db, c, Ao.id, {})).requisitions[0]; await RQ.raiseRequisitions(db, c, Bo.id, {});
-      await RQ.stockCheck(db, c, prA.id, { apply: true });
+      await stockCheck(prA.id, { apply: true });
       await check('held by STOCK CHECK', it, Ao, Bo, 4); }
     // (b) by a receipt on A's purchase order
     { const it = await F.item('S10B');
@@ -399,6 +415,7 @@ try {
     b = await lineState(Bo.line.id);
     ok('an unallocated line on a REQUESTED PO is not supply (no date yet)', b.state === 'waiting');
     await PS.markOrdered(db, c, po.id, {});
+    await PS.approvePurchaseOrder(db, c, po.id, {});   // §71: placed = approved by the MD
     b = await lineState(Bo.line.id);
     ok(`placed: the unallocated line is POOLED — B takes it, dated ${D(12)}`, b.state === 'dated' && b.readyDate === D(12) && reasonOf(b, G).cover[0].pooled === true && reasonOf(b, G).cover[0].poCode === po.code, j([b.state, b.readyDate, reasonOf(b, G).cover]));
     says(reasonOf(b, G).text);
@@ -412,15 +429,15 @@ try {
 
   /* ============================================================================================ */
   if (run(12) || run(13)) {
-    section('12. Requested / quoting POs give "waiting — asked for, no date yet"');
+    section('12. Requested / pending-approval POs give "waiting — asked for, no date yet"');
     const Hh = await F.item('S12H'); const Ii = await F.item('S12I');
     const O = await F.order('O12', [[[Hh, 6], [Ii, 2]]]);
     let pr = (await RQ.raiseRequisitions(db, c, O.id, {})).requisitions[0];
-    const made = await RQ.makePurchaseOrders(db, c, { orders: [{ lines: [{ prLineId: prLine(pr, Hh).id }, { prLineId: prLine(pr, Ii).id }] }] });
+    const made = await buyThroughPr(db, c, { supplierId: F.S1, place: false, lines: [{ prLineId: prLine(pr, Hh).id }, { prLineId: prLine(pr, Ii).id }] });
     const po = made.purchaseOrders[0];
-    ok('a PO made without placing is REQUESTED, lines = what is open, linked to the requisition lines', po.status === 'requested' && po.supplier === null
+    pr = await prOf(O.id);
+    ok('a PO raised from the PR and not yet approved is REQUESTED (pending MD approval), lines = what is open, linked to the MR lines', po.status === 'requested'
       && j(po.lines.map((l) => [l.item.id, l.quantity, l.for[0].prLineId]).sort()) === j([[Hh, 6, prLine(pr, Hh).id], [Ii, 2, prLine(pr, Ii).id]].sort()), j(po.lines));
-    pr = made.requisitions[0];
     ok('requisition: both lines "asked", not resolved; status partly covered', pr.lines.every((l) => l.status === 'asked' && !l.resolved) && pr.status === 'partly_covered' && pr.done === false, pr.status);
     let res = await lineState(O.line.id);
     ok('engine: WAITING — asked for, no date yet', res.state === 'waiting' && /asked for on .* not ordered yet — no date/.test(res.text), res.text);
@@ -428,31 +445,38 @@ try {
     ok('planner refuses to place it', (await refusal(() => place(O.line.unitKey, WEEK(D(40)))))?.code === 'MATERIAL_NOT_READY');
     let st = await buyingStage(O.id, O.line.id);
     ok('Buying is NOT done: "asked for, not ordered with a date"', st.state === 'todo' && /asked for, not ordered with a date/.test(st.detail), st.detail);
-    const over = await refusal(() => RQ.makePurchaseOrders(db, c, { orders: [{ lines: [{ prLineId: prLine(pr, Hh).id, quantity: 1 }] }] }));
-    ok('buying more than is open is refused, naming order and item', !!over && over.problems.some((p) => p.includes(O.code) && p.includes(`${tag}-S12H`) && /only 0/.test(p)), j(over?.problems));
-    await PF.sendRfq(db, c, po.id, { supplierIds: [F.S1, F.S2] });
-    res = await lineState(O.line.id);
-    ok('quoting: still waiting', res.state === 'waiting' && (await prOf(O.id)).lines.every((l) => l.status === 'asked'));
+    const over = await refusal(() => buyThroughPr(db, c, { supplierId: F.S1, lines: [{ prLineId: prLine(pr, Hh).id, quantity: 1 }] }));
+    ok('buying more than is open is refused, naming the item', !!over && over.problems.some((p) => p.includes(`${tag}-S12H`) && /only 0/.test(p)), j(over?.problems));
+    const sent = await PS.getPurchaseOrder(db, COMPANY, po.id);
+    ok('pending MD approval (§71): still waiting', sent.stage === 'pending_approval' && res.state === 'waiting' && (await prOf(O.id)).lines.every((l) => l.status === 'asked'), sent.stage);
 
     if (run(13)) {
-      section('13. RFQ → quotes → place, split over two suppliers: requisition links and per-line dates survive');
-      const q0 = await PF.poQuotes(db, c, po.id);
-      const rl = (item) => q0.rfq.lines.find((l) => (l.item?.id ?? l.itemId) === item).id;
-      await PF.recordQuote(db, c, po.id, { supplierId: F.S1, lines: [{ rfqLineId: rl(Hh), unitPrice: 100, leadTimeDays: 5 }, { rfqLineId: rl(Ii), unitPrice: 55, leadTimeDays: 9 }] });
-      const q2 = await PF.recordQuote(db, c, po.id, { supplierId: F.S2, lines: [{ rfqLineId: rl(Hh), unitPrice: 120, leadTimeDays: 3 }, { rfqLineId: rl(Ii), unitPrice: 50, leadTimeDays: 20 }] });
-      const quoteLine = (supplierId, item) => q2.rfq.quotes.find((q) => (q.supplier?.id ?? q.supplierId) === supplierId).lines.find((l) => l.rfqLineId === rl(item)).id;
-      const placed = await PF.placeOrder(db, c, po.id, { awards: [{ rfqLineId: rl(Hh), quoteLineId: quoteLine(F.S1, Hh) }, { rfqLineId: rl(Ii), quoteLineId: quoteLine(F.S2, Ii) }] });
+      section('13. The PR (vendor columns, §71) → two POs, two suppliers: MR links and per-line dates (delivery days) survive');
+      await PS.cancelPurchaseOrder(db, c, po.id, { reason: 'bought through the purchase request instead' });
+      const savedMr = await PRS.saveMr(db, c, pr.id, { lines: pr.lines.map((l) => ({ lineId: l.id, takeFromStock: 0 })) });
+      const prq = savedMr.purchaseRequest.id;
+      // Section 12 raised its PO through this PR from S1, so S1 already has a column.
+      let grid = await PRS.getPr(db, COMPANY, prq);
+      for (const sid of [F.S1, F.S2]) if (!grid.vendors.some((v) => Number(v.supplier.id) === Number(sid))) grid = await PRS.addVendor(db, c, prq, { supplierId: sid });
+      const colOf = (sid) => grid.vendors.find((v) => Number(v.supplier.id) === Number(sid));
+      const glOf = (item) => grid.lines.find((l) => Number(l.item.id) === Number(item));
+      await PRS.setQuotes(db, c, colOf(F.S1).id, { quotes: [{ lineId: glOf(Hh).id, rate: 100, deliveryDays: 5 }, { lineId: glOf(Ii).id, rate: 55, deliveryDays: 9 }] });
+      grid = await PRS.setQuotes(db, c, colOf(F.S2).id, { quotes: [{ lineId: glOf(Hh).id, rate: 120, deliveryDays: 3 }, { lineId: glOf(Ii).id, rate: 50, deliveryDays: 20 }] });
+      const p1 = await PRS.raisePo(db, c, colOf(F.S1).id, { lines: [{ lineId: glOf(Hh).id, quantity: 6 }] });
+      const p2 = await PRS.raisePo(db, c, colOf(F.S2).id, { lines: [{ lineId: glOf(Ii).id, quantity: 2 }] });
+      const placed = { purchaseOrders: [await PS.approvePurchaseOrder(db, c, p1.purchaseOrder.id, {}), await PS.approvePurchaseOrder(db, c, p2.purchaseOrder.id, {})] };
       ok('two ordered POs, one per supplier', placed.purchaseOrders.length === 2 && placed.purchaseOrders.every((p) => p.status === 'ordered'));
       const lh = placed.purchaseOrders.flatMap((p) => p.lines).find((l) => l.item.id === Hh);
       const li = placed.purchaseOrders.flatMap((p) => p.lines).find((l) => l.item.id === Ii);
       ok('each PO line KEEPS its requisition line', lh.orders[0].prLineId === prLine(pr, Hh).id && li.orders[0].prLineId === prLine(pr, Ii).id && lh.orders[0].requisition.code === pr.code, j([lh.orders, li.orders]));
       const dH = MR.dateOnly(lh.expectedDate); const dI = MR.dateOnly(li.expectedDate);
-      ok('…and has its OWN date (from its lead time)', !!dH && !!dI && dH !== dI, j([dH, dI]));
+      ok('…and has its OWN date (from its delivery days)', !!dH && !!dI && dH !== dI, j([dH, dI]));
       res = await lineState(O.line.id);
       ok('engine: DATED, by the later of the two lines', res.state === 'dated' && res.readyDate === (dH > dI ? dH : dI) && reasonOf(res, Hh).date === dH && reasonOf(res, Ii).date === dI, j([res.state, res.readyDate, dH, dI]));
       pr = await prOf(O.id);
-      ok('requisition: covered; each line shows its PO, supplier and date', pr.status === 'covered' && prLine(pr, Hh).purchase[0].supplier.id === F.S1 && prLine(pr, Ii).purchase[0].supplier.id === F.S2
-        && prLine(pr, Hh).purchase[0].date === dH && prLine(pr, Ii).cover.lastDate === dI, j(pr.lines.map((l) => l.purchase)));
+      const liveOf = (item) => prLine(pr, item).purchase.find((p) => p.state !== 'closed');
+      ok('requisition: covered; each line shows its PO, supplier and date (the cancelled one listed as closed)', pr.status === 'covered' && liveOf(Hh).supplier.id === F.S1 && liveOf(Ii).supplier.id === F.S2
+        && liveOf(Hh).date === dH && prLine(pr, Ii).cover.lastDate === dI, j(pr.lines.map((l) => l.purchase)));
       st = await buyingStage(O.id, O.line.id);
       ok('Buying is DONE: 2 on order, with the last delivery', st.state === 'done' && /2 on order, last delivery/.test(st.detail), st.detail);
       says(st.detail);
@@ -468,14 +492,14 @@ try {
     await F.receive(Jj, 3);
     const O = await F.order('O14', [[[Jj, 3], [K, 4], [L, 2]]]);
     let pr = (await RQ.raiseRequisitions(db, c, O.id, {})).requisitions[0];
-    const one = await RQ.stockCheck(db, c, pr.id, { lineIds: [prLine(pr, Jj).id] });
+    const one = await stockCheck(pr.id, { lineIds: [prLine(pr, Jj).id] });
     ok('the stock check DRY RUN for ONE requisition line (lineIds) answers that row only', one.applied === false && one.lines.length === 1 && one.lines[0].lineId === prLine(pr, Jj).id && one.lines[0].proposeHold === 3, j(one.lines));
-    const bad = await refusal(() => RQ.stockCheck(db, c, pr.id, { lineIds: [999999999] }));
+    const bad = await refusal(() => stockCheck(pr.id, { lineIds: [999999999] }));
     ok('…a line id that is not on the requisition is refused', bad?.status === 422);
-    const applied = await RQ.stockCheck(db, c, pr.id, { apply: true, lineIds: [prLine(pr, Jj).id] });
+    const applied = await stockCheck(pr.id, { apply: true, lineIds: [prLine(pr, Jj).id] });
     ok('…and APPLY with lineIds holds that row only', applied.held.length === 1 && applied.held[0].lineId === prLine(pr, Jj).id);
     await buy([[prLine(pr, K).id, 4, D(15)]]);
-    pr = (await RQ.setSkip(db, c, pr.id, { lineIds: [prLine(pr, L).id] }, true)).requisition;
+    pr = (await skip(pr.id, { lineIds: [prLine(pr, L).id] }, true)).requisition;
     ok('line statuses: from_stock, covered, skipped', j([prLine(pr, Jj).status, prLine(pr, K).status, prLine(pr, L).status]) === j(['from_stock', 'covered', 'skipped']), j(pr.lines.map((l) => l.status)));
     ok('requisition status "mixed" — every material decided, one skipped — and done', pr.status === 'mixed' && pr.done === true, pr.status);
     says(pr.sentence);
@@ -506,10 +530,10 @@ try {
     const m = await lineState(Mine.line.id); const o = await lineState(Other.line.id);
     ok('the owner\'s order can use it (free, the customer\'s own)', m.state === 'ready' && reasonOf(m, N).cover[0].kind === 'free' && reasonOf(m, N).cover[0].owner === 'customer', j(reasonOf(m, N).cover));
     ok('another customer\'s order cannot — though it is ahead in claim order', o.state === 'waiting' && reasonOf(o, N).short === 3);
-    ok('stock check: free for the owner 3, for the other 0', (await RQ.stockCheck(db, c, prM.id, {})).lines[0].freeInStock === 3 && (await RQ.stockCheck(db, c, prO.id, {})).lines[0].freeInStock === 0);
+    ok('stock check: free for the owner 3, for the other 0', (await stockCheck(prM.id, {})).lines[0].freeInStock === 3 && (await stockCheck(prO.id, {})).lines[0].freeInStock === 0);
     const snap = await snapshot();
     ok('planner agrees', unitOf(snap, Mine.line.unitKey).material.state === 'ready' && unitOf(snap, Other.line.unitKey).material.state === 'waiting');
-    const held = await RQ.stockCheck(db, c, prM.id, { apply: true });
+    const held = await stockCheck(prM.id, { apply: true });
     const [[hb]] = await db.query("SELECT batch_id FROM cf_stock_reservations WHERE company_id = ? AND pr_line_id = ? AND status = 'active'", [COMPANY, prLine(held.requisition, N).id]);
     ok('holding it for the owner claims the customer\'s LOT', held.requisition.status === 'fulfilled_from_stock' && hb.batch_id != null);
   }
@@ -537,7 +561,7 @@ try {
       const madeB = await buy([[prLine(pr, G.B).id, t.B, D(15)]], { supplier: G.SUP });
       poB = madeB.purchaseOrders[0];
       await G.receive(G.C, t.C);
-      await RQ.stockCheck(db, c, pr.id, { apply: true, lineIds: [prLine(pr, G.C).id] });
+      await stockCheck(pr.id, { apply: true, lineIds: [prLine(pr, G.C).id] });
       pr = await prOf(GA.id);
       ok('requisition line A is covered by THREE POs, each its own quantity and date', prLine(pr, G.A).purchase.length === 3 && j(prLine(pr, G.A).purchase.map((p) => [p.quantity, p.date])) === j(dA.map((d) => [PER_GIRDER.A, d]))
         && prLine(pr, G.A).status === 'covered' && prLine(pr, G.A).cover.firstDate === dA[0] && prLine(pr, G.A).cover.lastDate === dA[2], j(prLine(pr, G.A).purchase.map((p) => [p.quantity, p.date])));
@@ -652,16 +676,16 @@ try {
         const Ao = await F.order('O16A', [[[it, 9]]]); const Bo = await F.order('O16B', [[[it, 9]]]);
         const prA = (await RQ.raiseRequisitions(db, c, Ao.id, {})).requisitions[0];
         const prB = (await RQ.raiseRequisitions(db, c, Bo.id, {})).requisitions[0];
-        await RQ.stockCheck(db, c, prA.id, { apply: true });
+        await stockCheck(prA.id, { apply: true });
         const made = await buy([[prLine(prA, it).id, 5, D(9)]]);
-        await RQ.setSkip(db, c, prB.id, { all: true }, true);
+        await skip(prB.id, { all: true }, true);
         ok('(a) A holds 4 and has 5 coming; B (skipped) waits', (await lineState(Ao.line.id)).state === 'dated' && (await lineState(Bo.line.id)).state === 'waiting');
         await SO.setOrderStatus(db, c, Ao.id, 'closed');
         const [[al]] = await db.query('SELECT COUNT(*) AS n FROM cf_purchase_line_orders WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [COMPANY, Ao.id]);
         ok('(a) closing A: its holds are let go and its PO share is bought for nobody', Number((await activeHolds(it)).n) === 0 && Number(al.n) === 0);
         const b = await lineState(Bo.line.id);
         ok('(a) B has the 4 in stock and is still short of 5 (a skip never takes a PO, even a pooled one)', b.state === 'waiting' && reasonOf(b, it).short === 5 && reasonOf(b, it).cover.some((x) => x.kind === 'free' && x.qty === 4), j(reasonOf(b, it).cover));
-        await RQ.setSkip(db, c, prB.id, { all: true }, false);
+        await skip(prB.id, { all: true }, false);
         const b2 = await lineState(Bo.line.id);
         ok(`(a) un-skipped, B is DATED by the freed PO line (pooled, ${D(9)}): the waiting order unblocked`, b2.state === 'dated' && b2.readyDate === D(9) && reasonOf(b2, it).cover.some((x) => x.pooled && x.poCode === made.purchaseOrders[0].code), j([b2.state, b2.readyDate])); }
       // (b) a PO cancelled → its requisition lines are open again.
@@ -683,7 +707,7 @@ try {
         const t = totals(1);
         await G.receive(G.A, t.A); await G.receive(G.B, t.B); await G.receive(G.C, t.C);
         let pr = (await RQ.raiseRequisitions(db, c, GB.id, {})).requisitions[0];
-        await RQ.stockCheck(db, c, pr.id, { apply: true });
+        await stockCheck(pr.id, { apply: true });
         ok('(d) a frozen girder line held wholly from stock: fulfilled, unit ready', (await prOf(GB.id)).status === 'fulfilled_from_stock' && (await lineState(GB.lineId)).state === 'ready');
         const rel = await REL.releaseLine(db, c, GB.lineId, { finishedAreaId: G.dispatch, view: 'none' });
         const releaseId = rel.id ?? (await REL.liveReleaseOfLine(db, COMPANY, GB.lineId)).id;
@@ -700,9 +724,9 @@ try {
         const t2 = totals(2);
         await G.receive(G.B, t2.B);
         let pr = (await RQ.raiseRequisitions(db, c, GC.id, {})).requisitions[0];
-        await RQ.stockCheck(db, c, pr.id, { apply: true, lineIds: [prLine(pr, G.B).id] });
+        await stockCheck(pr.id, { apply: true, lineIds: [prLine(pr, G.B).id] });
         await buy([[prLine(pr, G.A).id, t2.A, D(11)]], { supplier: G.SUP });
-        await RQ.setSkip(db, c, pr.id, { lineIds: [prLine(pr, G.C).id] }, true);
+        await skip(pr.id, { lineIds: [prLine(pr, G.C).id] }, true);
         pr = await prOf(GC.id);
         ok('(e) before the revision: B from stock, A on order, C skipped', j([prLine(pr, G.B).status, prLine(pr, G.A).status, prLine(pr, G.C).status]) === j(['from_stock', 'covered', 'skipped']));
         const rev = await REV.reviseOrder(db, c, GC.id);
@@ -729,19 +753,13 @@ try {
           && prLine(moved, G.B).cover.held === t1.B && moved.counts.over === 2, j(moved.lines.map((l) => [l.need, l.cover.over, l.cover.held])));
         const [[heldB]] = await db.query("SELECT COALESCE(SUM(quantity), 0) AS q FROM cf_stock_reservations WHERE company_id = ? AND pr_line_id = ? AND status = 'active'", [COMPANY, prLine(moved, G.B).id]);
         ok('(e) …the holds are all still there', Number(heldB.q) === t2.B);
-        const freeB = (await availability(db, COMPANY, [G.B])).get(G.B).free;
-        const dryX = await RQ.releaseExcess(db, c, prLine(moved, G.B).id, {});
-        ok('(e) release-excess, dry run: says what would be let go and writes nothing', dryX.applied === false && dryX.excess === t2.B - t1.B && dryX.plan.length === 1 && dryX.plan[0].kind === 'hold' && dryX.plan[0].quantity === t2.B - t1.B, j(dryX.plan));
-        const didB = await RQ.releaseExcess(db, c, prLine(moved, G.B).id, { apply: true });
-        const didA = await RQ.releaseExcess(db, c, prLine(moved, G.A).id, { apply: true });
-        ok('(e) applied: B keeps exactly its need held; A\'s PO share is cut to its need (the PO line itself is not)', prLine(didB.requisition, G.B).cover.over === 0 && prLine(didB.requisition, G.B).cover.held === t1.B
-          && didA.plan[0].kind === 'allocation' && prLine(didA.requisition, G.A).cover.over === 0 && prLine(didA.requisition, G.A).cover.ordered === t1.A, j([didA.plan, prLine(didA.requisition, G.A).cover]));
-        ok('(e) the freed stock is free again', (await availability(db, COMPANY, [G.B])).get(G.B).free === freeB + t2.B - t1.B); }
+        // (§71: the release-excess action went with the old MR panel; the excess is still reported, nothing is dropped.)
+      }
       // (g) a revision DISCARDED: the requisition goes back to the line it came from, with its holds.
       { const GE = await G.girderOrder('GE', 1);
         await G.receive(G.B, PER_GIRDER.B);
         const pr = (await RQ.raiseRequisitions(db, c, GE.id, {})).requisitions[0];
-        await RQ.stockCheck(db, c, pr.id, { apply: true, lineIds: [prLine(pr, G.B).id] });
+        await stockCheck(pr.id, { apply: true, lineIds: [prLine(pr, G.B).id] });
         const rev = await REV.reviseOrder(db, c, GE.id);
         ok('(g) revised: the requisition sits on the revision\'s line', (await RQ.orderRequisitions(db, COMPANY, rev.id)).requisitions[0]?.line.id === rev.lines[0].id);
         const back = await REV.discardRevision(db, c, rev.id);
@@ -753,7 +771,7 @@ try {
         await G.receive(G.A, PER_GIRDER.A);
         const freeBefore = (await availability(db, COMPANY, [G.A])).get(G.A).free;
         const pr = (await RQ.raiseRequisitions(db, c, GD.id, {})).requisitions[0];
-        await RQ.stockCheck(db, c, pr.id, { apply: true, lineIds: [prLine(pr, G.A).id] });
+        await stockCheck(pr.id, { apply: true, lineIds: [prLine(pr, G.A).id] });
         ok('(f) an inquiry\'s frozen line can be requisitioned and hold stock', (await availability(db, COMPANY, [G.A])).get(G.A).free === freeBefore - PER_GIRDER.A);
         await SO.deleteOrder(db, c, GD.id);
         const [[left]] = await db.query('SELECT COUNT(*) AS n FROM cf_requisitions WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [COMPANY, pr.id]);

@@ -390,13 +390,7 @@ try {
   ok('per item, the rows\' to-buy adds up to wanted − held − free − on order (nothing covered twice)',
     [...byItem.values()].every((e) => Math.abs(e.toBuy - Math.max(0, e.wanted - e.reserved - e.free - e.onOrder)) < EPS));
   const suggestTotals = sumBy(listPlanned.filter((r) => r.toBuy > EPS), (r) => r.item.id, (r) => r.toBuy);
-  // One-PO flow (§46): the order's "Request items" starts from its share of the shortage.
-  const { orderShortfall } = await import(pathToFileURL(path.join(BE, 'apps/cf_erp/services/purchaseFlowService.js')).href);
-  const mineByItem = new Map();
-  for (const r of listPlanned) for (const x of r.split ?? []) if (Number(x.orderId) === Number(line.order_id)) mineByItem.set(r.item.id, (mineByItem.get(r.item.id) ?? 0) + x.toBuy);
-  const shortfall = await orderShortfall(conn, COMPANY, line.order_id);
-  ok('the order shortfall (Request items) is its share of the buy list, one row per item',
-    shortfall.length === [...mineByItem.values()].filter((v) => v > EPS).length && shortfall.every((s) => Math.abs(s.toBuy - (mineByItem.get(s.item.id) ?? 0)) < EPS), `${shortfall.length} rows`);
+  // (§71: the order's "Request items" dialog and its shortfall went with the §46 flow — the MR → PR flow replaces them.)
   void suggestTotals;
 
   // Release: the planned rows become released rows, and nothing is counted twice.

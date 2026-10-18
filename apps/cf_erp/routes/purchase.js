@@ -1,32 +1,35 @@
 /**
- * purchase.js — buying what the released jobs are short of (Phase 6).
+ * purchase.js — purchase orders and their receipts.
  *
- *   GET    /buy-list?show=&search=&summary=   what is short, item by item, each with estUnitPrice/estSource/estCost;
- *                                      summary=1 returns { rows, total: { estCost, currency, items, unpricedItems } }
- *   GET    /purchase-orders?status=&supplierId=&search=
+ *   GET    /purchase-orders?status=&stage=&type=&supplierId=&search=   (stage, §71: pending_approval | waiting | part_received |
+ *                                      closed | closed_short | cancelled | requested; type: material | contractor)
+ *   GET    /purchase-orders/pending-lines?search=&supplierId=   Inventory › Receive against PO: lines still pending (§71)
  *   POST   /purchase-orders             { code?, supplierId?, expectedDate?, notes? }
  *   GET    /purchase-orders/:id
  *   PUT    /purchase-orders/:id         { supplierId?, expectedDate?, notes? }
- *   POST   /purchase-orders/:id/order   { supplierId? } — draft → ordered
+ *   POST   /purchase-orders/:id/order   { supplierId? } — send for MD approval (§71: it no longer places it)
+ *   POST   /purchase-orders/:id/approve { note? } — THE MD approves: pending → waiting for goods (cf_erp_plate_change_approve, "MD approval")
+ *   POST   /purchase-orders/:id/close   { reason } — close short: what is pending is released, the PR line's "PO raised" goes down
  *   POST   /purchase-orders/:id/cancel  { reason? }
  *   POST   /purchase-orders/:id/lines   { itemId, quantity, expectedDate?, note?, unitPrice? }  (no unitPrice = last price paid)
  *   PUT    /purchase-lines/:id          { quantity?, expectedDate?, note?, unitPrice? }  (null clears)
  *   DELETE /purchase-lines/:id
  *   POST   /purchase-lines/:id/receive  { quantity?, stockingAreaId, batch?/batchId?, movementDate?, reference?, notes?, unitCost? }
- *                                      unitCost defaults to the line's unitPrice; it goes to the stock ledger with the receipt;
- *                                      the share bought for a sales order is held for it -> { movement, held, order }
+ *                                      a GRN (several per PO). unitCost defaults to the line's unitPrice; the share bought for a
+ *                                      sales order / MR line is earmarked to it -> { movement, held, order }. All received → the PO closes.
  *   PUT    /purchase-lines/:id/orders   { orders: [{ orderId, quantity }] }  which sales orders the line is bought for (§43)
  *   POST   /stock/holds/:id/release     lets a hold go -> { ok }
  *   POST /purchase-orders and PUT /purchase-orders/:id take forOrderId (the default for lines added later);
  *   POST /purchase-orders/:id/lines takes orderId (null = for stock; left out = the header's)
+ * (The buy list route went with its screen, §71: the MR → PR → PO flow replaces it; buyList still feeds Home's count.)
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
-  buyList, listPurchaseOrders, getPurchaseOrder, createPurchaseOrder, updatePurchaseOrder,
-  addPurchaseLine, updatePurchaseLine, removePurchaseLine, markOrdered, cancelPurchaseOrder, receiveLine, buyListTotal,
-  setPurchaseLineOrders,
+  listPurchaseOrders, getPurchaseOrder, createPurchaseOrder, updatePurchaseOrder,
+  addPurchaseLine, updatePurchaseLine, removePurchaseLine, markOrdered, cancelPurchaseOrder, receiveLine,
+  setPurchaseLineOrders, approvePurchaseOrder, closePurchaseOrder, pendingLines,
 } from '../services/purchaseService.js';
 import { releaseHold } from '../services/purchaseLinkService.js';
 
@@ -36,17 +39,18 @@ const id = (req) => intParam(req.params.id);
 const company = (req) => ctx(req).companyId;
 const view = guard(PERM.inventoryView);
 const manage = guard(PERM.inventory);
+const approve = guard(PERM.plateChangeApprove);
+// The MD approves purchase orders, so may read them without the inventory grants (§71).
+const viewPo = guardAny(PERM.inventoryView, PERM.plateChangeApprove);
 
-router.get('/buy-list', view, handle(async (req) => {
-  const rows = await buyList(pool, company(req), req.query);
-  return String(req.query.summary ?? '') === '1' ? { rows, total: buyListTotal(rows) } : rows;
-}));
-
-router.get('/purchase-orders', view, handle((req) => listPurchaseOrders(pool, company(req), req.query)));
+router.get('/purchase-orders', viewPo, handle((req) => listPurchaseOrders(pool, company(req), req.query)));
+router.get('/purchase-orders/pending-lines', view, handle((req) => pendingLines(pool, company(req), req.query)));
 router.post('/purchase-orders', manage, handle((req) => tx(req, (db, c) => createPurchaseOrder(db, c, req.body ?? {}))));
-router.get('/purchase-orders/:id', view, handle((req) => getPurchaseOrder(pool, company(req), id(req))));
+router.get('/purchase-orders/:id', viewPo, handle((req) => getPurchaseOrder(pool, company(req), id(req))));
 router.put('/purchase-orders/:id', manage, handle((req) => tx(req, (db, c) => updatePurchaseOrder(db, c, id(req), req.body ?? {}))));
 router.post('/purchase-orders/:id/order', manage, handle((req) => tx(req, (db, c) => markOrdered(db, c, id(req), req.body ?? {}))));
+router.post('/purchase-orders/:id/approve', approve, handle((req) => tx(req, (db, c) => approvePurchaseOrder(db, c, id(req), req.body ?? {}))));
+router.post('/purchase-orders/:id/close', manage, handle((req) => tx(req, (db, c) => closePurchaseOrder(db, c, id(req), req.body ?? {}))));
 router.post('/purchase-orders/:id/cancel', manage, handle((req) => tx(req, (db, c) => cancelPurchaseOrder(db, c, id(req), req.body ?? {}))));
 router.post('/purchase-orders/:id/lines', manage, handle((req) => tx(req, (db, c) => addPurchaseLine(db, c, id(req), req.body ?? {}))));
 
