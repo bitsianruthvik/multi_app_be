@@ -18,7 +18,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { postMovement } from './stockService.js';
 import { releaseAfterWrite, liveReleaseOfLine } from './releaseService.js';
-import { invoiceShipments } from './invoiceService.js';
+import { invoiceShipments, billedByMilestones } from './invoiceService.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -152,7 +152,9 @@ export async function shipLine(db, c, lineId, input = {}) {
     movementIds.push(movement.id);
   }
   await db.query('UPDATE cf_sales_order_lines SET delivered_qty = delivered_qty + ? WHERE company_id = ? AND id = ?', [shipped, c.companyId, l.id]);
-  const wantInvoice = !(input.invoice === false || input.invoice === 'false' || input.invoice === 0);
+  let wantInvoice = !(input.invoice === false || input.invoice === 'false' || input.invoice === 0);
+  // §74: an order billed by its payment milestones (an approved acceptance) is invoiced from Accounts › Billing, not per truck.
+  if (wantInvoice && await billedByMilestones(db, c.companyId, l.order_id)) wantInvoice = false;
   const invoice = wantInvoice ? await invoiceShipments(db, c, l.order_id, movementIds) : null;
   const release = await liveReleaseOfLine(db, c.companyId, l.id);
   return {

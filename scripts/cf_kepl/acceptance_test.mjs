@@ -23,7 +23,7 @@
  *  10  a PO's approval through the inbox (context: lines, rates, the other quotes); a rejection sends it back
  *  11  close short needs approval; approved → closed short
  *  12  the board's lanes from facts (material → in production → dispatched → post-production → closed) and the
- *      checklist (done / undo / done, recorded; the last stage closes the order)
+ *      checklist (done / undo / done, recorded; since 3B the last stage closes it only once fully paid — accounts_test.mjs)
  *  13  a stock order still confirms with its button; a revision carries the acceptance
  */
 import path from 'node:path';
@@ -390,11 +390,17 @@ try {
   events = await ACC.orderEvents(db, COMPANY, O1.id);
   ok('every tick and undo is an event billing reads', events.filter((e) => e.type === 'post_stage_done').length === 2 && events.some((e) => e.type === 'post_stage_undone') && events.find((e) => e.type === 'post_stage_done').date === '2026-10-18');
   const d2 = await BOARD.markStageDone(db, c, c1.stages[1].id, { note: 'Erected.' });
-  ok('the last stage done → the order closes by itself', d2.orderClosed === true);
+  // Step 3B (§74, user 2026-10-18): an order with accepted terms closes when its stages are done AND it is fully paid —
+  // accounts_test.mjs drives the payments and the close; here nothing is billed, so it stays open and says what is owed.
+  ok('the last stage done, nothing paid → the order stays open (3B: it closes once fully paid)', d2.orderClosed === false);
   board = await BOARD.orderBoard(db, COMPANY, { search: tag });
-  ok('…and the board shows it Closed', card(board, O1.id)?.lane === 'closed');
+  c1 = card(board, O1.id);
+  ok('…the board keeps it in Post-production, every stage done, no Close yet, and says what is to come', c1?.lane === 'post_production' && c1.stagesDone === 2 && c1.canClose === false && !!c1.facts.payment && c1.facts.payment.fullyPaid === false, j(c1?.facts?.payment));
   events = await ACC.orderEvents(db, COMPANY, O1.id);
-  ok('an event "order_closed" is recorded', events.some((e) => e.type === 'order_closed'));
+  ok('no "order_closed" event yet', !events.some((e) => e.type === 'order_closed'));
+  await SO.setOrderStatus(db, c, O1.id, 'closed', { fromRoute: true });
+  board = await BOARD.orderBoard(db, COMPANY, { search: tag });
+  ok('closed by hand (the status route), the board shows it Closed', card(board, O1.id)?.lane === 'closed');
   ok('the lanes are the seven, in order', board.lanes.map((l) => l.key).join(',') === 'inquiry,pending_approval,material,in_production,dispatched,post_production,closed');
   ok('laneOf: an inquiry with nothing pending is Inquiry', BOARD.laneOf({ status: 'inquiry', acceptancePending: false }) === 'inquiry');
 

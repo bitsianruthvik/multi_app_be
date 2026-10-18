@@ -230,7 +230,7 @@ try {
   eq('for order B: ours + B\'s = 7', avB.free, 7);
   ok('A\'s lot never shows for order B', !avB.batches.some((b) => b.batchId === lotPA.id));
   await expectRefusal('A\'s material is not issued to order B', () => post({ movementType: 'issue', fromAreaId: F.area, orderId: F.OB, lines: [{ itemId: F.P, quantity: 1, batchId: lotPA.id }] }), /used only for their order/);
-  await expectRefusal('…nor issued with no order at all', () => post({ movementType: 'issue', fromAreaId: F.area, lines: [{ itemId: F.P, quantity: 1, batchId: lotPA.id }] }), /issued only to their order/);
+  await expectRefusal('…nor issued with no order at all', () => post({ movementType: 'issue', usedFor: 'general', fromAreaId: F.area, lines: [{ itemId: F.P, quantity: 1, batchId: lotPA.id }] }), /issued only to their order/);
   const own = await ROLL.ownFreeStock(conn, COMPANY, [F.P, F.S]);
   ok('ownFreeStock (for the buy list) is ours only', own.get(F.P) === 4 && own.get(F.S) === 10, JSON.stringify([...own]));
 

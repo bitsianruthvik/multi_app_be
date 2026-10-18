@@ -6739,3 +6739,177 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = D
              AND name IN ('cf_erp_approve_order_acceptance', 'cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po',
                           'cf_erp_approve_po_close_short', 'cf_erp_approve_rate_change', 'cf_erp_approve_rebaseline')) >= 6,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §74  ACCOUNTS — Billing board, milestone invoices, receipts, order costing, "Used for" on every issue (2026-10-18)
+-- The same text as TM/s74.sql. Additive and guarded: safe to re-run. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md
+-- "2026-10-18 — Step 3B". Services: billingService.js (milestones → cards, the board, raise an invoice, the PDF),
+-- receiptService.js (payments, part payments, outstanding, the order closes when paid), costingService.js (one cost
+-- sheet per sales order, read off the ledger with valuationService.orderCostSheets).
+--
+-- User, 2026-10-18: a new top-level "Accounts". BILLING BOARD — one card per payment milestone of an accepted order
+-- (or per dispatch / per week for pro-rata ones), lanes Upcoming → Due to bill → Billed → Paid; a milestone becomes
+-- DUE by itself from what the app tracks. "Raise invoice" on due cards → a GST TAX INVOICE (PDF). RECEIPTS against an
+-- invoice / order, part payments, outstanding. ORDER COSTING per sales order. Every ISSUE from stock says what it is
+-- USED FOR: a sales order (optionally its line) or General (overhead).
+--
+--   cf_invoices.invoice_kind      'dispatch' (the §37 invoice with each truck, as before) | 'billing' (raised from the
+--                                 Billing board; its lines are cf_invoice_billing_lines). Existing rows: 'dispatch'.
+--   cf_invoices.credit_days       billing invoices: the customer pays within N days of the invoice date …
+--   cf_invoices.due_date          … by this date (invoice date + credit days). Past it and not fully paid = overdue.
+--   cf_invoice_billing_lines      one line per billed CARD (order, milestone key, part key — 'all', a week 'w2026-10-12',
+--                                 a dispatch 'mv123') and tax group (HSN | rate; tax_key). claim = 1 while the line holds
+--                                 its card (a live line of an issued invoice); a cancelled invoice sets it NULL, so a card
+--                                 is billed AT MOST ONCE (uq_cibl_claim) and a cancel frees it. Money is frozen here.
+--   cf_receipts                   a payment received: the order (its customer), the date, the amount, how (bank,
+--                                 cheque, UPI, cash, other) and its reference. invoice_id = the invoice it was recorded
+--                                 against (if any). Removed = soft-deleted with a reason.
+--   cf_receipt_allocations        how a receipt is spread over the order's invoices (the named one first, then the
+--                                 oldest open one). What is not allocated is ON ACCOUNT for the order and goes onto the
+--                                 next invoice raised.
+--   cf_stock_movements.used_for   an ISSUE says what it is used for: 'order' (order_id, optionally order_line_id) or
+--                                 'general' (overhead). NULL on rows from before §74 and on movements that are not issues.
+--   Tags cf_erp_accounts_view (see the Accounts screens) and cf_erp_accounts_manage (raise invoices, record receipts),
+--   granted to every company's admin role for cf_erp and to company 30005's "MD"; an "Accounts" role can be given them.
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_invoices' AND COLUMN_NAME = 'invoice_kind');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_invoices ADD COLUMN invoice_kind VARCHAR(12) NOT NULL DEFAULT 'dispatch'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_invoices' AND COLUMN_NAME = 'credit_days');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_invoices ADD COLUMN credit_days INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_invoices' AND COLUMN_NAME = 'due_date');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_invoices ADD COLUMN due_date DATE NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_invoices' AND INDEX_NAME = 'idx_cinv_kind');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_invoices ADD INDEX idx_cinv_kind (company_id, invoice_kind, status)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND COLUMN_NAME = 'used_for');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_movements ADD COLUMN used_for VARCHAR(10) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_invoice_billing_lines (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  invoice_id      INT            NOT NULL,
+  line_no         INT            NOT NULL,
+  order_id        INT            NOT NULL,
+  milestone_key   VARCHAR(40)    NOT NULL,
+  part_key        VARCHAR(60)    NOT NULL,           -- 'all' | 'w<monday>' | 'mv<movement id>' | '<key>+' (a late top-up)
+  tax_key         VARCHAR(40)    NOT NULL DEFAULT '', -- '<hsn>|<rate>|<service>' — a card split over its tax groups
+  claim           TINYINT        NULL DEFAULT 1,
+  label           VARCHAR(255)   NULL,               -- the milestone's name
+  description     VARCHAR(500)   NULL,
+  part_note       VARCHAR(255)   NULL,               -- "Week of 2026-10-12: 3.2 t through Fabrication", "Dispatch MV-000812"
+  fraction        DECIMAL(12,8)  NULL,               -- the share of the milestone this card is
+  due_on          DATE           NULL,               -- when the card became due
+  hsn_code        VARCHAR(8)     NULL,
+  is_service      TINYINT(1)     NULL,
+  gst_rate        DECIMAL(5,2)   NULL,
+  taxable         DECIMAL(18,2)  NOT NULL,
+  cgst            DECIMAL(18,2)  NULL,
+  sgst            DECIMAL(18,2)  NULL,
+  igst            DECIMAL(18,2)  NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cibl_tenant (company_id, id),
+  UNIQUE KEY uq_cibl_claim  (company_id, order_id, milestone_key, part_key, tax_key, claim),
+  KEY idx_cibl_invoice (company_id, invoice_id),
+  KEY idx_cibl_order   (company_id, order_id),
+
+  CONSTRAINT fk_cibl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cibl_invoice FOREIGN KEY (company_id, invoice_id) REFERENCES cf_invoices(company_id, id),
+  CONSTRAINT fk_cibl_order   FOREIGN KEY (company_id, order_id)   REFERENCES cf_sales_orders(company_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_receipts (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  code            VARCHAR(30)    NULL,               -- RC-000123
+  order_id        INT            NOT NULL,
+  customer_id     INT            NULL,
+  invoice_id      INT            NULL,               -- recorded against this invoice (else against the order)
+  receipt_date    DATE           NOT NULL,
+  amount          DECIMAL(18,2)  NOT NULL,
+  mode            VARCHAR(12)    NOT NULL DEFAULT 'bank',   -- bank | cheque | upi | cash | other
+  reference       VARCHAR(100)   NULL,               -- UTR, cheque number …
+  notes           VARCHAR(500)   NULL,
+  removed_reason  VARCHAR(255)   NULL,
+  removed_by      INT            NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT            NULL,
+
+  UNIQUE KEY uq_crcp_tenant (company_id, id),
+  KEY idx_crcp_order (company_id, order_id, receipt_date),
+  KEY idx_crcp_date  (company_id, receipt_date),
+
+  CONSTRAINT fk_crcp_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_crcp_order    FOREIGN KEY (company_id, order_id)    REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_crcp_customer FOREIGN KEY (company_id, customer_id) REFERENCES cf_parties(company_id, id),
+  CONSTRAINT fk_crcp_invoice  FOREIGN KEY (company_id, invoice_id)  REFERENCES cf_invoices(company_id, id),
+  CONSTRAINT fk_crcp_creator  FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_crcp_remover  FOREIGN KEY (removed_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_receipt_allocations (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  receipt_id      INT            NOT NULL,
+  invoice_id      INT            NOT NULL,
+  amount          DECIMAL(18,2)  NOT NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_cral_tenant (company_id, id),
+  KEY idx_cral_receipt (company_id, receipt_id),
+  KEY idx_cral_invoice (company_id, invoice_id),
+
+  CONSTRAINT fk_cral_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cral_receipt FOREIGN KEY (company_id, receipt_id) REFERENCES cf_receipts(company_id, id),
+  CONSTRAINT fk_cral_invoice FOREIGN KEY (company_id, invoice_id) REFERENCES cf_invoices(company_id, id)
+);
+
+-- The two Accounts permissions: a feature and a capability each.
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT t.name, t.tag, t.kind
+  FROM (SELECT 'CF ERP: view accounts (billing, invoices, receipts, costing)' AS name, 'cf_erp_accounts_view' AS tag, 'frontend' AS kind
+        UNION ALL SELECT 'CF ERP: manage accounts (raise invoices, record receipts)', 'cf_erp_accounts_manage', 'backend') t
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = t.tag AND f.deleted_at IS NULL);
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag IN ('cf_erp_accounts_view', 'cf_erp_accounts_manage')
+   AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+-- Granted to every company's ADMIN role for cf_erp, and to Placebo's MD.
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND (LOWER(r.name) = 'admin' OR (a.company_id = 30005 AND UPPER(r.name) = 'MD'))
+   AND fc.name IN ('cf_erp_accounts_view', 'cf_erp_accounts_manage')
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME IN ('cf_invoice_billing_lines', 'cf_receipts', 'cf_receipt_allocations')) = 3
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_invoices' AND COLUMN_NAME IN ('invoice_kind', 'credit_days', 'due_date')) = 3
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_stock_movements' AND COLUMN_NAME = 'used_for') = 1
+      AND (SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL
+             AND name IN ('cf_erp_accounts_view', 'cf_erp_accounts_manage')) >= 2,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

@@ -22,6 +22,7 @@ import { loadMaster } from './records.js';
 import { listStock } from './stockService.js';
 import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
 import { untrackedOf } from '../lib/nestUntracked.js';
+import { cutPlaces } from '../lib/cutPlaces.js';
 
 const EPS = 1e-9;
 const round2 = (n) => Number(Number(n).toFixed(2));
@@ -520,4 +521,102 @@ export async function orderCosts(db, companyId, orderId) {
     notOnALine: { issued: loose.issued, customerIssued: loose.customerIssued, scrap: loose.scrap },
     totals,
   };
+}
+
+/* ---- the cost sheet of many orders at once (Accounts › Order costing, init.sql §74) ------------------------------ */
+
+/**
+ * THE COST SHEET, read off the stock ledger for many orders at once (fixed reads: the ledger grouped, the items'
+ * classification, the cut places, the orders' MR items). Every revision of an order counts for it (same number).
+ * Per order, in rupees (ours at cost; NULL cost = "not costed", counted apart, never as 0):
+ *
+ *   material      what left stock for the order and did not come back: plates / sections / bought parts — taken by
+ *                 the production ledger (cut, step start), issued against the order or written off. Net of returns
+ *                 (a cut undone puts the plate back).
+ *   consumables   ISSUES from stock "Used for" the order (§74) of items that are not on the order's MR and are not
+ *                 plate or section stock: welding wire, gas, paint … (an issue of an MR item or a plate is material).
+ *   customer      the customer's own material used: quantity only, ₹0 to us (their reference value shown apart).
+ *   credits       scrap at the scrap rate (the value that went into the SCRAP area) + offcuts back to stock (the value
+ *                 of the offcut pieces cut from the order's plates). Net of undo.
+ * Left out: what production made (its own lots — pieces moving through WIP, finished goods, shipments) and WIP legs.
+ *
+ * Returns Map orderId → { material, consumables, customer, credits: { scrap, offcuts, total }, uncostedRows,
+ * items: [{ itemId, code, name, uom, kind, quantity, value, uncosted }] }.
+ */
+export async function orderCostSheets(db, companyId, orderIds) {
+  const ids = [...new Set((orderIds ?? []).map(Number))];
+  const out = new Map();
+  if (!ids.length) return out;
+  const [codes] = await db.query('SELECT id, code_active FROM cf_sales_orders WHERE company_id = ? AND id IN (?)', [companyId, ids]);
+  const actives = [...new Set(codes.map((r) => r.code_active).filter(Boolean))];
+  const [fam] = actives.length ? await db.query('SELECT id, code_active FROM cf_sales_orders WHERE company_id = ? AND code_active IN (?) AND deleted_at IS NULL', [companyId, actives]) : [[]];
+  const ownerOf = new Map();                       // any revision's id → the asked order's id
+  for (const r of codes) ownerOf.set(Number(r.id), Number(r.id));
+  for (const f of fam) {
+    const asked = codes.find((x) => x.code_active === f.code_active);
+    if (asked && !ownerOf.has(Number(f.id))) ownerOf.set(Number(f.id), Number(asked.id));
+  }
+  const all = [...ownerOf.keys()];
+  const [[rows], [mrItems], places] = await Promise.all([
+    db.query(
+      `SELECT m.order_id, m.movement_type, m.used_for, l.item_id, a.purpose, (COALESCE(b.owner_party_id, 0) <> 0) AS theirs,
+              SUM(l.quantity) AS qty, SUM(l.value) AS value, SUM(l.value IS NULL) AS uncosted, COUNT(*) AS n
+         FROM cf_stock_ledger l
+         JOIN cf_stock_movements m ON m.id = l.movement_id AND m.deleted_at IS NULL
+         JOIN cf_stocking_areas a ON a.id = l.stocking_area_id
+         LEFT JOIN cf_stock_batches b ON b.id = l.batch_id
+        WHERE l.company_id = ? AND m.order_id IN (?) AND m.movement_type IN ('issue', 'transform', 'scrap')
+          AND b.production_item_id IS NULL
+        GROUP BY m.order_id, m.movement_type, m.used_for, l.item_id, a.purpose, (COALESCE(b.owner_party_id, 0) <> 0)`,
+      [companyId, all]),
+    db.query(
+      `SELECT DISTINCT r.order_id, rl.item_id FROM cf_requisition_lines rl JOIN cf_requisitions r ON r.id = rl.requisition_id AND r.deleted_at IS NULL
+        WHERE rl.company_id = ? AND r.order_id IN (?) AND rl.deleted_at IS NULL`,
+      [companyId, all]),
+    cutPlaces(db, companyId),
+  ]);
+  const itemIds = [...new Set(rows.map((r) => Number(r.item_id)))];
+  const [items] = itemIds.length ? await db.query(
+    `SELECT m.id, m.code, m.name, m.classification_id, i.uom FROM cf_master_records m LEFT JOIN cf_item_details i ON i.master_id = m.id
+      WHERE m.company_id = ? AND m.id IN (?)`, [companyId, itemIds]) : [[]];
+  const itemOf = new Map(items.map((i) => [Number(i.id), i]));
+  const nodeIn = (set, itemId) => set?.has(Number(itemOf.get(Number(itemId))?.classification_id));
+  const isStockPlate = (id) => nodeIn(places.plate?.stockIds, id) || nodeIn(places.section?.stockIds, id);
+  const isOffcut = (id) => nodeIn(places.plate?.offcutIds, id) || nodeIn(places.section?.offcutIds, id);
+  const onMr = new Set(mrItems.map((r) => `${ownerOf.get(Number(r.order_id)) ?? r.order_id}:${r.item_id}`));
+  const sheet = () => ({ material: 0, consumables: 0, customer: { rows: 0, quantity: 0 }, credits: { scrap: 0, offcuts: 0, total: 0 }, uncostedRows: 0, items: new Map() });
+  for (const id of ids) out.set(id, sheet());
+  const addItem = (s, itemId, kind, qty, value, uncosted) => {
+    const k = `${kind}:${itemId}`;
+    const it = itemOf.get(Number(itemId));
+    const e = s.items.get(k) ?? { itemId: Number(itemId), code: it?.code ?? null, name: it?.name ?? null, uom: it?.uom ?? null, kind, quantity: 0, value: 0, uncosted: 0 };
+    e.quantity = round6(e.quantity + qty); e.value = round2(e.value + value); e.uncosted += uncosted;
+    s.items.set(k, e);
+  };
+  for (const r of rows) {
+    const s = out.get(ownerOf.get(Number(r.order_id)));
+    if (!s) continue;
+    const purpose = r.purpose;
+    if (purpose === 'dispatch' || purpose === 'wip') continue;         // shipments; pieces in production
+    const qty = Number(r.qty);
+    const value = Number(r.value ?? 0);
+    const uncosted = Number(r.uncosted);
+    if (Number(r.theirs)) {
+      if (purpose !== 'scrap' && qty < 0) { s.customer.rows += Number(r.n); s.customer.quantity = round6(s.customer.quantity - qty); addItem(s, r.item_id, 'customer', -qty, 0, 0); }
+      continue;
+    }
+    if (purpose === 'scrap') { s.credits.scrap = round2(s.credits.scrap + value); addItem(s, r.item_id, 'scrap', qty, value, uncosted); s.uncostedRows += uncosted; continue; }
+    if (isOffcut(r.item_id) && value > 0) { s.credits.offcuts = round2(s.credits.offcuts + value); addItem(s, r.item_id, 'offcut', qty, value, uncosted); continue; }
+    const consumable = r.movement_type === 'issue' && r.used_for === 'order' && !isStockPlate(r.item_id) && !isOffcut(r.item_id)
+      && !onMr.has(`${ownerOf.get(Number(r.order_id))}:${r.item_id}`);
+    s.uncostedRows += uncosted;
+    if (consumable) { s.consumables = round2(s.consumables - value); addItem(s, r.item_id, 'consumable', -qty, -value, uncosted); }
+    else { s.material = round2(s.material - value); addItem(s, r.item_id, 'material', -qty, -value, uncosted); }
+  }
+  for (const s of out.values()) {
+    s.credits.total = round2(s.credits.scrap + s.credits.offcuts);
+    s.items = [...s.items.values()].filter((i) => Math.abs(i.quantity) > 1e-9 || Math.abs(i.value) > 0.004)
+      .sort((a, b) => a.kind.localeCompare(b.kind) || Math.abs(b.value) - Math.abs(a.value));
+  }
+  return out;
 }

@@ -23,6 +23,8 @@ export const PERM = {
   plateChangeApprove: 'cf_erp_plate_change_approve', // MD APPROVAL (label since §71): plate changes / substitutes (init.sql §62, §68); admin and MD.
   // §73: purchase orders, acceptances, rate changes, close short … are approved in the Management inbox, each by its own
   // tag — approvalService.APPROVAL_TYPES (cf_erp_approve_*).
+  accountsView: 'cf_erp_accounts_view',     // §74: Accounts — the Billing board, invoices, receipts, order costing
+  accounts: 'cf_erp_accounts_manage',       // §74: raise invoices from due cards, record and remove receipts
   floor: 'cf_erp_floor',                    // the machine log: read the floor screens and record work and stops (init.sql §32)
 };
 

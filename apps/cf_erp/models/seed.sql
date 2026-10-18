@@ -28,7 +28,9 @@ SELECT x.feature_name, x.feature_tag, x.type
     SELECT 'CF ERP: approve contractor POs',                 'cf_erp_approve_contractor_po',     'backend'          UNION ALL
     SELECT 'CF ERP: approve closing a PO short',             'cf_erp_approve_po_close_short',    'backend'          UNION ALL
     SELECT 'CF ERP: approve rate changes',                   'cf_erp_approve_rate_change',       'backend'          UNION ALL
-    SELECT 'CF ERP: approve re-baselines',                   'cf_erp_approve_rebaseline',        'backend'
+    SELECT 'CF ERP: approve re-baselines',                   'cf_erp_approve_rebaseline',        'backend'          UNION ALL
+    SELECT 'CF ERP: view accounts (billing, invoices, receipts, costing)', 'cf_erp_accounts_view', 'frontend'     UNION ALL
+    SELECT 'CF ERP: manage accounts (raise invoices, record receipts)', 'cf_erp_accounts_manage', 'backend'
   ) x
  WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = x.feature_tag AND f.deleted_at IS NULL);
 
@@ -39,11 +41,12 @@ SELECT f.feature_tag, JSON_ARRAY(f.id)
  WHERE f.feature_tag IN ('cf_erp_catalog_view', 'cf_erp_catalog_manage', 'cf_erp_setup_manage', 'cf_erp_codegen_manage',
                      'cf_erp_orders_view', 'cf_erp_orders_manage', 'cf_erp_parties_manage',
                      'cf_erp_production_view', 'cf_erp_production_manage', 'cf_erp_inventory_view', 'cf_erp_inventory_manage', 'cf_erp_floor', 'cf_erp_purchase_approve', 'cf_erp_plate_change_approve',
-                     'cf_erp_approve_order_acceptance', 'cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po', 'cf_erp_approve_po_close_short', 'cf_erp_approve_rate_change', 'cf_erp_approve_rebaseline')
+                     'cf_erp_approve_order_acceptance', 'cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po', 'cf_erp_approve_po_close_short', 'cf_erp_approve_rate_change', 'cf_erp_approve_rebaseline',
+                     'cf_erp_accounts_view', 'cf_erp_accounts_manage')
    AND f.deleted_at IS NULL
    AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
 
--- 3. Every company's admin role gets all twenty (plate-change approve goes to NO other role by default), for that company's cf_erp app.
+-- 3. Every company's admin role gets all twenty-two (plate-change approve goes to NO other role by default), for that company's cf_erp app.
 --    (The backend lets admins through anyway; the frontend's usePermission does not.)
 INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
 SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
@@ -52,7 +55,8 @@ SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
   JOIN features_capability fc ON fc.name IN ('cf_erp_catalog_view', 'cf_erp_catalog_manage', 'cf_erp_setup_manage', 'cf_erp_codegen_manage',
                      'cf_erp_orders_view', 'cf_erp_orders_manage', 'cf_erp_parties_manage',
                      'cf_erp_production_view', 'cf_erp_production_manage', 'cf_erp_inventory_view', 'cf_erp_inventory_manage', 'cf_erp_floor', 'cf_erp_purchase_approve', 'cf_erp_plate_change_approve',
-                     'cf_erp_approve_order_acceptance', 'cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po', 'cf_erp_approve_po_close_short', 'cf_erp_approve_rate_change', 'cf_erp_approve_rebaseline')
+                     'cf_erp_approve_order_acceptance', 'cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po', 'cf_erp_approve_po_close_short', 'cf_erp_approve_rate_change', 'cf_erp_approve_rebaseline',
+                     'cf_erp_accounts_view', 'cf_erp_accounts_manage')
                              AND fc.deleted_at IS NULL
  WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
    AND NOT EXISTS (

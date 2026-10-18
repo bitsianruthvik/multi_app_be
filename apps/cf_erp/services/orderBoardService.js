@@ -9,7 +9,7 @@
  *   in_production     a line released to production (production orders come later; for now a release)
  *   dispatched        something shipped, not everything
  *   post_production   everything shipped; the card is the order's own post-production stages as a checklist
- *   closed            closed (all stages done — and, in step 3B, fully paid)
+ *   closed            closed: every stage done and — for an order with accepted terms (step 3B, §74) — FULLY PAID
  * Ticking a stage "Done" (a date and a note) is recorded (cf_order_post_stages + an event in cf_order_events, which
  * billing reads in 3B). When the last stage is done and everything is shipped, the order closes by itself.
  */
@@ -60,7 +60,8 @@ export async function orderBoard(db, companyId, q = {}) {
   const lanes = LANES.map((l) => ({ ...l, cards: [] }));
   if (!orders.length) return { lanes, today: today() };
   const ids = orders.map((o) => o.id);
-  const [[lines], acc, stagesBy, mrs] = await Promise.all([
+  const { orderBilling } = await import('./billingService.js');
+  const [[lines], acc, stagesBy, mrs, billing] = await Promise.all([
     db.query(
       `SELECT l.order_id, COUNT(*) AS n, SUM(LEAST(COALESCE(l.delivered_qty, 0), l.quantity)) AS delivered, SUM(l.quantity) AS quantity,
               SUM(COALESCE(l.delivered_qty, 0) > 0) AS any_delivered, SUM(COALESCE(l.delivered_qty, 0) + 0.000001 >= l.quantity) AS lines_delivered,
@@ -70,6 +71,7 @@ export async function orderBoard(db, companyId, q = {}) {
     acceptanceStates(db, companyId, ids),
     postStagesOf(db, companyId, ids),
     readRequisitions(db, companyId, { open: true }),
+    orderBilling(db, companyId, ids),
   ]);
   const lineOf = new Map(lines.map((l) => [Number(l.order_id), l]));
   const mrOf = new Map();
@@ -97,6 +99,7 @@ export async function orderBoard(db, companyId, q = {}) {
     const lane = laneOf(f);
     const committed = dateText(o.committed_date);
     const stagesDone = stages.filter((s) => s.done).length;
+    const bill = billing.get(Number(o.id))?.summary ?? null;
     lanes.find((x) => x.key === lane).cards.push({
       id: o.id, code: o.code, title: o.title ?? null, customer: o.customer_name ?? null, status: o.status, lane,
       committedDate: committed, overdue: !!committed && committed < t && o.status !== 'closed',
@@ -107,11 +110,16 @@ export async function orderBoard(db, companyId, q = {}) {
         materialInPlace: !!m && !m.held && m.materials > 0 && m.locked >= m.materials,
         acceptance: a.approved ? { status: 'approved', version: a.approved.version } : a.pending ? { status: 'pending', version: a.pending.version } : a.sentBack ? { status: a.sentBack.status, note: a.sentBack.decisionNote ?? null } : null,
         rateChangePending: !!(a.approved && a.pending),
+        // §74: the money — an order with accepted terms closes only when it is fully paid.
+        payment: bill ? {
+          fullyPaid: bill.fullyPaid, outstanding: bill.outstanding, due: bill.due, upcoming: bill.upcoming, received: bill.received,
+          text: bill.fullyPaid ? 'Fully paid' : bill.outstanding > 0.5 ? `₹${Number(bill.outstanding).toLocaleString('en-IN')} to be received` : bill.due > 0 ? `₹${Number(bill.due).toLocaleString('en-IN')} due to bill` : 'Milestones still to come',
+        } : null,
       },
       stages,
       stagesDone,
       // Every stage done and everything shipped: the order can be closed (it closes by itself on the last tick).
-      canClose: lane === 'post_production' && stagesDone >= stages.length,
+      canClose: lane === 'post_production' && stagesDone >= stages.length && (!bill || bill.fullyPaid),
     });
   }
   return { lanes, today: t };
@@ -127,8 +135,11 @@ async function requireStage(db, companyId, id) {
   return s;
 }
 
-/** Everything shipped, every stage done → the order closes by itself (salesOrderService records order_closed). */
-async function closeIfDone(db, c, orderId) {
+/**
+ * Everything shipped, every stage done → the order closes by itself (salesOrderService records order_closed).
+ * §74 (user, 2026-10-18): an order with accepted terms must also be FULLY PAID (every milestone billed, every invoice paid).
+ */
+export async function closeIfDone(db, c, orderId) {
   const [[r]] = await db.query(
     `SELECT o.status,
             (SELECT COUNT(*) FROM cf_order_post_stages s WHERE s.company_id = o.company_id AND s.order_id = o.id AND s.deleted_at IS NULL AND s.done_on IS NULL) AS open_stages,
@@ -138,6 +149,8 @@ async function closeIfDone(db, c, orderId) {
     [c.companyId, Number(orderId)],
   );
   if (r?.status !== 'confirmed' || Number(r.open_stages) > 0 || !Number(r.line_count) || Number(r.unshipped) > 0) return false;
+  const { paidUp } = await import('./billingService.js');
+  if (!(await paidUp(db, c.companyId, orderId)).fullyPaid) return false;
   const { setOrderStatus } = await import('./salesOrderService.js');
   await setOrderStatus(db, c, orderId, 'closed');
   return true;

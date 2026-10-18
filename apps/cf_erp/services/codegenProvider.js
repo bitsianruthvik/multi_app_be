@@ -777,6 +777,9 @@ function plainDocumentEntity(entity, label, table) {
 }
 registerEntity('purchase_request', plainDocumentEntity('purchase_request', 'Purchase requests', 'cf_purchase_requests'));
 registerEntity('rfq', plainDocumentEntity('rfq', 'Requests for quotation', 'cf_rfqs'));
+// §74: a GST tax invoice raised from Accounts › Billing. With no rule its number comes from the year's GST series
+// (INV/26-27/0001, cf_invoice_series); a rule's number must stay within 16 characters (the GST portal's limit).
+registerEntity('tax_invoice', plainDocumentEntity('tax_invoice', 'Tax invoices', 'cf_invoices'));
 
 // ---- Contractor work orders (init.sql §30) ---------------------------------------
 // A contractor's share of an order line. With no rule the number is WO-000123

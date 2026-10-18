@@ -138,7 +138,7 @@ try {
   p = await pool1(conn, F.Q);
   eq('a second receipt at 130 makes the average 115', p.avg, 115);
   eq('over 20', p.qty, 20);
-  const is1 = await post({ movementType: 'issue', fromAreaId: F.A1, lines: [{ itemId: F.Q, quantity: 5 }] });
+  const is1 = await post({ movementType: 'issue', usedFor: 'general', fromAreaId: F.A1, lines: [{ itemId: F.Q, quantity: 5 }] });
   eq('an issue leaves at the average', is1.lines[0].unitCost, 115);
   eq('value 575', is1.lines[0].value, 575);
   eq('signed: the stock lost 575', is1.lines[0].valueChange, -575);
@@ -162,7 +162,7 @@ try {
   eq('a count that finds one more values it at the average', cnt.lines[0].valueChange, 115);
   p = await pool1(conn, F.Q);
   eq('…and it joins the average (15 again)', p.qty, 15);
-  await expectRefusal('only a receipt carries a cost', () => post({ movementType: 'issue', fromAreaId: F.A1, lines: [{ itemId: F.Q, quantity: 1, unitCost: 5 }] }), /only a receipt carries a cost/);
+  await expectRefusal('only a receipt carries a cost', () => post({ movementType: 'issue', usedFor: 'general', fromAreaId: F.A1, lines: [{ itemId: F.Q, quantity: 1, unitCost: 5 }] }), /only a receipt carries a cost/);
 
   section('3. A reversal moves the exact opposite value');
   const rv = await STOCK.reverseMovement(conn, c, sc.id, { reason: 'found it' });
@@ -178,7 +178,7 @@ try {
   const lot2 = b2.lines[0].batch.id;
   const [[lot1Row]] = await conn.query('SELECT unit_cost FROM cf_stock_batches WHERE id = ?', [lot1]);
   eq('the lot holds its receipt cost', Number(lot1Row.unit_cost), 2000);
-  const bi = await post({ movementType: 'issue', fromAreaId: F.A1, lines: [{ itemId: F.B, quantity: 2, batchId: lot2 }] });
+  const bi = await post({ movementType: 'issue', usedFor: 'general', fromAreaId: F.A1, lines: [{ itemId: F.B, quantity: 2, batchId: lot2 }] });
   eq('an issue from a lot leaves at THAT lot\'s cost', bi.lines[0].value, 5000);
   const top = await post({ movementType: 'receipt', partyId: F.supplier, toAreaId: F.A1, lines: [{ itemId: F.B, quantity: 5, unitCost: 2600, batchId: lot1 }] });
   eq('a top-up line carries the price it came at', top.lines[0].unitCost, 2600);
@@ -191,7 +191,7 @@ try {
   const u2 = await post({ movementType: 'receipt', toAreaId: F.A1, lines: [{ itemId: F.I, quantity: 1, unitCost: 60000, batch: { code: `${RUN}-U2` } }] }, { fromProduction: true });
   ok('each unit is its own lot', u1.lines[0].batch.id !== u2.lines[0].batch.id);
   // Production takes a unit back off the shelf (dispatch does the same), so the issue is production's too.
-  const ui = await post({ movementType: 'issue', fromAreaId: F.A1, lines: [{ itemId: F.I, quantity: 1, batchId: u2.lines[0].batch.id }] }, { fromProduction: true });
+  const ui = await post({ movementType: 'issue', usedFor: 'general', fromAreaId: F.A1, lines: [{ itemId: F.I, quantity: 1, batchId: u2.lines[0].batch.id }] }, { fromProduction: true });
   eq('issuing unit 2 moves unit 2\'s cost', ui.lines[0].value, 60000);
 
   section('6. Not costed: NULL, never 0 — and costed stock leaves first');
@@ -202,13 +202,13 @@ try {
   let stN = await STOCK.itemStock(conn, COMPANY, F.N);
   eq('its stock row has no value', stN.rows[0].value, null);
   eq('…and 10 not costed', stN.rows[0].uncostedQty, 10);
-  const nIss = await post({ movementType: 'issue', fromAreaId: F.A1, lines: [{ itemId: F.N, quantity: 2 }] });
+  const nIss = await post({ movementType: 'issue', usedFor: 'general', fromAreaId: F.A1, lines: [{ itemId: F.N, quantity: 2 }] });
   eq('an issue of not-costed stock is not costed', nIss.lines[0].value, null);
   await post({ movementType: 'receipt', partyId: F.supplier, toAreaId: F.A1, lines: [{ itemId: F.N, quantity: 5, unitCost: 10 }] });
   stN = await STOCK.itemStock(conn, COMPANY, F.N);
   eq('13 on hand, 5 of them costed at 10: value 50', stN.totals.value, 50);
   eq('…and 8 not costed', stN.totals.uncostedQty, 8);
-  const nIss2 = await post({ movementType: 'issue', fromAreaId: F.A1, lines: [{ itemId: F.N, quantity: 3 }] });
+  const nIss2 = await post({ movementType: 'issue', usedFor: 'general', fromAreaId: F.A1, lines: [{ itemId: F.N, quantity: 3 }] });
   eq('costed stock leaves first, at the average', nIss2.lines[0].value, 30);
   p = await pool1(conn, F.N);
   eq('2 costed left', p.qty, 2);

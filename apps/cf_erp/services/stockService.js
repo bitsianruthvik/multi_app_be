@@ -393,6 +393,7 @@ async function movementCode(db, c, type, input, areaId) {
  *   orderId?   issue / scrap: the sales order it is for; receipt: the order the
  *              customer supplied it for; return: the order it is returned against
  *   orderLineId?  issue / scrap: the line of that order (job cost is per line)
+ *   usedFor?   issue (§74, REQUIRED): 'order' (with orderId) or 'general' (overhead) — an issue naming an orderId is for that order
  *   ownerPartyId?, ownerOrderId?  receipt: whose it is — default for every line
  *   reference?, reason? (required for adjustment, scrap and return), notes?,
  *   returnKg?  return: scrap handed back by weight (ownershipService)
@@ -407,6 +408,10 @@ async function movementCode(db, c, type, input, areaId) {
  * opts.allowEmpty — a return with no stock lines (only offcuts or scrap by
  * weight go back): the header is written alone. Only ownershipService sets it.
  */
+/** §74: what an issue is used for. */
+export const USED_FOR = ['order', 'general'];
+export const USED_FOR_MISSING = 'Say what it is used for: a sales order, or General (overhead).';
+
 export async function postMovement(db, c, input = {}, opts = {}) {
   // Production putting its own finished work on the shelf — never settable from
   // a request body, so a hand-typed receipt still refuses what only production
@@ -475,6 +480,17 @@ export async function postMovement(db, c, input = {}, opts = {}) {
       if (!ln) problems.push(`That line is not on order ${order.code}.`);
       else orderLine = ln;
     }
+  }
+  // §74 (user, 2026-10-18): every ISSUE says what it is USED FOR — a sales order (optionally its line) or General
+  // (overhead). Order costing reads consumables from these.
+  let usedFor = null;
+  if (type === 'issue') {
+    const asked = blank(input.usedFor) ? null : String(input.usedFor);
+    if (asked && !USED_FOR.includes(asked)) problems.push('Used for is a sales order or General.');
+    else if (asked === 'general' && !blank(input.orderId)) problems.push('An issue is used for a sales order or for General — not both.');
+    else if (asked === 'order' && blank(input.orderId)) problems.push('Choose the sales order it is used for.');
+    else if (!asked && blank(input.orderId)) problems.push(USED_FOR_MISSING);
+    usedFor = asked ?? (blank(input.orderId) ? null : 'order');
   }
   const reason = blank(input.reason) ? null : String(input.reason).trim().slice(0, 255);
   if (type === 'adjustment' && !reason) problems.push('Say why the stock changes — a count, damage found, a correction.');
@@ -559,10 +575,10 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   const movementOrder = order ?? (type === 'receipt' && receiptOrders.size === 1 ? { id: [...receiptOrders][0] } : null);
   const code = await movementCode(db, c, type, input, moving[0]?.legs[0]?.area?.id ?? null);
   const [r] = await db.query(
-    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, notes, return_kg, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, notes, return_kg, used_for, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [c.companyId, code, type, date, party?.id ?? null, movementOrder?.id ?? null, orderLine?.id ?? null,
-      blank(input.reference) ? null : String(input.reference).trim().slice(0, 100), reason, blank(input.notes) ? null : String(input.notes), returnKg, c.userId],
+      blank(input.reference) ? null : String(input.reference).trim().slice(0, 100), reason, blank(input.notes) ? null : String(input.notes), returnKg, usedFor, c.userId],
   );
   const movementId = r.insertId;
   if (!code) await db.query('UPDATE cf_stock_movements SET code = ? WHERE id = ?', [`${PREFIX[type]}-${String(movementId).padStart(6, '0')}`, movementId]);
@@ -846,10 +862,10 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
     }
   }
   const [r] = await db.query(
-    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, reversal_of_id, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, reversal_of_id, used_for, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [c.companyId, `REV-${m.code}`.slice(0, 60), m.movement_type, todayText(), m.party_id, m.order_id, m.order_line_id ?? null, m.reference,
-      String(reason).trim().slice(0, 255), m.id, c.userId],
+      String(reason).trim().slice(0, 255), m.id, m.used_for ?? null, c.userId],
   );
   const revId = r.insertId;
   for (const l of legs) {
@@ -907,6 +923,8 @@ function shapeMovement(m) {
     party: m.party_id ? { id: m.party_id, code: m.party_code, name: m.party_name } : null,
     order: m.order_id ? { id: m.order_id, code: m.order_code } : null,
     orderLine: m.order_line_id ? { id: m.order_line_id, lineNo: m.order_line_no ?? null } : null,
+    // §74: an issue's "Used for": 'order' | 'general' (null before §74 and on other movements).
+    usedFor: m.used_for ?? null,
     // What it moved, at cost (a transfer's two legs counted once). null = nothing
     // in it is costed; `uncostedRows` says how many ledger rows have no cost.
     value: m.abs_value == null ? null : round2(Number(m.abs_value) / (m.movement_type === 'transfer' ? 2 : 1)),

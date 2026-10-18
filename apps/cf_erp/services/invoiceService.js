@@ -147,6 +147,15 @@ export async function invoiceShipments(db, c, orderId, movementIds) {
 }
 
 /**
+ * §74: an order with an APPROVED customer acceptance is billed by its payment milestones (Accounts › Billing), so its
+ * dispatches make no draft invoice of their own — that would bill the same work twice. 1 read.
+ */
+export async function billedByMilestones(db, companyId, orderId) {
+  const [[a]] = await db.query("SELECT id FROM cf_order_acceptances WHERE company_id = ? AND order_id = ? AND status = 'approved' AND deleted_at IS NULL LIMIT 1", [companyId, Number(orderId)]);
+  return !!a;
+}
+
+/**
  * POST /orders/:id/invoices { movementIds?, invoiceId? } — a draft for shipments
  * not yet invoiced (all of the order's when none are named). invoiceId adds
  * them to that draft of the same order instead of starting a new one.
@@ -154,6 +163,7 @@ export async function invoiceShipments(db, c, orderId, movementIds) {
 export async function createInvoice(db, c, orderId, input = {}) {
   const order = await requireOrder(db, c.companyId, orderId);
   if (order.order_type === 'stock') throw invalid('STOCK_ORDER', `${order.code} is a stock order — nothing on it is sold, so there is nothing to invoice.`);
+  if (await billedByMilestones(db, c.companyId, order.id)) throw invalid('BILLED_BY_MILESTONES', `${order.code} is billed by its payment milestones — raise the invoice in Accounts › Billing.`);
   const ids = Array.isArray(input.movementIds) && input.movementIds.length ? input.movementIds.map(Number) : null;
   const shipments = await uninvoicedShipments(db, c.companyId, order.id, ids);
   if (ids) {
@@ -188,7 +198,8 @@ export async function orderInvoices(db, companyId, orderId) {
 // --- reading: drafts worked out live, issued ones from their frozen columns --------
 
 const INVOICE_SELECT = `SELECT inv.*, o.code AS order_code, p.name AS customer_name, p.code AS customer_code,
-            (SELECT COUNT(*) FROM cf_eway_bills e WHERE e.company_id = inv.company_id AND e.invoice_id = inv.id AND e.deleted_at IS NULL) AS eway_count
+            (SELECT COUNT(*) FROM cf_eway_bills e WHERE e.company_id = inv.company_id AND e.invoice_id = inv.id AND e.deleted_at IS NULL) AS eway_count,
+            (SELECT COALESCE(SUM(al.amount), 0) FROM cf_receipt_allocations al WHERE al.company_id = inv.company_id AND al.invoice_id = inv.id AND al.deleted_at IS NULL) AS received_amount
        FROM cf_invoices inv
        JOIN cf_sales_orders o ON o.id = inv.order_id
        LEFT JOIN cf_parties p ON p.id = inv.customer_id`;
@@ -244,6 +255,12 @@ async function buildViews(db, companyId, invoices) {
   );
   const linesOf = new Map(ids.map((id) => [id, []]));
   for (const r of lineRows) linesOf.get(r.invoice_id).push(r);
+  // §74: an invoice raised from the Billing board holds milestone lines (cf_invoice_billing_lines), frozen at raise.
+  const billing = invoices.filter((i) => i.invoice_kind === 'billing').map((i) => i.id);
+  if (billing.length) {
+    const { billingInvoiceLines } = await import('./billingService.js');
+    for (const [id, rows] of await billingInvoiceLines(db, companyId, billing)) linesOf.set(id, rows);
+  }
 
   let company = null; let items = new Map(); let measures = new Map(); let parties = new Map(); const addresses = new Map();
   if (drafts.length) {
@@ -342,7 +359,7 @@ function frozenView(inv, rows) {
   const lines = rows.map((r) => ({
     row: r,
     id: r.id, slNo: r.line_no, orderLineId: r.order_line_id, lineNo: r.order_line_no, movementId: r.movement_id, movementCode: r.movement_code,
-    description: r.description, hsnCode: r.hsn_code, isService: !!Number(r.is_service ?? 0),
+    description: r.description, hsnCode: r.hsn_code, isService: !!Number(r.is_service ?? 0), milestone: r.milestone ?? null,
     quantity: Number(r.quantity), uom: r.uom, billedQty: num(r.billed_qty), billedUom: r.billed_uom,
     rate: num(r.rate), rateBasis: r.rate_basis, taxable: num(r.taxable), gstRate: num(r.gst_rate),
     cgst: num(r.cgst), sgst: num(r.sgst), igst: num(r.igst),
@@ -377,6 +394,12 @@ function summaryOf(inv, view) {
     grandTotal: view.totals.grandTotal,
     irn: !!inv.irn,
     ewayBills: Number(inv.eway_count ?? 0),
+    // §74: raised from the Billing board (milestones) or with a dispatch; when it is due and what is still owed.
+    kind: inv.invoice_kind ?? 'dispatch',
+    creditDays: inv.credit_days == null ? null : Number(inv.credit_days),
+    dueDate: dateOnly(inv.due_date) ?? null,
+    received: round2(Number(inv.received_amount ?? 0)),
+    outstanding: inv.status === 'issued' ? round2(Math.max(0, Number(view.totals.grandTotal ?? 0) - Number(inv.received_amount ?? 0))) : 0,
   };
 }
 
@@ -690,6 +713,10 @@ export async function cancelInvoice(db, c, id, input = {}) {
     [String(input.reason).trim().slice(0, 255), c.userId ?? null, c.companyId, inv.id],
   );
   await db.query('UPDATE cf_invoice_lines SET claim = NULL WHERE company_id = ? AND invoice_id = ?', [c.companyId, inv.id]);
+  // §74: a billing invoice frees its cards (due again); money paid against it goes back on account.
+  if (inv.invoice_kind === 'billing') await db.query('UPDATE cf_invoice_billing_lines SET claim = NULL WHERE company_id = ? AND invoice_id = ?', [c.companyId, inv.id]);
+  const { releaseAllocations } = await import('./receiptService.js');
+  await releaseAllocations(db, c, inv.id, inv.order_id);
   return getInvoice(db, c.companyId, inv.id);
 }
 
