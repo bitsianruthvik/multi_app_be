@@ -47,12 +47,38 @@ export const DATASETS = [
   },
 ];
 
+/**
+ * PROBES: one or two sample records of an entity, every field, so the reports
+ * can be built against the fields THIS Service Layer actually has. Each is a
+ * plain GET with $top; the rows land in kd_rows as `probe:<name>` and are
+ * replaced every run. Remove a probe once the dataset it explored exists.
+ */
+const enc = encodeURIComponent;
+const PROBES = {
+  productionOrders: 'ProductionOrders?$top=1&$orderby=AbsoluteEntry%20desc',
+  genEntries: 'InventoryGenEntries?$top=1&$orderby=DocEntry%20desc',
+  genExits: 'InventoryGenExits?$top=1&$orderby=DocEntry%20desc',
+  incomingPayments: 'IncomingPayments?$top=1&$orderby=DocEntry%20desc',
+  vendorPayments: 'VendorPayments?$top=1&$orderby=DocEntry%20desc',
+  grpo: 'PurchaseDeliveryNotes?$top=1&$orderby=DocEntry%20desc',
+  warehouses: 'Warehouses?$top=2',
+  transferRequests: 'InventoryTransferRequests?$top=1&$orderby=DocEntry%20desc',
+  itemWarehouse: 'Items?$select=ItemCode,ItemWarehouseInfoCollection&$top=1&$filter=' + enc('QuantityOnStock gt 0'),
+  invoiceLines: 'Invoices?$select=DocEntry,DocumentLines&$top=1&$orderby=DocEntry%20desc',
+  crossjoin: '$crossjoin(Invoices,Invoices/DocumentLines)?$expand=' + enc('Invoices($select=DocEntry,DocDate,CardCode),Invoices/DocumentLines($select=ItemCode,Quantity,LineTotal,WarehouseCode)')
+    + '&$filter=' + enc('Invoices/DocEntry eq Invoices/DocumentLines/DocEntry') + '&$top=2',
+};
+for (const [name, path] of Object.entries(PROBES)) {
+  DATASETS.push({ key: `probe:${name}`, path, full: true, keyField: (r) => String(r.DocEntry ?? r.AbsoluteEntry ?? r.ItemCode ?? r.WarehouseCode ?? 'sample') });
+}
+
 export const byKey = Object.fromEntries(DATASETS.map((d) => [d.key, d]));
 
 const isoDay = (d) => (d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10));
 
 /** The Service Layer GET path for one dataset, given where its last good sync got to. */
 export function pathFor(ds, sinceDate) {
+  if (ds.path) return ds.path;
   const filters = [];
   if (ds.filter) filters.push(ds.filter);
   if (!ds.full) {
