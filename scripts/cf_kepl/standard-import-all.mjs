@@ -12,6 +12,7 @@
  *        [--scan]                          every folder with a bom.json, not only the finished list
  *        [--out <folder>]                  default ../drawing_bom/out
  *        [--user <id>] [--prod]            as standard-import.mjs (--prod: DB_* from TM/.env.tidb)
+ *        [--section-class BR]              as standard-import.mjs: the impact class of the section bars filled on --apply
  *
  * A set whose bom.json fails validation (schema, tree, the tree's quantities, a DXF it names that is missing) is
  * skipped and the reason said. A set already imported (same number) is reported "already there" and never written
@@ -112,8 +113,11 @@ try {
       if (APPLY) {
         if (rep.standard.alreadyThere) { await conn.rollback(); r.applied = 'already there — not written'; continue; }
         const done = await STD.importStandard(conn, c, { bom: v.bom, files: v.files, apply: true, catalog });
+        // What the drawing settles but the mapping left empty (lengths, girder type, holes, surface, bars, flows).
+        const { fillImportedGaps } = await imp('apps/cf_erp/services/standardGapFixService.js');
+        done.report.gapFill = await fillImportedGaps(conn, c, { standardId: done.standardId, bom: v.bom, sectionClass: arg('section-class') ? String(arg('section-class')).toUpperCase() : null });
         await conn.commit();
-        r.applied = `standard #${done.report.written.standardId}, version #${done.report.written.versionId}`;
+        r.applied = `standard #${done.report.written.standardId}, version #${done.report.written.versionId}; filled from the drawing: ${done.report.gapFill.values} values, ${done.report.gapFill.sections} section bars, ${done.report.gapFill.flows} flows`;
         r.created = done.report.written.newDefinitions.map((d) => `${d.name} (#${d.id} ${d.code ?? ''})`.trim());
       }
     } catch (err) {

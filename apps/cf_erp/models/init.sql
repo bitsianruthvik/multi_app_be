@@ -7985,3 +7985,53 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
              AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'nest_max_plate_sizes') = 1,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §87  AI NESTING STORED BESIDE THE MANUAL ONE — the line's AI alternative and which side is the main one (2026-10-18)
+-- The same text as TM/s87.sql. Additive and guarded: safe to re-run. Service: services/nestAlternativeService.js,
+-- routes GET/POST …/nesting/alternative[/swap] (routes/nesting.js). Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md
+-- "2026-10-18 — AI nesting beside the manual one".
+--
+-- The user (2026-10-18): whenever a manual nesting (ProNest .nif / DXF upload) is saved on a line, AI nests the same
+-- pieces in the background (Standard) and the result is STORED as the line's alternative — never replacing the
+-- uploaded nesting by itself. The Compare tab shows both; a person may make AI's nesting the main one and switch back
+-- until the line has a production order.
+--
+--   cf_nest_alternatives   ONE row per line (uq_cna_line), written over when the upload changes.
+--     run_uid              the AI run (cf_nest_runs.run_uid, purpose 'compare', scope 'subset') that IS the alternative
+--     upload_key           which upload it answers (nestCompareService.compareState's uploadKey)
+--     main_side            'uploaded' (the customer's nesting is saved on the line) | 'ai' (AI's nesting is)
+--     upload_lot_ids       the customer's plates (cf_plate_lots ids) — soft-deleted while AI's nesting is the main one,
+--                          brought back as they were (placements, offcuts, files) by "switch back"
+--     upload_file_ids      the customer's files (cf_nest_files ids) those plates came from
+--     ai_lot_ids           AI's plates written by the last swap
+--     swap_count, swapped_at, swapped_by   the last swap
+-- No column of an existing table changes. The code reads nothing more when the table is missing (no alternative).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS cf_nest_alternatives (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  order_line_id    INT           NOT NULL,
+  run_uid          CHAR(36)      NULL,
+  upload_key       VARCHAR(32)   NULL,
+  main_side        VARCHAR(10)   NOT NULL DEFAULT 'uploaded',
+  upload_lot_ids   TEXT          NULL,
+  upload_file_ids  TEXT          NULL,
+  ai_lot_ids       TEXT          NULL,
+  swap_count       INT           NOT NULL DEFAULT 0,
+  swapped_at       DATETIME(3)   NULL,
+  swapped_by       INT           NULL,
+  created_by       INT           NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_cna_tenant (company_id, id),
+  UNIQUE KEY uq_cna_line (company_id, order_line_id),
+  CONSTRAINT fk_cna_company FOREIGN KEY (company_id) REFERENCES companies (id),
+  CONSTRAINT fk_cna_line    FOREIGN KEY (company_id, order_line_id) REFERENCES cf_sales_order_lines (company_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_nest_alternatives') = 1,
+          'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

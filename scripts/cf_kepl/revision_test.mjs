@@ -780,7 +780,8 @@ try {
   // own bulk derive, ~44 on the KEPL line); the copy itself is ~30 statements.
   // 110 since 2026-10-10: the cut pieces a revision derives also take the values their own flow reads (a fixed handful of reads, not one a row).
   // §73: +2 — the revision copies the customer acceptance (its versions, its post-production checklist), set-based.
-  ok('and about a hundred for a line, not one a row', small.tally.n <= 112, String(small.tally.n));
+  // 113: +1 for the order's accepted value (orderValueService, 2026-10-19), read beside the others.
+  ok('and about a hundred for a line, not one a row', small.tally.n <= 113, String(small.tally.n));
 
   section('11b. Linked copies come along as groups of the NEW revision (init.sql §59)');
   {

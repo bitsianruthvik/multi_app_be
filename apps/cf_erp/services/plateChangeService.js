@@ -51,6 +51,10 @@ import { markUntracked, unmarkUntracked } from './nestUntrackedService.js';
 import { plateRatesPerKg } from './valuationService.js';
 import { openLines, lineNeeds } from './materialReadyService.js';
 import { syncRequisitionOfLine } from './requisitionService.js';
+// §87: AI's nesting beside the uploaded one — making it the main nesting (or switching back) is a plate change too.
+import { swapAlternative } from './nestAlternativeService.js';
+// PERFORMANCE 17: the line's fixed facts read once for the before / the action / the after.
+import { withMemo, memoized } from '../lib/requestMemo.js';
 
 const EPS = 1e-6;
 const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
@@ -90,6 +94,7 @@ export const KINDS = Object.freeze({
   untracked: { label: 'Mark pieces as cut from offcuts' },
   untracked_undo: { label: 'Undo pieces cut from offcuts' },
   substitute: { label: 'The customer sent a different plate' },
+  swap_alternative: { label: "Swap the uploaded nesting and AI's" },
 });
 
 export const STATUS_LABEL = Object.freeze({
@@ -113,6 +118,7 @@ const RUNNERS = {
   nest_plates: (db, c, lineId, body) => setNestPlates(db, c, lineId, body),
   untracked: (db, c, lineId, body) => markUntracked(db, c, lineId, body),
   untracked_undo: (db, c, lineId, body) => unmarkUntracked(db, c, lineId, body),
+  swap_alternative: (db, c, lineId, body) => swapAlternative(db, c, lineId, body),
 };
 
 /** True when the call writes nothing (a preview) — it is never held and never becomes a request. */
@@ -227,11 +233,11 @@ const posOf = (state) => {
  * cost, else last receipt, else the last price paid, else the list price — per kg) × the plate's kg. A plate
  * with none has NO price (unit null): the total is then "not costed", never 0.
  */
-async function platePrices(db, companyId, nests) {
+async function platePrices(db, companyId, nests, alsoPlates = []) {
   const out = new Map();
   const ids = [...new Set(nests.map((n) => Number(n.plateItemId)))];
   if (!ids.length) return out;
-  const rates = await plateRatesPerKg(db, companyId, ids);
+  const rates = await ratesOf(db, companyId, ids, alsoPlates.map((p) => Number(p.id)));
   for (const id of ids) {
     const r = rates.get(id);
     const n = nests.find((x) => Number(x.plateItemId) === id);
@@ -247,6 +253,17 @@ async function needOf(db, companyId, line) {
   if (!lines.length) return { known: false, items: new Map() };
   const n = (await lineNeeds(db, companyId, lines)).get(Number(line.id));
   return { known: !!n?.known, items: n?.items ?? new Map() };
+}
+
+/**
+ * Plate rates per kg, once per plate save (lib/requestMemo.js): the first ask reads `ids` AND `also` (every plate the
+ * line may be nested on) in one go, so the "after" of the save — new plate sizes — reads nothing. Outside a scope: `ids`.
+ */
+async function ratesOf(db, companyId, ids, also = []) {
+  const all = [...new Set([...ids, ...also])].sort((a, b) => a - b);
+  const known = await memoized(db, `plateRates:${companyId}`, async () => ({ ids: new Set(all), rates: await plateRatesPerKg(db, companyId, all) }));
+  if (ids.every((id) => known.ids.has(id))) return known.rates;
+  return plateRatesPerKg(db, companyId, ids);
 }
 
 /** The plates saved, per catalog plate: code, size, how many and their kg. */
@@ -266,7 +283,9 @@ function platesOf(saved) {
 /** Everything the impact sheet and the checklist read about a line at one moment. */
 async function snapshot(db, companyId, lineId, { state = null } = {}) {
   const st = state ?? (await lineStates(db, companyId, [lineId])).get(Number(lineId));
-  const m = await measureSavedLine(db, companyId, lineId, { costsOf: (nests) => platePrices(db, companyId, nests) });
+  // The snapshot reads no cut length (it is not on the sheet) — the true-shape cut walk is skipped. Prices are read for
+  // every plate the line may use at once, so the "after" of a save finds its new plates already priced.
+  const m = await measureSavedLine(db, companyId, lineId, { cuts: false, costsOf: (nests, ctx) => platePrices(db, companyId, nests, ctx?.plates ?? []) });
   const need = await needOf(db, companyId, m.ctx.line);
   const mt = m.metrics;
   return {
@@ -566,6 +585,15 @@ function actionBody(body) {
  */
 export async function plateChangeGate(db, c, lineId, kind, rawBody = {}, run = null) {
   if (!RUNNERS[kind]) throw new Error(`plateChangeGate: unknown kind ${kind}`);
+  // PERFORMANCE 17 (2026-10-18): the before, the action and the after read the line's structure, cut plates, catalog
+  // plates, cut settings and drawings ONCE (150 → ~70 round trips for "Use this nesting" with its before / after sheet).
+  return withMemo(db, () => gate(db, c, lineId, kind, rawBody, run));
+}
+
+/** The kinds whose save changes the line's choices (read back in the sheet's words): their after reads the state again. */
+const keepsState = (kind) => kind !== 'choices' && kind !== 'nest_plates';
+
+async function gate(db, c, lineId, kind, rawBody, run) {
   const body = actionBody(rawBody);
   const doIt = (b) => (run ? run(b) : RUNNERS[kind](db, c, lineId, b));
   if (isPreview(kind, body)) return doIt(body);
@@ -582,7 +610,8 @@ export async function plateChangeGate(db, c, lineId, kind, rawBody = {}, run = n
     const before = await snapshot(db, companyId, lineId);
     const out = await doIt(body);
     if (out && out.applied === false) return out;
-    const after = await snapshot(db, companyId, lineId);
+    // The buying state (POs, holds) is the before's: a plate save does not change it, and the after only needs the plates.
+    const after = await snapshot(db, companyId, lineId, { state: keepsState(kind) ? before.state : null });
     const impact = await impactOf(db, companyId, kind, before, after, { direct: true });
     return { ...(out ?? {}), plateChange: { direct: true, impact } };
   }
@@ -599,7 +628,7 @@ export async function plateChangeGate(db, c, lineId, kind, rawBody = {}, run = n
   try {
     out = await doIt(body);
     if (out && out.applied === false) { await db.query('ROLLBACK TO SAVEPOINT cf_plate_change'); return out; }
-    after = await snapshot(db, companyId, lineId);
+    after = await snapshot(db, companyId, lineId, { state: keepsState(kind) ? before.state : null });
   } catch (e) {
     await db.query('ROLLBACK TO SAVEPOINT cf_plate_change');
     throw e;

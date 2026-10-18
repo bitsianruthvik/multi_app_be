@@ -61,7 +61,8 @@ export async function orderBoard(db, companyId, q = {}) {
   if (!orders.length) return { lanes, today: today() };
   const ids = orders.map((o) => o.id);
   const { orderBilling } = await import('./billingService.js');
-  const [[lines], acc, stagesBy, mrs, billing] = await Promise.all([
+  const { orderValuesFor } = await import('./orderValueService.js');
+  const [[lines], acc, stagesBy, mrs, billing, values] = await Promise.all([
     db.query(
       `SELECT l.order_id, COUNT(*) AS n, SUM(LEAST(COALESCE(l.delivered_qty, 0), l.quantity)) AS delivered, SUM(l.quantity) AS quantity,
               SUM(COALESCE(l.delivered_qty, 0) > 0) AS any_delivered, SUM(COALESCE(l.delivered_qty, 0) + 0.000001 >= l.quantity) AS lines_delivered,
@@ -72,6 +73,7 @@ export async function orderBoard(db, companyId, q = {}) {
     postStagesOf(db, companyId, ids),
     readRequisitions(db, companyId, { open: true, lineBound: true }),
     orderBilling(db, companyId, ids),
+    orderValuesFor(db, companyId, ids),
   ]);
   const lineOf = new Map(lines.map((l) => [Number(l.order_id), l]));
   const mrOf = new Map();
@@ -103,6 +105,8 @@ export async function orderBoard(db, companyId, q = {}) {
     lanes.find((x) => x.key === lane).cards.push({
       id: o.id, code: o.code, title: o.title ?? null, customer: o.customer_name ?? null, status: o.status, lane,
       committedDate: committed, overdue: !!committed && committed < t && o.status !== 'closed',
+      // ONE order value (orderValueService): accepted terms, else the estimate from the line rates.
+      value: values.get(Number(o.id)) ?? null,
       facts: {
         lines: f.lines, released: f.released,
         dispatched: `${Number(l.lines_delivered) || 0} of ${f.lines} line${f.lines === 1 ? '' : 's'} shipped`,

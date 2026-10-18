@@ -306,6 +306,29 @@ async function lockChecks(db, companyId, line, { refreshed = null } = {}) {
   }
   add({ key: 'cut_pieces', applies: cutApplies, title: allKinds.size === 1 && allKinds.has('section') ? 'Every section part has its cut piece' : allKinds.size > 1 ? 'Every part has its cut piece' : 'Every plate part has its cut piece', stageKey: 'structure', ...cutCheck });
 
+  // 5b. Flows — a WARNING only (user, 2026-10-18: "not every part needs a flow" before the freeze). A made row with no
+  //     flow is something RELEASE refuses, so it is said here, with the rows, so the screen can give them a flow in one
+  //     go (a frozen line still takes a flow for a row that has none). Cut pieces are left out: they take the company's
+  //     cut-plate / cut-section flow at release, with a button of their own there.
+  const noFlow = [];
+  const seenFlow = new Set();
+  for (const n of plan.all ?? []) {
+    if (!n.made || n.flow || n.kind !== 'temporary' || n.role === 'Cut from' || n.role === 'Raw plate' || seenFlow.has(n.key)) continue;
+    seenFlow.add(n.key);
+    noFlow.push({ recordId: Number(n.id), lineId: n.lineId != null ? Number(n.lineId) : null, name: nameOf(n) });
+  }
+  if (noFlow.length) {
+    const names = examples(noFlow.map((r) => r.name));
+    add({
+      key: 'flows', ok: false, warning: true, applies: true, stageKey: 'structure',
+      title: 'Every made part says how it is made',
+      detail: `${plural(noFlow.length, 'made row')} ${noFlow.length === 1 ? 'has' : 'have'} no flow yet — ${names}. Freezing is not held up, but release will ask for ${noFlow.length === 1 ? 'it' : 'them'}.`,
+      todo: 'Give them a flow now (one for all, or row by row on the Structure stage) — or freeze as it is and give them one before release.',
+      problems: [`${plural(noFlow.length, 'made row')} of line ${line.line_no} ${noFlow.length === 1 ? 'has' : 'have'} no flow — ${names}. Release will ask for ${noFlow.length === 1 ? 'it' : 'them'}.`],
+      rows: noFlow,
+    });
+  }
+
   // 6. Codes: what lock would write, with the position it would give — every
   //    running number handed out in turn, none drawn.
   out.memo = await seedPieceMemo(db, companyId, line, nodes);

@@ -34,6 +34,9 @@
  *   request of either — queues our own Standard nesting of the same pieces in the background (afterUploadSaved); the answer
  *   carries autoCompare: { queued, effort, message } and never waits for it.
  *   POST   /orders/:orderId/lines/:lineId/nesting/compare/accept { side: 'uploaded' | 'auto', runId } — take one side
+ *   GET    /orders/:orderId/lines/:lineId/nesting/alternative     §87: AI's nesting stored beside the upload — which side is the main one
+ *   POST   /orders/:orderId/lines/:lineId/nesting/alternative/swap { to: 'ai' | 'uploaded', runId? } — make AI's the main
+ *                                                                nesting, or switch back (a plate write: plateChangeGate 'swap_alternative')
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc      every nest's DXF + nests.csv, zipped
  *   GET  /orders/:orderId/lines/:lineId/nesting/cnc/:lotId   one nest's DXF
  *        …/nesting/cnc[/:lotId]?style=ai[&leads=1][&order=1]  the "AI" ProNest DXF (services/aiNestDxf.js); the zip adds each nest's cut plan
@@ -87,6 +90,8 @@ import { createNestPlates } from '../services/nestPlateCatalogService.js';
 import { getUntracked, markUntracked, unmarkUntracked } from '../services/nestUntrackedService.js';
 // The uploaded nesting beside our automatic one, and taking one of them.
 import { getCompare, startCompare, acceptCompare, scheduleAutoCompare } from '../services/nestCompareService.js';
+// §87: AI's nesting stored beside the uploaded one, and swapping which of the two is the main nesting.
+import { alternativeOf, swapAlternative } from '../services/nestAlternativeService.js';
 // The CNC files: one DXF per nest with a layout, and the line's zip.
 import { lotDxf, lineCncZip, lotAiPlan } from '../services/cncExportService.js';
 // Plate changes after a purchase order (init.sql §62): every plate write below goes through the gate.
@@ -285,6 +290,18 @@ router.delete('/orders/:orderId/lines/:lineId/nesting/compare', view,
   handle((req) => read(req, (db, companyId, id) => cancelRun(companyId, id, { purpose: 'compare' }))));
 router.post('/orders/:orderId/lines/:lineId/nesting/compare/accept', manage,
   handle((req) => gated(req, 'compare', req.body ?? {}, (db, c, id, b) => acceptCompare(db, c, id, b))));
+
+// §87 (2026-10-18): the alternative. The GET is light (the screen asks it to keep the Compare tab when AI's nesting is the
+// main one and no customer's plate is saved); the swap is a plate write like any other — through the gate, with the
+// before / after sheet when the screen asks (`impact: true`). The line's finished nesting proposal goes with it.
+router.get('/orders/:orderId/lines/:lineId/nesting/alternative', view,
+  handle((req) => read(req, (db, companyId, id) => alternativeOf(db, companyId, id))));
+router.post('/orders/:orderId/lines/:lineId/nesting/alternative/swap', manage,
+  handle(async (req) => {
+    const out = await gated(req, 'swap_alternative', req.body ?? {}, (db, c, id, b) => swapAlternative(db, c, id, b));
+    if (!out?.requested) await dismissRun(ctx(req).companyId, lineId(req), { accepted: true });
+    return out;
+  }));
 
 /** A file out: the buffer, its type, and a download name. */
 const sendFile = (res, out, type) => {

@@ -557,7 +557,7 @@ export async function orderCostSheets(db, companyId, orderIds) {
     if (asked && !ownerOf.has(Number(f.id))) ownerOf.set(Number(f.id), Number(asked.id));
   }
   const all = [...ownerOf.keys()];
-  const [[rows], [mrItems], places] = await Promise.all([
+  const [[rows], [mrItems], places, [offcutRows]] = await Promise.all([
     db.query(
       `SELECT m.order_id, m.movement_type, m.used_for, l.item_id, a.purpose, (COALESCE(b.owner_party_id, 0) <> 0) AS theirs,
               SUM(l.quantity) AS qty, SUM(l.value) AS value, SUM(l.value IS NULL) AS uncosted, COUNT(*) AS n
@@ -574,6 +574,14 @@ export async function orderCostSheets(db, companyId, orderIds) {
         WHERE rl.company_id = ? AND r.order_id IN (?) AND rl.deleted_at IS NULL`,
       [companyId, all]),
     cutPlaces(db, companyId),
+    // The offcut LOTS cutting made from the order's plates (cf_offcuts with a stock piece): their kilograms — the
+    // stock quantity of an offcut item is pieces, not kg (2026-10-18, scrap & offcuts against what was charged).
+    db.query(
+      `SELECT sl.order_id, COUNT(*) AS n, COALESCE(SUM(o.weight_kg), 0) AS kg
+         FROM cf_offcuts o JOIN cf_sales_order_lines sl ON sl.id = o.order_line_id
+        WHERE o.company_id = ? AND sl.order_id IN (?) AND o.deleted_at IS NULL AND o.batch_id IS NOT NULL AND COALESCE(o.owner_party_id, 0) = 0
+        GROUP BY sl.order_id`,
+      [companyId, all]),
   ]);
   const itemIds = [...new Set(rows.map((r) => Number(r.item_id)))];
   const [items] = itemIds.length ? await db.query(
@@ -584,8 +592,13 @@ export async function orderCostSheets(db, companyId, orderIds) {
   const isStockPlate = (id) => nodeIn(places.plate?.stockIds, id) || nodeIn(places.section?.stockIds, id);
   const isOffcut = (id) => nodeIn(places.plate?.offcutIds, id) || nodeIn(places.section?.offcutIds, id);
   const onMr = new Set(mrItems.map((r) => `${ownerOf.get(Number(r.order_id)) ?? r.order_id}:${r.item_id}`));
-  const sheet = () => ({ material: 0, consumables: 0, customer: { rows: 0, quantity: 0 }, credits: { scrap: 0, offcuts: 0, total: 0 }, uncostedRows: 0, items: new Map() });
+  const sheet = () => ({ material: 0, consumables: 0, customer: { rows: 0, quantity: 0 }, credits: { scrap: 0, offcuts: 0, total: 0, scrapKg: 0, offcutKg: 0, offcutLots: 0 }, uncostedRows: 0, items: new Map() });
   for (const id of ids) out.set(id, sheet());
+  for (const r of offcutRows) {
+    const s = out.get(ownerOf.get(Number(r.order_id)));
+    if (!s) continue;
+    s.credits.offcutKg = round6(s.credits.offcutKg + Number(r.kg)); s.credits.offcutLots += Number(r.n);
+  }
   const addItem = (s, itemId, kind, qty, value, uncosted) => {
     const k = `${kind}:${itemId}`;
     const it = itemOf.get(Number(itemId));
@@ -608,7 +621,7 @@ export async function orderCostSheets(db, companyId, orderIds) {
       if (purpose !== 'scrap' && qty < 0) { s.customer.rows += Number(r.n); s.customer.quantity = round6(s.customer.quantity - qty); addItem(s, r.item_id, 'customer', -qty, 0, 0); }
       continue;
     }
-    if (purpose === 'scrap') { s.credits.scrap = round2(s.credits.scrap + value); addItem(s, r.item_id, 'scrap', qty, value, uncosted); s.uncostedRows += uncosted; continue; }
+    if (purpose === 'scrap') { s.credits.scrap = round2(s.credits.scrap + value); s.credits.scrapKg = round6(s.credits.scrapKg + qty); addItem(s, r.item_id, 'scrap', qty, value, uncosted); s.uncostedRows += uncosted; continue; }
     if (isOffcut(r.item_id) && value > 0) { s.credits.offcuts = round2(s.credits.offcuts + value); addItem(s, r.item_id, 'offcut', qty, value, uncosted); continue; }
     const consumable = r.movement_type === 'issue' && r.used_for === 'order' && !isStockPlate(r.item_id) && !isOffcut(r.item_id)
       && !onMr.has(`${ownerOf.get(Number(r.order_id))}:${r.item_id}`);

@@ -536,7 +536,9 @@ try {
     await F.addDrawings(conn, fx);
     const taken = withDrawings.groups.map((g) => g.shapes?.taken ?? 'rectangles (no drawing in this steel)');
     console.log(`    with drawings: ${withDrawings.totals.plates} plates, ${(withDrawings.totals.areaBought / 1e6).toFixed(3)} m² — ${taken.join(' / ')}; without: ${without.totals.plates} plates, ${(without.totals.areaBought / 1e6).toFixed(3)} m²`);
-    ok('with drawings: no more plates, no more steel bought, nothing left off', withDrawings.totals.plates <= without.totals.plates && withDrawings.totals.areaBought <= without.totals.areaBought + 1e-6 && withDrawings.totals.unplaced === 0 && withDrawings.totals.pieces === without.totals.pieces);
+    // Since §83 (nestCost) a layout is ranked by its cost, not its plate count: three 3000 × 1500 plates (13.5 m²) beat
+    // a 6000 × 2000 and a 3000 × 1500 (16.5 m²). So: no more steel bought, nothing left off (2026-10-18, by design).
+    ok('with drawings: no more steel bought, nothing left off', withDrawings.totals.areaBought <= without.totals.areaBought + 1e-6 && withDrawings.totals.unplaced === 0 && withDrawings.totals.pieces === without.totals.pieces);
     ok('…so, measured on the same true parts, no more waste', withDrawings.totals.weightKg <= without.totals.weightKg + 1e-6 && withDrawings.totals.partsKg < without.totals.partsKg);
     const gA = withDrawings.groups.find((g) => g.shapes);
     ok('the steel with drawings in it was a shape job, and says which layout it took', !!gA && ['shape', 'rectangles'].includes(gA.shapes.taken) && gA.shapes.drawings === 5 && gA.shapes.rectangles.plates >= gA.nests.length, J(gA?.shapes));

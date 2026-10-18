@@ -456,6 +456,8 @@ export async function purchaseOrderTax(db, companyId, pos, lines) {
       taxPayableByUs: rc ? res.totals.tax : 0,
       isIgst: supply?.isIgst ?? null,
       taxComplete: res.complete,
+      // 2026-10-18: a PO showed "GST ₹0" because its items had no rate. Say how many lines are left out of the GST.
+      noGstLines: res.lines.filter((l) => l.gstRate == null).length,
     });
   }
   return { lineTax, poTax };

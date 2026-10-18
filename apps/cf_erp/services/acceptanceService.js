@@ -33,11 +33,20 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { parseFormula, evaluateFormula, FormulaError } from './formulaEngine.js';
 import { bomsOfParents, linesOfBomsWithChildBom, childKindOf } from './bomGraph.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
-import { measuresOf, lastPricesPaid, round2 } from './priceService.js';
+import { measuresOf, lastPricesPaid, listPricesOf, perUnitPrice, round2 } from './priceService.js';
 import { requestApproval, withdrawApprovals, pendingOf } from './approvalService.js';
+import { orderValuesFor } from './orderValueService.js';
 
 export const CHARGE_BILLING = { pro_rata: 'Pro-rata — as the work passes the operation, invoiced weekly', on_completion: 'On completion of the operation for the whole order' };
 export const WEIGHT_SOURCES = { drawing: 'As per drawing', actual: 'Actual weight' };
+/**
+ * SCRAP & OFFCUTS (2026-10-18, user: scrap and offcut costs may be claimed from the customer). A charge whose basis is
+ * the steel the order's nesting leaves over: scrap kg × rate, offcut kg × rate, or a % of the material. The kilograms
+ * are ESTIMATED from the order's saved (AI / accepted) nesting — each plate's waste split by cause: offcut = the
+ * offcuts kept; scrap = rim + sequence gaps + wastage (the kerf is burnt, not scrap). Billed like every other charge
+ * (pro-rata through its operation, or on completion); Order costing sets the actual kg beside it.
+ */
+export const SCRAP_BASES = { scrap: 'Scrap kg × rate', offcut: 'Offcut kg × rate', material_pct: '% of the material' };
 export const MILESTONE_KINDS = ['percent', 'amount'];
 /** What a payment milestone can wait for — only things the app tracks. */
 export const TRIGGERS = {
@@ -174,9 +183,13 @@ export function readTerms(input = {}, ctx, { requireAll = true } = {}) {
       const unit = text(b.unit, 20);
       if (!unit) problems.push(`${where}: say the unit of the formula (m², nos …).`);
       basis = { type: 'formula', expression: String(b.expression ?? '').trim(), unit };
-    } else problems.push(`${where}: the basis is weight or a formula.`);
+    } else if (b.type === 'scrap') {
+      if (!SCRAP_BASES[b.of]) problems.push(`${where}: scrap & offcuts are charged by scrap kg, offcut kg or a % of the material.`);
+      else basis = { type: 'scrap', of: b.of };
+    } else problems.push(`${where}: the basis is weight, a formula or scrap & offcuts.`);
     const rate = Number(r?.rate);
-    if (blank(r?.rate) || !Number.isFinite(rate) || rate < 0) problems.push(`${where}: give the rate.`);
+    if (blank(r?.rate) || !Number.isFinite(rate) || rate < 0) problems.push(`${where}: give the ${b.type === 'scrap' && b.of === 'material_pct' ? '%' : 'rate'}.`);
+    else if (b.type === 'scrap' && b.of === 'material_pct' && rate > 100) problems.push(`${where}: a % of the material is at most 100.`);
     if (!CHARGE_BILLING[r?.billing]) problems.push(`${where}: billed pro-rata or on completion.`);
     return { key: keyOf(r?.key, 'c', i), label, operationId: op ? Number(op.id) : null, basis, rate: Number.isFinite(rate) ? round6(rate) : null, billing: r?.billing ?? null };
   });
@@ -362,8 +375,41 @@ async function formulaQuantities(db, companyId, orderId, lines, formulas) {
 }
 
 /**
+ * The steel the order's SAVED nesting leaves over, by kind (SCRAP_BASES above). One plate = one cf_plate_lots row of
+ * the order's lines; its waste_json splits the waste by cause (mm²): offcut → offcut kg; rim + sequenceGaps + wastage
+ * → scrap kg; kerf is burnt. A plate saved before the split was recorded counts its offcuts only (`unsplit`).
+ * 1 read. → { plates, plateKg, partsKg, scrapKg, offcutKg, kerfKg, unsplit }
+ */
+export async function nestWasteOf(db, companyId, lineIds) {
+  const ids = [...new Set((lineIds ?? []).map(Number).filter(Boolean))];
+  const out = { plates: 0, plateKg: 0, partsKg: 0, scrapKg: 0, offcutKg: 0, kerfKg: 0, unsplit: 0 };
+  if (!ids.length) return out;
+  const [lots] = await db.query(
+    `SELECT l.id, l.thickness_mm, l.length_mm, l.width_mm, l.density, l.waste_json,
+            (SELECT COALESCE(SUM(o.weight_kg), 0) FROM cf_offcuts o WHERE o.company_id = l.company_id AND o.plate_lot_id = l.id AND o.deleted_at IS NULL) AS offcut_kg
+       FROM cf_plate_lots l WHERE l.company_id = ? AND l.order_line_id IN (?) AND l.deleted_at IS NULL AND l.kind = 'plate'`,
+    [companyId, ids],
+  );
+  for (const l of lots) {
+    const t = Number(l.thickness_mm); const d = Number(l.density ?? 7850) || 7850;
+    const kg = (a) => (Number(a) * t * d) / 1e9;
+    const w = parseJson(l.waste_json);
+    out.plates += 1;
+    out.plateKg += kg(Number(l.length_mm) * Number(l.width_mm));
+    if (w && w.offcut != null) {
+      out.offcutKg += kg(w.offcut);
+      out.scrapKg += kg(Number(w.rim ?? 0) + Number(w.sequenceGaps ?? 0) + Number(w.wastage ?? 0));
+      out.kerfKg += kg(w.kerf ?? 0);
+      if (w.partsArea != null) out.partsKg += kg(w.partsArea);
+    } else { out.offcutKg += Number(l.offcut_kg ?? 0); out.unsplit += 1; }
+  }
+  for (const k of ['plateKg', 'partsKg', 'scrapKg', 'offcutKg', 'kerfKg']) out[k] = round3(out[k]);
+  return out;
+}
+
+/**
  * THE ESTIMATED ORDER VALUE of a set of terms, and the margin over material. Fixed reads (formulaQuantities + the MR
- * lines + last prices).
+ * lines + last prices + list prices + the nesting's waste when a scrap & offcuts charge asks for it).
  */
 export async function estimateTerms(db, companyId, facts, terms, ctx) {
   const tonnes = round6(facts.lines.reduce((t, l) => t + (l.weightT ?? 0), 0));
@@ -375,7 +421,37 @@ export async function estimateTerms(db, companyId, facts, terms, ctx) {
     const f = checkChargeFormula(ch.basis.expression, ctx.specByCode);
     if (f.parsed) formulas.push({ key: ch.key, parsed: f.parsed });
   }
-  const fq = await formulaQuantities(db, companyId, facts.o.id, facts.lines, formulas);
+  const wantsWaste = terms.charges.some((ch) => ch.basis?.type === 'scrap');
+  const [fq, waste] = await Promise.all([
+    formulaQuantities(db, companyId, facts.o.id, facts.lines, formulas),
+    wantsWaste ? nestWasteOf(db, companyId, facts.lines.map((l) => l.id)) : null,
+  ]);
+  const material = terms.material?.rate != null ? { quantity: round3(ourTonnes), unit: 't', rate: terms.material.rate, amount: round2(ourTonnes * terms.material.rate) } : null;
+  // What the material we buy on the order's MRs costs: the last price paid, else the catalog list price; an item with
+  // neither is NOT COSTED and named (never a silent ₹0 — 2026-10-18, "Material we buy ₹0").
+  const [mrLines] = await db.query(
+    `SELECT rl.item_id, SUM(rl.quantity) AS quantity, MAX(m.code) AS code, MAX(m.name) AS name
+       FROM cf_requisition_lines rl JOIN cf_requisitions r ON r.id = rl.requisition_id AND r.deleted_at IS NULL
+       LEFT JOIN cf_master_records m ON m.id = rl.item_id
+      WHERE rl.company_id = ? AND r.order_id = ? AND rl.deleted_at IS NULL AND COALESCE(r.supply, 'we_buy') <> 'customer' GROUP BY rl.item_id`,
+    [companyId, facts.o.id],
+  );
+  const mrIds = mrLines.map((r) => r.item_id);
+  const [prices, lists, mrMeasures] = mrLines.length
+    ? await Promise.all([lastPricesPaid(db, companyId, mrIds), listPricesOf(db, companyId, mrIds), measuresOf(db, companyId, mrIds)])
+    : [new Map(), new Map(), new Map()];
+  const unitCostOf = (r) => {
+    const paid = prices.get(Number(r.item_id))?.unitPrice;
+    if (paid != null) return { unit: Number(paid), from: 'paid' };
+    const l = lists.get(Number(r.item_id));
+    const u = l?.listPrice == null ? null : perUnitPrice(l.listPrice, l.priceBasis, mrMeasures.get(Number(r.item_id)));
+    return u == null ? null : { unit: Number(u), from: 'list' };
+  };
+  const costed = mrLines.map((r) => ({ r, c: unitCostOf(r) }));
+  const priced = costed.filter((x) => x.c);
+  const fromList = priced.filter((x) => x.c.from === 'list').length;
+  const notCosted = costed.filter((x) => !x.c).map((x) => ({ itemId: Number(x.r.item_id), code: x.r.code ?? null, name: x.r.name ?? null }));
+  const materialCost = mrLines.length ? round2(priced.reduce((t, x) => t + Number(x.r.quantity) * x.c.unit, 0)) : null;
   const charges = terms.charges.map((ch) => {
     let quantity = null; let unit = null; let note = null;
     if (ch.basis?.type === 'weight') {
@@ -385,22 +461,26 @@ export async function estimateTerms(db, companyId, facts, terms, ctx) {
       const e = fq.get(ch.key);
       quantity = e ? round6(e.quantity) : null; unit = ch.basis.unit;
       note = e ? `${e.rows} part row${e.rows === 1 ? '' : 's'}${e.missingRows ? ` · ${e.missingRows} without ${[...e.missing].slice(0, 3).join(', ')}` : ''}` : 'The formula does not read.';
+    } else if (ch.basis?.type === 'scrap') {
+      if (ch.basis.of === 'material_pct') {
+        // A % of the material: of the material row charged, else of what the MR material costs us.
+        const base = material?.amount ?? materialCost;
+        const amount = base == null || ch.rate == null ? null : round2((base * ch.rate) / 100);
+        return { key: ch.key, label: ch.label, operation: ctx.opById.get(ch.operationId)?.name ?? null, basisKind: 'scrap', scrapOf: 'material_pct', quantity: base == null ? null : round2(base), unit: '₹ material', rate: ch.rate, rateUnit: '%', amount,
+          note: base == null ? 'No material charged and no MR priced yet — the % has nothing to apply to.' : material ? `${ch.rate} % of the material charged` : `${ch.rate} % of the MR material at cost` };
+      }
+      const kg = ch.basis.of === 'offcut' ? waste?.offcutKg : waste?.scrapKg;
+      quantity = waste?.plates ? kg : null; unit = 'kg';
+      note = !waste?.plates ? 'No nesting saved yet — the kilograms come from the order’s nesting.'
+        : `From the nesting: ${waste.plates} plate${waste.plates === 1 ? '' : 's'}, scrap ${round3(waste.scrapKg)} kg, offcuts ${round3(waste.offcutKg)} kg${waste.unsplit ? ` · ${waste.unsplit} plate${waste.unsplit === 1 ? '' : 's'} without a scrap split (offcuts only)` : ''}`;
+      const amount = quantity == null || ch.rate == null ? null : round2(quantity * ch.rate);
+      return { key: ch.key, label: ch.label, operation: ctx.opById.get(ch.operationId)?.name ?? null, basisKind: 'scrap', scrapOf: ch.basis.of, quantity: quantity == null ? null : round3(quantity), unit, rate: ch.rate, rateUnit: '₹/kg', amount, note };
     }
     const amount = quantity == null || ch.rate == null ? null : round2(quantity * ch.rate);
     return { key: ch.key, label: ch.label, operation: ctx.opById.get(ch.operationId)?.name ?? null, quantity: quantity == null ? null : round3(quantity), unit, rate: ch.rate, amount, note };
   });
-  const material = terms.material?.rate != null ? { quantity: round3(ourTonnes), unit: 't', rate: terms.material.rate, amount: round2(ourTonnes * terms.material.rate) } : null;
   const lumpSums = terms.lumpSums.map((l) => ({ key: l.key, label: l.label, amount: l.amount ?? 0 }));
   const value = round2(charges.reduce((t, c) => t + (c.amount ?? 0), 0) + (material?.amount ?? 0) + lumpSums.reduce((t, l) => t + l.amount, 0));
-  // What the material we buy on the order's MRs costs at the last price paid.
-  const [mrLines] = await db.query(
-    `SELECT rl.item_id, SUM(rl.quantity) AS quantity FROM cf_requisition_lines rl JOIN cf_requisitions r ON r.id = rl.requisition_id AND r.deleted_at IS NULL
-      WHERE rl.company_id = ? AND r.order_id = ? AND rl.deleted_at IS NULL AND COALESCE(r.supply, 'we_buy') <> 'customer' GROUP BY rl.item_id`,
-    [companyId, facts.o.id],
-  );
-  const prices = mrLines.length ? await lastPricesPaid(db, companyId, mrLines.map((r) => r.item_id)) : new Map();
-  const priced = mrLines.filter((r) => prices.get(Number(r.item_id))?.unitPrice != null);
-  const materialCost = mrLines.length ? round2(priced.reduce((t, r) => t + Number(r.quantity) * Number(prices.get(Number(r.item_id)).unitPrice), 0)) : null;
   const milestones = terms.milestones.map((m) => ({
     key: m.key, label: m.label,
     amount: m.kind === 'percent' ? round2((value * (m.value ?? 0)) / 100) : round2(m.value ?? 0),
@@ -410,7 +490,11 @@ export async function estimateTerms(db, companyId, facts, terms, ctx) {
     tonnes: round3(tonnes), ourTonnes: round3(ourTonnes), unweighedLines: unweighed,
     charges, material, lumpSums, value,
     materialCost, materialCostNote: !mrLines.length ? 'No MR yet — the material cost is not known.'
-      : priced.length < mrLines.length ? `${mrLines.length - priced.length} of ${mrLines.length} MR materials have no price paid yet.` : 'The MR materials at the last price paid.',
+      : notCosted.length ? `Not costed: ${notCosted.length} of ${mrLines.length} MR materials have no price paid and no list price — set the plate rate (the item's list price).`
+        : fromList ? `The MR materials at the last price paid; ${fromList} at the catalog list price (nothing bought yet).` : 'The MR materials at the last price paid.',
+    // Items with no cost at all — the screens show "not costed — set the plate rate" with a link to each item.
+    materialNotCosted: notCosted,
+    waste,
     marginOverMaterial: materialCost == null ? null : round2(value - materialCost),
     marginPct: materialCost == null || value <= 0 ? null : round2(((value - materialCost) / value) * 100),
     milestones, milestonesTotal: billed,
@@ -427,7 +511,7 @@ export function termLists(ctx) {
   return {
     operations: ctx.operations, formulaFields: ctx.fields,
     triggers: TRIGGER_KEYS.map((key) => ({ key, label: TRIGGERS[key].label, proRata: !!TRIGGERS[key].proRata, needs: TRIGGERS[key].needs ?? [] })),
-    afterTriggers: AFTER_KEYS, dispatchModes: DISPATCH_MODES, billing: CHARGE_BILLING, weightSources: WEIGHT_SOURCES,
+    afterTriggers: AFTER_KEYS, dispatchModes: DISPATCH_MODES, billing: CHARGE_BILLING, weightSources: WEIGHT_SOURCES, scrapBases: SCRAP_BASES,
   };
 }
 
@@ -598,9 +682,9 @@ async function mrsOf(db, companyId, orderId) {
  */
 export async function getAcceptance(db, companyId, orderId) {
   const facts = await orderFacts(db, companyId, orderId);
-  const [ctx, versions, mrs, stagesBy, templates] = await Promise.all([
+  const [ctx, versions, mrs, stagesBy, templates, values] = await Promise.all([
     termContext(db, companyId), versionsOf(db, companyId, orderId), mrsOf(db, companyId, orderId), postStagesOf(db, companyId, [orderId]),
-    listTemplates(db, companyId),
+    listTemplates(db, companyId), orderValuesFor(db, companyId, [Number(facts.o.id)]),
   ]);
   const { approved, pending, sentBack } = standing(versions);
   const shown = pending ?? sentBack ?? approved;
@@ -631,6 +715,8 @@ export async function getAcceptance(db, companyId, orderId) {
     terms: read,
     fromTemplates: !shown,
     estimate,
+    // ONE order value (orderValueService): what the order header shows, and the estimate from the line rates beside it.
+    orderValue: values.get(Number(o.id)) ?? null,
     approved, pending, sentBack,
     versions: versions.map(({ terms: _t, estimate: _e, ...v }) => v),
     confirmProblems: approved ? [] : confirmProblems(facts),

@@ -1,4 +1,4 @@
-import { pool } from '../../../db.js';
+import { pool, isDeadConnection } from '../../../db.js';
 import { attachNodeCache, detachNodeCache } from './nodeCache.js';
 import { invalidateTrackerCache } from './trackerCache.js';
 
@@ -20,9 +20,8 @@ import { invalidateTrackerCache } from './trackerCache.js';
  * never ride a pooled connection into the next company's request.
  */
 export async function withTransaction(fn) {
-  const conn = await pool.getConnection();
+  const conn = await beginOnLiveConnection();
   try {
-    await conn.beginTransaction();
     attachNodeCache(conn);
     const result = await fn(conn);
     await conn.commit();
@@ -37,6 +36,28 @@ export async function withTransaction(fn) {
     detachNodeCache(conn);
     conn.release();
   }
+}
+
+/**
+ * A connection with its transaction begun. A BEGIN that fails because the
+ * connection was already dead ran nothing, so another connection is taken
+ * (2026-10-18: TiDB Cloud's gateway hangs up on pooled connections; see db.js
+ * withReadRetry). Any other failure is the caller's.
+ */
+async function beginOnLiveConnection(attempts = 3) {
+  let last;
+  for (let i = 1; i <= attempts; i += 1) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      return conn;
+    } catch (err) {
+      last = err;
+      if (!isDeadConnection(err) || i === attempts) { try { conn.release(); } catch { /* ignore */ } throw err; }
+      try { conn.destroy(); } catch { /* it is going anyway */ }
+    }
+  }
+  throw last;
 }
 
 /**

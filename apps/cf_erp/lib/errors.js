@@ -1,3 +1,5 @@
+import { isDeadConnection } from '../../../db.js';
+
 /**
  * Errors a person can act on. `fail()` (core/middleware/requirePerm.js) trusts
  * the status and message of these and passes `code`, `problems` and `detail`
@@ -77,6 +79,13 @@ const UNIQUE_MESSAGES = {
  */
 export function translateDbError(err) {
   if (!err || err instanceof CfError || err.status) return err;
+  // The database hung up on the connection mid-request (db.js isDeadConnection): a moment's
+  // trouble, said as one — a 503 the screen shows (and a GET retries) — not "Something went wrong".
+  if (isDeadConnection(err)) {
+    return new CfError(503, 'DB_CONNECTION_LOST',
+      'The connection to the database dropped for a moment. Try again — if you were saving, reload first to see whether it was saved.',
+      { expose: true, cause: err });
+  }
   if (err.errno === 1062) {
     const key = /for key '(?:[^.']+\.)?([^']+)'/.exec(err.sqlMessage || '')?.[1];
     return conflict('DUPLICATE', UNIQUE_MESSAGES[key] || 'That value is already in use.', { detail: key });

@@ -15,6 +15,7 @@
  * variant under the blanks node still counts. Read once per request: a few
  * small queries, no per-row calls.
  */
+import { memoized } from './requestMemo.js';
 const SUBTREE_HOPS = 8;
 export const CUT_KINDS = ['plate', 'section'];
 export const SECTION_DEFAULTS = { sawKerfMm: 3, endTrimMm: 10, minOffcutMm: 500 };
@@ -43,7 +44,12 @@ const PLACE_SUBTREES_SQL = `
   )
   SELECT place_id, role, seed_id, id FROM sub`;
 
-export async function cutPlaces(db, companyId) {
+export function cutPlaces(db, companyId) {
+  // Inside a plate save's scope only (lib/requestMemo.js): asked by the survey and by the drawing facts.
+  return memoized(db, `cutPlaces:${companyId}`, () => readCutPlaces(db, companyId));
+}
+
+async function readCutPlaces(db, companyId) {
   // Two round trips side by side: the place rows with the settings, and every
   // place's live subtree (production is ~49 ms a round trip, and a cut-piece
   // derive asks after every save).

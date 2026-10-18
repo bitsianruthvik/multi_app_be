@@ -50,7 +50,9 @@ export const requirePerm = (tag) => (req, res, next) => {
 export function fail(res, err, fallbackStatus = 500) {
   const status = err?.status || fallbackStatus;
   if (status >= 500) {
-    logger.error({ err }, 'fab_erp: request failed');
+    logger.error({ err: err?.cause ?? err, code: err?.code }, 'fab_erp: request failed');
+    // A 5xx a service wrote FOR A PERSON (`expose`, e.g. cf_erp's DB_CONNECTION_LOST 503) keeps its words.
+    if (err?.expose && err?.message) return res.status(status).json({ message: err.message, ...(err.code ? { code: err.code } : {}) });
     return res.status(status).json({ message: 'Something went wrong.' });
   }
   const body = { message: err?.message ?? 'Something went wrong.' };

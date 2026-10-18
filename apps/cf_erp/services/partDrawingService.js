@@ -69,6 +69,7 @@
 import { invalid, notFound } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
+import { memoized } from '../lib/requestMemo.js';
 import { cutFromOf } from '../lib/cutFrom.js';
 import { explode } from './bomService.js';
 import { readPartDrawing, orientTo } from './partGeometry.js';
@@ -1045,7 +1046,12 @@ export async function drawingFile(db, companyId, orderId, lineId, drawingId) {
  * rings only when every piece of the cut plate has the same shape, oriented to its length;
  * shapeNote says why not, when some piece of it does have a drawing.
  */
-export async function drawingFactsOfLine(db, companyId, lineId) {
+export function drawingFactsOfLine(db, companyId, lineId) {
+  // Read once per plate save (lib/requestMemo.js — plateChangeGate's scope): a nesting save writes no drawing.
+  return memoized(db, `drawingFacts:${companyId}:${Number(lineId)}`, () => readDrawingFacts(db, companyId, lineId));
+}
+
+async function readDrawingFacts(db, companyId, lineId) {
   // A DXF without a shape counts too: it may be a plate part's, saved before the row was known as one.
   const [has] = await db.query("SELECT COUNT(*) AS n FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND (geometry_json IS NOT NULL OR (file_kind = 'dxf' AND dxf_text IS NOT NULL))", [companyId, lineId]);
   const out = new Map();

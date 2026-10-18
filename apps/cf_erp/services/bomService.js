@@ -17,6 +17,7 @@
  * roll-ups up the tree, inherited values down it (valueService.refreshValues).
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
+import { memoized } from '../lib/requestMemo.js';
 import { requireMaster, kindOf, LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import {
   bomTypeOf, bomOfParent, bomsOfParents, linesOfBom, linesOfBoms, linesOfBomsWithChildBom, loadLine, childKindOf, descendantIds,
@@ -455,7 +456,12 @@ export async function reviseBom(db, c, parentId, input = {}) {
  * every node carries its quantity per parent and its total — the product of
  * the quantities above it, starting from rootQuantity (a sales line's).
  */
-export async function explode(db, companyId, rootId, { rootQuantity = 1, maxDepth = 15, withCut = false } = {}) {
+export function explode(db, companyId, rootId, { rootQuantity = 1, maxDepth = 15, withCut = false } = {}) {
+  // Inside a plate save's scope only (lib/requestMemo.js): the survey and the drawing facts walk the same tree.
+  return memoized(db, `explode:${companyId}:${rootId}:${rootQuantity}:${maxDepth}:${withCut ? 1 : 0}`, () => readExplode(db, companyId, rootId, { rootQuantity, maxDepth, withCut }));
+}
+
+async function readExplode(db, companyId, rootId, { rootQuantity = 1, maxDepth = 15, withCut = false } = {}) {
   // Side by side; and below, one read per level (the children's BOMs come with their lines).
   const [root, rootBom] = await Promise.all([requireMaster(db, companyId, rootId), bomOfParent(db, companyId, rootId)]);
   const [[rf]] = await db.query(

@@ -32,6 +32,7 @@ import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
 import { fail } from '../../../core/middleware/requirePerm.js';
 import { translateDbError } from '../lib/errors.js';
 import { getTaxSettings, putTaxSettings, GST_STATES, validateGstin } from '../services/taxService.js';
+import { familyTaxView, applyFamilyTax } from '../services/taxFamilyService.js';
 import {
   listInvoices, getInvoice, updateInvoice, deleteInvoice, removeInvoiceLine, issueInvoice, cancelInvoice,
   setIrn, addEwayBill, removeEwayBill, orderInvoices, createInvoice,
@@ -48,6 +49,9 @@ const manage = guard(PERM.orders);
 router.get('/settings/tax', view, handle((req) => getTaxSettings(pool, company(req))));
 router.put('/settings/tax', manage, handle((req) => tx(req, (db, c) => putTaxSettings(db, c, req.body ?? {}))));
 router.get('/tax/states', view, handle(() => GST_STATES));
+// HSN / GST by catalog family (2026-10-18): the gaps per family and a bulk set (items + templates; catalog managers).
+router.get('/tax/families', guard(PERM.view), handle((req) => familyTaxView(pool, company(req))));
+router.put('/tax/families/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => applyFamilyTax(db, c, id(req), req.body ?? {}))));
 router.get('/tax/validate-gstin', view, handle((req) => validateGstin(req.query.gstin)));
 
 router.get('/invoices', view, handle((req) => listInvoices(pool, company(req), req.query)));

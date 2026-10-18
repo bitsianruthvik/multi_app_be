@@ -23,6 +23,7 @@ import { pool, getPoolStats } from "./db.js";
 import jobsStatusRoute from "./core/jobs/jobsStatusRoute.js";
 import schemaRoutes from "./core/routes/schemaRoutes.js";
 import appsRoutes from "./core/routes/appsRoutes.js";
+import { createProcessGuard } from "./core/utils/processGuard.js";
 
 dotenv.config();
 
@@ -32,6 +33,13 @@ if (!process.env.JWT_SECRET) {
   process.exit(1);
 }
 const app = express();
+
+// One request must not take the server down, and a server that goes down must say why
+// (core/utils/processGuard.js): requests in flight, slow requests, event-loop stalls, memory, at most one
+// large body at a time, uncaught errors, and a drain on SIGTERM. Mounted FIRST, before the body parsers.
+const guard = createProcessGuard({ beforeExit: () => pool.end() });
+guard.start();
+app.use(guard.track);
 
 // Increase payload size limit for audio uploads (50MB)
 app.use(express.json({ limit: "50mb" }));
@@ -78,7 +86,8 @@ app.use(
 );
 
 app.use(cookieParser());
-app.use(pinoHttp({ logger }));
+// Never write a token to the log: Render kept every request's Bearer JWT and cookie in plain text (found 2026-10-18).
+app.use(pinoHttp({ logger, redact: { paths: ["req.headers.authorization", "req.headers.cookie", "res.headers[\"set-cookie\"]"], censor: "[redacted]" } }));
 
 // =====================
 // Static uploads
@@ -145,6 +154,7 @@ app.get("/health", async (req, res) => {
       status: "ok",
       uptime: process.uptime(),
       db: { status: "connected", pool: getPoolStats() },
+      guard: guard.health(),
     });
   } catch (e) {
     res.status(503).json({
@@ -221,10 +231,10 @@ try {
 // Server
 // =====================
 const PORT = parseInt(process.env.PORT || "4000", 10);
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   logger.info({ port: PORT }, "Server running");
 });
-
-process.on("unhandledRejection", (err) => logger.error({ err }, "Unhandled rejection"));
-process.on("uncaughtException", (err) => logger.error({ err }, "Uncaught exception"));
+// Keep-alive longer than the proxy's, a 10-minute request ceiling (Node's 5-minute default cut long writes off).
+guard.attachServer(server);
+// unhandledRejection / uncaughtException / SIGTERM / SIGINT are handled by the guard (logged with the requests in flight).
 logger.info({ workerTokenSet: !!process.env.WORKER_SERVICE_TOKEN }, "SERVER WORKER TOKEN check");

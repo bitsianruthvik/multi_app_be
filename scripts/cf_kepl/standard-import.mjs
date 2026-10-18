@@ -11,6 +11,10 @@
  *   node scripts/cf_kepl/standard-import.mjs ../drawing_bom/out/RDSO_11751R3 --company 2 --apply    writes it, ONE transaction
  *        [--source-url <url>]   when bom.json records none
  *        [--user <id>]          who it is written by (default: the company's first user)
+ *        [--section-class BR]   on --apply, section parts take the catalog bar of this impact class (the class is the
+ *                               order's on these sets); without it they are left to choose. Values the drawing settles
+ *                               (segment lengths, girder type, segment holes / drilled thickness, assembly surface)
+ *                               and flows by usage are filled either way (lib/standardGaps.js, 2026-10-18).
  *        [--json]               the report as JSON
  *        [--prod]               the production database: DB_* from TM/.env.tidb (the same way the other cf_kepl scripts reach it)
  *
@@ -78,6 +82,10 @@ try {
   // The setup step (options the standards need, the BO label) — in this same transaction when applying.
   const setup = await STD.importSetup(conn, c, { apply: APPLY });
   const out = await STD.importStandard(conn, c, { bom, files, apply: APPLY, sourceUrl: arg('source-url') });
+  if (APPLY && out.standardId) {
+    const { fillImportedGaps } = await imp('apps/cf_erp/services/standardGapFixService.js');
+    try { out.report.gapFill = await fillImportedGaps(conn, c, { standardId: out.standardId, bom, sectionClass: arg('section-class') ? String(arg('section-class')).toUpperCase() : null }); } catch (e) { out.report.gapFill = { error: e.message }; }
+  }
   out.report.setup = setup.actions;
   if (APPLY) await conn.commit();
   const trips = count.get();
@@ -122,6 +130,9 @@ function printReport(r, { host, co, trips }) {
   for (const x of r.definitionValues ?? []) line(`Definition value: ${x}`);
   for (const x of r.info ?? []) line(`Note: ${x}`);
   if (r.problems.length) { line('\nPROBLEMS:'); for (const p of r.problems) line(`  - ${p}`); }
+  if (r.gapFill) line(r.gapFill.error ? `
+Gaps left to fill (the fill failed: ${r.gapFill.error})` : `
+Gaps filled from the drawing: ${r.gapFill.values} values, ${r.gapFill.sections} section bars, ${r.gapFill.flows} flows (of ${r.gapFill.before}); left for a person: ${r.gapFill.skipped.length}${r.gapFill.problems.length ? `; refused: ${r.gapFill.problems.join('; ')}` : ''}`);
   if (r.written) line(`\nWritten: standard #${r.written.standardId}, version #${r.written.versionId}, register drawing #${r.written.drawingId}, ${r.written.rows} rows, ${r.written.files} files.`);
   line(`\nRound trips: ${trips}${APPLY ? '' : ' (dry run reads)'}`);
   if (!APPLY) line('Nothing written. --apply writes it in one transaction.');

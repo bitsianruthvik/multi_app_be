@@ -1191,7 +1191,7 @@ export async function resolveProcess(db, companyId, { customerId = null, orderTy
  * helpers below stay deliberately narrow so the duplication stays small, and
  * both name the line of `resolutionService` they mirror.
  */
-async function chainsFor(db, companyId, items) {
+export async function chainsFor(db, companyId, items) {
   // items: [{ id, classification_id, source_definition_id }]
   const byNode = new Map();
   let frontier = [...new Set(items.map((i) => i.classification_id).filter(Boolean))];
@@ -1302,7 +1302,7 @@ async function resolveBooleanSpec(db, companyId, specId, chains) {
  *
  * @returns {Promise<Map<number, {required: number, missing: Array<{specCode, specName}>}>>}
  */
-async function missingRequiredValues(db, companyId, chains) {
+export async function missingRequiredValues(db, companyId, chains) {
   const perItem = new Map([...chains.keys()].map((id) => [id, { required: 0, missing: [] }]));
   if (!chains.size) return perItem;
   const assignments = await loadSubjectRows(db, companyId, {

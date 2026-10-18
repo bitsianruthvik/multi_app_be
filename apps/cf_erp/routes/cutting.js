@@ -13,6 +13,10 @@
  *                             [{ id, code, name, thickness, width, depth, lengthMm, sectionArea, grade, nodeName }]
  *                             catalog items filed under the section stock places; the search ignores spaces and
  *                             reads "x" and "×" alike, so "75x75x8" finds ISA 75 × 75 × 8 in every stock length.
+ *   GET  /section-stock/nearest?search=  { size, exact, nearest, like } — a typed size read as a size ("110 x 110 x 12",
+ *                             "ISA110", "L110*110*12"): the bars of exactly that size, else the nearest of the same profile
+ *                             (heavier / lighter said), and the bar a new size would be made like. A /section-stock search
+ *                             that finds nothing by name falls back to the same size match.
  *   GET  /flows/cut-sections  { flow } — the flow a new cut section takes (production view)
  *   PUT  /flows/cut-sections  { flowId } — null clears it (production manage)
  *   GET  /nest-shop-rules     the AI nesting's shop habits (init.sql §75, services/shopRules.js): { on, schema, defaults,
@@ -26,6 +30,7 @@ import { PERM, guard, handle, ctx } from '../lib/http.js';
 import { invalid, assertNoProblems } from '../lib/errors.js';
 import { cutPlaces, CUT_KINDS } from '../lib/cutPlaces.js';
 import { sectionSteelOf } from '../lib/cutFrom.js';
+import { nearestSections, parseSectionSize, profileOfName, sizeMatches } from '../lib/sectionSize.js';
 import { getCutPlateFlow, getCutSectionFlow, setCutSectionFlow, requireUsableFlow } from '../services/flowService.js';
 import { getShopRules, saveShopRules } from '../services/shopRules.js';
 
@@ -210,12 +215,8 @@ async function savePlaces(db, c, input = {}) {
 /** "75 X 75×8" -> "75x75x8": spaces out, × read as x, one case. */
 const normalise = (s) => String(s ?? '').toLowerCase().replace(/×/g, 'x').replace(/[\s\-_]+/g, '');
 
-async function sectionStock(db, companyId, q = {}) {
-  const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 200);
-  const places = await cutPlaces(db, companyId);
-  if (!places.section.stockIds.size) return [];
-  const term = normalise(q.search);
-  const like = term ? `%${term.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%` : null;
+/** The section stock bars (catalog items under the section stock places), with their steel; `like` narrows by name / code. */
+async function stockBars(db, companyId, stockIds, { like = null, limit = 50 } = {}) {
   // The same normalising in SQL: spaces, dashes and underscores out, × as x, lower case.
   const norm = (col) => `REPLACE(REPLACE(REPLACE(REPLACE(LOWER(${col}), '×', 'x'), ' ', ''), '-', ''), '_', '')`;
   const [rows] = await db.query(
@@ -227,7 +228,7 @@ async function sectionStock(db, companyId, q = {}) {
         ${like ? `AND (${norm('m.name')} LIKE ? OR ${norm('m.code')} LIKE ?)` : ''}
       ORDER BY m.name, m.id
       LIMIT ?`,
-    [companyId, [...places.section.stockIds], ...(like ? [like, like] : []), limit],
+    [companyId, [...stockIds], ...(like ? [like, like] : []), limit],
   );
   const steel = await sectionSteelOf(db, companyId, rows.map((r) => r.id));
   return rows.map((r) => {
@@ -239,6 +240,47 @@ async function sectionStock(db, companyId, q = {}) {
       nodeName: r.node_name,
     };
   });
+}
+/** Every bar a size search reads (a company files a few hundred at most; capped). */
+const ALL_BARS = 3000;
+/** Bars of exactly this size, by their steel, however it was typed. */
+const bySize = (bars, size) => {
+  const sized = bars.filter((b) => sizeMatches(size, b));
+  // A profile word typed ("ISA") narrows to the bars named so — unless none is ("L" typed, the catalog says "ISA").
+  const named = size.profile ? sized.filter((b) => profileOfName(b.name) === size.profile) : sized;
+  return named.length ? named : sized;
+};
+
+async function sectionStock(db, companyId, q = {}) {
+  const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 200);
+  const places = await cutPlaces(db, companyId);
+  if (!places.section.stockIds.size) return [];
+  const term = normalise(q.search);
+  const like = term ? `%${term.replace(/[\%_]/g, (ch) => `\${ch}`)}%` : null;
+  const rows = await stockBars(db, companyId, places.section.stockIds, { like, limit });
+  if (rows.length || !term) return rows;
+  // Nothing by name: read the search as a size ("110 110 12", "L110*110*12", "ISA110") and match the bars' steel.
+  const size = parseSectionSize(q.search);
+  if (!size) return rows;
+  return bySize(await stockBars(db, companyId, places.section.stockIds, { limit: ALL_BARS }), size).slice(0, limit);
+}
+
+/**
+ * GET /section-stock/nearest?search= — the typed size, read: { size: { profile, dims, lengthMm } | null, exact: Bar[],
+ * nearest: [{ key, label, profile, distance, differs, weight: 'heavier'|'lighter'|'same', weightPct, bars: Bar[] }] } — the nearest catalog sizes of
+ * the same profile when no bar has the size exactly (lib/sectionSize.nearestSections), and `like`: the bar a new size
+ * would be made like (the nearest one) so the picker can offer "Add this size to the catalog".
+ */
+async function sectionNearest(db, companyId, q = {}) {
+  const size = parseSectionSize(q.search);
+  const empty = { size, exact: [], nearest: [], like: null };
+  if (!size) return empty;
+  const places = await cutPlaces(db, companyId);
+  if (!places.section.stockIds.size) return empty;
+  const bars = await stockBars(db, companyId, places.section.stockIds, { limit: ALL_BARS });
+  const exact = bySize(bars, size).filter((b) => !size.lengthMm || Number(b.lengthMm) === size.lengthMm);
+  const nearest = nearestSections(size, bars.filter((b) => !exact.some((e) => e.id === b.id)), { limit: Math.min(Math.max(Number(q.limit) || 6, 1), 20) });
+  return { size, exact, nearest, like: nearest[0]?.bars[0] ?? null };
 }
 
 router.get('/cut-places', guard(PERM.view), handle((req) => placesView(pool, ctx(req).companyId)));
@@ -252,8 +294,9 @@ router.put('/nest-shop-rules', guard(PERM.catalog), handle((req) => tx(req, (db,
   return saveShopRules(db, c, req.body);
 })));
 router.get('/section-stock', guard(PERM.view), handle((req) => sectionStock(pool, ctx(req).companyId, req.query)));
+router.get('/section-stock/nearest', guard(PERM.view), handle((req) => sectionNearest(pool, ctx(req).companyId, req.query)));
 router.get('/flows/cut-sections', guard(PERM.productionView), handle((req) => getCutSectionFlow(pool, ctx(req).companyId)));
 router.put('/flows/cut-sections', guard(PERM.production), handle((req) => tx(req, (db, c) => setCutSectionFlow(db, c, req.body ?? {}))));
 
-export { placesView, savePlaces, sectionStock };
+export { placesView, savePlaces, sectionStock, sectionNearest };
 export default router;

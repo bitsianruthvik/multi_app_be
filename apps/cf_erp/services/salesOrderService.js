@@ -45,6 +45,7 @@ import { CURRENCY, readPrice, readBasis, readCurrency, round2, num, measuresOf, 
 import { releaseOrderHolds } from './purchaseLinkService.js';
 import { releaseOrderAllocations, retireRequisitionsOfLines } from './requisitionLifecycle.js';
 import { retirePlanRowsOfLines, retirePlanRowsOfOrder } from './executionPlanService.js';
+import { acceptedValuesOf, orderValueOf } from './orderValueService.js';
 
 /**
  * Amount per line: Map lineId → { billed, billedUom, amount, amountNote }. One
@@ -243,15 +244,17 @@ export async function listOrders(db, companyId, q = {}) {
       ),
     ]) : null,
   ]);
-  // Each order's total (init.sql §36): its priced lines, and the weights some of them need — two reads.
+  // Each order's total (init.sql §36): its priced lines, and the weights some of them need — two reads; + the terms (one).
   const totals = new Map();
+  let termsOf = new Map();
   if (rows.length) {
     const [lines] = await db.query(
       `SELECT l.id, l.order_id, l.line_no, l.item_id, l.quantity, l.rate, l.rate_basis
          FROM cf_sales_order_lines l WHERE l.company_id = ? AND l.order_id IN (?) AND l.deleted_at IS NULL`,
       [companyId, rows.map((o) => o.id)],
     );
-    const amounts = await lineAmounts(db, companyId, lines);
+    const [amounts, terms] = await Promise.all([lineAmounts(db, companyId, lines), acceptedValuesOf(db, companyId, rows.map((o) => o.id))]);
+    termsOf = terms;
     const byOrder = new Map();
     for (const l of lines) { if (!byOrder.has(l.order_id)) byOrder.set(l.order_id, []); byOrder.get(l.order_id).push(l); }
     for (const [orderId, ls] of byOrder) totals.set(orderId, orderTotal(ls, amounts));
@@ -259,7 +262,10 @@ export async function listOrders(db, companyId, q = {}) {
     const { orderTax } = await salesOrderTax(db, companyId, rows, lines, amounts);
     for (const o of rows) totals.set(o.id, { ...(totals.get(o.id) ?? orderTotal([], new Map())), ...orderTax.get(o.id) });
   }
-  const shaped = rows.map((o) => ({ ...shapeOrder(o), total: totals.get(o.id) ?? orderTotal([], new Map()) }));
+  const shaped = rows.map((o) => {
+    const total = totals.get(o.id) ?? orderTotal([], new Map());
+    return { ...shapeOrder(o), total, value: orderValueOf(total, termsOf.get(Number(o.id)), { lineCount: Number(o.line_count ?? 0) }) };
+  });
   if (!paged) return shaped;
   const [[[{ n: total }]], [byStatus]] = counted;
   const chips = Object.fromEntries(ORDER_CHIPS.map((k) => [k, 0]));
@@ -361,11 +367,13 @@ export async function getOrder(db, companyId, id) {
   );
   linesP.catch(() => { /* awaited below; an order that is not there throws first */ });
   const o = await requireOrder(db, companyId, id);
-  const [[[cust]], [revs], [lines]] = await Promise.all([
+  const [[[cust]], [revs], [lines], terms] = await Promise.all([
     o.customer_id ? db.query('SELECT code, name FROM cf_parties WHERE id = ?', [o.customer_id]) : [[null]],
     // Every revision of this order, oldest first — one index lookup on the number.
     db.query('SELECT id, revision, status, revised_at FROM cf_sales_orders WHERE company_id = ? AND code_active = ? ORDER BY revision', [companyId, String(o.code).toLowerCase()]),
     linesP,
+    // The accepted terms (orderValueService) — side by side with the reads above, no extra wait.
+    acceptedValuesOf(db, companyId, [o.id]),
   ]);
   const order = shapeOrder({ ...o, customer_code: cust?.code, customer_name: cust?.name });
   // The standard drawing each line came from (init.sql §69) — only asked when a line names one.
@@ -383,6 +391,8 @@ export async function getOrder(db, companyId, id) {
     lineAmounts(db, companyId, lines),
   ]);
   order.total = orderTotal(lines, amounts);
+  // ONE order value (orderValueService): the accepted terms once they exist, else the estimate from the line rates.
+  order.value = orderValueOf(order.total, terms.get(Number(o.id)), { lineCount: lines.length });
   // Estimated GST (init.sql §37): per line and on the total, by the ship-to state.
   const { lineTax, orderTax } = await salesOrderTax(db, companyId, [o], lines, amounts);
   Object.assign(order.total, orderTax.get(o.id));

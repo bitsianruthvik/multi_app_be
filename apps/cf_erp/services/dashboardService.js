@@ -37,6 +37,7 @@ import { productionMachineIds } from './operationService.js';
 import { plantZone, wallOf, epochOfWall, TYPE_JOINS, TYPE_COLS, typePathOf } from './floorService.js';
 import { availability } from './rollOutService.js';
 import { amountOf, kgPerUom } from './priceService.js';
+import { orderValueOf } from './orderValueService.js';
 
 const MIN = 60000;
 const DAY_MS = 86400000;
@@ -797,7 +798,13 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
               o.customer_id, p.name AS customer_name,
               l.id AS line_id, l.line_no, l.item_id, l.quantity, l.made_qty, l.delivered_qty, l.committed_date, l.rate, l.rate_basis,
               mr.code AS item_code, mr.name AS item_name, i.uom,
-              (SELECT r.id FROM cf_production_releases r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL LIMIT 1) AS release_id
+              (SELECT r.id FROM cf_production_releases r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL LIMIT 1) AS release_id,
+              -- ONE order value (orderValueService, 2026-10-18): the approved terms' value, and the pending one — read here,
+              -- not in a read of their own (the dashboard keeps its fixed handful of reads).
+              (SELECT JSON_EXTRACT(a.estimate_json, '$.value') FROM cf_order_acceptances a WHERE a.company_id = o.company_id AND a.order_id = o.id
+                  AND a.status = 'approved' AND a.deleted_at IS NULL ORDER BY a.version DESC LIMIT 1) AS acc_approved,
+              (SELECT JSON_EXTRACT(a.estimate_json, '$.value') FROM cf_order_acceptances a WHERE a.company_id = o.company_id AND a.order_id = o.id
+                  AND a.status = 'pending' AND a.deleted_at IS NULL ORDER BY a.version DESC LIMIT 1) AS acc_pending
          FROM cf_sales_orders o
          JOIN cf_sales_order_lines l ON l.order_id = o.id AND l.deleted_at IS NULL
          LEFT JOIN cf_parties p ON p.id = o.customer_id
@@ -960,6 +967,15 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
       [companyId, lineItemIds],
     ) : [[]],
   ]);
+  const termsOf = new Map();
+  for (const l of lines) {
+    if (termsOf.has(Number(l.order_id))) continue;
+    const v = (x) => (x == null ? null : Number(typeof x === 'string' ? JSON.parse(x) : x));
+    termsOf.set(Number(l.order_id), {
+      approved: l.acc_approved == null ? null : { value: v(l.acc_approved) },
+      pending: l.acc_pending == null ? null : { value: v(l.acc_pending) },
+    });
+  }
   const onOrder = new Map(poRows.map((r) => [r.item_id, { qty: Number(r.open_qty), expected: dayText(r.first_expected) }]));
   const M_PER = { m: 1, mtr: 1, metre: 1, meter: 1, mm: 0.001, cm: 0.01, km: 1000 };
   const measure = new Map();
@@ -1123,9 +1139,15 @@ export async function ordersDashboard(dbIn, companyId, q = {}, { withMoney = tru
     const inv = invOf.get(orderId) ?? [];
     const issuedRow = issuedOf.get(orderId);
     const amounts = lineRows.map((l) => l._amount);
+    // ONE order value (orderValueService): the accepted terms once they exist, else the estimate from the line rates.
+    const ov = withMoney ? orderValueOf({
+      amount: amounts.some((a) => a != null) ? Math.round(amounts.reduce((t, a) => t + (a ?? 0), 0) * 100) / 100 : 0,
+      complete: amounts.every((a) => a != null), unpricedLines: lineRows.filter((l) => !l._rated).map((l) => l.lineNo),
+    }, termsOf.get(Number(orderId)), { lineCount: lineRows.length }) : null;
     const money = withMoney ? {
-      value: amounts.some((a) => a != null) ? Math.round(amounts.reduce((t, a) => t + (a ?? 0), 0) * 100) / 100 : null,
-      valueComplete: amounts.every((a) => a != null),
+      value: ov.amount,
+      valueBasis: ov.basis, valueLabel: ov.label, estimate: ov.estimate, differs: ov.differs,
+      valueComplete: ov.basis === 'estimate' ? amounts.every((a) => a != null) : ov.amount != null,
       unpricedLines: lineRows.filter((l) => !l._rated).map((l) => l.lineNo),
       invoiced: Math.round(inv.filter((v) => v.status === 'issued').reduce((t, v) => t + Number(v.taxable ?? 0), 0) * 100) / 100,
       invoicedCount: inv.filter((v) => v.status === 'issued').reduce((t, v) => t + Number(v.n), 0),

@@ -184,8 +184,140 @@ const DEAD_SOCKET = new Set([
   "ETIMEDOUT",
   "ECONNABORTED",
 ]);
+// The same, said in words by the driver: a command sent on a connection the
+// server already hung up on ("Can't add new command when connection is in
+// closed state") carries no code at all.
+const DEAD_SOCKET_TEXT = /Connection lost|server closed the connection|closed state|ERR_STREAM_DESTROYED|socket hang up/i;
 export const isDeadConnection = (err) =>
-  !!err && (DEAD_SOCKET.has(err.code) || err.fatal === true);
+  !!err && (DEAD_SOCKET.has(err.code) || err.fatal === true || DEAD_SOCKET_TEXT.test(String(err.message ?? "")));
+
+/**
+ * A statement that only READS — safe to send again on another connection when
+ * the first one turned out to be dead, because running it twice changes nothing.
+ * Locking reads (FOR UPDATE / LOCK IN SHARE MODE), GET_LOCK and `WITH … UPDATE`
+ * are not: they are writes in disguise, or belong to a transaction.
+ */
+const READ_HEAD = /^\s*(?:(?:\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$))\s*)*\(?\s*(SELECT|SHOW|WITH|DESCRIBE|DESC|EXPLAIN)\b/i;
+const NOT_A_PLAIN_READ = /\bFOR\s+UPDATE\b|\bFOR\s+SHARE\b|\bLOCK\s+IN\s+SHARE\s+MODE\b|\bINTO\s+(?:OUTFILE|DUMPFILE|@)|\bGET_LOCK\s*\(|\bRELEASE_LOCK\s*\(|\)\s*(?:UPDATE|DELETE|INSERT|REPLACE)\b/i;
+export function isReadOnlySql(sql) {
+  const text = typeof sql === "string" ? sql : sql && typeof sql.sql === "string" ? sql.sql : null;
+  if (!text) return false;
+  const head = READ_HEAD.exec(text);
+  if (!head) return false;
+  return !NOT_A_PLAIN_READ.test(text);
+}
+
+/**
+ * POOL READS SURVIVE A CONNECTION THE SERVER HAS ALREADY CLOSED (2026-10-18).
+ *
+ * TiDB Cloud's gateway hangs up on pooled connections on its own schedule
+ * (`wait_timeout` is 8 h; it is not that), and mysql2 can hand such a
+ * connection out in the moment between the hangup and the driver noticing it.
+ * The first statement then fails with "Connection lost: The server closed the
+ * connection." On production this was seen three times in a week — the order's
+ * payments read in "Record payment" (billingService.billingFacts, 2026-10-18
+ * 13:16 UTC), and the classification tree twice — each a 500 that worked on the
+ * second click. A fan-out read (Promise.all of seven queries) draws seven
+ * connections at once, including the least recently used, so the screens that
+ * read the most were the ones that met it.
+ *
+ * A plain read sent on a dead connection never ran, and would change nothing if
+ * it had: it is sent again (another connection each time — mysql2 drops the
+ * fatally-errored one). Writes are NOT retried here; that belongs in a
+ * transaction (`getConnection` below makes its start safe instead).
+ */
+export function withReadRetry(target, method, { attempts = 3, log = logger } = {}) {
+  const original = target[method];
+  if (typeof original !== "function" || original.__readRetry) return;
+  const wrapped = async function (sql, ...rest) {
+    let last;
+    for (let i = 1; i <= attempts; i += 1) {
+      try {
+        return await original.call(this, sql, ...rest);
+      } catch (err) {
+        last = err;
+        if (i === attempts || !isDeadConnection(err) || !isReadOnlySql(sql)) throw err;
+        log.warn({ attempt: i, code: err.code, msg: String(err.message ?? "").slice(0, 120) }, "[db] read retried after a dead connection");
+      }
+    }
+    throw last;
+  };
+  wrapped.__readRetry = true;
+  target[method] = wrapped;
+}
+
+/**
+ * A connection for a transaction that is ALIVE as far as can be told: one whose
+ * socket is already gone is dropped for another, and one that sat idle longer
+ * than DB_PING_IDLE_MS (default 30 s) answers a ping first (one round trip, only
+ * after a pause). Without this a transaction's BEGIN met the same hung-up
+ * connection and the save failed with a 500.
+ */
+const PING_IDLE_MS = Number(process.env.DB_PING_IDLE_MS) >= 0 && process.env.DB_PING_IDLE_MS !== undefined && process.env.DB_PING_IDLE_MS !== ""
+  ? Number(process.env.DB_PING_IDLE_MS) : 30_000;
+export function withLiveConnections(target, { attempts = 3, pingIdleMs = PING_IDLE_MS, log = logger } = {}) {
+  const original = target.getConnection;
+  if (typeof original !== "function" || original.__live) return;
+  const wrapped = async function (...args) {
+    let last;
+    for (let i = 1; i <= attempts; i += 1) {
+      const conn = await original.apply(this, args);
+      const core = conn?.connection ?? conn;
+      const gone = !!(core?._closing || core?._fatalError || core?.stream?.destroyed);
+      const idleFor = core?.lastActiveTime ? Date.now() - core.lastActiveTime : 0;
+      try {
+        if (gone) throw Object.assign(new Error("pooled connection already closed"), { code: "PROTOCOL_CONNECTION_LOST" });
+        if (pingIdleMs > 0 && idleFor > pingIdleMs) await conn.ping();
+        return conn;
+      } catch (err) {
+        last = err;
+        try { conn.destroy(); } catch { /* it is going anyway */ }
+        log.warn({ attempt: i, idleMs: idleFor, code: err.code }, "[db] dropped a dead pooled connection");
+      }
+    }
+    throw last;
+  };
+  wrapped.__live = true;
+  target.getConnection = wrapped;
+}
+
+/** A driver connection that has already seen its socket close (no round trip needed to know). */
+export const isClosedConnection = (conn) => {
+  const core = conn?.connection ?? conn;
+  return !!(core?._closing || core?._fatalError || core?.stream?.destroyed);
+};
+
+/**
+ * The driver's own pool never hands out a connection it can already SEE is closed.
+ *
+ * mysql2 (3.15) has a sharp edge here: `pool.query` on a connection in the
+ * closed state rejects the query AND THEN throws a TypeError from inside its
+ * callback (`conn.query(cmd).once` on undefined) — an uncaught exception, which
+ * would end the process were it not for index.js's handler. Skipping such a
+ * connection costs nothing (a flag check) and removes the case.
+ */
+export function guardCoreGetConnection(corePool, { attempts = 5, force = false } = {}) {
+  const original = corePool?.getConnection;
+  if (typeof original !== "function" || (original.__guarded && !force)) return () => {};
+  const guarded = function (cb) {
+    let left = attempts;
+    const take = () => original.call(this, (err, conn) => {
+      if (err || !isClosedConnection(conn) || left <= 1) return cb(err, conn);
+      left -= 1;
+      try { conn.destroy(); } catch { /* it is going anyway */ }
+      take();
+    });
+    take();
+  };
+  guarded.__guarded = true;
+  corePool.getConnection = guarded;
+  return () => { corePool.getConnection = original; };
+}
+
+guardCoreGetConnection(pool.pool);
+withReadRetry(pool, "query");
+withReadRetry(pool, "execute");
+withLiveConnections(pool);
 
 /**
  * A pooled connection that has been PROVEN alive, for work that begins after a

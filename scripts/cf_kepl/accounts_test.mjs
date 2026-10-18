@@ -120,6 +120,10 @@ try {
   const makeOrder = async (key, qty) => {
     const o = await G.girderOrder(key, qty, { status: 'inquiry', lock: true });
     await db.query('UPDATE cf_sales_orders SET process_id = ? WHERE id = ?', [prc.id, o.id]);
+    // The lock is written with MySQL NOW(), the SERVER's wall clock; the pool reads DATETIMEs as UTC ('Z', db.js). On a
+    // local IST server that reads back 5½ h late — after 18:30 the freeze lands TOMORROW and "design frozen" is not due
+    // yet (2026-10-18: "fails on local data"; prod is UTC throughout). Pin the freeze to the morning of today.
+    await db.query('UPDATE cf_sales_order_lines SET locked_at = ? WHERE order_id = ? AND locked_at IS NOT NULL', [`${T} 06:00:00`, o.id]);
     const [[line]] = await db.query('SELECT item_id FROM cf_sales_order_lines WHERE id = ?', [o.lineId]);
     await db.query(`INSERT INTO cf_spec_values (company_id, specification_id, subject_type, subject_id, value_number, uom, source) VALUES (?, ?, 'master', ?, 2000, 'kg', 'entered')
                     ON DUPLICATE KEY UPDATE value_number = 2000, uom = 'kg'`, [COMPANY, weightSpec.id, line.item_id]);

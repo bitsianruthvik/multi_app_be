@@ -329,7 +329,8 @@ try {
   ok('the production figures are tiny (under 10 KB) where the full tracker is megabytes', bytes(fProd.out) < 10 * 1024 && bytes(fFull.out) > 1024 * 1024, `${kb(fProd.out)} vs ${kb(fFull.out)}`);
   ok(`the order page's first load (order, process, figures, movements, grid) takes at most 90 round trips (took ${firstTrips})`, firstTrips <= 90);
   ok(`the order's process read takes at most 50 round trips (took ${fProc.trips})`, fProc.trips <= 50);
-  ok(`the order read takes at most 10 round trips (took ${fOrder.trips})`, fOrder.trips <= 10);
+  // 11: +1 for the accepted value (orderValueService, 2026-10-19), sent beside the customer/revisions/lines reads.
+  ok(`the order read takes at most 11 round trips (took ${fOrder.trips})`, fOrder.trips <= 11);
   const sumRel = fProd.out.releases.find((r) => r.id === rel.id);
   const fullRel = fFull.out.releases.find((r) => r.id === rel.id);
   const { items: _i, requirements: _q, ...fullHead } = fullRel;

@@ -56,6 +56,9 @@ import { cutsOfLotsAsync } from './plateCutsService.js';
 import { plateRatesPerKg } from './valuationService.js';
 import { shapeOfCutPlate } from './nestShapes.js';
 import { startRun, memoryRun, snapshot, unpackPlan, packPlan, resumeRun, settleRuns, cancelRun } from './nestRunService.js';
+// §87 (2026-10-18): the AI alternative stored beside the uploaded nesting, and which of the two is the main one.
+import { readAlternative, recordAlternativeRun, alternativeView } from './nestAlternativeService.js';
+import { savedLotsOf as savedLotsById } from './nestingService.js';
 
 const WASTE_KEYS = ['kerf', 'sequenceGaps', 'rim', 'offcut', 'wastage'];
 const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
@@ -126,7 +129,7 @@ function fromSavedLot(lot, pieces, m) {
  * THE METRICS of a set of plates — one function for both sides of the comparison.
  * Every number is worked out; `cost.value` is null (with `cost.reason`) when any plate has no cost.
  */
-export async function nestingMetrics(nests, { facts, sizeOf, costs }) {
+export async function nestingMetrics(nests, { facts, sizeOf, costs, cuts: withCuts = true }) {
   let boughtKg = 0; let partsKg = 0; let pieces = 0;
   const wasteKg = Object.fromEntries(WASTE_KEYS.map((k) => [k, 0]));
   const offcut = { count: 0, kg: 0, largestKg: null, largestAreaM2: null };
@@ -159,7 +162,8 @@ export async function nestingMetrics(nests, { facts, sizeOf, costs }) {
       offcuts: (n.offcuts ?? []).length, offcutKg: r3(offKg), cost: plateCost, costBasis: basis,
     });
   }
-  const cuts = await cutsOfLotsAsync(nests.map((n) => ({ kerf: n.kerfMm, pieces: n.pieces, free: !!n.free })), facts, sizeOf);
+  // `cuts: false` (the plate-change sheet, which shows no cut length): the true-shape cut walk is skipped — null below.
+  const cuts = withCuts ? await cutsOfLotsAsync(nests.map((n) => ({ kerf: n.kerfMm, pieces: n.pieces, free: !!n.free })), facts, sizeOf) : { cutLengthMm: null, sharedMm: null, piercings: null };
   return {
     metrics: {
       plates: nests.length, pieces,
@@ -169,7 +173,9 @@ export async function nestingMetrics(nests, { facts, sizeOf, costs }) {
       wasteKgTotal: r3(boughtKg - partsKg),
       wasteKg: Object.fromEntries(WASTE_KEYS.map((k) => [k, r3(wasteKg[k])])),
       offcuts: { count: offcut.count, kg: r3(offcut.kg), largestKg: offcut.largestKg == null ? 0 : r3(offcut.largestKg), largestAreaM2: offcut.largestAreaM2 ?? 0 },
-      cutLengthM: r3(cuts.cutLengthMm / 1000), sharedCutM: r3(cuts.sharedMm / 1000), piercings: cuts.piercings,
+      cutLengthM: cuts.cutLengthMm == null ? null : r3(cuts.cutLengthMm / 1000), sharedCutM: cuts.sharedMm == null ? null : r3(cuts.sharedMm / 1000), piercings: cuts.piercings,
+      // NET STEEL (§87, 2026-10-18): what the job really consumes when every offcut is kept and used again — bought − offcuts.
+      netTonnes: r3((boughtKg - offcut.kg) / 1000),
       cost: uncosted.length
         ? { value: null, currency: 'INR', basis: null, customerPlates, reason: `No cost for ${uncosted.join(', ')}: ${uncosted.length === 1 ? 'it has' : 'they have'} never been received or bought and ${uncosted.length === 1 ? 'has' : 'have'} no list price, so the nesting cannot be priced.` }
         : { value: r2(cost), currency: 'INR', basis: [...bases].join(' / ') || (customerPlates ? "the customer's own plates" : null), customerPlates, reason: null },
@@ -211,14 +217,19 @@ const describeRun = (row) => (row ? {
  * Everything the three entry points need, read once: the line, what is saved, the two demands
  * and the runs that answer them.
  */
-async function compareState(db, companyId, lineId) {
+export async function compareState(db, companyId, lineId, { alt: knownAlt } = {}) {
   const ctx = await importContext(db, companyId, lineId);
   const [saved, facts, excl, untracked] = await Promise.all([savedLotsOf(db, companyId, lineId), drawingFactsOfLine(db, companyId, lineId), exclusionsOfLine(db, companyId, lineId), untrackedOfLine(db, companyId, lineId)]);
   const cpById = new Map(ctx.cutPlates.map((cp) => [cp.id, cp]));
   const shapes = new Map();
   const shapeOf = (cp) => { if (!shapes.has(cp.id)) shapes.set(cp.id, shapeOfCutPlate(cp, facts)); return shapes.get(cp.id); };
   const mctx = { cpById, shapeOf, settingRows: ctx.settingRows, plates: ctx.plates };
-  const uploadedLots = saved.filter((l) => l.origin === 'imported');
+  let uploadedLots = saved.filter((l) => l.origin === 'imported');
+  // §87: AI's nesting made the MAIN one — the customer's plates are kept (soft-deleted) and read back by id, so the
+  // comparison stands as it was: the same upload, the same pieces, the same demand, the same AI run.
+  const alt = knownAlt !== undefined ? knownAlt : await readAlternative(db, companyId, lineId);
+  const swapped = !!alt && alt.main === 'ai' && alt.valid && !uploadedLots.length;
+  if (swapped) uploadedLots = await savedLotsById(db, companyId, lineId, { ids: alt.uploadLotIds });
   const subset = new Map();
   for (const l of uploadedLots) for (const p of l.pieces) if (isUploadedPiece(l, p)) subset.set(p.cutPlateId, (subset.get(p.cutPlateId) ?? 0) + 1);
   // Never more of a cut plate than the line needs: an over-covered upload is compared on what the line needs.
@@ -256,10 +267,10 @@ async function compareState(db, companyId, lineId) {
   // A finished run of ANOTHER demand: what "stale" means.
   const stale = rows.find((r) => USABLE.has(r.status) && r.demand_hash && r.demand_hash !== demandSubset?.hash && r.demand_hash !== demandLine?.hash) ?? null;
   const failed = rows.find((r) => r.status === 'failed') ?? null;
-  return { ctx, saved, facts, excl, untracked, cpById, mctx, uploadedLots, subset, only, uploadKey, demandSubset, demandLine, demandError, rows, mem, rowSubset, rowLine, stale, failed };
+  return { ctx, saved, facts, excl, untracked, cpById, mctx, uploadedLots, subset, only, uploadKey, demandSubset, demandLine, demandError, rows, mem, rowSubset, rowLine, stale, failed, alt, swapped };
 }
 
-async function plansOf(db, companyId, rowIds) {
+export async function plansOf(db, companyId, rowIds) {
   const ids = [...new Set(rowIds.filter(Boolean))];
   const out = new Map();
   if (!ids.length) return out;
@@ -502,11 +513,16 @@ export async function getCompare(db, companyId, lineId, { with: other = 'auto', 
     coverage, leftOver,
     // What accepting the automatic side would replace, in numbers (2026-10-10; additive).
     willReplace: willReplaceOf(st.saved, planLine ?? null, ctx.cutPlates, st.excl),
+    // §87: the stored AI alternative — which side is the main nesting now, and whether (and why not) it may be swapped.
+    alternative: alternativeView({
+      alt: st.alt, swapped: st.swapped, autoSide, blocker, differ,
+      additions: st.swapped ? 0 : st.uploadedLots.reduce((a, l) => a + l.pieces.filter((p) => !isUploadedPiece(l, p)).length, 0),
+    }),
     run: running,
     lastFailure: !autoSide && !running && st.failed ? { ...describeRun(st.failed), error: parseJson(st.failed.error_json) } : null,
     canAccept: {
       uploaded: !!uploaded && !!autoSide && autoSide.status === 'ready',
-      auto: !!autoSide && autoSide.status === 'ready' && !!lineSide && !blocker,
+      auto: !!autoSide && autoSide.status === 'ready' && !!lineSide && !blocker && !st.swapped,
       reason: decided ? `Already decided: the ${decided === 'auto' ? 'automatic' : 'uploaded'} nesting was taken.`
         : blocker ? blocker.message
           : !autoSide ? 'There is no automatic run of this demand to decide against yet.'
@@ -591,7 +607,11 @@ export async function startAutoCompare(db, c, lineId, { trigger = 'upload', reru
     if ((mem.purpose ?? 'nest') === 'compare' && mem.jobs?.every((j) => j.input?.only)) cancelRun(companyId, lineId, { purpose: 'compare' });
     else return { started: false, busy: true, message: 'A nesting run is working on this line. AI\'s nesting of the upload starts when it is done.' };
   }
-  if (st.rowSubset && !rerun) return { started: false, answered: true, runId: st.rowSubset.run_uid, message: 'AI\'s nesting of these pieces is already done. It is shown again.' };
+  if (st.rowSubset && !rerun) {
+    // §87: that run is the line's alternative of this upload too.
+    await recordAlternativeRun(db, c, lineId, { runUid: st.rowSubset.run_uid, uploadKey: st.uploadKey });
+    return { started: false, answered: true, runId: st.rowSubset.run_uid, message: 'AI\'s nesting of these pieces is already done. It is shown again.' };
+  }
   const pieces = Object.values(st.only).reduce((a, q) => a + q, 0);
   const upload = { key: st.uploadKey, plates: st.uploadedLots.length, pieces };
   const base = { effort: AUTO_COMPARE_EFFORT, trigger };
@@ -600,6 +620,8 @@ export async function startAutoCompare(db, c, lineId, { trigger = 'upload', reru
     purpose: 'compare', db: db === pool ? undefined : db,
     jobs: [{ scope: 'subset', input: { ...base, only: st.only, upload } }],
   });
+  // §87: this run IS the line's alternative of this upload (stored when it finishes, found again by its demand).
+  await recordAlternativeRun(db, c, lineId, { runUid: snap.runId, uploadKey: st.uploadKey });
   return { started: true, running: true, runId: snap.runId, status: 'running', jobs: ['subset'], run: snap, message: AUTO_QUEUED };
 }
 
@@ -680,6 +702,8 @@ export async function acceptCompare(db, c, lineId, input = {}) {
   if (rows.some((r) => r.status !== 'ready')) throw invalid('RUN_NOT_READY', rows.some((r) => r.status === 'running') ? 'That run is still working — wait for it to finish.' : 'That run failed, so there is no automatic nesting to decide against. Run the comparison again.');
 
   const st = await compareState(db, companyId, lineId);
+  // §87: with AI's nesting the main one the uploaded side is kept aside — the swap (and switch back) decides, not this.
+  if (st.swapped) throw invalid('ALREADY_SWAPPED', "AI's nesting is already the main one. Switch back on the Compare tab if you want the customer's.");
   if (!st.uploadedLots.length) throw invalid('NOTHING_UPLOADED', 'Nothing is uploaded on this line any more, so there is nothing to decide between.');
   const current = rows.filter((r) => r.demand_hash && (r.demand_hash === st.demandSubset?.hash || r.demand_hash === st.demandLine?.hash));
   if (!current.length) throw invalid('STALE_RUN', 'That run nested a different demand — the line has changed since. Compare again.');
@@ -750,15 +774,15 @@ export async function metricsOfPlan(db, companyId, lineId, plan) {
  *                     (the impact sheet prices by valuationService.plateRatesPerKg, as the order's costs do).
  * Returns { ctx, saved, metrics, perPlate }.
  */
-export async function measureSavedLine(db, companyId, lineId, { costsOf }) {
+export async function measureSavedLine(db, companyId, lineId, { costsOf, cuts = true }) {
   const ctx = await importContext(db, companyId, lineId);
   const [saved, facts] = await Promise.all([savedLotsOf(db, companyId, lineId), drawingFactsOfLine(db, companyId, lineId)]);
   const cpById = new Map(ctx.cutPlates.map((cp) => [cp.id, cp]));
   const shapes = new Map();
   const shapeOf = (cp) => { if (!shapes.has(cp.id)) shapes.set(cp.id, shapeOfCutPlate(cp, facts)); return shapes.get(cp.id); };
   const nests = saved.length ? await fromSavedLots(saved.map((l) => [l, l.pieces]), { cpById, shapeOf, settingRows: ctx.settingRows, plates: ctx.plates }) : [];
-  const costs = await costsOf(nests);
-  const m = await nestingMetrics(nests, { facts, sizeOf: new Map(ctx.cutPlates.map((cp) => [cp.id, cp.steel ?? {}])), costs });
+  const costs = await costsOf(nests, ctx);
+  const m = await nestingMetrics(nests, { facts, sizeOf: new Map(ctx.cutPlates.map((cp) => [cp.id, cp.steel ?? {}])), costs, cuts });
   return { ctx, saved, ...m };
 }
 

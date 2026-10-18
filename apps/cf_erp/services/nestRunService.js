@@ -905,8 +905,9 @@ export async function insertFinishedRun(db, run) {
   const budgetMs = Number(run.budgetMs) || runBudgetMs(input.effort);
   const [res] = await db.query(
     `INSERT INTO cf_nest_runs (company_id, order_line_id, run_uid, kind, scope, purpose, status, demand_hash, params_json, plan_json, plan_encoding, metrics_json, log_json, started_at, finished_at, started_by_name, created_by, budget_ms, budget_used_ms)
-     VALUES (?, ?, ?, 'auto', ?, 'nest', 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [run.companyId, run.lineId, uid, scope, run.demand?.hash ?? null, JSON.stringify(input), packed.text, packed.encoding,
+     VALUES (?, ?, ?, 'auto', ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    // purpose: 'nest' (a proposal the page shows) or 'compare' (§87: AI's alternative of an upload, made by the backfill).
+    [run.companyId, run.lineId, uid, scope, run.purpose === 'compare' ? 'compare' : 'nest', run.demand?.hash ?? null, JSON.stringify(input), packed.text, packed.encoding,
       metricsOfJob({ budgetMs, sections: run.sections ?? null }, j, true), JSON.stringify((run.log ?? []).slice(-LOG_CAP)),
       new Date(run.startedAt ?? Date.now()), new Date(run.finishedAt ?? Date.now()), String(run.startedBy ?? 'offline runner').slice(0, 190), run.userId ?? null,
       budgetMs, Math.max(0, Math.round((run.finishedAt ?? Date.now()) - (run.startedAt ?? Date.now())))],
