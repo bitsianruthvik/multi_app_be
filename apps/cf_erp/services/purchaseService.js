@@ -1291,6 +1291,12 @@ export async function receiveLine(db, c, lineId, input = {}) {
   // §68: the customer may send MORE than asked — it is theirs, not earmarked, and flagged to go back. A supplier may not.
   if (quantity != null && quantity > left + EPS && !theirs) problems.push(`Only ${fmt(left)} ${l.uom} of this line is still outstanding.`);
   if (blank(input.stockingAreaId)) problems.push('Say which stocking area it went into.');
+  else {
+    // A purchase lands in a STORE (or quarantine, to be inspected): production takes plates only from storage / WIP,
+    // so goods booked into the dispatch yard or a scrap bay could never be used (SO260014, 2026-10-18).
+    const [[area]] = await db.query('SELECT code, purpose FROM cf_stocking_areas WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(input.stockingAreaId)]);
+    if (area && !['storage', 'quarantine'].includes(area.purpose)) problems.push(`${area.code} is a ${area.purpose} area — goods from a purchase go into a store (or quarantine for inspection).`);
+  }
   // §68: a DIFFERENT item than the line — only on a customer's PO, with a reason, as a plate change for the MD.
   const substitute = blank(input.substituteItemId) ? null : await checkSubstitute(db, c.companyId, l, input, problems);
   const receipt = receiptLineFor(l, { ...input, quantity }, problems);
