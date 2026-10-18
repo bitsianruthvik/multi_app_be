@@ -743,3 +743,9 @@ export async function savedReports(companyId) {
   }).sort((a, b) => Number(a.standard) - Number(b.standard) || a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
   return { asOf: await lastSync(companyId), count: list.length, karni: list.filter((r) => !r.standard).length, reports: list };
 }
+
+/** Shared with the insight engine (services/insightService.js). */
+export const shared = {
+  load, masters, unitMap, lastSync, MASTER_SETS,
+  num, day, live, lineOpen, interUnit, trade, round, todayIso, addDays, monthKey, fyStart, lastMonths, payTotal, payLive,
+};

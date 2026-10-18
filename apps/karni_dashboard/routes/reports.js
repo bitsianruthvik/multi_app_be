@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { pool } from '../../../db.js';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import * as reports from '../services/reportService.js';
+import { insights } from '../services/insightService.js';
 
 /**
  * The screens' side: a platform login with access to this app (protect checks
@@ -25,6 +26,7 @@ const cid = (req) => req.company.id;
 
 router.get('/status', protect, wrap((req) => reports.status(cid(req))));
 router.get('/units', protect, wrap((req) => reports.units(cid(req))));
+router.get('/insights', protect, wrap((req) => insights(cid(req), req.query)));
 router.get('/overview', protect, wrap((req) => reports.overview(cid(req), req.query)));
 router.get('/sales', protect, wrap((req) => reports.sales(cid(req), req.query)));
 router.get('/sales/customer/:cardCode', protect, wrap((req) => reports.salesCustomer(cid(req), req.params.cardCode, req.query)));
