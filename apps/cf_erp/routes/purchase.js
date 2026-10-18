@@ -7,9 +7,12 @@
  *   POST   /purchase-orders             { code?, supplierId?, expectedDate?, notes? }
  *   GET    /purchase-orders/:id
  *   PUT    /purchase-orders/:id         { supplierId?, expectedDate?, notes? }
- *   POST   /purchase-orders/:id/order   { supplierId? } — send for MD approval (§71: it no longer places it)
- *   POST   /purchase-orders/:id/approve { note? } — THE MD approves: pending → waiting for goods (cf_erp_plate_change_approve, "MD approval")
- *   POST   /purchase-orders/:id/close   { reason } — close short: what is pending is released, the PR line's "PO raised" goes down
+ *   POST   /purchase-orders/:id/order   { supplierId? } — send for approval (§71: it no longer places it; §73: a row of the Management inbox)
+ *   POST   /purchase-orders/:id/approve { note? } — Management approves (§73: through the inbox — cf_erp_approve_purchase_order, or
+ *                                      cf_erp_approve_contractor_po for a contractor PO): pending → waiting for goods
+ *   POST   /purchase-orders/:id/reject  { note } — Management sends it back to the buyer (not placed)
+ *   POST   /purchase-orders/:id/close   { reason } — ASK to close short (§73: cf_erp_approve_po_close_short approves it in the inbox);
+ *                                      on approval what is pending is released and the PR line's "PO raised" goes down
  *   POST   /purchase-orders/:id/cancel  { reason? }
  *   POST   /purchase-orders/:id/lines   { itemId, quantity, expectedDate?, note?, unitPrice? }  (no unitPrice = last price paid)
  *   PUT    /purchase-lines/:id          { quantity?, expectedDate?, note?, unitPrice? }  (null clears)
@@ -29,8 +32,11 @@ import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
   listPurchaseOrders, getPurchaseOrder, createPurchaseOrder, updatePurchaseOrder,
   addPurchaseLine, updatePurchaseLine, removePurchaseLine, markOrdered, cancelPurchaseOrder, receiveLine,
-  setPurchaseLineOrders, approvePurchaseOrder, closePurchaseOrder, pendingLines,
+  setPurchaseLineOrders, requestCloseShort, pendingLines,
 } from '../services/purchaseService.js';
+import { APPROVAL_PERMS, decide, pendingOf } from '../services/approvalService.js';
+import { approverOf } from './approvals.js';
+import { CfError } from '../lib/errors.js';
 import { releaseHold } from '../services/purchaseLinkService.js';
 
 const router = Router();
@@ -39,9 +45,19 @@ const id = (req) => intParam(req.params.id);
 const company = (req) => ctx(req).companyId;
 const view = guard(PERM.inventoryView);
 const manage = guard(PERM.inventory);
-const approve = guard(PERM.plateChangeApprove);
-// The MD approves purchase orders, so may read them without the inventory grants (§71).
-const viewPo = guardAny(PERM.inventoryView, PERM.plateChangeApprove);
+// Management approves purchase orders, so may read them without the inventory grants (§71; §73: any approval tag).
+const viewPo = guardAny(PERM.inventoryView, PERM.plateChangeApprove, ...APPROVAL_PERMS);
+const approve = guardAny(...APPROVAL_PERMS);
+/** The PO's own approval decided through the inbox (approvalService.decide checks the tag and requester ≠ approver). */
+const decidePo = (decision) => handle((req) => withTransaction(async (db) => {
+  const c = ctx(req);
+  const row = await pendingOf(db, c.companyId, 'purchase_order', id(req), ['purchase_order', 'contractor_po']);
+  if (!row) {
+    const [[po]] = await db.query('SELECT id FROM cf_purchase_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, id(req)]);
+    throw po ? new CfError(422, 'NOT_PENDING', 'This purchase order is not waiting for approval.') : new CfError(404, 'NOT_FOUND', 'Purchase order not found.');
+  }
+  return (await decide(db, c, row.id, { decision, note: req.body?.note }, approverOf(req))).result;
+}));
 
 router.get('/purchase-orders', viewPo, handle((req) => listPurchaseOrders(pool, company(req), req.query)));
 router.get('/purchase-orders/pending-lines', view, handle((req) => pendingLines(pool, company(req), req.query)));
@@ -49,8 +65,9 @@ router.post('/purchase-orders', manage, handle((req) => tx(req, (db, c) => creat
 router.get('/purchase-orders/:id', viewPo, handle((req) => getPurchaseOrder(pool, company(req), id(req))));
 router.put('/purchase-orders/:id', manage, handle((req) => tx(req, (db, c) => updatePurchaseOrder(db, c, id(req), req.body ?? {}))));
 router.post('/purchase-orders/:id/order', manage, handle((req) => tx(req, (db, c) => markOrdered(db, c, id(req), req.body ?? {}))));
-router.post('/purchase-orders/:id/approve', approve, handle((req) => tx(req, (db, c) => approvePurchaseOrder(db, c, id(req), req.body ?? {}))));
-router.post('/purchase-orders/:id/close', manage, handle((req) => tx(req, (db, c) => closePurchaseOrder(db, c, id(req), req.body ?? {}))));
+router.post('/purchase-orders/:id/approve', approve, decidePo('approve'));
+router.post('/purchase-orders/:id/reject', approve, decidePo('reject'));
+router.post('/purchase-orders/:id/close', manage, handle((req) => tx(req, (db, c) => requestCloseShort(db, c, id(req), req.body ?? {}))));
 router.post('/purchase-orders/:id/cancel', manage, handle((req) => tx(req, (db, c) => cancelPurchaseOrder(db, c, id(req), req.body ?? {}))));
 router.post('/purchase-orders/:id/lines', manage, handle((req) => tx(req, (db, c) => addPurchaseLine(db, c, id(req), req.body ?? {}))));
 

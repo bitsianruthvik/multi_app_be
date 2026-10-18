@@ -51,6 +51,7 @@ import { getOrder } from './salesOrderService.js';
 import { carryRequisitions, returnRequisitions } from './requisitionLifecycle.js';
 import { copyOrderDefaults } from './orderDefaultService.js';
 import { copyExecutionPlan, retirePlanRowsOfOrder } from './executionPlanService.js';
+import { copyAcceptance, retireAcceptance } from './acceptanceService.js';
 
 /** The commercial stages a customer order may be revised in. */
 const REVISABLE = new Set(['inquiry', 'quoted', 'confirmed']);
@@ -197,6 +198,8 @@ export async function reviseOrder(db, c, orderId) {
   await copyOrderDefaults(db, c, o.id, newId);
   // ---- the execution plan (init.sql §72): the order's choice, and each line's onto the line that revises it ----
   await copyExecutionPlan(db, c, o.id, newId);
+  // ---- the customer acceptance (init.sql §73): its versions (a pending one comes as withdrawn) and its post-production checklist ----
+  await copyAcceptance(db, c, o.id, newId);
 
   // ---- the old revision is kept as it was ------------------------------------
   await db.query(
@@ -280,6 +283,7 @@ export async function discardRevision(db, c, orderId) {
     }
   }
   await retirePlanRowsOfOrder(db, companyId, o.id);
+  await retireAcceptance(db, c, o.id);
   await db.query('UPDATE cf_sales_orders SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [companyId, o.id]);
 
   // ---- the revision it replaced is the latest again, as it stood ----------------

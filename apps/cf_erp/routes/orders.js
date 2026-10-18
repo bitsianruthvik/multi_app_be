@@ -5,7 +5,8 @@
  *   POST   /orders                     { orderType, customerId?, title?, customerReference?, receivedOn?, committedDate?, deliveryAddress?, notes?, code? }
  *   GET    /orders/:id                 header + lines (+ structure counts per custom line) + total; each line rate, rateBasis, billed, billedUom, amount, amountNote
  *   PUT    /orders/:id                 header fields; the number only while the order has no lines
- *   POST   /orders/:id/status          { status }  — inquiry, quoted, confirmed, closed, lost, cancelled (customer)
+ *   POST   /orders/:id/status          { status }  — inquiry, quoted, closed, lost, cancelled (customer: CONFIRMED only through its
+ *                                                   Customer acceptance, §73 — routes/acceptance.js)
  *                                                   draft, confirmed, closed, cancelled (stock)
  *   DELETE /orders/:id                 draft, inquiry, lost or cancelled orders only — not a revision (discard it)
  *   POST   /orders/:id/revise          the next revision of the order: a copy of it, unlocked (revisionService)
@@ -49,7 +50,7 @@ router.get('/orders', guard(PERM.ordersView), handle((req) => listOrders(pool, c
 router.post('/orders', guard(PERM.orders), handle((req) => tx(req, (db, c) => createOrder(db, c, req.body ?? {}))));
 router.get('/orders/:id', guard(PERM.ordersView), handle((req) => getOrder(pool, ctx(req).companyId, id(req))));
 router.put('/orders/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => updateOrder(db, c, id(req), req.body ?? {}))));
-router.post('/orders/:id/status', guard(PERM.orders), handle((req) => tx(req, (db, c) => setOrderStatus(db, c, id(req), req.body?.status))));
+router.post('/orders/:id/status', guard(PERM.orders), handle((req) => tx(req, (db, c) => setOrderStatus(db, c, id(req), req.body?.status, { fromRoute: true }))));
 router.delete('/orders/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => deleteOrder(db, c, id(req)))));
 // A change after lock is a new revision of the same order (init.sql §27). Both
 // write the whole order in one transaction, so a refusal leaves nothing behind.

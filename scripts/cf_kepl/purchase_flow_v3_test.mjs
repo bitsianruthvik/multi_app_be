@@ -204,7 +204,7 @@ try {
   /* ════════════════════ 6. MD approval ════════════════════ */
   step('6. Pending MD approval → approved → waiting for goods');
   const early = await refusal(() => PS.receiveLine(db, c, poA.lines[0].id, { quantity: 1, stockingAreaId: S.store }));
-  ok('a GRN against a PO waiting for the MD is refused, in words', early?.code === 'NOT_ORDERED' && /waiting for MD approval/.test(early.message), early?.message);
+  ok('a GRN against a PO waiting for the MD is refused, in words', early?.code === 'NOT_ORDERED' && /waiting for Management approval/.test(early.message), early?.message);
   say(`Refused: "${early?.message}"`);
   poA = await PS.approvePurchaseOrder(db, c, poA.id, {});
   poB = await PS.approvePurchaseOrder(db, c, poB.id, {});

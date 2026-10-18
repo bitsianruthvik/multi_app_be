@@ -57,7 +57,7 @@ const LINE = Number(process.env.CF_FLOW_LINE ?? 923);
 const RUN = `OF${Date.now().toString(36).toUpperCase()}`;
 const EPS = 1e-6;
 // Line items merged into Structure & values, and the Execution plan comes before the freeze (2026-10-18).
-const TRAIN = ['structure', 'values', 'execution_plan', 'lock', 'nesting', 'buying', 'production'];
+const TRAIN = ['structure', 'values', 'execution_plan', 'lock', 'nesting', 'buying', 'acceptance', 'production'];
 
 let passed = 0;
 let failed = 0;
@@ -125,7 +125,7 @@ try {
 
   /* ---- 1. the train ---------------------------------------------------------- */
   section('1. The stage train');
-  eq('the catalogue is structure, values, execution plan, freeze, nesting, buying, production — no cut pieces, no line items', PROC.STAGE_KEYS, TRAIN);
+  eq('the catalogue is structure, values, execution plan, freeze, nesting, buying, customer acceptance, production — no cut pieces, no line items', PROC.STAGE_KEYS, TRAIN);
   ok('cut_pieces is not a stage a process can be built from', !PROC.stageCatalogue().some((s) => s.key === 'cut_pieces'));
   ok('cut_pieces is retired like confirm', PROC.RETIRED_STAGE_KEYS.has('cut_pieces') && PROC.RETIRED_STAGE_KEYS.has('confirm'));
   eq('lock reads "Freeze design"', PROC.stageCatalogue().find((s) => s.key === 'lock')?.label, 'Freeze design');
@@ -177,9 +177,9 @@ try {
   }
   ok('the values kind is still in the catalogue (it still gates Freeze design)', PROC.STAGE_KEYS.includes('values'));
   const buyWait0 = stageOf(proc, 'buying')?.waitingOn;
-  eq('buying waits on the header Confirm: no stage key, action confirm', [buyWait0?.stageKey, buyWait0?.action], [null, 'confirm']);
-  eq('…in words', buyWait0?.message, 'Confirm the order first — nothing is bought for an inquiry.');
-  eq('production waits on the same Confirm', stageOf(proc, 'production')?.waitingOn?.action, 'confirm');
+  // §73: a customer's MR is raised and shared BEFORE the customer accepts — the material request waits for no Confirm.
+  ok('buying does not wait on a Confirm any more (the MR is raised before the acceptance)', buyWait0?.action !== 'confirm', JSON.stringify(buyWait0));
+  eq('production waits on the customer acceptance (this process has no such stage: the plain acceptance tab of the order)', [stageOf(proc, 'production')?.waitingOn?.stageKey, stageOf(proc, 'production')?.waitingOn?.action], [null, 'acceptance']);
   /** Every waitingOn on every line: none points at cut_pieces, and each key is a stage the order shows (or null for Confirm). */
   const badWaits = (pv) => pv.lines.flatMap((l) => l.stages.filter((s) => s.waitingOn && (s.waitingOn.stageKey === 'cut_pieces'
     || (s.waitingOn.stageKey != null && !l.stages.some((y) => y.stageKey === s.waitingOn.stageKey)))).map((s) => `line ${l.lineNo} ${s.stageKey} → ${s.waitingOn.stageKey}`));
@@ -190,7 +190,7 @@ try {
   await conn.query('UPDATE cf_plate_lots SET deleted_at = NOW() WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [COMPANY, LINE]);
   invalidateNodeCache(conn);
   proc = await PROC.orderProcess(conn, COMPANY, line.order_id);
-  eq('with the design not frozen, the order can still be confirmed', proc.canConfirm, true);
+  ok('a customer order offers no Confirm move — it is confirmed by its acceptance (§73)', !(await SO.getOrder(conn, COMPANY, line.order_id)).allowedTransitions.includes('confirmed'));
   eq('nesting waits on the freeze', stageOf(proc, 'nesting')?.waitingOn?.stageKey, 'lock');
   const lockStage = stageOf(proc, 'lock');
   ok('the freeze does not wait on nesting or say anything about plates', lockStage?.waitingOn?.stageKey !== 'nesting' && !(lockStage?.blockers ?? []).some((b) => /plate/i.test(b.message)),

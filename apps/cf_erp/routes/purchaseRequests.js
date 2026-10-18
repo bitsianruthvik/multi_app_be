@@ -14,9 +14,9 @@
  *   PUT    /purchase-request-vendors/:id { supplierId }        another vendor in that column
  *   DELETE /purchase-request-vendors/:id
  *   PUT    /purchase-request-vendors/:id/quotes { quotes: [{ lineId, rate, deliveryDays?, remark? }] }   rate blank = no quote
- *   GET    /purchase-request-vendors/:id/pending-pos           that vendor's POs still waiting for MD approval (to add to)
+ *   GET    /purchase-request-vendors/:id/pending-pos           that vendor's POs still waiting for Management approval (to add to)
  *   POST   /purchase-request-vendors/:id/purchase-orders { lines: [{ lineId, quantity }], addToPoId?, notes? }
- *                                                              → { purchaseOrder (pending MD approval), purchaseRequest }
+ *                                                              → { purchaseOrder (pending Management approval), purchaseRequest }
  * Reading needs inventory view; changing needs inventory manage (the purchase routes' own grants).
  * The MD's approval and the close are on routes/purchase.js (POST /purchase-orders/:id/approve | /close).
  */

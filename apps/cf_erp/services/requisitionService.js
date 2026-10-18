@@ -59,6 +59,17 @@ const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const BUYABLE_ORDER_STATUSES = ['draft', 'inquiry', 'quoted', 'confirmed'];
 
 /*
+ * CUSTOMER ACCEPTANCE GATES THE MR (§73, user 2026-10-18). A customer's order raises its MR before the customer has
+ * accepted: the MR is SHARED with the customer (PDF / Excel) but HELD — nothing downstream happens: no stock earmarked,
+ * no purchase request, no ₹0 PO to the customer. Management's approval of the acceptance confirms the order and
+ * RELEASES its held MRs to Purchase (releaseHeldRequisitions). A stock order, or a customer order already confirmed,
+ * raises its MR released, as before.
+ */
+export const HELD_SENTENCE = 'Shared with the customer. Purchase starts once the customer\'s acceptance is approved.';
+export const heldForAcceptance = (o) => o.order_type === 'customer' && !['confirmed', 'closed'].includes(o.status);
+export const heldMessage = (code) => `${code} waits for the customer's acceptance — Purchase starts once Management approves it.`;
+
+/*
  * MATERIAL REQUEST (init.sql §66, 2026-10-16). The requisition is called a MATERIAL REQUEST (MR) on every
  * screen; a new one is numbered MR-<order>-<line> (one raised before keeps its PR- number). Who supplies
  * the material is asked when the order is made — the order's `material_supply`, a line may say otherwise —
@@ -222,7 +233,7 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
   if (filter.open) { where.push('o.status IN (?)'); args.push(OPEN_ORDER_STATUSES); }
   if (!blank(filter.search)) { where.push('(r.code LIKE ? OR o.code LIKE ? OR cu.name LIKE ?)'); args.push(...Array(3).fill(`%${String(filter.search).trim()}%`)); }
   const [heads] = await db.query(
-    `SELECT r.id, r.code, r.order_id, r.order_line_id, r.notes, r.synced_at, r.created_at, r.created_by, r.supply, u.name AS raised_by_name,
+    `SELECT r.id, r.code, r.order_id, r.order_line_id, r.notes, r.synced_at, r.created_at, r.created_by, r.supply, r.held_for_acceptance, r.customer_date, u.name AS raised_by_name,
             o.code AS order_code, o.status AS order_status, o.customer_id, cu.name AS customer_name,
             l.line_no, l.quantity AS line_quantity, l.locked_at, l.description, m.code AS item_code, m.name AS item_name,
             (SELECT pr.id FROM cf_production_releases pr WHERE pr.company_id = l.company_id AND pr.order_line_id = l.id AND pr.deleted_at IS NULL LIMIT 1) AS release_id
@@ -306,7 +317,11 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
       order: { id: h.order_id, code: h.order_code, status: h.order_status, customer: h.customer_id ? { id: h.customer_id, name: h.customer_name } : null },
       line: { id: lineId, lineNo: h.line_no, name: h.item_name ?? h.description ?? `Line ${h.line_no}`, quantity: Number(h.line_quantity), frozen: !!h.locked_at, released: !!h.release_id },
       status, statusLabel: REQUISITION_STATUS_LABEL[status], done: live.length > 0 ? live.every((l) => l.resolved) : true,
-      sentence: !known ? `${needs?.why ?? 'This line is not on an open order.'} The requisition shows the need as it was last raised.` : requisitionSentence(status, own, ready),
+      // §73: raised before the customer accepted — shared with the customer, not released to Purchase yet.
+      heldForAcceptance: !!Number(h.held_for_acceptance ?? 0),
+      customerDate: dateOnly(h.customer_date),
+      sentence: Number(h.held_for_acceptance ?? 0) ? HELD_SENTENCE
+        : !known ? `${needs?.why ?? 'This line is not on an open order.'} The requisition shows the need as it was last raised.` : requisitionSentence(status, own, ready),
       raisedAt: h.created_at, raisedBy: h.created_by ? { id: h.created_by, name: h.raised_by_name ?? null } : null, syncedAt: h.synced_at ?? null,
       needKnown: known, needComplete: !!needs?.ready, stale, missing, counts,
       materialReady: ready,
@@ -316,7 +331,7 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
 }
 
 export async function requireOrderRow(db, companyId, orderId, { lock = false } = {}) {
-  const [[o]] = await db.query(`SELECT id, code, status, customer_id, material_supply FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`, [companyId, Number(orderId)]);
+  const [[o]] = await db.query(`SELECT id, code, status, order_type, customer_id, material_supply FROM cf_sales_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`, [companyId, Number(orderId)]);
   if (!o) throw notFound('Sales order');
   return o;
 }
@@ -486,12 +501,26 @@ export async function raiseRequisitions(db, c, orderId, input = {}) {
   ]);
   const hadLine = new Set(had.map((r) => Number(r.order_line_id)));
   const fresh = can.filter((l) => !hadLine.has(Number(l.id)));
-  // A new one is an MR (§66); who supplies its material is fixed on it now.
-  await insertRows(db, 'cf_requisitions', ['company_id', 'code', 'order_id', 'order_line_id', 'supply', 'notes', 'created_by'],
+  // §73: before the customer's acceptance is approved the MR is raised HELD (shared, not released to Purchase).
+  const held = heldForAcceptance(o);
+  let customerDate = null;
+  if (held && !blank(input.customerDate)) {
+    if (!DATE_RE.test(String(input.customerDate))) throw invalid('INVALID', "The customer's promised date needs YYYY-MM-DD.");
+    customerDate = String(input.customerDate);
+  }
+  // A new one is an MR (§66); who supplies its material is set on it (and follows the order until it is released, §73).
+  await insertRows(db, 'cf_requisitions', ['company_id', 'code', 'order_id', 'order_line_id', 'supply', 'notes', 'created_by', 'held_for_acceptance', 'customer_date'],
     fresh.map((l) => [c.companyId, `${MR_PREFIX}-${o.code}-${l.line_no}`.slice(0, 140), o.id, l.id, supplies.get(Number(l.id))?.supply ?? supplyOf(o.material_supply),
-      blank(input.notes) ? null : String(input.notes).slice(0, 500), c.userId ?? null]));
-  const [prs] = await db.query('SELECT id, order_line_id, supply FROM cf_requisitions WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [c.companyId, lineIds]);
+      blank(input.notes) ? null : String(input.notes).slice(0, 500), c.userId ?? null, held ? 1 : 0, customerDate]));
+  if (held && customerDate && had.length) {
+    await db.query('UPDATE cf_requisitions SET customer_date = ? WHERE company_id = ? AND id IN (?) AND held_for_acceptance = 1', [customerDate, c.companyId, had.map((r) => r.id)]);
+  }
+  const [prs] = await db.query('SELECT id, order_line_id, supply, held_for_acceptance FROM cf_requisitions WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [c.companyId, lineIds]);
   await syncLines(db, c, prs, needs);
+  if (held) {
+    // Shared with the customer, nothing downstream: no earmark, no customer PO, no adopted cover.
+    return { raised: fresh.length, refreshed: had.length, notRaised, earmarked: [], customerPurchaseOrders: [], heldForAcceptance: true, ...(await orderRequisitions(db, c.companyId, o.id)) };
+  }
   await adoptOrderCover(db, c, [o.id], { needs });
   /*
    * MR (§66): raising it EARMARKS. A line the customer supplies always takes the customer's own lots that are
@@ -503,7 +532,42 @@ export async function raiseRequisitions(db, c, orderId, input = {}) {
   const theirs = prs.filter((p) => supplyOf(p.supply) === 'customer').map((p) => p.id);
   const earmarked = ours || theirs.length ? await earmarkOnRaise(db, c, o, ours ? prs.map((p) => p.id) : theirs, { ours }) : [];
   const customerPurchaseOrders = theirs.length ? await askCustomer(db, c, o, theirs, { date: input.customerDate, lines: can }) : [];
-  return { raised: fresh.length, refreshed: had.length, notRaised, earmarked, customerPurchaseOrders, ...(await orderRequisitions(db, c.companyId, o.id)) };
+  return { raised: fresh.length, refreshed: had.length, notRaised, earmarked, customerPurchaseOrders, heldForAcceptance: false, ...(await orderRequisitions(db, c.companyId, o.id)) };
+}
+
+/**
+ * THE ACCEPTANCE IS APPROVED (§73): the order's HELD MRs are released to Purchase — exactly what raising them on a
+ * confirmed order does: what the order already had held / on order is handed to them (adoptOrderCover), a line the
+ * customer supplies takes the customer's own lots here for the order, and what it still lacks goes on the customer's
+ * ₹0 PO (dated by the promised date typed when it was raised, else the committed dates). A line we buy goes to the MR
+ * screen in Purchase (take from stock, then the PR). Called by setOrderStatus when the order becomes confirmed.
+ * Nothing held → nothing done (1 read).
+ */
+export async function releaseHeldRequisitions(db, c, orderId) {
+  const [held] = await db.query('SELECT id, order_line_id, supply, customer_date FROM cf_requisitions WHERE company_id = ? AND order_id = ? AND held_for_acceptance = 1 AND deleted_at IS NULL', [c.companyId, Number(orderId)]);
+  if (!held.length) return { released: [], earmarked: [], customerPurchaseOrders: [] };
+  const o = await requireOrderRow(db, c.companyId, orderId);
+  await db.query('UPDATE cf_requisitions SET held_for_acceptance = 0 WHERE company_id = ? AND id IN (?)', [c.companyId, held.map((r) => r.id)]);
+  const lines = await openLines(db, c.companyId, { orderIds: [o.id] });
+  const needs = await lineNeeds(db, c.companyId, lines);
+  await syncLines(db, c, held, needs);
+  await adoptOrderCover(db, c, [o.id], { needs });
+  const theirs = held.filter((p) => supplyOf(p.supply) === 'customer');
+  const ids = theirs.map((p) => p.id);
+  const earmarked = ids.length ? await earmarkOnRaise(db, c, o, ids, { ours: false }) : [];
+  const date = theirs.map((p) => dateOnly(p.customer_date)).filter(Boolean).sort()[0] ?? null;
+  const customerPurchaseOrders = ids.length ? await askCustomer(db, c, o, ids, { date, lines }) : [];
+  return { released: held.map((r) => r.id), earmarked, customerPurchaseOrders };
+}
+
+/** The supply of an order's HELD MRs follows the order / its lines while they wait (§73: editable until accepted). 1 write. */
+export async function followSupplyOfHeld(db, c, orderId) {
+  await db.query(
+    `UPDATE cf_requisitions r JOIN cf_sales_order_lines l ON l.id = r.order_line_id JOIN cf_sales_orders o ON o.id = r.order_id
+        SET r.supply = IF(COALESCE(l.material_supply, o.material_supply) = 'customer', 'customer', 'we_buy')
+      WHERE r.company_id = ? AND r.order_id = ? AND r.held_for_acceptance = 1 AND r.deleted_at IS NULL`,
+    [c.companyId, Number(orderId)],
+  );
 }
 
 /**

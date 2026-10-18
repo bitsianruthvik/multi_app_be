@@ -6487,3 +6487,255 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
              AND TABLE_NAME = 'cf_order_execution_plans'
              AND COLUMN_NAME IN ('order_id','order_line_id','production_level','production_level_id','dispatch_level','dispatch_level_id','saved_by','saved_at','line_live')) = 9,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §73  CUSTOMER ACCEPTANCE, the MANAGEMENT approvals inbox, the SALES ORDERS BOARD (2026-10-18) — the same text as TM/s73.sql
+-- Additive and guarded: safe to re-run. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md "2026-10-18 — Step 3A".
+-- Services: approvalService.js (one inbox, one decision path per approval type), acceptanceService.js (terms, templates,
+-- estimate, approve → confirmed + MR released + terms locked), orderBoardService.js (lanes, post-production checklist).
+--
+-- User, 2026-10-18: SO → Structure & values → Execution plan → Freeze design → Nesting → MR raised → MR shared with the
+-- customer → CUSTOMER ACCEPTED (the order's confirm step). Saving the acceptance sends it to Management; only on approval
+-- is the order confirmed, the MR released to Purchase and the terms locked. A later change of rates or terms is a new
+-- approval ("rate change after acceptance").
+--   cf_approvals            ONE row per thing asked of Management: its type (order_acceptance, purchase_order,
+--                           contractor_po, po_close_short, rate_change, rebaseline), the subject it is about, who asked and
+--                           when, the decision (approved / rejected / withdrawn) with who / when / note, and a snapshot of
+--                           the context the approver saw (context_json). At most one PENDING row per type + subject
+--                           (pending_live + uq_cap_pending). Each type has its own permission tag (below).
+--   cf_term_templates       Setup › Templates: saved rows for the acceptance grids — kind 'charges' | 'milestones' |
+--                           'stages' — one default per kind (default_live). rows_json = the grid's rows.
+--   cf_order_acceptances    one row per VERSION of an order's accepted terms: kind 'acceptance' (the first) or
+--                           'rate_change' (after approval), status pending → approved | rejected | withdrawn; an approved
+--                           version is LOCKED and is superseded only by a later approved one. terms_json = charges,
+--                           material row, lump sums, payment milestones, post-production stages, material supply;
+--                           estimate_json = the estimated order value / margin worked out when it was saved.
+--   cf_order_post_stages    the order's post-production stages (from its approved terms) as a checklist: done_on + note +
+--                           who / when. Ticking one records an event.
+--   cf_order_events         what has happened to an order that billing (step 3B) reads: order_accepted, terms_changed,
+--                           post_stage_done, post_stage_undone, order_closed … with a date, an optional quantity and a note.
+--   cf_requisitions.held_for_acceptance  1 = the MR was raised before the customer accepted: it is SHARED with the customer
+--                           but NOT released to Purchase (no stock earmarked, no PR, no customer PO) until the acceptance
+--                           is approved. Existing rows default 0 (released, as they always were).
+--   cf_requisitions.customer_date        the customer's promised date typed when a held customer-supplied MR was raised;
+--                           the customer's ₹0 PO takes it when the MR is released.
+-- Process data (company 30005 only): every process with a Material request (buying) stage gets an 'acceptance' stage
+-- (its place comes from the stage catalogue: after Material request, before Production).
+-- Permissions: six tags (cf_erp_approve_*), each its own capability, granted to every company's ADMIN role for cf_erp and
+-- to company 30005's "MD" role. cf_erp_plate_change_approve stays for plate changes and substitutes.
+-- TiDB: CREATE TABLE IF NOT EXISTS; each ADD COLUMN guarded on its own; set-based INSERT … SELECT; no subquery in a JOIN … ON.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS cf_approvals (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  approval_type    VARCHAR(40)   NOT NULL,           -- order_acceptance | purchase_order | contractor_po | po_close_short | rate_change | rebaseline
+  subject_type     VARCHAR(40)   NOT NULL,           -- order_acceptance | purchase_order
+  subject_id       INT           NOT NULL,
+  subject_code     VARCHAR(140)  NULL,
+  order_id         INT           NULL,               -- the sales order it is about, when there is one
+  title            VARCHAR(255)  NOT NULL,
+  summary          VARCHAR(500)  NULL,
+  amount           DECIMAL(18,2) NULL,
+  status           VARCHAR(12)   NOT NULL DEFAULT 'pending',   -- pending | approved | rejected | withdrawn
+  requested_by     INT           NULL,
+  requested_at     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  request_note     VARCHAR(500)  NULL,
+  decided_by       INT           NULL,
+  decided_at       DATETIME      NULL,
+  decision_note    VARCHAR(500)  NULL,
+  context_json     JSON          NULL,
+
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  pending_live     INT GENERATED ALWAYS AS (IF(status = 'pending' AND deleted_at IS NULL, subject_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cap_tenant  (company_id, id),
+  UNIQUE KEY uq_cap_pending (company_id, approval_type, subject_type, pending_live),
+  KEY idx_cap_status  (company_id, status, approval_type),
+  KEY idx_cap_subject (company_id, subject_type, subject_id),
+  KEY idx_cap_order   (company_id, order_id),
+
+  CONSTRAINT fk_cap_company   FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cap_order     FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cap_requester FOREIGN KEY (requested_by) REFERENCES users(id),
+  CONSTRAINT fk_cap_decider   FOREIGN KEY (decided_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_term_templates (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  kind          VARCHAR(12)   NOT NULL,              -- charges | milestones | stages
+  name          VARCHAR(140)  NOT NULL,
+  is_default    TINYINT(1)    NOT NULL DEFAULT 0,
+  rows_json     JSON          NULL,
+  notes         VARCHAR(500)  NULL,
+  created_by    INT           NULL,
+  updated_by    INT           NULL,
+
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  default_live  VARCHAR(12) GENERATED ALWAYS AS (IF(is_default = 1 AND deleted_at IS NULL, kind, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_ctt_tenant  (company_id, id),
+  UNIQUE KEY uq_ctt_default (company_id, default_live),
+  KEY idx_ctt_kind (company_id, kind),
+
+  CONSTRAINT fk_ctt_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_ctt_creator FOREIGN KEY (created_by) REFERENCES users(id),
+  CONSTRAINT fk_ctt_updater FOREIGN KEY (updated_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_order_acceptances (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  order_id       INT           NOT NULL,
+  version        INT           NOT NULL DEFAULT 1,
+  kind           VARCHAR(12)   NOT NULL DEFAULT 'acceptance',   -- acceptance | rate_change
+  status         VARCHAR(12)   NOT NULL DEFAULT 'pending',      -- pending | approved | rejected | withdrawn | superseded
+  terms_json     JSON          NULL,
+  estimate_json  JSON          NULL,
+  note           VARCHAR(500)  NULL,
+  approval_id    INT           NULL,
+  saved_by       INT           NULL,
+  saved_at       DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  decided_by     INT           NULL,
+  decided_at     DATETIME      NULL,
+  decision_note  VARCHAR(500)  NULL,
+
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  pending_live   INT GENERATED ALWAYS AS (IF(status = 'pending' AND deleted_at IS NULL, order_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_coa_tenant  (company_id, id),
+  UNIQUE KEY uq_coa_version (company_id, order_id, version),
+  UNIQUE KEY uq_coa_pending (company_id, pending_live),
+  KEY idx_coa_order (company_id, order_id, status),
+
+  CONSTRAINT fk_coa_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_coa_order    FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_coa_approval FOREIGN KEY (company_id, approval_id) REFERENCES cf_approvals(company_id, id),
+  CONSTRAINT fk_coa_saver    FOREIGN KEY (saved_by) REFERENCES users(id),
+  CONSTRAINT fk_coa_decider  FOREIGN KEY (decided_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_order_post_stages (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  order_id      INT           NOT NULL,
+  stage_key     VARCHAR(40)   NOT NULL,
+  name          VARCHAR(140)  NOT NULL,
+  sequence      INT           NOT NULL DEFAULT 1,
+  done_on       DATE          NULL,
+  done_note     VARCHAR(500)  NULL,
+  done_by       INT           NULL,
+  done_at       DATETIME      NULL,
+
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  key_live      VARCHAR(40) GENERATED ALWAYS AS (IF(deleted_at IS NULL, stage_key, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cops_tenant (company_id, id),
+  UNIQUE KEY uq_cops_key    (company_id, order_id, key_live),
+  KEY idx_cops_order (company_id, order_id, sequence),
+
+  CONSTRAINT fk_cops_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cops_order   FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_cops_doer    FOREIGN KEY (done_by) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_order_events (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  order_id      INT           NOT NULL,
+  event_type    VARCHAR(40)   NOT NULL,              -- order_accepted | terms_changed | post_stage_done | post_stage_undone | order_closed
+  ref_type      VARCHAR(40)   NULL,                  -- post_stage | acceptance
+  ref_id        INT           NULL,
+  label         VARCHAR(255)  NULL,
+  event_date    DATE          NOT NULL,
+  quantity      DECIMAL(18,6) NULL,
+  uom           VARCHAR(16)   NULL,
+  note          VARCHAR(500)  NULL,
+  recorded_by   INT           NULL,
+  recorded_at   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_coev_tenant (company_id, id),
+  KEY idx_coev_order (company_id, order_id, event_date),
+  KEY idx_coev_type  (company_id, event_type, event_date),
+
+  CONSTRAINT fk_coev_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_coev_order    FOREIGN KEY (company_id, order_id) REFERENCES cf_sales_orders(company_id, id),
+  CONSTRAINT fk_coev_recorder FOREIGN KEY (recorded_by) REFERENCES users(id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'held_for_acceptance');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_requisitions ADD COLUMN held_for_acceptance TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'customer_date');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_requisitions ADD COLUMN customer_date DATE NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- The Customer acceptance stage, for Placebo's processes that have a Material request stage and none yet.
+INSERT INTO cf_process_stages (company_id, process_id, stage_key, sequence, requirement)
+SELECT s.company_id, s.process_id, 'acceptance', MAX(s.sequence) + 1, 'required'
+  FROM cf_process_stages s
+ WHERE s.company_id = 30005 AND s.deleted_at IS NULL
+ GROUP BY s.company_id, s.process_id
+HAVING SUM(s.stage_key = 'buying') > 0 AND SUM(s.stage_key = 'acceptance') = 0;
+
+-- The six approval permissions: a feature and a capability each.
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT t.name, t.tag, 'backend'
+  FROM (SELECT 'CF ERP: approve order acceptance' AS name, 'cf_erp_approve_order_acceptance' AS tag
+        UNION ALL SELECT 'CF ERP: approve purchase orders', 'cf_erp_approve_purchase_order'
+        UNION ALL SELECT 'CF ERP: approve contractor POs', 'cf_erp_approve_contractor_po'
+        UNION ALL SELECT 'CF ERP: approve closing a PO short', 'cf_erp_approve_po_close_short'
+        UNION ALL SELECT 'CF ERP: approve rate changes', 'cf_erp_approve_rate_change'
+        UNION ALL SELECT 'CF ERP: approve re-baselines', 'cf_erp_approve_rebaseline') t
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = t.tag);
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag IN ('cf_erp_approve_order_acceptance', 'cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po',
+                         'cf_erp_approve_po_close_short', 'cf_erp_approve_rate_change', 'cf_erp_approve_rebaseline')
+   AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+-- Granted to every company's ADMIN role for cf_erp, and to Placebo's MD.
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND (LOWER(r.name) = 'admin' OR (a.company_id = 30005 AND UPPER(r.name) = 'MD'))
+   AND fc.name IN ('cf_erp_approve_order_acceptance', 'cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po',
+                   'cf_erp_approve_po_close_short', 'cf_erp_approve_rate_change', 'cf_erp_approve_rebaseline')
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+-- A purchase order already waiting for the MD (purchase flow v3) gets its row in the inbox.
+INSERT INTO cf_approvals (company_id, approval_type, subject_type, subject_id, subject_code, title, summary, status, requested_by, requested_at)
+SELECT p.company_id, IF(p.po_type = 'contractor', 'contractor_po', 'purchase_order'), 'purchase_order', p.id, p.code,
+       CONCAT('Purchase order ', p.code), NULL, 'pending', p.created_by, COALESCE(p.updated_at, p.created_at)
+  FROM cf_purchase_orders p
+ WHERE p.deleted_at IS NULL AND p.approval_status = 'pending' AND p.status IN ('requested', 'quoting', 'draft')
+   AND NOT EXISTS (SELECT 1 FROM cf_approvals x WHERE x.company_id = p.company_id AND x.subject_type = 'purchase_order'
+                    AND x.subject_id = p.id AND x.status = 'pending' AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME IN ('cf_approvals', 'cf_term_templates', 'cf_order_acceptances', 'cf_order_post_stages', 'cf_order_events')) = 5
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME IN ('held_for_acceptance', 'customer_date')) = 2
+      AND (SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL
+             AND name IN ('cf_erp_approve_order_acceptance', 'cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po',
+                          'cf_erp_approve_po_close_short', 'cf_erp_approve_rate_change', 'cf_erp_approve_rebaseline')) >= 6,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

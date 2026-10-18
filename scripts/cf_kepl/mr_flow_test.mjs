@@ -342,16 +342,17 @@ try {
 
   step('C2. Who supplies it is fixed once the MR is raised');
   let e = await refusal(() => SO.updateOrder(db, c, X.id, { materialSupply: 'we_buy' }));
-  ok('the order cannot switch to "We buy" now', /fixed once a material request is raised/.test(j([e?.message, e?.problems])), j([e?.message, e?.problems]));
+  ok('the order cannot switch to "We buy" now', /fixed once a material request is (raised|released to Purchase)/.test(j([e?.message, e?.problems])), j([e?.message, e?.problems]));
   say(`Order → "We buy": refused — ${(e.problems ?? [e.message]).join(' ')}`);
   e = await refusal(() => SO.setLineSupply(db, c, X.lines[0].id, { supply: 'we_buy' }));
-  ok('nor the line', !!e && /is raised/.test(j(e.problems ?? e.message)), j(e?.problems ?? e?.message));
+  ok('nor the line', !!e && /is raised|is with Purchase/.test(j(e.problems ?? e.message)), j(e?.problems ?? e?.message));
   say(`Line 1 → "We buy": refused — ${(e.problems ?? [e.message]).join(' ')}`);
   // §71: a customer-supplied MR has no purchase request, so nothing can be bought for it from a vendor.
   const custSaved = await PRS.mrScreen(db, COMPANY, mrX.id);
   ok('a customer MR has no purchase request (nothing to buy from a vendor)', custSaved.purchaseRequest === null);
   say('A PO to a supplier for it: there is no purchase request to raise one from.');
-  const Z = await makeOrder('LINEOVR', [1]);
+  // §73: who supplies it is part of the accepted terms — editable until the acceptance is approved, so on an inquiry.
+  const Z = await makeOrder('LINEOVR', [1], { confirm: false });
   const lo = await SO.setLineSupply(db, c, Z.lines[0].id, { supply: 'customer' });
   ok('before its MR, a line of a "We buy" order may say "Customer supplies"', lo.supply === 'customer' && lo.materialSupply === 'customer');
   const z0 = (await RQ.orderRequisitions(db, COMPANY, Z.id)).linesWithout[0];
@@ -429,8 +430,11 @@ try {
     ...list.counts.owners.parties.map((p) => [p.name.replace(`${tag} `, ''), String(p.n), list.counts.held.filter((h) => Number(h.partyId) === Number(p.id)).map((h) => `${n(h.quantity)} ${h.uom}`).join(', ')])]);
 
   /* ══════════════════ D. PROMISED DATES, PLATE CHANGES, SUBSTITUTES, MATERIAL TO RETURN (§68) ══════════════════ */
-  step('D1. The customer\'s promised date', 'An inquiry with no committed date anywhere, material from the customer. Raising its MR needs the date the customer promised.');
-  const ND = await makeOrder('NODATE', [1], { customer: CUS_X, materialSupply: 'customer', committed: null, confirm: false });
+  // §73: an inquiry's MR is held until the customer accepts (no customer PO yet), and accepting needs a committed date —
+  // so the question comes up for an accepted order whose committed date was taken away since.
+  step('D1. The customer\'s promised date', 'A confirmed order with no committed date left anywhere, material from the customer. Raising its MR needs the date the customer promised.');
+  const ND = await makeOrder('NODATE', [1], { customer: CUS_X, materialSupply: 'customer', committed: '2099-12-31' });
+  await db.query('UPDATE cf_sales_orders SET committed_date = NULL WHERE id = ?', [ND.id]);
   let e2 = await refusal(() => RQ.raiseRequisitions(db, c, ND.id, {}));
   ok('with no committed date on the line or the order, the raise asks for the promised date (422 CUSTOMER_DATE)', e2?.code === 'CUSTOMER_DATE', j([e2?.code, e2?.message]));
   say(`Refused: ${e2?.message}`);

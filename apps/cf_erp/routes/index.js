@@ -39,6 +39,9 @@ import plateChangeRoutes from './plateChanges.js';
 import cutAllowanceRoutes from './cutAllowances.js';
 // Standard drawings (init.sql §69): numbered standards with a BOM tree, copied onto order lines and back.
 import standardRoutes from './standards.js';
+// Customer acceptance, the Management approvals inbox, the Orders board (init.sql §73).
+import approvalRoutes from './approvals.js';
+import acceptanceRoutes from './acceptance.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -138,5 +141,7 @@ router.use(sectionNestingRoutes);
 router.use(plateChangeRoutes);
 router.use(cutAllowanceRoutes);
 router.use(standardRoutes);
+router.use(approvalRoutes);
+router.use(acceptanceRoutes);
 
 export default router;

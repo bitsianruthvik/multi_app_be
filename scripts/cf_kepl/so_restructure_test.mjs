@@ -95,12 +95,12 @@ try {
 
   /* ------------------------------------------------------------------------ */
   section('1. The stage train');
-  eq('the catalogue, in order', PROC.STAGE_KEYS, ['structure', 'values', 'execution_plan', 'lock', 'nesting', 'buying', 'production']);
+  eq('the catalogue, in order (§73: Customer acceptance after the material request)', PROC.STAGE_KEYS, ['structure', 'values', 'execution_plan', 'lock', 'nesting', 'buying', 'acceptance', 'production']);
   ok('Line items is retired (with confirm and cut pieces)', PROC.RETIRED_STAGE_KEYS.has('lines') && PROC.RETIRED_STAGE_KEYS.has('confirm') && PROC.RETIRED_STAGE_KEYS.has('cut_pieces'));
   const kinds = PROC.stageCatalogue();
   eq('order-wide steps say so; per-line steps say line', kinds.map((k) => `${k.key}:${k.scope}`),
-    ['structure:order', 'values:order', 'execution_plan:order', 'lock:line', 'nesting:line', 'buying:order', 'production:line']);
-  eq('labels', kinds.map((k) => k.label), ['Structure & values', 'Values', 'Execution plan', 'Freeze design', 'Nesting', 'Material request', 'Production']);
+    ['structure:order', 'values:order', 'execution_plan:order', 'lock:line', 'nesting:line', 'buying:order', 'acceptance:order', 'production:line']);
+  eq('labels', kinds.map((k) => k.label), ['Structure & values', 'Values', 'Execution plan', 'Freeze design', 'Nesting', 'Material request', 'Customer acceptance', 'Production']);
 
   // A process of our own, as an older screen would send it: Line items first, the old order.
   const prc = await PROC.createProcess(conn, c, { code: `${RUN}-P`, name: 'Restructure test' });

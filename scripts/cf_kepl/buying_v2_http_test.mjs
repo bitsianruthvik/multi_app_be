@@ -21,8 +21,8 @@
  *   the main path     raise → the MR screen (take from stock) → the PR (vendor columns, quotes) → raise PO →
  *                     MD approval → a PO line's date moved → the reads → the planner (snapshot, a refused save, a save)
  *                     (§71, 2026-10-18: the MR stock check, skip, the boards and release-excess are gone — 404)
- *   permissions       403 for every write without cf_erp_inventory_manage; approve needs cf_erp_plate_change_approve
- *                     ("MD approval"); the planner its own grant
+ *   permissions       403 for every write without cf_erp_inventory_manage; approve needs cf_erp_approve_purchase_order
+ *                     (§73: the Management inbox; requester ≠ approver); close short is asked, then approved; the planner its own grant
  *   tenant isolation  404 for another company's MR, PR, vendor column, PO, order and line
  *   errors            every problem at once, naming order, item and purchase order
  */
@@ -88,6 +88,8 @@ const [[userA]] = await pool.query('SELECT id FROM users WHERE company_id = ? AN
 const [companiesB] = await pool.query('SELECT id FROM companies WHERE id <> ? AND deleted_at IS NULL ORDER BY id', [COMPANY]);
 const COMPANY_B = Number(process.env.CF_BUY_OTHER_COMPANY ?? companiesB[0]?.id);
 if (!COMPANY_B) throw new Error('There is no second company to test tenant isolation with.');
+// §73: Management decides — a different person from the one who asked (requester ≠ approver).
+const [[userMd]] = await pool.query('SELECT id FROM users WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1 OFFSET 1', [COMPANY]);
 const [[userB]] = await pool.query('SELECT id FROM users WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY_B]);
 const [[slugRow]] = await pool.query('SELECT slug FROM companies WHERE id = ?', [COMPANY]);
 
@@ -138,9 +140,10 @@ const SEE = ['cf_erp_inventory_view', 'cf_erp_orders_view', 'cf_erp_production_v
 const T_MANAGER = mint(COMPANY, userA?.id, [...SEE, 'cf_erp_inventory_manage', 'cf_erp_production_manage']);
 const T_VIEWER = mint(COMPANY, userA?.id, SEE);
 const T_NONE = mint(COMPANY, userA?.id, ['cf_erp_orders_view']);
-const T_B = mint(COMPANY_B, userB?.id ?? userA?.id, [...SEE, 'cf_erp_inventory_manage', 'cf_erp_production_manage', 'cf_erp_plate_change_approve']);
-// The MD: sees purchasing and approves (the permission cf_erp_plate_change_approve, labelled "MD approval").
-const T_MD = mint(COMPANY, userA?.id, [...SEE, 'cf_erp_plate_change_approve']);
+const APPROVE_PO = ['cf_erp_approve_purchase_order', 'cf_erp_approve_po_close_short'];
+const T_B = mint(COMPANY_B, userB?.id ?? userA?.id, [...SEE, 'cf_erp_inventory_manage', 'cf_erp_production_manage', ...APPROVE_PO]);
+// Management (§73): sees purchasing and approves POs and closing them short — through the approvals inbox.
+const T_MD = mint(COMPANY, userMd?.id ?? userA?.id, [...SEE, ...APPROVE_PO]);
 const examples = {};
 /** One call: { status, json }. token undefined = manager, null = none. `as` records it as the example of that name. */
 async function call(method, url, { token = T_MANAGER, body, as = null } = {}) {
@@ -239,9 +242,9 @@ try {
   const poLine2 = r.json.purchaseOrder.lines[0].id;
   ok('vendor 2: the last 1 of B → the PR line is fully ordered', r.status === 200 && gl(r.json.purchaseRequest, fx.B).poRaised === 4 && gl(r.json.purchaseRequest, fx.B).open === 0, J(r.json?.purchaseRequest?.lines));
   r = await call('POST', `/purchase-lines/${poLine2}/receive`, { body: { quantity: 1, stockingAreaId: fx.store } });
-  ok('a GRN while it waits for the MD → 422', r.status === 422 && /waiting for MD approval/.test(r.json.message), J(r.json));
+  ok('a GRN while it waits for the MD → 422', r.status === 422 && /waiting for Management approval/.test(r.json.message), J(r.json));
   r = await call('POST', `/purchase-orders/${po1}/approve`, { body: {} });
-  ok('approving without cf_erp_plate_change_approve ("MD approval") → 403', r.status === 403);
+  ok('approving without an approval tag (cf_erp_approve_purchase_order) → 403', r.status === 403);
   r = await call('POST', `/purchase-orders/${po1}/approve`, { token: T_MD, body: {}, as: 'approve' });
   ok('the MD approves → 200, waiting for goods', r.status === 200 && r.json.stage === 'waiting' && r.json.status === 'ordered' && r.json.approval.status === 'approved', J(r.json?.stage));
   r = await call('POST', `/purchase-orders/${po2}/approve`, { token: T_MD, body: {} });
@@ -343,7 +346,12 @@ try {
   r = await call('POST', `/purchase-orders/${po1}/close`, { token: T_VIEWER, body: { reason: 'mill short' } });
   ok('closing without the manage grant → 403', r.status === 403);
   r = await call('POST', `/purchase-orders/${po1}/close`, { body: { reason: 'mill short' }, as: 'closeShort' });
-  ok('close short → 200: closed short, nothing pending, 3 released', r.status === 200 && r.json.stage === 'closed_short' && r.json.lines[0].pending === 0 && r.json.lines[0].closedQty === 3, J(r.json?.lines));
+  ok('asking to close short → 200: nothing changes yet, it waits for Management (§73)', r.status === 200 && r.json.stage !== 'closed_short' && r.json.pendingApprovals.some((a) => a.type === 'po_close_short'), J(r.json?.pendingApprovals));
+  r = await call('GET', '/approvals?type=po_close_short', { token: T_MD });
+  const ask = r.json.rows.find((a) => a.subject.id === po1);
+  ok('Management sees it in the inbox, with the reason', r.status === 200 && ask?.context?.reason === 'mill short', J(r.json?.rows?.map((a) => a.subject)));
+  r = await call('POST', `/approvals/${ask.id}/decide`, { token: T_MD, body: { decision: 'approve' }, as: 'approveCloseShort' });
+  ok('approved → closed short, nothing pending, 3 released', r.status === 200 && r.json.result.stage === 'closed_short' && r.json.result.lines[0].pending === 0 && r.json.result.lines[0].closedQty === 3, J(r.json?.result?.lines));
   r = await call('GET', `/purchase-requests/${prqId}`, { token: T_VIEWER });
   ok('…the PR line\'s "PO raised" went down by 3 (4 → 1)', r.status === 200 && gl(r.json, fx.B).poRaised === 1 && gl(r.json, fx.B).open === 3, J(gl(r.json, fx.B)));
 } catch (err) {

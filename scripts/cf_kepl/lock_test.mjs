@@ -402,9 +402,9 @@ try {
   same('Nesting applies to a line with cut plates even with no NESTING specification, and is not done until a plan is saved', [nestStage0?.applies, nestStage0?.state], [true, 'todo']);
   says(nestStage0?.detail);
   const prodStage0 = procBefore.lines[0].stages.find((st) => st.stageKey === 'production');
-  same('Production says what it waits on: the header Confirm (no stage key, action confirm)', [prodStage0?.waitingOn?.stageKey, prodStage0?.waitingOn?.action, typeof prodStage0?.waitingOn?.message], [null, 'confirm', 'string']);
+  same('Production says what it waits on: the customer acceptance (§73; this process has no such stage — the plain acceptance tab of the order)', [prodStage0?.waitingOn?.stageKey, prodStage0?.waitingOn?.action, typeof prodStage0?.waitingOn?.message], [null, 'acceptance', 'string']);
   ok('no stage called confirm is shown', !procBefore.stages.some((st) => st.stageKey === 'confirm'));
-  eq('the order can be confirmed before the design is frozen', procBefore.canConfirm, true);
+  ok('a customer order offers no Confirm move before (or after) the freeze — its acceptance confirms it (§73)', !(await SO.getOrder(conn, COMPANY, A.order.id)).allowedTransitions.includes('confirmed'));
 
   /* ---- 3. lock ------------------------------------------------------------------ */
   section('3. lockLine writes exactly what lockPlan showed, piece for piece');

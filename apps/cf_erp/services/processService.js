@@ -43,7 +43,9 @@
  *      vanishes leaves somebody wondering whether they forgot it.
  *
  * Nothing here blocks anything — not even confirmation, since 2026-09-30
- * (CF_ERP_ORDER_FLOW_PLAN: Confirm is the customer's yes, not a stage).
+ * (CF_ERP_ORDER_FLOW_PLAN: Confirm is the customer's yes, not a stage). Since §73 (2026-10-18) the customer's yes IS
+ * a stage again, of its own kind — 'acceptance' (Customer acceptance, after the Material request): its terms are
+ * approved by Management (acceptanceService), and that approval is what confirms a customer's order.
  * `blockers` are things worth knowing, not permission to press a button.
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
@@ -525,12 +527,14 @@ export const STAGE_CATALOGUE = [
        * are the buy list's own: a released line's requirements, or a frozen
        * line's planned material (releaseService.plannedMaterialOfLines).
        */
-      if (!ctx.confirmed) {
+      // A STOCK order is still bought for once it is confirmed (draft → confirmed). A customer's order raises its MR
+      // before the customer accepts (§73) — the confirmed check for it comes after the design and the nest, below.
+      if (!ctx.confirmed && ctx.order.order_type !== 'customer') {
         return {
           state: 'todo',
-          detail: 'Waiting for the order to be confirmed — nothing is bought for an inquiry',
+          detail: 'Waiting for the order to be confirmed — nothing is bought for a draft',
           blockers: [],
-          waitingOn: confirmFirst('Confirm the order first — nothing is bought for an inquiry.'),
+          waitingOn: confirmFirst('Confirm the order first — nothing is bought for a draft.'),
         };
       }
       if (ctx.line.line_type === 'custom' && !ctx.lock.lockedAt) {
@@ -549,6 +553,20 @@ export const STAGE_CATALOGUE = [
           blockers: [],
           waitingOn: { stageKey: 'nesting', message: `Nest the line first — ${n(k, 'cut plate')} ${k === 1 ? 'has' : 'have'} no plate yet.` },
         };
+      }
+      /*
+       * BEFORE THE CUSTOMER ACCEPTS (§73): the MR is raised and SHARED with the customer, and held — Purchase starts once
+       * the acceptance is approved. So this step is done when the line's MR is raised.
+       */
+      if (!ctx.confirmed) {
+        const mr = ctx.mrByLine?.get(Number(ctx.line.id)) ?? null;
+        return mr
+          ? { state: 'done', detail: `${mr.code} raised and shared with the customer — Purchase starts once the acceptance is approved`, blockers: [] }
+          : {
+            state: 'todo',
+            detail: 'Raise the MR and share it with the customer',
+            blockers: [{ count: 0, message: `Line ${ctx.line.line_no} has no material request yet — raise it, then share it with the customer.` }],
+          };
       }
       const rows = ctx.buyRows;
       if (!rows.length) return { state: 'done', detail: 'Nothing to buy', blockers: [] };
@@ -609,6 +627,36 @@ export const STAGE_CATALOGUE = [
     },
   },
   {
+    key: 'acceptance',
+    label: 'Customer acceptance',
+    description: "The customer's yes (§73): the charges, the payment milestones and the post-production stages, sent to Management. Its approval confirms the order, releases the MR to Purchase and locks the terms.",
+    scope: 'order',
+    /** The answer is the order's: every line says the same, so the tab shows it once. */
+    sameForEveryLine: true,
+    applies: (ctx) => ctx.order.order_type === 'customer',
+    state(ctx) {
+      const a = ctx.acceptance ?? {};
+      const when = (d) => (d ? ` on ${new Date(d).toLocaleDateString('en-IN')}` : '');
+      if (a.approved) {
+        return {
+          state: 'done',
+          detail: a.pending ? `Accepted (version ${a.approved.version}) · a rate change waits for approval`
+            : `Accepted — approved${a.approved.decidedBy ? ` by ${a.approved.decidedBy}` : ''}${when(a.approved.decidedAt)}`,
+          blockers: [],
+        };
+      }
+      if (ctx.confirmed) return { state: 'done', detail: 'Confirmed before the acceptance was a step', blockers: [] };
+      if (a.pending) return { state: 'partial', detail: 'Sent to Management — waiting for approval', blockers: [{ count: 0, message: "The customer's acceptance waits for Management's approval." }] };
+      const noMr = (ctx.material.length > 0 || ctx.buyRows.length > 0) && !ctx.mrByLine?.has(Number(ctx.line.id));
+      return {
+        state: 'todo',
+        detail: a.sentBack ? `Sent back${a.sentBack.decisionNote ? `: ${a.sentBack.decisionNote}` : ''} — change the terms and save again` : "Capture the customer's terms and send them for approval",
+        blockers: [{ count: 0, message: "The customer's acceptance is not approved yet." }],
+        waitingOn: noMr ? { stageKey: 'buying', message: 'Raise the MR and share it with the customer first.' } : null,
+      };
+    },
+  },
+  {
     key: 'production',
     label: 'Production',
     description: 'Releasing to the shop what the order makes rather than buys. Needs a confirmed order and a frozen design; the steps wait for their material.',
@@ -621,7 +669,10 @@ export const STAGE_CATALOGUE = [
         const openPlates = ctx.planned && !ctx.planned.ready ? ctx.planned.openPlates : 0;
         return {
           // Not buying: release does not wait for the steel — its steps do.
-          waitingOn: !ctx.confirmed ? confirmFirst('Confirm the order first — release needs a confirmed order.')
+          waitingOn: !ctx.confirmed ? (ctx.order.order_type === 'customer'
+            // The process's Customer acceptance stage, or (an older process without it) the order's plain acceptance tab.
+            ? { stageKey: ctx.acceptanceStage ? 'acceptance' : null, action: ctx.acceptanceStage ? null : 'acceptance', message: "The customer's acceptance must be approved first — release needs a confirmed order." }
+            : confirmFirst('Confirm the order first — release needs a confirmed order.'))
             : mustFreeze ? { stageKey: 'lock', message: 'Freeze the design first — release takes its piece codes from the frozen design.' }
               : openPlates ? { stageKey: 'nesting', message: `Nest the line first — ${n(openPlates, 'cut plate')} ${openPlates === 1 ? 'has' : 'have'} no plate yet.` }
                 : null,
@@ -1667,7 +1718,7 @@ function buyRowsOf(ctx, line, material) {
 }
 
 /** One line's slice of the order context — the object every stage is handed. */
-function lineContext(ctx, order, line, { planStage = false } = {}) {
+function lineContext(ctx, order, line, { planStage = false, acceptanceStage = false } = {}) {
   const tree = ctx.trees.get(line.id);
   const split = splitLine(ctx, order, line);
 
@@ -1711,6 +1762,9 @@ function lineContext(ctx, order, line, { planStage = false } = {}) {
     values: { required, missing },
     release: ctx.releases.get(line.id) ?? null,
     confirmed: ['confirmed', 'closed'].includes(orderStatusOf(order)),
+    // §73: the order's acceptance standing and each line's MR (read by orderProcess when the process asks).
+    acceptance: ctx.acceptance ?? null,
+    mrByLine: ctx.mrByLine ?? null,
     planned: ctx.planned.get(Number(line.id)) ?? null,
     ...buyRowsOf(ctx, line, split.material),
     today: ctx.ready?.today ?? null,
@@ -1718,6 +1772,7 @@ function lineContext(ctx, order, line, { planStage = false } = {}) {
     // The execution plan (§72) and whether this process has its stage (Freeze design points at it only then).
     plan: ctx.planBy?.get(line.id) ?? null,
     planStage,
+    acceptanceStage,
     // This line's plate parts, each once, and whether each has its cut piece.
     cut: { parts: [...new Set(split.made.map((x) => x.id))].map((id) => ctx.partById.get(id)).filter(Boolean) },
   };
@@ -1803,6 +1858,7 @@ function notApplicableDetail(key, ctx) {
       return 'This line has no cut plates and no material to lay out';
     case 'buying': return 'Everything under this line is made, so there is nothing to buy';
     case 'production': return 'Everything under this line comes from stock, so nothing is made';
+    case 'acceptance': return 'A stock order has no customer to accept it';
     default: return 'Not needed for this line';
   }
 }
@@ -1864,7 +1920,7 @@ function rollUp(stage, kind, perLine) {
       : 'partial';
 
   const worst = live.find((x) => x.s.state === 'todo') ?? live.find((x) => x.s.state === 'partial') ?? live[0];
-  const detail = live.length === 1
+  const detail = live.length === 1 || kind?.sameForEveryLine
     ? worst.s.detail
     : state === 'done'
       ? `All ${n(live.length, 'line')} done`
@@ -1929,7 +1985,7 @@ export async function orderProcess(db, companyId, orderId) {
       : `This order was created before it had a process. ${match.reason}`;
   }
   if (!process) {
-    return { order: { id: order.id, code: order.code, status: order.status }, process: null, reason, lines: [], stages: [], nextStage: null, canConfirm: false };
+    return { order: { id: order.id, code: order.code, status: order.status, orderType: order.order_type }, process: null, reason, lines: [], stages: [], nextStage: null };
   }
 
   const stageRows = process.stages
@@ -1952,8 +2008,18 @@ export async function orderProcess(db, companyId, orderId) {
   const [ctx, overrideValues] = await Promise.all([ctxP ?? loadOrderContext(db, companyId, order, lines), overrides]);
 
   const planStage = stageRows.some((s) => s.stage_key === 'execution_plan');
+  // §73: the order's acceptance standing and which lines have an MR — two reads, only for a process that asks.
+  if (stageRows.some((s) => s.stage_key === 'acceptance' || s.stage_key === 'buying')) {
+    const { acceptanceStates } = await import('./acceptanceService.js');
+    const [acc, [mrs]] = await Promise.all([
+      acceptanceStates(db, companyId, [order.id]),
+      db.query('SELECT id, code, order_line_id, held_for_acceptance FROM cf_requisitions WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [companyId, order.id]),
+    ]);
+    ctx.acceptance = acc.get(Number(order.id)) ?? null;
+    ctx.mrByLine = new Map(mrs.map((r) => [Number(r.order_line_id), { id: r.id, code: r.code, held: !!Number(r.held_for_acceptance) }]));
+  }
   const perLine = lines.map((line) => {
-    const lctx = lineContext(ctx, order, line, { planStage });
+    const lctx = lineContext(ctx, order, line, { planStage, acceptanceStage: stageRows.some((s) => s.stage_key === 'acceptance') });
     return {
       lineId: line.id,
       lineNo: line.line_no,
@@ -1980,16 +2046,6 @@ export async function orderProcess(db, companyId, orderId) {
   const stages = stageRows.map((stage) => rollUp(stage, CATALOGUE_BY_KEY.get(stage.stage_key), perLine));
   const next = stages.find((s) => !satisfied(s)) ?? null;
 
-  // CONFIRM IS THE CUSTOMER'S YES, NOT THE END OF THE DESIGN (2026-09-30): it
-  // can happen at any point once the order has lines — no stage holds it up.
-  // What setOrderStatus checks is checked here too, so the button never offers
-  // what the server refuses: a customer order needs its customer and a
-  // committed date (on the order, or on every line).
-  const undated = lines.filter((l) => !l.committed_date);
-  const canConfirm = lines.length > 0
-    && ['inquiry', 'quoted', 'draft'].includes(order.status)
-    && (order.order_type !== 'customer' || (!!order.customer_id && (!!order.committed_date || !undated.length)));
-
   return {
     order: { id: order.id, code: order.code, status: order.status, orderType: order.order_type },
     process: { id: process.id, code: process.code, name: process.name, status: process.status },
@@ -1997,9 +2053,8 @@ export async function orderProcess(db, companyId, orderId) {
     lines: perLine,
     stages,
     nextStage: next?.stageKey ?? null,
-    canConfirm,
-    // Everything still outstanding, across every stage — nothing gates the
-    // confirm any more, so this is what is left to do, not what holds it up.
+    // Everything still outstanding, across every stage — what is left to do. A customer's order is confirmed by its
+    // Customer acceptance (§73), a stock order by its Confirm button.
     blockers: stages.flatMap((s) => s.blockers ?? []),
   };
 }

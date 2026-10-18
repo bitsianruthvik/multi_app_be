@@ -45,6 +45,8 @@ const STAGES = [
   { stageKey: 'lock', sequence: 40, requirement: 'required' },
   { stageKey: 'nesting', sequence: 50, requirement: 'required' },
   { stageKey: 'buying', sequence: 60, requirement: 'optional' },
+  // §73: the customer's yes — the order's confirm step, approved by Management.
+  { stageKey: 'acceptance', sequence: 65, requirement: 'required' },
   { stageKey: 'production', sequence: 70, requirement: 'optional' },
 ];
 

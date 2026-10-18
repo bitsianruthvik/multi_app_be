@@ -779,7 +779,8 @@ try {
   // Most of it is making the line's cut pieces from scratch (cutPlateService's
   // own bulk derive, ~44 on the KEPL line); the copy itself is ~30 statements.
   // 110 since 2026-10-10: the cut pieces a revision derives also take the values their own flow reads (a fixed handful of reads, not one a row).
-  ok('and about a hundred for a line, not one a row', small.tally.n <= 110, String(small.tally.n));
+  // §73: +2 — the revision copies the customer acceptance (its versions, its post-production checklist), set-based.
+  ok('and about a hundred for a line, not one a row', small.tally.n <= 112, String(small.tally.n));
 
   section('11b. Linked copies come along as groups of the NEW revision (init.sql §59)');
   {

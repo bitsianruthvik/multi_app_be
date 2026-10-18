@@ -162,7 +162,7 @@ try {
   ok(`GOLDEN, ${BIG} units: the same (${big.bytes} bytes compared for the date edit)`, big.goldenDate && big.goldenQty && big.goldenCancel && big.goldenCold, j([big.goldenCold, big.goldenDate, big.goldenQty, big.goldenCancel]));
   ok(`…and the answers are not empty: the date edit made ${big.poDateLate} planned cards late, the cut hit ${big.poQtyHit}, the cancel ${big.poCancelHit}`, small.poDateLate === 3 && big.poDateLate === 3 && big.poQtyHit >= 1 && big.poCancelHit === 3, j([small.poDateLate, big.poDateLate, big.poQtyHit, big.poCancelHit]));
   ok(`a PO line DATE edit is ≤ 17 round trips (§71: +1 the date change recorded, +1 the history read with the PO): ${big.poDate} (it was ${big.poDateCold} the whole way)`, big.poDate <= 17, String(big.poDate));
-  ok(`a PO CANCEL is ≤ 16 round trips (§71: +1 the date history read with the PO): ${big.poCancel}`, big.poCancel <= 16, String(big.poCancel));
+  ok(`a PO CANCEL is ≤ 18 round trips (§71: +1 the date history read with the PO; §73: +1 its inbox rows withdrawn, +1 the PO's pending approvals read): ${big.poCancel}`, big.poCancel <= 18, String(big.poCancel));
   ok(`a PO line QUANTITY cut is ≤ 18 (§71: +1 the date history read): ${big.poQty} (it also reads and trims the line's shares, and may restate the order)`, big.poQty <= 18, String(big.poQty));
   ok('getPurchaseOrder still names the supplier and the sales order (now read with the header)', small.poHeader && big.poHeader);
   ok(`the engine itself is ≤ 10 reads (lines 1, needs ≤ 4, supply 5): ${big.engineLines}`, big.engineLines <= 10, String(big.engineLines));

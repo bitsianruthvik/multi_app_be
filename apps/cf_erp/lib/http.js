@@ -20,7 +20,9 @@ export const PERM = {
   inventoryView: 'cf_erp_inventory_view',   // see stocking areas, stock, batches and movements
   inventory: 'cf_erp_inventory_manage',     // stocking areas, receipts, issues, transfers, counts, scrap, batches
   purchaseApprove: 'cf_erp_purchase_approve', // approve / reject purchase requests (init.sql §39); raising and RFQs use inventory manage
-  plateChangeApprove: 'cf_erp_plate_change_approve', // MD APPROVAL (label since §71): approve purchase orders to a vendor, and plate changes / substitutes (init.sql §62, §68); admin and MD
+  plateChangeApprove: 'cf_erp_plate_change_approve', // MD APPROVAL (label since §71): plate changes / substitutes (init.sql §62, §68); admin and MD.
+  // §73: purchase orders, acceptances, rate changes, close short … are approved in the Management inbox, each by its own
+  // tag — approvalService.APPROVAL_TYPES (cf_erp_approve_*).
   floor: 'cf_erp_floor',                    // the machine log: read the floor screens and record work and stops (init.sql §32)
 };
 

@@ -109,6 +109,13 @@ export const TRANSITIONS = {
   },
 };
 const FIRST_STATUS = { customer: 'inquiry', stock: 'draft' };
+/**
+ * The moves a person may make with the status buttons. A CUSTOMER's order is confirmed only by the approval of its
+ * Customer acceptance (§73, acceptanceService) — never by a button, so 'confirmed' is not offered.
+ */
+export const allowedTransitionsOf = (orderType, status) => (TRANSITIONS[orderType]?.[status] ?? []).filter((t) => !(orderType === 'customer' && t === 'confirmed'));
+/** Said when a customer's order is asked to become confirmed any other way. */
+export const ACCEPTANCE_FIRST = "A customer's order is confirmed by its Customer acceptance: save the terms there, and it is confirmed when Management approves them.";
 const DELETABLE = new Set(['draft', 'inquiry', 'lost', 'cancelled']);
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -290,7 +297,7 @@ function shapeOrder(o) {
     statusBeforeRevised: o.status_before_revised ?? null,
     lineCount: o.line_count == null ? undefined : Number(o.line_count),
     overdue: !!committed && committed < today() && !LOCKED.has(o.status),
-    allowedTransitions: TRANSITIONS[o.order_type]?.[o.status] ?? [],
+    allowedTransitions: allowedTransitionsOf(o.order_type, o.status),
     createdAt: o.created_at,
     updatedAt: o.updated_at,
   };
@@ -439,7 +446,7 @@ function readSupply(v, orderType, problems) {
 export async function setLineSupply(db, c, lineId, input = {}) {
   const [[l]] = await db.query(
     `SELECT l.id, l.line_no, l.order_id, l.material_supply, o.code AS order_code, o.order_type, o.status, o.material_supply AS order_supply,
-            (SELECT r.code FROM cf_requisitions r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL LIMIT 1) AS mr_code
+            (SELECT r.code FROM cf_requisitions r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.held_for_acceptance = 0 AND r.deleted_at IS NULL LIMIT 1) AS mr_code
        FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id
       WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL FOR UPDATE`,
     [c.companyId, Number(lineId)],
@@ -448,9 +455,13 @@ export async function setLineSupply(db, c, lineId, input = {}) {
   const problems = [];
   const supply = input.supply === null || input.supply === '' ? null : readSupply(input.supply, l.order_type, problems);
   if (input.supply != null && input.supply !== '' && !supply && !problems.length) problems.push('Say who supplies the material.');
-  if (l.mr_code && (supply ?? null) !== (l.material_supply ?? null)) problems.push(`Line ${l.line_no}'s material request ${l.mr_code} is raised — who supplies its material is fixed now.`);
+  const changed = (supply ?? null) !== (l.material_supply ?? null);
+  // §73: fixed once the line's MR is RELEASED to Purchase; an MR held for the customer's acceptance follows the change.
+  if (l.mr_code && changed) problems.push(`Line ${l.line_no}'s material request ${l.mr_code} is with Purchase — who supplies its material is fixed now.`);
+  else if (changed && l.order_type === 'customer' && ['confirmed', 'closed'].includes(l.status)) problems.push(`${l.order_code}'s acceptance is approved — who supplies the material is part of the accepted terms now.`);
   assertNoProblems(problems, `Line ${l.line_no} of ${l.order_code}: the material supply cannot be changed.`);
   await db.query('UPDATE cf_sales_order_lines SET material_supply = ? WHERE company_id = ? AND id = ?', [supply, c.companyId, l.id]);
+  if (changed) await (await import('./requisitionService.js')).followSupplyOfHeld(db, c, l.order_id);
   const effective = supply ?? (l.order_supply === 'customer' ? 'customer' : 'we_buy');
   return { lineId: l.id, lineNo: l.line_no, materialSupply: supply, supply: effective, order: { id: l.order_id, code: l.order_code, materialSupply: l.order_supply === 'customer' ? 'customer' : 'we_buy' } };
 }
@@ -516,6 +527,7 @@ export async function updateOrder(db, c, id, input = {}) {
   assertOpen(o);
   const problems = [];
   const sets = {};
+  let followHeld = false;
   if (input.orderType !== undefined && input.orderType !== o.order_type) problems.push('An order stays a customer order or a stock order.');
   if (input.code !== undefined) {
     const code = String(input.code ?? '').trim();
@@ -541,10 +553,12 @@ export async function updateOrder(db, c, id, input = {}) {
   if (input.materialSupply !== undefined) {
     const supply = readSupply(input.materialSupply, o.order_type, problems);
     if (supply && supply !== (o.material_supply ?? 'we_buy')) {
-      // Fixed once a material request is raised: the MR was raised as it stood (§66).
-      const [mrs] = await db.query('SELECT code FROM cf_requisitions WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 3', [c.companyId, id]);
-      if (mrs.length) problems.push(`Who supplies the material is fixed once a material request is raised (${mrs.map((r) => r.code).join(', ')}). Set it on a line that has no MR yet.`);
-      else sets.material_supply = supply;
+      // Fixed once a material request is RELEASED to Purchase (§66; §73: an MR held for the customer's acceptance follows the
+      // change) — and, for a customer's order, once its acceptance is approved (it is part of the accepted terms).
+      const [mrs] = await db.query('SELECT code FROM cf_requisitions WHERE company_id = ? AND order_id = ? AND held_for_acceptance = 0 AND deleted_at IS NULL ORDER BY id LIMIT 3', [c.companyId, id]);
+      if (mrs.length) problems.push(`Who supplies the material is fixed once a material request is released to Purchase (${mrs.map((r) => r.code).join(', ')}). Set it on a line that has no MR yet.`);
+      else if (o.order_type === 'customer' && ['confirmed', 'closed'].includes(o.status)) problems.push(`${o.code}'s acceptance is approved — who supplies the material is part of the accepted terms now.`);
+      else { sets.material_supply = supply; followHeld = true; }
     }
   }
   assertNoProblems(problems);
@@ -552,6 +566,7 @@ export async function updateOrder(db, c, id, input = {}) {
     await db.query(`UPDATE cf_sales_orders SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, id]);
   }
+  if (followHeld) await (await import('./requisitionService.js')).followSupplyOfHeld(db, c, id);
   return getOrder(db, c.companyId, id);
 }
 
@@ -561,8 +576,16 @@ export async function updateOrder(db, c, id, input = {}) {
  * Drafts and unchosen selections do not block confirming; they will block
  * release to production.
  */
-export async function setOrderStatus(db, c, id, status) {
+export async function setOrderStatus(db, c, id, status, opts = {}) {
   const o = await requireOrder(db, c.companyId, id, { lock: true });
+  /*
+   * §73: CONFIRMED = THE CUSTOMER ACCEPTED. A customer's order becomes confirmed when Management approves its acceptance
+   * (opts.viaAcceptance). The status route never confirms one (opts.fromRoute); a script or another service may only
+   * when the order's process has no Customer acceptance stage (an older process).
+   */
+  if (status === 'confirmed' && o.order_type === 'customer' && o.status !== 'confirmed' && !opts.viaAcceptance) {
+    if (opts.fromRoute || await processHasStage(db, c.companyId, o.process_id, 'acceptance')) throw invalid('ACCEPTANCE_FIRST', ACCEPTANCE_FIRST);
+  }
   if (o.status === status) return getOrder(db, c.companyId, id);
   // 'revised' is set by revising and cleared by discarding the revision — never by hand.
   if (o.status === 'revised') throw invalid('ORDER_LOCKED', revisedWords(o));
@@ -619,7 +642,21 @@ export async function setOrderStatus(db, c, id, status) {
     [status, c.companyId, id],
   );
   if (wasLocked && !willLock) await refreshOrderValues(db, c, id);
+  // §73: confirmed — the MRs shared with the customer before the acceptance go to Purchase now.
+  if (status === 'confirmed') await (await import('./requisitionService.js')).releaseHeldRequisitions(db, c, id);
+  // What billing (step 3B) reads: the order closed.
+  if (status === 'closed') {
+    await db.query("INSERT INTO cf_order_events (company_id, order_id, event_type, label, event_date, recorded_by) VALUES (?, ?, 'order_closed', ?, CURDATE(), ?)",
+      [c.companyId, id, `${o.code} closed`, c.userId ?? null]);
+  }
   return getOrder(db, c.companyId, id);
+}
+
+/** Whether a process has a stage of that key (a stored, live row). 1 read; no process → false. */
+export async function processHasStage(db, companyId, processId, stageKey) {
+  if (!processId) return false;
+  const [[r]] = await db.query('SELECT 1 AS x FROM cf_process_stages WHERE company_id = ? AND process_id = ? AND stage_key = ? AND deleted_at IS NULL LIMIT 1', [companyId, processId, stageKey]);
+  return !!r;
 }
 
 /** Re-works the values of every temporary item on an order, children before parents. */
@@ -650,6 +687,7 @@ export async function deleteOrder(db, c, id) {
   await retireLineOwnedRows(db, c.companyId, lines.map((l) => l.id));
   for (const l of lines) await removeLineRows(db, c, l.id, { ownedDone: true });
   await retirePlanRowsOfOrder(db, c.companyId, id);
+  await (await import("./acceptanceService.js")).retireAcceptance(db, c, id);
   await db.query('UPDATE cf_sales_orders SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   return { ok: true };
 }

@@ -30,9 +30,9 @@ import { likeOf } from '../lib/listing.js';
 import { availability } from './rollOutService.js';
 import { lineReadiness, openLines, today as clockToday, OPEN_ORDER_STATUSES } from './materialReadyService.js';
 import {
-  readRequisitions, syncLines, claimRows, askCustomer, supplyOf, requireOrderRow, SUPPLY_LABEL,
+  readRequisitions, syncLines, claimRows, askCustomer, supplyOf, requireOrderRow, SUPPLY_LABEL, heldMessage,
 } from './requisitionService.js';
-import { getPurchaseOrder, poStage, PO_STAGE_LABEL } from './purchaseService.js';
+import { getPurchaseOrder, poStage, PO_STAGE_LABEL, askPoApproval } from './purchaseService.js';
 import { CURRENCY } from './priceService.js';
 
 const EPS = 1e-6;
@@ -128,10 +128,14 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
   const pos = new Map();
   for (const l of v.lines) for (const p of l.purchase) if (p.purchaseOrder.status !== 'cancelled') pos.set(p.purchaseOrder.id, { ...p.purchaseOrder, supplier: p.supplier });
   const open = OPEN_ORDER_STATUSES.includes(v.order.status);
+  // §73: an MR raised before the customer accepted is shared, not released — nothing is taken or bought until approval.
+  const heldMr = !!v.heldForAcceptance;
   return {
     id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel,
     order: v.order, line: v.line, status: v.status, statusLabel: v.statusLabel, stale: v.stale, needKnown: v.needKnown, needComplete: v.needComplete,
-    canEdit: open, reason: open ? null : `${v.order.code} is ${v.order.status} — its material request no longer changes.`,
+    heldForAcceptance: heldMr,
+    canEdit: open && !heldMr,
+    reason: heldMr ? heldMessage(v.code) : open ? null : `${v.order.code} is ${v.order.status} — its material request no longer changes.`,
     lines,
     purchaseRequest: prOf.get(v.id) ?? null,
     purchaseOrders: [...pos.values()],
@@ -155,7 +159,7 @@ export async function listMrs(db, companyId, q = {}) {
       const lockedLines = live.filter((l) => (l.cover.earmarked ?? 0) + EPS >= l.need).length;
       return {
         id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel, order: v.order, line: v.line,
-        status: v.status, statusLabel: v.statusLabel, materials: live.length, lockedLines,
+        status: v.status, statusLabel: v.statusLabel, materials: live.length, lockedLines, heldForAcceptance: !!v.heldForAcceptance,
         lockedWords: live.length ? `${lockedLines} of ${live.length} locked` : 'Nothing to buy',
         purchaseRequest: prOf.get(v.id) ?? null, raisedAt: v.raisedAt,
       };
@@ -174,11 +178,12 @@ export async function listMrs(db, companyId, q = {}) {
  */
 export async function saveMr(db, c, id, input = {}) {
   const [[head]] = await db.query(
-    `SELECT r.id, r.order_id, r.order_line_id, r.supply, o.code AS order_code, o.status AS order_status
+    `SELECT r.id, r.code, r.order_id, r.order_line_id, r.supply, r.held_for_acceptance, o.code AS order_code, o.status AS order_status
        FROM cf_requisitions r JOIN cf_sales_orders o ON o.id = r.order_id WHERE r.company_id = ? AND r.id = ? AND r.deleted_at IS NULL FOR UPDATE`,
     [c.companyId, Number(id)],
   );
   if (!head) throw notFound('Material request');
+  if (Number(head.held_for_acceptance)) throw invalid('HELD_FOR_ACCEPTANCE', heldMessage(head.code));
   if (!OPEN_ORDER_STATUSES.includes(head.order_status)) throw invalid('NOT_OPEN', `${head.order_code} is ${head.order_status} — its material request no longer changes.`);
   let R = await lineReadiness(db, c.companyId, { full: true });
   const s = await syncLines(db, c, [head], R.needs);
@@ -616,7 +621,7 @@ export async function raisePo(db, c, vendorId, input = {}) {
     const [[p]] = await db.query('SELECT * FROM cf_purchase_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, Number(input.addToPoId)]);
     if (!p) problems.push('That purchase order does not exist.');
     else if (Number(p.supplier_id) !== Number(v.supplier_id)) problems.push(`${p.code} is not to ${v.supplier_name}.`);
-    else if (p.approval_status !== 'pending' || !['requested', 'quoting', 'draft'].includes(p.status)) problems.push(`${p.code} is not waiting for MD approval any more — raise a new purchase order.`);
+    else if (p.approval_status !== 'pending' || !['requested', 'quoting', 'draft'].includes(p.status)) problems.push(`${p.code} is not waiting for Management approval any more — raise a new purchase order.`);
     else if (Number(p.supplied_by_customer ?? 0)) problems.push(`${p.code} is the customer's own purchase order.`);
     else target = p;
   }
@@ -706,10 +711,12 @@ export async function raisePo(db, c, vendorId, input = {}) {
     await db.query(`UPDATE cf_purchase_line_orders SET quantity = quantity + CASE id ${shareGrow.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
       [...shareGrow.flat(), c.companyId, shareGrow.map((s) => s[0])]);
   }
+  // §73: a PO waiting for approval is a row of the Management inbox (a new PO, or lines added to one still waiting).
+  await askPoApproval(db, c, poId);
   return { purchaseOrder: await getPurchaseOrder(db, c.companyId, poId), purchaseRequest: await getPr(db, c.companyId, pr.id) };
 }
 
-/** POs of a vendor still waiting for MD approval — what "Add to an existing PO" offers. 1 read. */
+/** POs of a vendor still waiting for Management approval — what "Add to an existing PO" offers. 1 read. */
 export async function pendingPosOfVendor(db, companyId, vendorId) {
   const v = await requireVendorRow(db, companyId, vendorId);
   const [rows] = await db.query(

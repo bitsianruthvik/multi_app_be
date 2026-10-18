@@ -137,7 +137,7 @@ export async function cockpit(db, companyId) {
     { key: 'buy', title: 'Material to buy', count: b.toBuy, unit: plural(b.toBuy, 'item', 'items'), tone: 'danger',
       description: 'Short after what is held and what is already on order — nobody has this steel.', actionLabel: 'Open material requests', path: 'material-requests' },
     { key: 'approve', title: 'Purchase orders to approve', count: b.pendingApproval, unit: plural(b.pendingApproval, 'order', 'orders'), tone: 'warning',
-      description: 'Every purchase order to a vendor waits for MD approval before it is placed.', actionLabel: 'Open them', path: 'purchase-orders?stage=pending_approval' },
+      description: 'Every purchase order to a vendor waits for approval in Management before it is placed.', actionLabel: 'Open Approvals', path: 'approvals' },
     { key: 'deliveries', title: 'Deliveries to book in', count: b.awaitingDelivery, unit: plural(b.awaitingDelivery, 'order', 'orders'), tone: 'info',
       description: 'Purchase orders placed and not fully received.', actionLabel: 'Receive against PO', path: 'receive' },
     { key: 'delivered', title: 'Orders fully delivered', count: delivered, unit: plural(delivered, 'order', 'orders'), tone: 'success',
