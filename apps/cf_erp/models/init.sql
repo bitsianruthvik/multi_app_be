@@ -7738,3 +7738,229 @@ SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN approve_own_
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SELECT 'SCHEMA-OK' AS result;
+
+-- ============================================================================
+-- §85  CONTRACTOR WORK ORDERS — from a production order's BOM rows × operations, a contractor PO, weekly payments (2026-10-18)
+-- The same text as TM/s85.sql. Additive and guarded: safe to re-run. Service: contractorWorkOrderService.js, routes
+-- routes/contractorWorkOrders.js. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md "2026-10-18 — Step 6: contractor work orders".
+--
+--   cf_work_orders.kind              'cells' = the older §30 work orders (cells on locked pieces; kept readable),
+--                                    'po' = a work order made from a production order with its contractor PO.
+--   cf_work_orders.purchase_order_id the contractor PO (po_type 'contractor'; one line per operation, quantity in t,
+--                                    rate per t). Management approves it ('contractor_po') → the work order is issued.
+--   cf_work_orders.production_order_id  the production order (§76) it was made from.
+--   cf_work_order_scope              the cells: production order × path (the BOM line chain "<line>:<id>/<id>…") ×
+--                                    operation, with the rows' quantity, kg each and tonnes, and the PO line it is paid on.
+--                                    One live owner per cell (uq_cwos_cell); a cancelled work order frees its cells.
+--   cf_work_order_payments (+ _lines) a week's payment: date, reference, per operation the tonnes done (→ the PO line's
+--                                    qty_received, so the PO closes by itself when all is done), rate and amount.
+--                                    Removed = deleted_at + reason (the tonnes go back).
+-- Released steps of a cell carry cf_production_steps.work_order_id (§30) — floor, machine queue and planner read it.
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_work_orders' AND COLUMN_NAME = 'kind');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_work_orders ADD COLUMN kind VARCHAR(12) NOT NULL DEFAULT 'cells'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_work_orders' AND COLUMN_NAME = 'purchase_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_work_orders ADD COLUMN purchase_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_work_orders' AND COLUMN_NAME = 'production_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_work_orders ADD COLUMN production_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_work_orders' AND INDEX_NAME = 'idx_cwo_po');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_work_orders ADD INDEX idx_cwo_po (company_id, purchase_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_work_orders' AND INDEX_NAME = 'idx_cwo_prod');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_work_orders ADD INDEX idx_cwo_prod (company_id, production_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_work_order_scope (
+  id                    INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id            INT            NOT NULL,
+  work_order_id         INT            NOT NULL,
+  production_order_id   INT            NOT NULL,
+  order_line_id         INT            NOT NULL,
+  bom_line_id           INT            NULL,              -- NULL = the line's own item (the root row)
+  path_key              VARCHAR(1000)  NOT NULL,          -- "<order line id>:<bom line id>/<bom line id>…"
+  path_hash             CHAR(40)       NOT NULL,          -- sha1(path_key), for the unique cell key
+  operation_id          INT            NOT NULL,
+  po_line_id            INT            NULL,              -- the contractor PO line this cell is paid on
+  quantity              DECIMAL(18,6)  NOT NULL DEFAULT 0, -- how many the production order makes of the row
+  unit_kg               DECIMAL(18,6)  NULL,
+  tonnes                DECIMAL(18,6)  NULL,
+  deleted_at            DATETIME       DEFAULT NULL,
+  created_at            TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  is_live               TINYINT        GENERATED ALWAYS AS (IF(deleted_at IS NULL, 1, NULL)) VIRTUAL,
+  UNIQUE KEY uq_cwos_tenant (company_id, id),
+  UNIQUE KEY uq_cwos_cell (company_id, production_order_id, operation_id, path_hash, is_live),
+  KEY idx_cwos_wo (company_id, work_order_id),
+  KEY idx_cwos_line (company_id, order_line_id),
+  KEY idx_cwos_po_line (company_id, po_line_id),
+  CONSTRAINT fk_cwos_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cwos_wo FOREIGN KEY (company_id, work_order_id) REFERENCES cf_work_orders(company_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_work_order_payments (
+  id                 INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT            NOT NULL,
+  work_order_id      INT            NOT NULL,
+  purchase_order_id  INT            NOT NULL,
+  payment_date       DATE           NOT NULL,
+  reference          VARCHAR(100)   NULL,
+  notes              VARCHAR(500)   NULL,
+  tonnes             DECIMAL(18,6)  NOT NULL DEFAULT 0,
+  amount             DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  created_by         INT            NULL,
+  created_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  deleted_at         DATETIME       DEFAULT NULL,       -- removed (entered by mistake)
+  removed_by         INT            NULL,
+  remove_reason      VARCHAR(500)   NULL,
+  UNIQUE KEY uq_cwop_tenant (company_id, id),
+  KEY idx_cwop_wo (company_id, work_order_id),
+  KEY idx_cwop_date (company_id, payment_date),
+  CONSTRAINT fk_cwop_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cwop_wo FOREIGN KEY (company_id, work_order_id) REFERENCES cf_work_orders(company_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_work_order_payment_lines (
+  id            INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT            NOT NULL,
+  payment_id    INT            NOT NULL,
+  po_line_id    INT            NOT NULL,
+  operation_id  INT            NULL,
+  tonnes        DECIMAL(18,6)  NOT NULL DEFAULT 0,
+  rate          DECIMAL(18,4)  NULL,
+  amount        DECIMAL(18,2)  NOT NULL DEFAULT 0,
+  UNIQUE KEY uq_cwopl_tenant (company_id, id),
+  KEY idx_cwopl_payment (company_id, payment_id),
+  KEY idx_cwopl_po_line (company_id, po_line_id),
+  CONSTRAINT fk_cwopl_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cwopl_payment FOREIGN KEY (company_id, payment_id) REFERENCES cf_work_order_payments(company_id, id)
+);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME IN ('cf_work_order_scope', 'cf_work_order_payments', 'cf_work_order_payment_lines')) = 3
+      AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_work_orders' AND COLUMN_NAME IN ('kind', 'purchase_order_id', 'production_order_id')) = 3,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §84  THE PLANNER per production order, at step level (STEP 5, 2026-10-18)
+-- The same text as TM/s84.sql. Additive and guarded (new tables only): safe to re-run. Service:
+-- plannerV3Service.js (+ the pure plannerV3Engine.js), routes/planner3.js. Contract: TM/CF_ERP_ORDER_FLOW_PLAN.md
+-- "2026-10-18 — Step 5: the planner".
+--
+--   cf_plan3_settings          one row per company: the mode (auto = "by AI" / manual = Management) and the last
+--                              saved plan (when, by whom, in which mode).
+--   cf_plan3_order_inputs      Management's inputs per production order: earliest start, priority rank, pinned
+--                              (a pinned production order keeps its rank and earliest start in AUTO mode).
+--   cf_plan3_steps             the SAVED plan: each step's planned start / end, machine, machine type and what
+--                              decided its start (binding). Replaced as a whole by every save.
+--   cf_plan3_orders            the SAVED plan per production order: start, end, money its finish unlocks, late,
+--                              the main slowed-by reason, minutes left, steps that cannot be planned, rank.
+--   cf_plan3_baselines         baseline versions: active (one), pending (asked, waiting for Management — approval
+--                              type 'rebaseline', §73), superseded, rejected, withdrawn. v1 is saved by the first
+--                              saved plan without approval.
+--   cf_plan3_baseline_orders   a baseline's production order dates (copied from cf_plan3_orders when it was asked).
+-- The planner reads production orders (§76), steps and waits, material requirements and supply (§56), each machine's
+-- calendar (shifts − planned downtime − open faults, §82). Nothing here is read by any other screen yet.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS cf_plan3_settings (
+  company_id        INT            NOT NULL PRIMARY KEY,
+  mode              VARCHAR(10)    NOT NULL DEFAULT 'auto',
+  last_run_at       DATETIME       NULL,
+  last_run_by       INT            NULL,
+  last_run_mode     VARCHAR(10)    NULL,
+  updated_by        INT            NULL,
+  created_at        TIMESTAMP      NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP      NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_cp3s_company FOREIGN KEY (company_id) REFERENCES companies (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS cf_plan3_order_inputs (
+  id                    INT        AUTO_INCREMENT PRIMARY KEY,
+  company_id            INT        NOT NULL,
+  production_order_id   INT        NOT NULL,
+  earliest_start        DATE       NULL,
+  priority_rank         INT        NULL,
+  pinned                TINYINT(1) NOT NULL DEFAULT 0,
+  updated_by            INT        NULL,
+  created_at            TIMESTAMP  NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at            TIMESTAMP  NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_cp3i_po (company_id, production_order_id),
+  CONSTRAINT fk_cp3i_company FOREIGN KEY (company_id) REFERENCES companies (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS cf_plan3_steps (
+  company_id            INT          NOT NULL,
+  step_id               INT          NOT NULL,
+  production_order_id   INT          NOT NULL,
+  machine_id            INT          NULL,
+  type_key              VARCHAR(20)  NULL,
+  planned_start         DATETIME     NULL,
+  planned_end           DATETIME     NULL,
+  `binding`             VARCHAR(20)  NULL,
+  PRIMARY KEY (company_id, step_id),
+  KEY idx_cp3st_po (company_id, production_order_id),
+  KEY idx_cp3st_machine (company_id, machine_id, planned_start)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS cf_plan3_orders (
+  company_id            INT            NOT NULL,
+  production_order_id   INT            NOT NULL,
+  planned_start         DATETIME       NULL,
+  planned_end           DATETIME       NULL,
+  money                 DECIMAL(16,2)  NOT NULL DEFAULT 0,
+  late                  TINYINT(1)     NOT NULL DEFAULT 0,
+  reason_kind           VARCHAR(20)    NULL,
+  reason_text           VARCHAR(500)   NULL,
+  minutes_left          DECIMAL(16,3)  NOT NULL DEFAULT 0,
+  unplanned             INT            NOT NULL DEFAULT 0,
+  rank_no               INT            NULL,
+  run_at                DATETIME       NOT NULL,
+  PRIMARY KEY (company_id, production_order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS cf_plan3_baselines (
+  id                INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT            NOT NULL,
+  version           INT            NOT NULL,
+  status            VARCHAR(12)    NOT NULL DEFAULT 'pending',
+  note              VARCHAR(500)   NULL,
+  approval_id       INT            NULL,
+  requested_by      INT            NULL,
+  decided_by        INT            NULL,
+  decided_at        DATETIME       NULL,
+  created_at        TIMESTAMP      NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP      NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_cp3b_status (company_id, status),
+  UNIQUE KEY uq_cp3b_version (company_id, version),
+  CONSTRAINT fk_cp3b_company FOREIGN KEY (company_id) REFERENCES companies (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS cf_plan3_baseline_orders (
+  baseline_id           INT            NOT NULL,
+  company_id            INT            NOT NULL,
+  production_order_id   INT            NOT NULL,
+  planned_start         DATETIME       NULL,
+  planned_end           DATETIME       NULL,
+  money                 DECIMAL(16,2)  NOT NULL DEFAULT 0,
+  PRIMARY KEY (baseline_id, production_order_id),
+  KEY idx_cp3bo_company (company_id, production_order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME IN ('cf_plan3_settings', 'cf_plan3_order_inputs', 'cf_plan3_steps', 'cf_plan3_orders',
+                                'cf_plan3_baselines', 'cf_plan3_baseline_orders')) = 6,
+          'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+

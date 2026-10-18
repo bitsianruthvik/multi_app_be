@@ -35,9 +35,11 @@ const HANDLERS = {
   order_acceptance: () => import('./acceptanceService.js').then((m) => m.acceptanceApprovalHandler),
   rate_change: () => import('./acceptanceService.js').then((m) => m.acceptanceApprovalHandler),
   purchase_order: () => import('./purchaseService.js').then((m) => m.poApprovalHandler),
-  contractor_po: () => import('./purchaseService.js').then((m) => m.poApprovalHandler),
+  // Step 6 (§85): the PO's own handling, then its contractor work order is issued.
+  contractor_po: () => import('./contractorWorkOrderService.js').then((m) => m.contractorPoApprovalHandler),
   po_close_short: () => import('./purchaseService.js').then((m) => m.closeShortApprovalHandler),
-  rebaseline: async () => null,
+  // Step 5 (§84): the saved plan becomes the baseline (plannerV3Service).
+  rebaseline: () => import('./plannerV3Service.js').then((m) => m.rebaselineApprovalHandler),
 };
 
 const blank = (v) => v == null || String(v).trim() === '';

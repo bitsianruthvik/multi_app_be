@@ -25,8 +25,9 @@
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { CfError } from '../lib/errors.js';
 import {
-  getAssignment, assignCells, listWorkOrders, listWorkOrdersByOrder, getWorkOrder, updateWorkOrder, setWorkOrderStatus,
+  getAssignment, listWorkOrders, listWorkOrdersByOrder, getWorkOrder, updateWorkOrder, setWorkOrderStatus,
 } from '../services/workOrderService.js';
 
 const router = Router();
@@ -36,8 +37,10 @@ const id = (req) => intParam(req.params.id);
 
 router.get('/orders/:orderId/lines/:lineId/assignment', guard(PERM.productionView),
   handle((req) => getAssignment(pool, ctx(req).companyId, orderId(req), lineId(req))));
+// RETIRED (Step 6, §85, user 2026-10-18): contractor work is given from a PRODUCTION ORDER (BOM rows × operations →
+// a contractor PO → Management → the work order, in Accounts). The older work orders stay readable here.
 router.post('/orders/:orderId/lines/:lineId/assignment', guard(PERM.production),
-  handle((req) => withTransaction((db) => assignCells(db, ctx(req), orderId(req), lineId(req), req.body ?? {}))));
+  handle(async () => { throw new CfError(422, 'RETIRED', 'Contractor work is given from a production order now — open it and use "Give work to a contractor".'); }));
 
 router.get('/work-orders', guard(PERM.productionView), handle((req) => listWorkOrders(pool, ctx(req).companyId, req.query)));
 router.get('/work-orders/by-order', guard(PERM.productionView), handle((req) => listWorkOrdersByOrder(pool, ctx(req).companyId, req.query)));

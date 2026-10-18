@@ -1205,7 +1205,8 @@ export const closeShortApprovalHandler = {
  * on a PO waiting for goods (approved, or the customer's), with what it is for. 1 read.
  */
 export async function pendingLines(db, companyId, q = {}) {
-  const where = ['p.company_id = ?', 'p.deleted_at IS NULL', "p.status IN ('ordered','partially_received')", 'p.closed_at IS NULL', 'l.quantity > l.qty_received'];
+  // Step 6 (§85): a contractor's PO moves by its work order's payments (Accounts), never by a GRN.
+  const where = ['p.company_id = ?', 'p.deleted_at IS NULL', "p.status IN ('ordered','partially_received')", 'p.closed_at IS NULL', 'l.quantity > l.qty_received', "p.po_type <> 'contractor'"];
   const args = [companyId];
   if (!blank(q.supplierId)) { where.push('p.supplier_id = ?'); args.push(Number(q.supplierId)); }
   const like = likeOf(q.search);

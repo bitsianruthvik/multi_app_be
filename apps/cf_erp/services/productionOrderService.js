@@ -212,6 +212,8 @@ export async function stampLines(db, c, lineIds) {
       WHERE s.company_id = ? AND pi.company_id = ? AND pi.release_id IN (?) AND s.deleted_at IS NULL`,
     [c.companyId, c.companyId, rels.map((r) => r.id)],
   );
+  // Step 6 (§85): the steps of cells given to a contractor carry their work order. Loaded late (it imports this file).
+  await (await import('./contractorWorkOrderService.js')).stampContractorSteps(db, c, { lineIds: ids });
   return pairs.length;
 }
 

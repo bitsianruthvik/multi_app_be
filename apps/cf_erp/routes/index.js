@@ -27,6 +27,8 @@ import placeholderRoutes from './placeholders.js';
 import timeRoutes from './times.js';
 import workOrderRoutes from './workOrders.js';
 import plannerRoutes from './planner.js';
+// Step 5 (§84): the planner per production order, step level, baseline + plan health.
+import planner3Routes from './planner3.js';
 import floorRoutes from './floor.js';
 import gstRoutes from './gst.js';
 import dashboardRoutes from './dashboard.js';
@@ -55,6 +57,8 @@ import toolsResourcesRoutes from './toolsResources.js';
 import maintenanceRoutes from './maintenance.js';
 // The stores chain: the general MR, To reorder, how items are procured, a machine's store (init.sql §79).
 import storesRoutes from './stores.js';
+// Step 6: contractor work orders from a production order, in Accounts (init.sql §85).
+import contractorWorkOrderRoutes from './contractorWorkOrders.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -146,6 +150,7 @@ router.use(placeholderRoutes);
 router.use(timeRoutes);
 router.use(workOrderRoutes);
 router.use(plannerRoutes);
+router.use(planner3Routes);
 router.use(floorRoutes);
 router.use(gstRoutes);
 router.use(dashboardRoutes);
@@ -163,5 +168,6 @@ router.use(addLineRoutes);
 router.use(toolsResourcesRoutes);
 router.use(maintenanceRoutes);
 router.use(storesRoutes);
+router.use(contractorWorkOrderRoutes);
 
 export default router;
