@@ -268,6 +268,20 @@ try {
   ok('the inbox counts what waits per type', inbox.counts.order_acceptance >= 1);
   const own = await refusal(() => AP.decide(db, c, firstApproval, { decision: 'approve' }, { can: all, isAdmin: false }));
   ok('the person who asked cannot approve it', own?.code === 'OWN_REQUEST' && own.status === 403, own?.message);
+  ok('…and the inbox says so (ownAllowed off by default)', inbox.ownAllowed === false);
+  // §78: the testing-phase switch lets the asker decide; off again straight after, so the rest runs four-eyes.
+  const [[ownCol]] = await db.query("SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'approve_own_requests'");
+  if (Number(ownCol.n)) {
+    const [[hadRow]] = await db.query('SELECT approve_own_requests AS v FROM cf_company_settings WHERE company_id = ?', [COMPANY]);
+    if (hadRow) {
+      await db.query('UPDATE cf_company_settings SET approve_own_requests = 1 WHERE company_id = ?', [COMPANY]);
+      ok('switch on: the asker may decide their own', (await AP.approvesOwnRequests(db, COMPANY)) === true
+        && (await AP.listApprovals(db, COMPANY, (t) => t === 'cf_erp_approve_order_acceptance', {})).ownAllowed === true);
+      await db.query('UPDATE cf_company_settings SET approve_own_requests = ? WHERE company_id = ?', [Number(hadRow.v) || 0, COMPANY]);
+      const ownAgain = await refusal(() => AP.decide(db, c, firstApproval, { decision: 'approve' }, { can: all, isAdmin: false }));
+      ok('switch off again: refused as before', ownAgain?.code === 'OWN_REQUEST');
+    }
+  }
   const noTag = await refusal(() => AP.decide(db, md, firstApproval, { decision: 'approve' }, { can: onlyPo, isAdmin: false }));
   ok('Management without the acceptance tag cannot approve it', noTag?.status === 403);
   const noWhy = await refusal(() => AP.decide(db, md, firstApproval, { decision: 'reject' }, asMd));

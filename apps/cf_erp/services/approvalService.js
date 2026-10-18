@@ -50,6 +50,18 @@ function requireType(type) {
   return t;
 }
 
+/**
+ * cf_company_settings.approve_own_requests (§78): 1 = a person holding the tag may decide what they asked for themselves.
+ * TEMPORARY, for the testing / early-adoption phase (Placebo, 2026-10-18) — turn it off for the four-eyes rule.
+ * Reads 0 when the column is not there yet.
+ */
+export async function approvesOwnRequests(db, companyId) {
+  try {
+    const [[s]] = await db.query('SELECT approve_own_requests FROM cf_company_settings WHERE company_id = ?', [companyId]);
+    return Number(s?.approve_own_requests) === 1;
+  } catch { return false; }
+}
+
 /** The types a person may decide: `can(tag)` answers for the person (admins pass every tag). */
 export const typesFor = (can) => APPROVAL_TYPE_KEYS.filter((k) => can(APPROVAL_TYPES[k].perm));
 
@@ -166,6 +178,7 @@ export async function listApprovals(db, companyId, can, q = {}) {
   ]);
   for (const r of counts) out.counts[r.t] = Number(r.n) || 0;
   out.rows = await withLiveContext(db, companyId, rows.map(shape));
+  out.ownAllowed = await approvesOwnRequests(db, companyId);
   return out;
 }
 
@@ -204,7 +217,8 @@ export async function decide(db, c, id, input = {}, who = { can: () => false, is
   const t = requireType(row.approval_type);
   if (!who.can(t.perm)) throw new CfError(403, 'FORBIDDEN', `Approving a ${t.label.toLowerCase()} needs the permission ${t.perm}.`);
   if (row.status !== 'pending') throw invalid('NOT_PENDING', `This was ${row.status} already${row.decided_at ? ` on ${new Date(row.decided_at).toLocaleDateString('en-IN')}` : ''}.`);
-  if (row.requested_by && c.userId && Number(row.requested_by) === Number(c.userId) && !who.isAdmin) {
+  if (row.requested_by && c.userId && Number(row.requested_by) === Number(c.userId) && !who.isAdmin
+    && !(await approvesOwnRequests(db, c.companyId))) {
     throw new CfError(403, 'OWN_REQUEST', 'You asked for this one — somebody else in Management decides it.');
   }
   const note = note500(input.note);
