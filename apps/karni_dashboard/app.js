@@ -3,6 +3,7 @@ import { fileURLToPath } from 'url';
 import { Router } from 'express';
 import connectorRoutes from './routes/connector.js';
 import reportRoutes from './routes/reports.js';
+import { startAlertCron } from './services/alertService.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -26,6 +27,8 @@ export default {
   resourceDefs: {},
   register(server) {
     server.use('/api/:companySlug/karni_dashboard', router);
+    // Daily / weekly alert digests (every 5 minutes it checks which are due).
+    startAlertCron();
   },
   migrations: path.join(__dirname, 'models', 'init.sql'),
 };

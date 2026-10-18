@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { pool } from '../../../db.js';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import * as reports from '../services/reportService.js';
-import { insights } from '../services/insightService.js';
+import { insights, act, history } from '../services/insightService.js';
+import * as alerts from '../services/alertService.js';
 
 /**
  * The screens' side: a platform login with access to this app (protect checks
@@ -27,6 +28,22 @@ const cid = (req) => req.company.id;
 router.get('/status', protect, wrap((req) => reports.status(cid(req))));
 router.get('/units', protect, wrap((req) => reports.units(cid(req))));
 router.get('/insights', protect, wrap((req) => insights(cid(req), req.query)));
+router.get('/insights/:ruleId/:subjectKey/history', protect, wrap((req) => history(cid(req), req.params.ruleId, req.params.subjectKey)));
+/** Done / snooze / not relevant / reopen / note — anyone with access to the app; logged with their name. */
+router.post('/insights/:ruleId/:subjectKey/action', protect, async (req, res) => {
+  try {
+    res.json(await act(cid(req), req.params.ruleId, req.params.subjectKey, req.body || {}, req.user));
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+router.get('/alerts', protect, wrap((req) => alerts.listAlerts(cid(req))));
+router.get('/alerts/preview', protect, wrap((req) => alerts.preview(cid(req))));
+router.get('/alert-settings', protect, wrap(async (req) => ({ settings: await alerts.getSettings(cid(req)), emailConfigured: alerts.emailConfigured(), canEdit: isAdmin(req) })));
+router.put('/alert-settings', protect, async (req, res) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: 'Only an admin can change alerts.' });
+  try { res.json({ settings: await alerts.saveSettings(cid(req), req.body || {}, req.user.id) }); } catch (err) { res.status(500).json({ error: err.message }); }
+});
 router.get('/overview', protect, wrap((req) => reports.overview(cid(req), req.query)));
 router.get('/sales', protect, wrap((req) => reports.sales(cid(req), req.query)));
 router.get('/sales/customer/:cardCode', protect, wrap((req) => reports.salesCustomer(cid(req), req.params.cardCode, req.query)));

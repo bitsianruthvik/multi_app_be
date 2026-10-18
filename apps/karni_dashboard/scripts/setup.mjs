@@ -32,8 +32,9 @@ console.log(`company   ${company.id}  ${company.name}`);
 
 // 1. Schema (CREATE TABLE IF NOT EXISTS — safe to re-run)
 const [[tbl]] = await conn.query("SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE 'kd\\_%'");
-console.log(`schema    ${tbl.n}/4 kd_ tables present`);
-if (APPLY && tbl.n < 4) {
+console.log(`schema    ${tbl.n}/8 kd_ tables present`);
+// init.sql is all CREATE TABLE IF NOT EXISTS: safe to run every time, adds only what is missing.
+if (APPLY && tbl.n < 8) {
   await conn.query(fs.readFileSync(path.join(__dir, '..', 'models', 'init.sql'), 'utf8'));
   console.log('schema    applied');
 }

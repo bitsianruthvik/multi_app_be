@@ -58,4 +58,72 @@ CREATE TABLE IF NOT EXISTS kd_sync_runs (
   KEY ix_kd_runs_company (company_id, started_at)
 );
 
+-- §5 Insight findings: one row per rule + subject (a customer, an item, an order line…),
+-- so a finding keeps its identity while its numbers move. status: new | open | done |
+-- snoozed | muted ("not relevant") | resolved (gone from the data). acted_* is the value
+-- when someone marked it, so it returns only when it gets materially worse.
+CREATE TABLE IF NOT EXISTS kd_insight_state (
+  company_id    BIGINT       NOT NULL,
+  rule_id       VARCHAR(40)  NOT NULL,
+  subject_key   VARCHAR(120) NOT NULL,
+  subject_label VARCHAR(200) NULL,
+  status        VARCHAR(12)  NOT NULL DEFAULT 'new',
+  reason        VARCHAR(80)  NULL,
+  metric        DOUBLE       NULL,
+  band          INT          NULL,
+  first_seen_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  resolved_at   DATETIME     NULL,
+  acted_by      BIGINT       NULL,
+  acted_by_name VARCHAR(120) NULL,
+  acted_at      DATETIME     NULL,
+  acted_metric  DOUBLE       NULL,
+  acted_band    INT          NULL,
+  snooze_until  DATETIME     NULL,
+  note          VARCHAR(500) NULL,
+  notified_at   DATETIME     NULL,
+  PRIMARY KEY (company_id, rule_id, subject_key),
+  KEY ix_kd_insight_status (company_id, status)
+);
+
+-- §6 Every action on a finding, and every automatic change of state.
+CREATE TABLE IF NOT EXISTS kd_insight_log (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  company_id  BIGINT       NOT NULL,
+  rule_id     VARCHAR(40)  NOT NULL,
+  subject_key VARCHAR(120) NOT NULL,
+  action      VARCHAR(20)  NOT NULL,
+  by_user     BIGINT       NULL,
+  by_name     VARCHAR(120) NULL,
+  at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  metric      DOUBLE       NULL,
+  note        VARCHAR(500) NULL,
+  KEY ix_kd_insight_log (company_id, rule_id, subject_key, at)
+);
+
+-- §7 Alerts sent (or prepared) to people: instant, daily and weekly.
+CREATE TABLE IF NOT EXISTS kd_alerts (
+  id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+  company_id   BIGINT       NOT NULL,
+  kind         VARCHAR(10)  NOT NULL,
+  area         VARCHAR(20)  NOT NULL,
+  title        VARCHAR(300) NOT NULL,
+  items        JSON         NOT NULL,
+  recipients   JSON         NULL,
+  email_status VARCHAR(20)  NOT NULL,
+  error        TEXT         NULL,
+  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY ix_kd_alerts (company_id, created_at)
+);
+
+-- §8 Per-company settings (alert recipients, times).
+CREATE TABLE IF NOT EXISTS kd_settings (
+  company_id BIGINT      NOT NULL,
+  k          VARCHAR(40) NOT NULL,
+  v          JSON        NOT NULL,
+  updated_by BIGINT      NULL,
+  updated_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (company_id, k)
+);
+
 SELECT 'SCHEMA-OK' AS karni_dashboard;

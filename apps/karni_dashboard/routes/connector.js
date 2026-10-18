@@ -5,6 +5,8 @@ import { Router } from 'express';
 import { pool } from '../../../db.js';
 import { DATASETS, byKey, pathFor, keyOf, dateOf, flatten } from '../lib/datasets.js';
 import { invalidate } from '../services/reportService.js';
+import { afterSync } from '../services/alertService.js';
+import { logger } from '../../../core/utils/logger.js';
 
 /**
  * The connector's side: no platform login. A connector proves itself with the
@@ -146,6 +148,8 @@ router.post('/connector/report', connectorAuth, async (req, res) => {
     [cid, req.connector.id, new Date(startedAt || Date.now()), new Date(finishedAt || Date.now()), ok ? 1 : 0, JSON.stringify(list)]);
   invalidate(cid);
   res.json({ ok: true });
+  // After the reply: bring the insight states up to date and send instant alerts.
+  afterSync(cid).catch((err) => logger.error({ err, cid }, 'karni_dashboard: afterSync failed'));
 });
 
 export default router;
