@@ -8,7 +8,7 @@
  *   withShopSpacing(settings, rules)     cut settings (nestingService.pickCutSettings) with the shop's
  *                                        spacing laid over them, when the company switched it on
  *   shopRimOf(settings)                  the plate-edge clearance both packers are handed
- *   readShopRules(db, companyId)         { on, rows, schema } — tolerant of init.sql §75 not applied yet
+ *   readShopRules(db, companyId)         { on, rows, schema, maxPlateSizes } — tolerant of init.sql §75 / §83 not applied yet
  *   saveShopRules(db, c, input)          the setting screen's save: a fixed number of statements
  *
  * WHAT THE SWITCH DOES (cf_company_settings.nest_shop_spacing, OFF until a person turns it on, so no
@@ -148,12 +148,22 @@ export function rotationsOf(settings) {
  */
 export async function readShopRules(db, companyId) {
   let on = false;
+  // §83 (2026-10-18): the plate-size limit rides on the same read; null = the default (nestCost: 2), 0 = no limit.
+  let maxPlateSizes = null; let sizesSchema = true;
   try {
-    const [[s]] = await db.query('SELECT nest_shop_spacing FROM cf_company_settings WHERE company_id = ?', [companyId]);
+    let s;
+    try {
+      [[s]] = await db.query('SELECT nest_shop_spacing, nest_max_plate_sizes FROM cf_company_settings WHERE company_id = ?', [companyId]);
+    } catch (e) {
+      if (!isMissing(e)) throw e;
+      sizesSchema = false;
+      [[s]] = await db.query('SELECT nest_shop_spacing FROM cf_company_settings WHERE company_id = ?', [companyId]);
+    }
     on = !!Number(s?.nest_shop_spacing ?? 0);
+    maxPlateSizes = s?.nest_max_plate_sizes == null ? null : Number(s.nest_max_plate_sizes);
   } catch (e) {
     if (!isMissing(e)) throw e;
-    return { on: false, rows: [], schema: false };
+    return { on: false, rows: [], schema: false, maxPlateSizes: null, sizesSchema: false };
   }
   try {
     const [rows] = await db.query(
@@ -161,10 +171,10 @@ export async function readShopRules(db, companyId) {
          FROM cf_nest_shop_rules WHERE company_id = ? AND deleted_at IS NULL ORDER BY thickness_mm`,
       [companyId],
     );
-    return { on, rows, schema: true };
+    return { on, rows, schema: true, maxPlateSizes, sizesSchema };
   } catch (e) {
     if (!isMissing(e)) throw e;
-    return { on: false, rows: [], schema: false };
+    return { on: false, rows: [], schema: false, maxPlateSizes, sizesSchema };
   }
 }
 
@@ -185,6 +195,10 @@ export async function getShopRules(db, companyId) {
   return {
     on: s.on,
     schema: s.schema,
+    /** Most plate sizes per thickness in one plan (§83): null = the default (2), 0 = no limit. */
+    maxPlateSizes: s.maxPlateSizes ?? null,
+    maxPlateSizesDefault: 2,
+    sizesSchema: !!s.sizesSchema,
     defaults: { ...SHOP_DEFAULTS, kerf: SHOP_KERF_POINTS },
     rows: s.rows.map((r) => ({ id: r.id, thicknessMm: Number(r.thickness_mm), ...Object.fromEntries(SHOP_RULE_FIELDS.map((f) => [f, num(r[COLS[f]])])), notes: r.notes ?? null })),
     resolved: thick.map((t) => shopRulesFor(t, s.rows)),
@@ -194,7 +208,8 @@ export async function getShopRules(db, companyId) {
 const bad = (msg) => invalid('INVALID_SHOP_RULES', msg);
 
 /**
- * Save the whole setting: `{ on?: boolean, rows?: [{ thicknessMm, kerfMm?, edgeMarginMm?, … }] }`.
+ * Save the whole setting: `{ on?: boolean, maxPlateSizes?: number|null, rows?: [{ thicknessMm, kerfMm?, edgeMarginMm?, … }] }`.
+ * maxPlateSizes (init.sql §83): the most plate sizes per thickness in one plan — null = the default (2), 0 = no limit.
  * `rows` replaces the saved rows (a thickness left out is soft-deleted; a blank field = the file
  * default). THREE statements whatever the number of rows: the switch, the upsert, the soft delete.
  */
@@ -202,6 +217,16 @@ export async function saveShopRules(db, c, input = {}) {
   const companyId = c.companyId;
   const s = await readShopRules(db, companyId);
   if (!s.schema) throw conflict('SCHEMA_MISSING', 'The shop rules need init.sql §75 (TM/s75.sql) applied to this database first.');
+  if (input.maxPlateSizes !== undefined) {
+    const v = input.maxPlateSizes == null || input.maxPlateSizes === '' ? null : Number(input.maxPlateSizes);
+    if (v != null && !(Number.isInteger(v) && v >= 0 && v <= 20)) throw bad('Plate sizes per thickness: a whole number 0–20 (0 = no limit), or blank for the default (2).');
+    if (!s.sizesSchema) throw conflict('SCHEMA_MISSING', 'The plate-size limit needs init.sql §83 (TM/s83.sql) applied to this database first.');
+    await db.query(
+      `INSERT INTO cf_company_settings (company_id, nest_max_plate_sizes, updated_by) VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE nest_max_plate_sizes = VALUES(nest_max_plate_sizes), updated_by = VALUES(updated_by)`,
+      [companyId, v, c.userId ?? null],
+    );
+  }
   if (input.on != null) {
     await db.query(
       `INSERT INTO cf_company_settings (company_id, nest_shop_spacing, updated_by) VALUES (?, ?, ?)

@@ -95,6 +95,7 @@ import {
   transformRing, pointInRing, polygonsOverlap, polygonsDistance, polygonInside,
   convexHull, convexDecompose, minkowskiDiffConvex, offsetConvex, booleanRegions, simplifyOutward,
 } from '../lib/polyGeom.js';
+import { remnantArea } from './nestCost.js';
 
 /** Placement tolerance, mm. Positions are exact to rounding; this only absorbs the rounding. */
 const EPS = 1e-7;
@@ -522,11 +523,50 @@ function truncState(ctx, st, keep) {
 }
 
 function commit(ctx, st, os, x, y, shapeIdx) {
-  st.placed.push({ os, x, y, c: ctx.kerf, shape: shapeIdx });
+  // `ctx.gap`: the clearance kept from this part by anything NOT sharing a cut with it (= the kerf unless the
+  // shop's spacing asks for more); a shared cut, exactly one kerf, is placed on purpose (sharedSpot).
+  st.placed.push({ os, x, y, c: ctx.gap, shape: shapeIdx });
   const a = ctx.shapes[shapeIdx].area;
   st.free -= a; st.used += a; st.nNew += 1;
   if (x + os.w > st.maxX) st.maxX = x + os.w;
   if (y + os.h > st.maxY) st.maxY = y + os.h;
+}
+
+/**
+ * The clearance between a part on the sheet and orientation B. With the shop's spacing (`ctx.gap` above the
+ * kerf, 2026-10-18): a pair that CAN share a cut — a whole equal edge each, facing (shareVectors) — keeps a
+ * kerf (canShare), so identical stiffeners still go edge to edge on one cut; a pair that cannot share one keeps the
+ * shop's gap. Measured on the ProNest jobs: the part gap for every unshared pair cost ~300 m of cut and
+ * 0.5 t on NITHINSAI 12 mm and broke the 13 mm block rule 674 times; this keeps the shared cuts and the steel.
+ * Without the setting every pair keeps P.c (the kerf), as before.
+ */
+function clearOf(ctx, P, B) {
+  if (P.shape < 0 || ctx.gap <= ctx.kerf + 1e-9) return P.c;
+  return canShare(ctx, P.os, B) ? ctx.kerf : P.c;
+}
+
+/**
+ * Can two orientations share a cut at all: a pair of facing (antiparallel) straight edges, the shorter at
+ * least half the longer? Not only EQUAL edges: two flanges of 10 440 and 11 520 mm laid a kerf apart are
+ * one cut along 10.4 m (plateCutsService counts it, and so does the shop). Cached per pair.
+ */
+function canShare(ctx, A, B) {
+  // Kept on A itself (a small map per orientation): this is asked for every part on the plate, every placement.
+  let map = A.canShare;
+  if (!map) { map = new Map(); A.canShare = map; }
+  const key = B.id;
+  let v = map.get(key);
+  if (v !== undefined) return v;
+  v = false;
+  for (const ea of edgesOfOS(ctx, A)) {
+    for (const eb of edgesOfOS(ctx, B)) {
+      if (ea.ux * eb.ux + ea.uy * eb.uy > -0.9999) continue;
+      if (Math.min(ea.l, eb.l) >= 0.5 * Math.max(ea.l, eb.l)) { v = true; break; }
+    }
+    if (v) break;
+  }
+  map.set(key, v);
+  return v;
 }
 
 /** The forbidden parts for orientation B on this sheet, extended as parts land. */
@@ -541,7 +581,7 @@ function obstaclesFor(ctx, st, B) {
     const xLo = m; const xHi = st.type.length - m - B.w; const yLo = m; const yHi = st.type.width - m - B.h;
     for (; ob.upto < st.placed.length; ob.upto += 1) {
       const P = st.placed[ob.upto];
-      const nf = getNfp(ctx, P.os, B, P.c);
+      const nf = getNfp(ctx, P.os, B, clearOf(ctx, P, B));
       for (let i = 0; i < nf.length; i += 1) {
         const part = nf[i];
         const X0 = part.x0 + P.x; const X1 = part.x1 + P.x; const Y0 = part.y0 + P.y; const Y1 = part.y1 + P.y;
@@ -623,7 +663,7 @@ function findPosition(ctx, st, B) {
     let free = true;
     for (let q = known.upto; free && q < st.placed.length; q += 1) {
       const P = st.placed[q];
-      const nf = getNfp(ctx, P.os, B, P.c);
+      const nf = getNfp(ctx, P.os, B, clearOf(ctx, P, B));
       const tx = known.x - P.x; const ty = known.y - P.y;
       for (let i = 0; i < nf.length; i += 1) {
         const part = nf[i];
@@ -761,6 +801,125 @@ function bestPlacement(ctx, st, shape, opt) {
         || (Math.abs(cnd.r - best.r) <= 1e-6 && cnd.y < best.y - 1e-6)))) best = cnd;
   }
   if (best && options && options.length > 1 && opt.rng() < opt.flip) best = options[Math.floor(opt.rng() * options.length)];
+  /*
+   * A SHARED CUT, WHERE IT COSTS NO STEEL (2026-10-18, COMPARE.md 4 and 6: the shop cuts 97 % of its
+   * pieces in common-line blocks — identical stiffeners edge to edge, one kerf apart, one cut for both).
+   * The drop-and-slide above finds the lowest-left legal spot, which on true shapes is often an
+   * interlock a kerf away but along no common edge. So the spots where this part shares a WHOLE EQUAL
+   * EDGE with a part just laid are tried too, and taken when they make the layout no longer.
+   */
+  if (ctx.shared) {
+    const sp = sharedSpot(ctx, st, shape, opt, best ? best.e + 1e-6 : Infinity);
+    if (sp && (!best || sp.e <= best.e + 1e-6)) best = sp;
+  }
+  return best;
+}
+
+/** How many of the parts last laid on a sheet a new part may share an edge with. */
+const SHARE_RECENT = 8;
+/** Edges shorter than this are not worth a common cut (and a polygonised arc has many of them). */
+const SHARE_MIN_EDGE = 30;
+/** Two edges are "equal" within this (aiCutPlan's EDGE_TOL_MM). */
+const SHARE_EDGE_TOL = 0.5;
+
+/** The straight edges of one orientation, counter-clockwise, in the orientation's own frame (bbox min at 0,0). */
+function edgesOfOS(ctx, os) {
+  if (os.edges) return os.edges;
+  const s = ctx.shapes[os.shape];
+  if (!s) { os.edges = []; return os.edges; }
+  const t = { rotationDeg: os.rotationDeg, mirrored: os.mirrored };
+  const ring = orientRing(transformRing(s.exact.outline, t), true);
+  const bb = bboxOfRing(ring);
+  const pts = ring.map((p) => [p[0] - bb.x0, p[1] - bb.y0]);
+  const out = [];
+  for (let i = 0; i < pts.length; i += 1) {
+    const a = pts[i]; const b = pts[(i + 1) % pts.length];
+    const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (l >= SHARE_MIN_EDGE) out.push({ a, b, l, ux: (b[0] - a[0]) / l, uy: (b[1] - a[1]) / l });
+  }
+  out.sort((p, q) => q.l - p.l);
+  os.edges = out.slice(0, 24);
+  return os.edges;
+}
+
+/**
+ * Where B stands, relative to A, to share one whole equal edge with it exactly one kerf apart:
+ * B's edge b0→b1 opposite A's edge a1→a0, on A's outside. Cached per pair of orientations.
+ */
+function shareVectors(ctx, A, B) {
+  let map = ctx.shareVec;
+  if (!map) { map = new Map(); ctx.shareVec = map; }
+  const key = A.id * 4194304 + B.id;
+  let v = map.get(key);
+  if (v) return v;
+  v = [];
+  const k = ctx.kerf;
+  for (const ea of edgesOfOS(ctx, A)) {
+    const nx = ea.uy; const ny = -ea.ux;           // outward of a counter-clockwise ring
+    for (const eb of edgesOfOS(ctx, B)) {
+      if (Math.abs(ea.l - eb.l) > SHARE_EDGE_TOL) continue;
+      if (ea.ux * eb.ux + ea.uy * eb.uy > -0.9999) continue;   // antiparallel only
+      const dx = ea.b[0] + nx * k - eb.a[0]; const dy = ea.b[1] + ny * k - eb.a[1];
+      if (!v.some((w) => Math.abs(w[0] - dx) < 1e-6 && Math.abs(w[1] - dy) < 1e-6)) v.push([dx, dy]);
+    }
+  }
+  map.set(key, v);
+  return v;
+}
+
+/** Strictly inside one of these no-fit parts (t relative to the obstacle)? */
+function inNfp(nf, tx, ty) {
+  for (let i = 0; i < nf.length; i += 1) {
+    const part = nf[i];
+    if (!(part.x0 + EPS < tx && tx < part.x1 - EPS && part.y0 + EPS < ty && ty < part.y1 - EPS)) continue;
+    if (part.poly && !(chord(part.poly.v, 0, 0, tx) && CH[0] + EPS < ty && ty < CH[1] - EPS)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** Is (x, y) a legal spot for B: a kerf from what it shares an edge with, the full clearance from the rest? */
+function spotFree(ctx, st, B, x, y) {
+  const m = ctx.margin;
+  if (x < m - EPS || y < m - EPS || x > st.type.length - m - B.w + EPS || y > st.type.width - m - B.h + EPS) return false;
+  const bx1 = x + B.w; const by1 = y + B.h;
+  // Newest first: what was laid last stands at the frontier, where a refused spot is refused — the loop ends early.
+  for (let q = st.placed.length - 1; q >= 0; q -= 1) {
+    const Q = st.placed[q];
+    const c = clearOf(ctx, Q, B);
+    if (Q.x - c >= bx1 || Q.x + Q.os.w + c <= x || Q.y - c >= by1 || Q.y + Q.os.h + c <= y) continue;
+    const tx = x - Q.x; const ty = y - Q.y;
+    if (!inNfp(getNfp(ctx, Q.os, B, c), tx, ty)) continue;
+    // Too close for a loose neighbour — legal only as a shared cut with it, and then a kerf is the rule.
+    if (Q.shape < 0 || c <= ctx.kerf + 1e-9) return false;
+    if (!shareVectors(ctx, Q.os, B).some((w) => Math.abs(w[0] - tx) < 1e-4 && Math.abs(w[1] - ty) < 1e-4)) return false;
+    if (inNfp(getNfp(ctx, Q.os, B, ctx.kerf), tx, ty)) return false;
+  }
+  return true;
+}
+
+/** The best spot sharing a whole edge with one of the parts last laid, or null. Same "best" as bestPlacement. */
+function sharedSpot(ctx, st, shape, opt, eMax = Infinity) {
+  const fam = opt.mask ? opt.mask.get(shape.idx) : undefined;
+  let best = null;
+  const from = Math.max(st.nBase, st.placed.length - SHARE_RECENT);
+  for (let i = 0; i < shape.os.length; i += 1) {
+    const B = shape.os[i];
+    if (fam !== undefined && B.fam !== fam) continue;
+    for (let q = st.placed.length - 1; q >= from; q -= 1) {
+      const P = st.placed[q];
+      if (P.shape < 0) continue;
+      for (const [dx, dy] of shareVectors(ctx, P.os, B)) {
+        const x = P.x + dx; const y = P.y + dy;
+        const r = x + B.w;
+        const e = Math.max(st.maxX, r);
+        if (e > eMax) continue;                     // it would make the layout longer than the spot already found
+        if (best && (e > best.e + 1e-6 || (Math.abs(e - best.e) <= 1e-6 && (r > best.r + 1e-6 || (Math.abs(r - best.r) <= 1e-6 && y >= best.y - 1e-6))))) continue;
+        if (!spotFree(ctx, st, B, x, y)) continue;
+        best = { B, x, y, e, r, shared: true };
+      }
+    }
+  }
   return best;
 }
 
@@ -843,6 +1002,9 @@ function buildTypes(ctx, sheets) {
     out.push({
       key: s.key ?? `sheet${n}`, length, width, available, preferred: !!s.preferred,
       areaCost: s.areaCost == null ? null : Number(s.areaCost),
+      // nestCost.plateCosts: what a CUSTOM / short plate costs on top of its steel (score only, never `areaBought`).
+      penalty: Number(s.penalty) > 0 ? Number(s.penalty) : 0,
+      sizeKey: `${Math.max(length, width)}x${Math.min(length, width)}`,
       outline: plain ? null : outline, fixedRaw: fixed, isFixedSheet: fixed.length > 0,
       area: outline ? ringArea(outline) : length * width, src: s, _i: 0, base: null, fits: null,
     });
@@ -907,10 +1069,24 @@ function markFits(ctx) {
  * ends the contest and is judged on how little of it is wasted; a bought plate
  * is judged on cost per square millimetre of part it took.
  */
-function* openBest(ctx, rem, stock, opt) {
+function* openBest(ctx, rem, stock, opt, sizes = null) {
   const distinct = [...new Set(rem)];
-  const cands = ctx.types.filter((t) => !t.isFixedSheet && (stock.get(t._i) ?? 0) > 0 && distinct.some((s) => t.fits[s]));
+  let cands = ctx.types.filter((t) => !t.isFixedSheet && (stock.get(t._i) ?? 0) > 0 && distinct.some((s) => t.fits[s])
+    && (!opt.onlyTypes || opt.onlyTypes.has(t._i) || costOf(t) <= 0));
+  // PLATE-SIZE DISCIPLINE (nestCost.js): once the layout buys `maxSizes` sizes, only those are opened —
+  // unless none of them takes anything that is left (a piece only another size holds is never stranded).
+  const R = ctx.cost;
+  if (R?.maxSizes && sizes && sizes.size >= R.maxSizes) {
+    const same = cands.filter((t) => costOf(t) <= 0 || sizes.has(t.sizeKey));
+    if (same.length) cands = same;
+  }
   if (!cands.length) return null;
+  /** What opening this plate costs, by the score: its price, its penalty, the handling, a new size. */
+  const priceOf = (t) => {
+    const c = costOf(t);
+    if (!R || c <= 0) return c;
+    return c + t.penalty + R.platePenalty + (sizes && sizes.size && !sizes.has(t.sizeKey) ? R.sizePenalty : 0);
+  };
   if (cands.length === 1) {
     const [st, left] = yield* fillSheet(ctx, cloneState(cands[0].base), rem, opt, false);
     return st.nNew ? { st, rem: left } : null;
@@ -935,7 +1111,7 @@ function* openBest(ctx, rem, stock, opt) {
     if (!tried.length) continue;
     tried.sort((a, b) => (owned
       ? (a.st.type.area - a.st.used) - (b.st.type.area - b.st.used)
-      : (costOf(a.st.type) / a.st.used) - (costOf(b.st.type) / b.st.used))
+      : (priceOf(a.st.type) / a.st.used) - (priceOf(b.st.type) / b.st.used))
       || b.st.used - a.st.used || a.st.type._i - b.st.type._i);
     return tried[0];
   }
@@ -960,10 +1136,14 @@ function* build(ctx, pool, kept, opt) {
   const stock = new Map();
   for (const t of ctx.types) stock.set(t._i, t.isFixedSheet ? 0 : t.available);
   for (const st of states) if (!st.type.isFixedSheet && st.nNew) stock.set(st.type._i, stock.get(st.type._i) - 1);
+  // The sizes this layout already buys (nestCost.js: few sizes per thickness).
+  const sizes = new Set();
+  if (ctx.cost) for (const st of states) if (st.nNew && !st.type.isFixedSheet && costOf(st.type) > 0) sizes.add(st.type.sizeKey);
   while (rem.length && states.length < ctx.maxNests) {
-    const pick = yield* openBest(ctx, rem, stock, opt);
+    const pick = yield* openBest(ctx, rem, stock, opt, sizes);
     if (!pick) break;
     states.push(pick.st); rem = pick.rem;
+    if (ctx.cost && costOf(pick.st.type) > 0) sizes.add(pick.st.type.sizeKey);
     stock.set(pick.st.type._i, stock.get(pick.st.type._i) - 1);
     if (opt.abortable && ctx.over()) return null;
   }
@@ -976,18 +1156,43 @@ function* build(ctx, pool, kept, opt) {
  * shrinking onto it would both believe they had it (nestingPacker's rule).
  */
 function shrink(ctx, states) {
-  const buyable = ctx.types.filter((t) => t.available === Infinity && !t.isFixedSheet && !t.outline && costOf(t) > 0);
+  // A size with a finite stock (nestingService caps every catalog size at what the job could need) may be
+  // swapped onto while some of it is left; a free plate (an offcut, the customer's) is never a target (cost 0).
+  const buyable = ctx.types.filter((t) => t.available > 0 && !t.isFixedSheet && !t.outline && costOf(t) > 0);
   if (!buyable.length) return states;
+  const usedN = new Map();
+  for (const st of states) if (st.nNew) usedN.set(st.type._i, (usedN.get(st.type._i) ?? 0) + 1);
+  // With the cost rules (nestCost.js) a swap must pay for itself in the SCORE: a size not bought yet costs
+  // its size penalty, and never takes the layout past `maxSizes`.
+  const R = ctx.cost;
+  const count = new Map();
+  if (R) for (const st of states) if (st.nNew && !st.type.isFixedSheet && costOf(st.type) > 0) count.set(st.type.sizeKey, (count.get(st.type.sizeKey) ?? 0) + 1);
+  const priceOf = (t) => costOf(t) + (R ? t.penalty : 0);
   return states.map((st) => {
     const here = costOf(st.type);
     if (here <= 0 || st.type.isFixedSheet || !st.nNew) return st;
-    let bestT = null;
+    let bestT = null; let bestP = Infinity;
     for (const t of buyable) {
-      if (costOf(t) >= here - EPS) continue;
+      if (t.available !== Infinity && (usedN.get(t._i) ?? 0) >= t.available) continue;
+      let p = priceOf(t);
+      if (R && t.sizeKey !== st.type.sizeKey) {
+        // the sizes after the swap: this plate's size may go, the new one may come
+        const n = count.size - ((count.get(st.type.sizeKey) ?? 0) === 1 ? 1 : 0) + (count.has(t.sizeKey) ? 0 : 1);
+        if (R.maxSizes && n > Math.max(R.maxSizes, count.size)) continue;
+        p += R.sizePenalty * (n - count.size);
+      }
+      if (p >= priceOf(st.type) - EPS) continue;
       if (st.maxX > t.length - ctx.margin + EPS || st.maxY > t.width - ctx.margin + EPS) continue;
-      if (!bestT || costOf(t) < costOf(bestT) - EPS || (Math.abs(costOf(t) - costOf(bestT)) <= EPS && t._i < bestT._i)) bestT = t;
+      if (!bestT || p < bestP - EPS || (Math.abs(p - bestP) <= EPS && t._i < bestT._i)) { bestT = t; bestP = p; }
     }
     if (!bestT) return st;
+    usedN.set(st.type._i, usedN.get(st.type._i) - 1);
+    usedN.set(bestT._i, (usedN.get(bestT._i) ?? 0) + 1);
+    if (R) {
+      count.set(st.type.sizeKey, count.get(st.type.sizeKey) - 1);
+      if (!count.get(st.type.sizeKey)) count.delete(st.type.sizeKey);
+      count.set(bestT.sizeKey, (count.get(bestT.sizeKey) ?? 0) + 1);
+    }
     // Laid from the lower-left corner, so a layout that fits the smaller plate's box simply moves over.
     return {
       ...st, type: bestT, placed: st.placed.slice(), free: bestT.area - st.used,
@@ -999,12 +1204,26 @@ function shrink(ctx, states) {
 function evaluate(ctx, built, source) {
   const states = shrink(ctx, built.states.filter((st) => st.nNew > 0));
   let cost = 0; let sheetArea = 0; let used = 0; let sumSq = 0; let env = 0;
+  let pen = 0; let credit = 0; let bought = 0;
+  const sizes = new Set();
+  const R = ctx.cost;
   for (const st of states) {
-    cost += costOf(st.type); sheetArea += st.type.area; used += st.used;
+    const c = costOf(st.type);
+    cost += c; sheetArea += st.type.area; used += st.used;
     sumSq += (st.used / st.type.area) ** 2;
     env += st.maxX * st.type.width;
+    if (R && c > 0 && !st.type.isFixedSheet) {
+      bought += 1; pen += st.type.penalty; sizes.add(st.type.sizeKey);
+      if (R.offcutValue > 0 && !st.type.outline) {
+        const a = remnantArea({ length: st.type.length, width: st.type.width, maxX: st.maxX, maxY: st.maxY, margin: ctx.margin, gap: ctx.gap, minArea: R.offcutMinArea, minSide: R.offcutMinSide });
+        credit += R.offcutValue * a * (c / st.type.area);
+      }
+    }
   }
-  return { states, rem: built.rem, unplaced: built.rem.length, cost, sheets: states.length, sheetArea, used, sumSq, env, source };
+  // nestCost.js: the score the search ranks by, and the sizes beyond the company's limit (ranked above it).
+  const score = R ? cost + pen + R.platePenalty * bought + R.sizePenalty * Math.max(0, sizes.size - 1) - credit : cost;
+  const over = R?.maxSizes ? Math.max(0, sizes.size - R.maxSizes) : 0;
+  return { states, rem: built.rem, unplaced: built.rem.length, cost, score, over, ruled: !!R, sizes: sizes.size, sheets: states.length, sheetArea, used, sumSq, env, source };
 }
 
 /**
@@ -1015,6 +1234,9 @@ function evaluate(ctx, built, source) {
 function better(a, b) {
   if (!b) return true;
   if (a.unplaced !== b.unplaced) return a.unplaced < b.unplaced;
+  // With the cost rules (nestCost.js): sizes beyond the limit, then the score. Without them score = cost, over = 0.
+  if ((a.over ?? 0) !== (b.over ?? 0)) return (a.over ?? 0) < (b.over ?? 0);
+  if (Math.abs((a.score ?? a.cost) - (b.score ?? b.cost)) > 1e-6) return (a.score ?? a.cost) < (b.score ?? b.cost);
   if (Math.abs(a.cost - b.cost) > 1e-6) return a.cost < b.cost;
   if (a.sheets !== b.sheets) return a.sheets < b.sheets;
   if (Math.abs(a.sheetArea - b.sheetArea) > 1e-6) return a.sheetArea < b.sheetArea;
@@ -1025,6 +1247,11 @@ function better(a, b) {
 /** The promise made about `start` and about the rectangle packer: plates, then waste. */
 function notWorse(a, g) {
   if (a.unplaced !== g.unplaced) return a.unplaced < g.unplaced;
+  // With the cost rules the promise is made in their terms: no more sizes over the limit, no worse a score.
+  if (a.ruled) {
+    if (a.over !== g.over) return a.over < g.over;
+    return a.score <= g.score + 1e-6;
+  }
   if (a.sheets !== g.sheets) return a.sheets < g.sheets;
   return a.sheetArea <= g.sheetArea + 1e-6;
 }
@@ -1160,9 +1387,10 @@ function* search(ctx, input) {
     if (better(sol, best)) {
       best = sol;
       // The caller hears of every layout that is better where it counts: pieces, steel, plates.
-      if (ctx.report && (!told || sol.unplaced !== told.unplaced || sol.sheets !== told.sheets || Math.abs(sol.cost - told.cost) > 1e-6)) {
-        told = { unplaced: sol.unplaced, sheets: sol.sheets, cost: sol.cost };
-        try { ctx.report({ sheets: sol.sheets, areaBought: sol.cost, sheetArea: sol.sheetArea, partArea: sol.used, unplaced: sol.unplaced, source: sol.source, trials, elapsedMs: Date.now() - ctx.t0 }); } catch { /* a listener never breaks a pack */ }
+      if (ctx.report && (!told || sol.unplaced !== told.unplaced || sol.sheets !== told.sheets || Math.abs(sol.cost - told.cost) > 1e-6 || Math.abs(sol.score - told.score) > 1e-6)) {
+        told = { unplaced: sol.unplaced, sheets: sol.sheets, cost: sol.cost, score: sol.score };
+        // `score` / `sizeOver`: what the search ranks by (nestCost.js) — the listeners rank the figures the same way.
+        try { ctx.report({ sheets: sol.sheets, areaBought: sol.cost, score: sol.score, sizeOver: sol.over ?? 0, sheetArea: sol.sheetArea, partArea: sol.used, unplaced: sol.unplaced, source: sol.source, trials, elapsedMs: Date.now() - ctx.t0 }); } catch { /* a listener never breaks a pack */ }
       }
       return true;
     }
@@ -1246,6 +1474,42 @@ function* search(ctx, input) {
     if (!built) { capped = true; break; }
     consider(evaluate(ctx, built, 'shape'));
   }
+  /*
+   * FEWEST PLATES OF THE LARGEST SIZE THAT FITS, ALWAYS TRIED (2026-10-18, COMPARE.md 3). The greedy
+   * opens each plate by price per part placed, so offered a menu it can settle on two short plates where
+   * one long one holds everything (NITHINSAI 20 mm: 2 × 7600×2000, 4.8 t, against 1 × 12000×2000, 3.8 t)
+   * — and the search never climbs out of it. So the one-size layout on the largest plate that takes
+   * every piece is laid as well, and kept when it is better.
+   */
+  if (!ctx.over()) {
+    const buy = ctx.types.filter((t) => !t.isFixedSheet && !t.outline && costOf(t) > 0 && (t.available ?? 0) > 0);
+    if (new Set(buy.map((t) => t.sizeKey)).size > 1) {
+      const all = (t) => ctx.shapes.every((s) => !ctx.placeable[s.idx] || t.fits[s.idx]);
+      const pool = buy.filter(all).length ? buy.filter(all) : buy;
+      const big = pool.reduce((a, t) => (t.area > a.area + EPS || (Math.abs(t.area - a.area) <= EPS && costOf(t) < costOf(a)) ? t : a));
+      /*
+       * …and the one-size layouts that LOOK cheapest: plates needed at 92 % fill × price, the best three
+       * sizes. The largest plate is then shrunk plate by plate (shrink) where its layout fits a smaller
+       * one; a one-size layout on a cheaper plate of the same length is found here directly.
+       */
+      let need = 0;
+      for (const sh of ctx.shapes) if (ctx.placeable[sh.idx]) need += sh.area * sh.qty;
+      const bySize = new Map();
+      for (const t of pool) if (!bySize.has(t.sizeKey) || costOf(t) < costOf(bySize.get(t.sizeKey))) bySize.set(t.sizeKey, t);
+      const est = (t) => Math.max(1, Math.ceil(need / (0.92 * (t.length - 2 * ctx.margin) * (t.width - 2 * ctx.margin)) - 1e-9)) * (costOf(t) + t.penalty);
+      const picks = [big.sizeKey, ...[...bySize.values()].sort((a, b) => est(a) - est(b) || a._i - b._i).map((t) => t.sizeKey).filter((k) => k !== big.sizeKey).slice(0, 3)];
+      for (const key of picks) {
+        const only = new Set(buy.filter((t) => t.sizeKey === key).map((t) => t._i));
+        for (const by of key === big.sizeKey ? ['area', 'maxdim'] : ['area']) {
+          if (ctx.over()) { capped = true; break; }
+          const built = yield* build(ctx, orderPool(ctx, counts0, by, null, 0), freshFixed(ctx), { ...plain, onlyTypes: only, abortable: !!best });
+          if (!built) { capped = true; break; }
+          consider(evaluate(ctx, built, 'shape'));
+        }
+        if (capped) break;
+      }
+    }
+  }
   ctx.floorMs = Date.now() - ctx.t0;
 
   /*
@@ -1295,8 +1559,8 @@ function* search(ctx, input) {
       let low = Infinity;
       for (const st of best.states) if (!st.type.isFixedSheet) low = Math.min(low, st.used / st.type.area);
       const p = progress;
-      if (best.unplaced < p.unplaced || best.cost < p.cost - 1e-6 || best.sheets < p.sheets || low < p.low - 0.01) {
-        progress = { unplaced: best.unplaced, cost: best.cost, sheets: best.sheets, low, it };
+      if (best.unplaced < p.unplaced || best.score < p.cost - 1e-6 || best.sheets < p.sheets || low < p.low - 0.01) {
+        progress = { unplaced: best.unplaced, cost: best.score, sheets: best.sheets, low, it };
       }
       if (it - progress.it > patienceOf(best)) break;
     }
@@ -1412,6 +1676,10 @@ function* solve(input) {
     pieces = [], sheets = [], kerf = 0, margin = 0, rotations = [0, 90, 180, 270], partInPart = true,
     effort = 'normal', seed = 1, budgetMs = null, deadlineAt = null, kerfAtRim = false, freeRegions = true,
     simplifyTol = SIMPLIFY_TOL, maxNests = 5000, maxPieces = 48, seeds = 'x1', seedGap = 1e-9,
+    // nestCost.costRulesFor (score: plate sizes, handling, remnants) — null = steel bought alone, as before.
+    // gap: the clearance between parts that do NOT share a cut (the shop's part gap; default the kerf).
+    // sharedCuts: also try the spots where a part shares a whole equal edge with one just laid (one kerf).
+    costRules = null, gap = null, sharedCuts = false,
     // In-thread only (functions do not cross to a worker; services/nestingWorker.js makes them there):
     //   shouldStop()  true = finish now with the best layout so far ("Stop and use this", or a cancel)
     //   onProgress(p) every layout better in pieces, steel or plates: { sheets, areaBought, partArea, unplaced, trials, elapsedMs }
@@ -1434,6 +1702,7 @@ function* solve(input) {
   const ctx = {
     maxPieces: Math.max(1, Math.trunc(Number(maxPieces))), note: (w) => { if (!notes.includes(w)) notes.push(w); },
     kerf: k, margin: m, rotations, partInPart: partInPart !== false, simplifyTol: Number(simplifyTol) || 0,
+    gap: Math.max(k, Number(gap) || 0), shared: !!sharedCuts, cost: costRules && typeof costRules === 'object' ? costRules : null,
     level, seed: Number(seed) | 0, t0, floorMs: null,
     deadline: Math.min(
       t0 + (budgetMs == null ? level.capMs : Math.max(0, Number(budgetMs))),
@@ -1540,6 +1809,10 @@ function* solve(input) {
       cutLengthMm: nests.reduce((a, n) => a + n.metrics.cutLengthMm, 0),
       /** Steel BOUGHT, as nestingPacker counts it: a plate already owned contributes nothing. */
       areaBought: best.cost,
+      /** nestCost.js: what the search ranked by (= areaBought without cost rules), and the sizes over the limit. */
+      score: best.score ?? best.cost,
+      sizeOver: best.over ?? 0,
+      sizes: best.sizes ?? null,
     },
     /** False only when the clock (or the caller's stop), not a counted rule, ended a search. */
     deterministic: !capped,

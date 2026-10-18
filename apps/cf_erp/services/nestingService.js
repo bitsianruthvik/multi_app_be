@@ -114,6 +114,7 @@ import { shapeJobsAvailable, shapeCapMs, checkpointOf } from './packJob.js';
 import { measurePlates } from './nestMeasure.js';
 // The shop's cutting habits (init.sql §75): spacing over the cut settings, the rim and rotations the packers get.
 import { shopRuleRows, withShopSpacing, shopRimOf, rotationsOf } from './shopRules.js';
+import { plateCosts, ratePerKg, costRulesFor, layoutScore, extentOf } from './nestCost.js';
 // Exact outline checks for two parts whose BOXES conflict (pairVerdict): one rule for the proposal and the accept.
 import { toPolygon, polygonsOverlap, polygonsDistance } from '../lib/polyGeom.js';
 
@@ -335,24 +336,31 @@ export async function resolveCutSettings(db, companyId, thicknessMm) {
 }
 
 export async function cutSettingRows(db, companyId) {
-  const sql = (shop) => `SELECT id, thickness_min_mm, thickness_max_mm, kerf_mm, seq_gap_min_mm, seq_gap_max_mm,
+  const sql = (level) => `SELECT id, thickness_min_mm, thickness_max_mm, kerf_mm, seq_gap_min_mm, seq_gap_max_mm,
             order_margin_length_mm, order_margin_width_mm, order_step_mm, guillotine,
-            offcut_min_area_mm2, offcut_min_side_mm, notes${shop ? `,
-            (SELECT cs.nest_shop_spacing FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS shop_on` : ''}
+            offcut_min_area_mm2, offcut_min_side_mm, notes${level >= 1 ? `,
+            (SELECT cs.nest_shop_spacing FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS shop_on` : ''}${level >= 2 ? `,
+            (SELECT cs.nest_max_plate_sizes FROM cf_company_settings cs WHERE cs.company_id = cf_cut_settings.company_id) AS max_sizes` : ''}
        FROM cf_cut_settings
       WHERE company_id = ? AND deleted_at IS NULL
       ORDER BY id`;
-  // THE SHOP'S SPACING (init.sql §75, shopRules.js) rides on the same read: the company's switch is a
-  // column of this query, and only when it is ON is one more read made for the per-thickness rows. A
-  // database without §75 answers the old query (one failed statement, then the old one).
+  // THE SHOP'S SPACING (init.sql §75, shopRules.js) and THE PLATE-SIZE LIMIT (§83, nestCost.js) ride on the
+  // same read: the company's settings are columns of this query, and only when the spacing is ON is one more
+  // read made for the per-thickness rows. A database without §83 / §75 answers the older query.
   let rows;
-  try { [rows] = await db.query(sql(true), [companyId]); } catch (e) {
-    if (!(e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054 || e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146)) throw e;
-    [rows] = await db.query(sql(false), [companyId]);
+  let level = 2;
+  for (;;) {
+    try { [rows] = await db.query(sql(level), [companyId]); break; } catch (e) {
+      if (level === 0 || !(e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054 || e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146)) throw e;
+      level -= 1;
+    }
   }
   const on = rows.some((r) => Number(r.shop_on) === 1);
   const shop = on ? { on: true, rows: await shopRuleRows(db, companyId), schema: true } : { on: false, rows: [], schema: true };
   Object.defineProperty(rows, 'shop', { value: shop, enumerable: false });
+  // NULL (or no §83) = the default limit (nestCost.COST_DEFAULTS.maxSizes, 2); 0 = no limit.
+  const ms = rows.find((r) => r.max_sizes != null)?.max_sizes;
+  Object.defineProperty(rows, 'maxPlateSizes', { value: ms == null ? undefined : Number(ms), enumerable: false });
   return rows;
 }
 
@@ -369,6 +377,25 @@ const shapeSettings = (r, basis) => ({
   offcutMinSideMm: r.offcut_min_side_mm == null ? DEFAULT_CUT_SETTINGS.offcutMinSideMm : Number(r.offcut_min_side_mm),
   basis,
 });
+
+/**
+ * What the true-shape packer is handed besides kerf and margin (2026-10-18, COMPARE.md 1–4, 6):
+ *   costRules   nestCost.costRulesFor — few plate sizes per thickness (the company's limit, default 2),
+ *               plate handling, CUSTOM / short plates, usable remnants valued at half their steel;
+ *   gap         the clearance between two parts that CANNOT share a cut (no whole equal edge facing): with
+ *               the shop's spacing on, its gap between blocks (13 mm) — a pair that can share one still goes
+ *               a kerf apart, so the shared cuts stay (shapePacker.clearOf; measured on the ProNest jobs, the
+ *               5 mm part gap for every unshared pair cost cut length and broke the block rule); off, the kerf;
+ *   sharedCuts  parts edge to edge one kerf apart (a whole equal edge) wherever that makes the layout no longer.
+ * `discipline: false` leaves the cost rules out (steel bought alone).
+ */
+export function shapeHabits(settings, thicknessMm, maxPlateSizes, discipline = true) {
+  return {
+    costRules: discipline ? costRulesFor(thicknessMm, { maxSizes: maxPlateSizes, offcutMinArea: settings.offcutMinAreaMm2, offcutMinSide: settings.offcutMinSideMm }) : null,
+    gap: settings.shopSpacing ? Math.max(Number(settings.kerfMm) || 0, Number(settings.groupGapMm) || 0) : Number(settings.kerfMm) || 0,
+    sharedCuts: true,
+  };
+}
 
 export function pickCutSettings(rows, thicknessMm) {
   // With the company's shop spacing switched on (shopRules.withShopSpacing): the edge margin and the gap
@@ -1588,6 +1615,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   // Standard only: a custom plate (or one that does not say) is not offered at all.
   const plates = everyPlate.filter(allowedBy(line.nest_plates));
   const theirs = await customerPlates(db, companyId, line.order_id, plates.map((p) => p.id));
+  const listPrices = input.plateDiscipline === false ? new Map() : await listPricesOf(db, companyId, plates.map((p) => p.id));
 
   // NEST THE REST. Pieces already on imported lots are not demand any more;
   // what is left is what the packer is asked to place. With nothing imported
@@ -1705,11 +1733,21 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     }
 
     const pieceArea = g.cutPlates.reduce((a, cp) => a + cp.steel.length * cp.steel.width * cp.pieces, 0);
+    // WHAT EACH PLATE COSTS (nestCost.js, 2026-10-18): its price as area of steel (the catalog list price
+    // where one is set, else its area), and what a CUSTOM or short plate costs on top. `plateDiscipline: false`
+    // plans by area alone, as before.
+    const discipline = input.plateDiscipline !== false;
+    const costs = discipline ? plateCosts(candidates.map((p) => {
+      const lp = listPrices.get(p.id);
+      const kg = kgOf(p.steel.length * p.steel.width, g.thickness, p.steel.density);
+      return { length: p.steel.length, width: p.steel.width, kind: p.kind, ratePerKg: lp ? ratePerKg(lp.listPrice, lp.priceBasis, kg) : null };
+    })) : null;
+    const costById = new Map(candidates.map((p, i) => [p.id, costs ? costs[i] : { areaCost: p.steel.length * p.steel.width, penalty: 0 }]));
     const sheets = sortSheets([
       ...candidates.map((p) => ({
         id: p.id, key: `pl${p.id}`, plate: p,
         length: p.steel.length, width: p.steel.width,
-        areaCost: p.steel.length * p.steel.width,
+        areaCost: costById.get(p.id).areaCost, penalty: costById.get(p.id).penalty,
         preferred: false,                                  // offcut sourcing is not built yet
         available: Math.min(1000, Math.max(1, Math.ceil(pieceArea / (p.steel.length * p.steel.width)) + 2)),
       })),
@@ -1777,10 +1815,11 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     const fill = useShapes ? (fillable.get(g.key) ?? []) : [];
     const shapeInput = useShapes ? {
       pieces: pieces.map((p) => { const sh = shapeOf(p.cutPlate); return { key: p.key, qty: p.qty, rings: sh?.drawn ? sh.rings : null, length: p.length, width: p.width, grain: 'any', allowMirror: false }; }),
-      sheets: packInput.sheets,
+      sheets: sheets.map((s) => ({ key: s.key, length: s.length, width: s.width, available: s.available, preferred: s.preferred, areaCost: s.areaCost, penalty: s.penalty ?? 0 })),
       // A kerf between parts; at the plate edge the clearance the rectangle packer leaves (rimOf).
       kerf: settings.kerfMm, margin: rim.shapeMargin, rotations: rotationsOf(settings), partInPart: true,
       effort: input.effort ?? 'standard', seed: input.seed ?? 1,
+      ...shapeHabits(settings, g.thickness, settingRows.maxPlateSizes, discipline),
     } : null;
     // A saved plate is owned already: free, one of it, its parts fixed where they are. The job
     // fills these FIRST (packJob.js), then opens new plates for what is left.
@@ -1897,16 +1936,20 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       const per = new Map();
       for (const [i, r] of reports) {
         const cur = per.get(jobs[i].key);
-        if (!cur || r.unplaced < cur.unplaced || (r.unplaced === cur.unplaced && r.areaBought < cur.areaBought - 1e-6)) per.set(jobs[i].key, r);
+        // Ranked as the answer is (packerPool.pickBest): pieces left off, plate sizes over the limit, the score.
+        const sc = (x) => x.score ?? x.areaBought;
+        if (!cur || r.unplaced < cur.unplaced || (r.unplaced === cur.unplaced && ((r.sizeOver ?? 0) < (cur.sizeOver ?? 0)
+          || ((r.sizeOver ?? 0) === (cur.sizeOver ?? 0) && sc(r) < sc(cur) - 1e-6)))) per.set(jobs[i].key, r);
       }
       for (const [k, f] of floors) if (!per.has(k)) per.set(k, f);
       if (per.size < prepared.length) return;
-      let plates = 0; let area = 0; let unplaced = 0;
-      for (const r of per.values()) { plates += r.plates; area += r.areaBought; unplaced += r.unplaced; }
-      if (toldBest && toldBest.plates === plates && Math.abs(toldBest.area - area) <= 1e-6 && toldBest.unplaced === unplaced) return;
-      toldBest = { plates, area, unplaced };
+      let plates = 0; let area = 0; let unplaced = 0; let score = 0; let sizeOver = 0;
+      for (const r of per.values()) { plates += r.plates; area += r.areaBought; unplaced += r.unplaced; score += r.score ?? r.areaBought; sizeOver += r.sizeOver ?? 0; }
+      if (toldBest && toldBest.plates === plates && Math.abs(toldBest.area - area) <= 1e-6 && Math.abs(toldBest.score - score) <= 1e-6 && toldBest.unplaced === unplaced && toldBest.sizeOver === sizeOver) return;
+      toldBest = { plates, area, unplaced, score, sizeOver };
       try {
-        input.onProgress({ phase: 'packing', best: { plates, areaBoughtM2: round3(area / 1e6), wastePct: area > 0 ? round3(Math.max(0, 1 - partsArea / area) * 100) : null, unplaced, elapsedMs: Date.now() - planStartedAt, budgetMs: planBudgetMs || null } });
+        // scoreM2: what the plan is ranked by (nestCost.js) — steel bought plus the plate rules, in m² of steel.
+        input.onProgress({ phase: 'packing', best: { plates, areaBoughtM2: round3(area / 1e6), scoreM2: round3(score / 1e6), sizeOver, wastePct: area > 0 ? round3(Math.max(0, 1 - partsArea / area) * 100) : null, unplaced, elapsedMs: Date.now() - planStartedAt, budgetMs: planBudgetMs || null } });
       } catch { /* progress only */ }
     };
     /*
@@ -1919,7 +1962,13 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     if (input.onProgress && prepared.length > 1) {
       try {
         const quick = await runAll(prepared.map((pr) => ({ key: pr.g.key, round: 0, seed: 1, input: { ...pr.packInput, effort: 'quick', restarts: undefined, seed: 1, budgetMs: null } })), { workers: input.workers ?? null, stop: input.control?.stop ?? null });
-        quick.forEach((r, i) => { if (r?.ok) floors.set(prepared[i].g.key, { plates: (r.out.nests ?? []).length, areaBought: Number(r.out.areaBought) || 0, unplaced: (r.out.unplaced ?? []).reduce((a, u) => a + (Number(u.qty) || 0), 0) }); });
+        quick.forEach((r, i) => {
+          if (!r?.ok) return;
+          // Scored as the steel's own jobs score (nestCost.js), or its search's first figure would look worse than this one.
+          const si = prepared[i].shapeInput;
+          const sc = si?.costRules ? layoutScore((r.out.nests ?? []).map((n) => ({ sheetKey: n.sheetKey, extent: extentOf(n) })), new Map(si.sheets.map((x) => [String(x.key), x])), si.costRules, { margin: Number(si.margin) || 0, gap: Math.max(Number(si.gap) || 0, Number(si.kerf) || 0) }) : null;
+          floors.set(prepared[i].g.key, { plates: (r.out.nests ?? []).length, areaBought: Number(r.out.areaBought) || 0, ...(sc ? { score: sc.score, sizeOver: sc.sizeOver } : {}), unplaced: (r.out.unplaced ?? []).reduce((a, u) => a + (Number(u.qty) || 0), 0) });
+        });
         onPackProgress({ index: -1, progress: null });
       } catch { /* the figure only starts later */ }
     }

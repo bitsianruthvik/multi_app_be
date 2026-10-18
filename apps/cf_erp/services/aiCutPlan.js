@@ -274,6 +274,7 @@ export function planCuts({ plate, pieces = [], rules: rulesIn = {}, options = {}
       const from = order.indexOf(s.id);
       order.splice(from, 1);
       order.splice(order.indexOf(best.u.id) + 1, 0, s.id);
+      s.fillsGap = best.u.id;
     }
   }
   // HARD: a part in an opening before its host (so before the opening). Physical — it outranks the sequence order.
@@ -301,6 +302,10 @@ export function planCuts({ plate, pieces = [], rules: rulesIn = {}, options = {}
     // A part moved before its host (rule 2) is cut where its host is: it neither steps back nor moves the head on.
     if (u.forcedByInner) continue;
     if (!seqMode && u.box.x0 < reached - BACK_STEP_MM) u.backStep = true;
+    // A small part cut straight after the block whose gap it fills is cut WHERE THAT BLOCK IS: it does not move
+    // the head on (2026-10-18, COMPARE.md 5 — a stiffener in the far corner of a long strip's gap made every
+    // big part after the strip look like a step back along the plate).
+    if (u.fillsGap != null) continue;
     reached = Math.max(reached, u.box.x0);
   }
 

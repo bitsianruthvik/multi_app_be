@@ -427,14 +427,19 @@ function launch(run, key, { resume = null } = {}) {
     if (e.text) log(run, e.text);
     // A run picked up again begins from its checkpoint: the first figures that come in (each steel's row floor,
     // before its search has re-read the kept layout) are worse than what it already had, and are not its best.
-    if (e.best && run.best && (e.best.unplaced > run.best.unplaced || (e.best.unplaced === run.best.unplaced && e.best.areaBoughtM2 > run.best.areaBoughtM2 + 1e-9))) return;
+    // Ranked by the plan's score (nestCost.js: steel bought plus the plate rules) where the plan gives one, else steel.
+    // …and above the score, plate sizes beyond the company's limit (sizeOver), as packerPool.pickBest ranks.
+    const scoreOf = (b) => b.scoreM2 ?? b.areaBoughtM2;
+    const ov = (b) => b.sizeOver ?? 0;
+    const worse = (a, b) => a.unplaced > b.unplaced || (a.unplaced === b.unplaced && (ov(a) > ov(b) || (ov(a) === ov(b) && scoreOf(a) > scoreOf(b) + 1e-9)));
+    if (e.best && run.best && worse(e.best, run.best)) return;
     if (e.best) {
       const at = Math.round(usedMs(run));
-      run.best = { plates: e.best.plates, areaBoughtM2: e.best.areaBoughtM2, wastePct: e.best.wastePct, unplaced: e.best.unplaced, atMs: at, scope: run.scopeNow ?? null };
+      run.best = { plates: e.best.plates, areaBoughtM2: e.best.areaBoughtM2, ...(e.best.scoreM2 != null ? { scoreM2: e.best.scoreM2, sizeOver: ov(e.best) } : {}), wastePct: e.best.wastePct, unplaced: e.best.unplaced, atMs: at, scope: run.scopeNow ?? null };
       const last = run.curve.at(-1);
       // A resumed run starts from where it was: its figure is a new point only when it is a better one.
-      if (!last || e.best.unplaced < last.unplaced || e.best.areaBoughtM2 < last.areaBoughtM2 - 1e-9 || e.best.plates < last.plates) {
-        run.curve.push({ atMs: at, plates: e.best.plates, areaBoughtM2: e.best.areaBoughtM2, wastePct: e.best.wastePct, unplaced: e.best.unplaced });
+      if (!last || e.best.unplaced < last.unplaced || ov(e.best) < ov(last) || scoreOf(e.best) < scoreOf(last) - 1e-9 || e.best.plates < last.plates) {
+        run.curve.push({ atMs: at, plates: e.best.plates, areaBoughtM2: e.best.areaBoughtM2, ...(e.best.scoreM2 != null ? { scoreM2: e.best.scoreM2, sizeOver: ov(e.best) } : {}), wastePct: e.best.wastePct, unplaced: e.best.unplaced });
         // Too many points: every other one of the older half goes (the first and the newest stay).
         if (run.curve.length > CURVE_CAP) run.curve = run.curve.filter((pt, i, all) => i === 0 || i >= all.length / 2 || i % 2 === 0);
       }

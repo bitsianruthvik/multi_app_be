@@ -398,10 +398,17 @@ section('9. The setting in the database: saved, read back, laid over the cut set
   const missing = (sqlHas) => ({ calls: 0, async query(sql) { this.calls += 1; if (sqlHas.some((w) => sql.includes(w))) { const e = new Error('Unknown column'); e.code = 'ER_BAD_FIELD_ERROR'; e.errno = 1054; throw e; } return [[{ id: 1, thickness_min_mm: null, thickness_max_mm: null, kerf_mm: 3, seq_gap_min_mm: 5, seq_gap_max_mm: 8, order_margin_length_mm: 100, order_margin_width_mm: 50, order_step_mm: 50, guillotine: 0 }]]; } });
   const m1 = missing(['nest_shop_spacing']);
   const r1 = await readShopRules(m1, 1);
-  ok('without §75: readShopRules → off, schema false (one statement)', r1.on === false && r1.schema === false && m1.calls === 1);
+  // (2026-10-18, §83: the plate-size limit rides on the same read — a database without §75 has no §83 either, so two statements fail)
+  ok('without §75: readShopRules → off, schema false (two statements: with §83, then without)', r1.on === false && r1.schema === false && m1.calls === 2);
+  const m1b = missing(['nest_max_plate_sizes']);
+  const r1b = await readShopRules(m1b, 1);
+  ok('with §75 but without §83: readShopRules reads the switch, says the limit is not there (3 statements: the §83 read failed, the old one, the rows)', r1b.schema === true && r1b.sizesSchema === false && m1b.calls === 3, J({ r1b, calls: m1b.calls }));
   const m2 = missing(['nest_shop_spacing']);
   const rows = await cutSettingRows(m2, 1);
-  ok('without §75: cutSettingRows answers the old query (2 statements: the new one failed), the band unchanged', rows.length === 1 && m2.calls === 2 && pickCutSettings(rows, 12).seqGapMinMm === 5);
+  ok('without §75: cutSettingRows answers the old query (3 statements: the §83 and §75 ones failed), the band unchanged', rows.length === 1 && m2.calls === 3 && pickCutSettings(rows, 12).seqGapMinMm === 5);
+  const m3 = missing(['nest_max_plate_sizes']);
+  const rows3 = await cutSettingRows(m3, 1);
+  ok('with §75 but without §83: cutSettingRows (2 statements), no limit read — the default (2) applies', rows3.length === 1 && m3.calls === 2 && rows3.maxPlateSizes === undefined);
   let db = null;
   try {
     const { pool } = await import('../../apps/cf_erp/lib/db.js');
@@ -432,6 +439,17 @@ section('9. The setting in the database: saved, read back, laid over the cut set
       let refused = null;
       try { await saveShopRules(db, { companyId: co.id, userId: null }, { rows: [{ thicknessMm: 16 }, { thicknessMm: 16 }] }); } catch (e) { refused = e; }
       ok('a thickness listed twice is refused (422)', refused?.status === 422 || refused?.statusCode === 422 || refused?.code === 'INVALID_SHOP_RULES', refused?.message);
+      // §83 (2026-10-18): the plate-size limit on the same screen
+      if (g.sizesSchema) {
+        const s3 = await saveShopRules(db, { companyId: co.id, userId: null }, { maxPlateSizes: 3 });
+        const rows3 = await cutSettingRows(db, co.id);
+        ok('plate sizes per thickness: saved 3, the screen shows 3, planNesting reads 3 (cutSettingRows.maxPlateSizes)', s3.maxPlateSizes === 3 && rows3.maxPlateSizes === 3, J({ screen: s3.maxPlateSizes, read: rows3.maxPlateSizes }));
+        const s0 = await saveShopRules(db, { companyId: co.id, userId: null }, { maxPlateSizes: null });
+        ok('…blank = the default (2): stored NULL, read as "not set"', s0.maxPlateSizes === null && s0.maxPlateSizesDefault === 2 && (await cutSettingRows(db, co.id)).maxPlateSizes === undefined);
+        let bad = null;
+        try { await saveShopRules(db, { companyId: co.id, userId: null }, { maxPlateSizes: 2.5 }); } catch (e) { bad = e; }
+        ok('…a non-whole number is refused (422)', bad?.code === 'INVALID_SHOP_RULES', bad?.message);
+      } else console.log('  (skipped: no §83 in the local database)');
     } finally { await db.rollback(); db.release(); }
   }
 }

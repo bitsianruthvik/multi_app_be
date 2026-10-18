@@ -414,9 +414,12 @@ export function pickBest(runs) {
     if (!r?.ok || !r.out) continue;
     const out = r.out;
     const stranded = (out.unplaced ?? []).reduce((a, u) => a + (Number(u.qty) || 0), 0);
-    const cand = { out, seed: r.seed, stranded, area: Number(out.areaBought) || 0 };
+    // nestCost.js (2026-10-18): a shape job with cost rules answers `score` (price + penalties − kept
+    // remnants) and `sizeOver` (plate sizes beyond the company's limit); everything else, steel bought.
+    const cand = { out, seed: r.seed, stranded, over: Number(out.sizeOver) || 0, area: Number(out.score ?? out.areaBought) || 0 };
     if (!best) { best = cand; continue; }
     if (cand.stranded !== best.stranded) { if (cand.stranded < best.stranded) best = cand; continue; }
+    if (cand.over !== best.over) { if (cand.over < best.over) best = cand; continue; }
     if (cand.area + 1e-6 < best.area) { best = cand; continue; }
     // Equal on both: the lowest seed wins, so the answer never depends on
     // which worker finished first.

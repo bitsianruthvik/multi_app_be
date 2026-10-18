@@ -7964,3 +7964,24 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = D
                                 'cf_plan3_baselines', 'cf_plan3_baseline_orders')) = 6,
           'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
 
+-- ============================================================================
+-- §83  AI NESTING — PLATE-SIZE DISCIPLINE: at most N plate sizes per thickness (2026-10-18)
+-- The same text as TM/s83.sql. Additive and guarded: safe to re-run. From the ProNest comparison
+-- (TM/nest_learning/COMPARE.md): the AI mixed up to six catalog sizes per thickness to save steel on
+-- paper; the shop buys one or two. services/nestCost.js scores a layout by price + CUSTOM / short-plate
+-- penalties + handling per plate + a penalty per extra size − half the steel of a kept remnant, and ranks
+-- a layout with more sizes than this limit below any that places every piece on fewer.
+--
+--   cf_company_settings.nest_max_plate_sizes   the most distinct plate sizes per thickness in one plan.
+--                                              NULL (default) = 2; 0 = no limit.
+-- The code reads nothing more when this column is missing (the limit is then 2).
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'nest_max_plate_sizes');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN nest_max_plate_sizes TINYINT UNSIGNED NULL DEFAULT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'nest_max_plate_sizes') = 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

@@ -75,6 +75,7 @@
  * plates: on the server's own thread that is seconds with every other request waiting.
  */
 import { nest } from './nestingPacker.js';
+import { layoutScore, extentOf } from './nestCost.js';
 
 let SP = null;
 try { SP = await import('./shapePacker.js'); } catch { SP = null; }
@@ -128,15 +129,31 @@ function runShapeJob(input, hooks = {}) {
   /** What the search reports, in the pool's words: plates and steel of the best layout so far. */
   const hooksFor = (base) => ({
     shouldStop: stopNow,
-    onProgress: (p) => tell({ plates: base.plates + p.sheets, areaBought: base.area + p.areaBought, unplaced: p.unplaced, source: p.source, trials: p.trials }),
+    onProgress: (p) => tell({ plates: base.plates + p.sheets, areaBought: base.area + p.areaBought, score: base.area + (p.score ?? p.areaBought), sizeOver: p.sizeOver ?? 0, unplaced: p.unplaced, source: p.source, trials: p.trials }),
     ...(typeof hooks.onCheckpoint === 'function' ? {
       checkpointMs: input.checkpointMs ?? 60_000,
       onCheckpoint: (c) => { try { hooks.onCheckpoint({ start: c.layout, fill: fillSlim, plates: c.sheets, areaBought: c.areaBought, unplaced: c.unplaced }); } catch { /* a listener never breaks a pack */ } },
     } : {}),
   });
-  const score = (o, plates, area) => ({ off: stranded(o), area, plates });
-  const beats = (a, b) => a.off < b.off || (a.off === b.off && (a.area < b.area - 1e-6 || (Math.abs(a.area - b.area) <= 1e-6 && a.plates < b.plates)));
-  const noWorse = (a, b) => a.off <= b.off && a.area <= b.area + 1e-6 && a.plates <= b.plates;
+  /*
+   * THE SCORE (nestCost.js, 2026-10-18): with `shape.costRules` the rows and the true shapes are judged
+   * alike by plate sizes over the company's limit, then the score (price + plate penalties + handling +
+   * sizes − kept remnants); without them by steel bought, as before.
+   */
+  const R = input.shape?.costRules ?? null;
+  const sheetMap = new Map((input.shape?.sheets ?? input.rect?.sheets ?? []).map((s) => [String(s.key), s]));
+  const score = (o, plates, area) => {
+    const base = { off: stranded(o), area, plates };
+    if (!R) return base;
+    const ls = layoutScore((o?.nests ?? []).map((n) => ({ sheetKey: n.sheetKey, extent: extentOf(n) })), sheetMap, R,
+      { margin: Number(input.shape?.margin) || 0, gap: Math.max(Number(input.shape?.gap) || 0, Number(input.shape?.kerf) || 0) });
+    return { ...base, score: ls.score, sizeOver: ls.sizeOver };
+  };
+  const sc = (a) => (a.score ?? a.area);
+  const ov = (a) => (a.sizeOver ?? 0);
+  const beats = (a, b) => a.off < b.off || (a.off === b.off && (ov(a) < ov(b) || (ov(a) === ov(b)
+    && (sc(a) < sc(b) - 1e-6 || (Math.abs(sc(a) - sc(b)) <= 1e-6 && (a.area < b.area - 1e-6 || (Math.abs(a.area - b.area) <= 1e-6 && a.plates < b.plates)))))));
+  const noWorse = (a, b) => a.off <= b.off && (R ? ov(a) <= ov(b) && sc(a) <= sc(b) + 1e-6 : a.area <= b.area + 1e-6 && a.plates <= b.plates);
   const errors = [];
   let outOfTime = false;
   // The drawing decides (see the header): why the rows stand although it should have.
@@ -155,7 +172,7 @@ function runShapeJob(input, hooks = {}) {
     const tRect = Date.now();
     const rect = rectOf(rectPieces, share * 0.4);
     const rs = score(rect, (rect.nests ?? []).length, Number(rect.areaBought) || 0);
-    tell({ plates: rs.plates, areaBought: rs.area, unplaced: rs.off, source: 'rows', trials: 0 });
+    tell({ plates: rs.plates, areaBought: rs.area, score: rs.score ?? rs.area, sizeOver: rs.sizeOver ?? 0, unplaced: rs.off, source: 'rows', trials: 0 });
     let shape = null;
     // NO TIME LEFT FOR SHAPES? Then the rectangle layout is the answer and the true-shape step is
     // not started at all: even cut short at once it reads and checks the whole start layout, which
@@ -239,6 +256,9 @@ function runShapeJob(input, hooks = {}) {
     nests: win?.nests ?? [],
     unplaced: win?.unplaced ?? [],
     areaBought: result.score.area,
+    /** nestCost.js: what the pool ranks seeds by (= areaBought without cost rules), and the plate sizes over the limit. */
+    score: sc(result.score),
+    sizeOver: ov(result.score),
     deterministic: !outOfTime && [floor, result.rect, result.shape, result.fill].every((o) => (o?.deterministic ?? true) !== false),
     /** A steel with a real drawing: true when the true-shape layout was to be taken whatever the rows did. */
     shapesDecide,

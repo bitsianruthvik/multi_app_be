@@ -91,7 +91,10 @@ try {
   ok('it was seen packing, with jobs counted', sawPacking && last.progress.total > 0 && last.progress.done === last.progress.total, J(last.progress));
   ok(`while it worked it said the best so far for the whole line (first: ${J(sawBest)})`, !!sawBest && sawBest.plates > 0 && sawBest.areaBoughtM2 > 0 && typeof sawBest.wastePct === 'number' && sawBest.unplaced === 0);
   const curve = last.progress.curve;
-  const neverWorse = curve.every((pt, i) => i === 0 || pt.unplaced < curve[i - 1].unplaced || (pt.unplaced === curve[i - 1].unplaced && pt.areaBoughtM2 <= curve[i - 1].areaBoughtM2 + 1e-9));
+  // Ranked by the plan's score where it gives one (nestCost.js, 2026-10-18: steel bought plus the plate rules), else steel.
+  const sc = (pt) => pt.scoreM2 ?? pt.areaBoughtM2;
+  const ov = (pt) => pt.sizeOver ?? 0;
+  const neverWorse = curve.every((pt, i) => i === 0 || pt.unplaced < curve[i - 1].unplaced || (pt.unplaced === curve[i - 1].unplaced && (ov(pt) < ov(curve[i - 1]) || (ov(pt) === ov(curve[i - 1]) && sc(pt) <= sc(curve[i - 1]) + 1e-9))));
   ok(`the improvement curve has ${curve.length} points, each no worse than the one before, times going up`, curve.length >= 1 && neverWorse && curve.every((pt, i) => i === 0 || pt.atMs >= curve[i - 1].atMs), J(curve.slice(0, 6)));
   console.log(`    curve: ${curve.map((pt) => `${(pt.atMs / 1000).toFixed(1)}s ${pt.plates}pl ${pt.wastePct}%`).join(' → ')}`);
   const texts = last.log.map((l) => l.text);
