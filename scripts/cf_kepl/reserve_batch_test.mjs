@@ -226,6 +226,15 @@ async function batchByCode(db, code) {
   return b.id;
 }
 const receipt = (c, db, date, toAreaId, lines) => STOCK.postMovement(db, c, { movementType: 'receipt', movementDate: date, toAreaId, reference: 'reserve_batch_test', lines });
+/**
+ * Stock that should sit in a WIP area: received into the store, then transferred there the same day (2026-10-19: goods from
+ * outside are received only into storage / quarantine — stockingAreaService.RECEIVING_PURPOSES).
+ */
+async function receiptInto(c, db, date, A, toAreaId, lines) {
+  const m = await receipt(c, db, date, A.sto, lines);
+  return STOCK.postMovement(db, c, { movementType: 'transfer', movementDate: date, fromAreaId: A.sto, toAreaId, reference: 'reserve_batch_test',
+    lines: m.lines.map((l) => ({ itemId: l.item.id, quantity: l.quantity, ...(l.batch?.id ? { batchId: l.batch.id } : {}) })) });
+}
 
 async function seedStock(db, c, A, I) {
   // PL-12X2500X12100: 9 plate lots.
@@ -248,7 +257,7 @@ async function seedStock(db, c, A, I) {
   await receipt(c, db, '2026-09-02', A.sto, [{ itemId: I.p1641, quantity: 100, batch: { code: 'RSV-1641-A' } }]);
   // PL-16X2300X6500: two small batches, in two areas.
   await receipt(c, db, '2026-09-03', A.sto, [{ itemId: I.p1624, quantity: 0.5, batch: { code: 'RSV-1624-A' } }]);
-  await receipt(c, db, '2026-09-04', A.wip, [{ itemId: I.p1624, quantity: 0.3, batch: { code: 'RSV-1624-B' } }]);
+  await receiptInto(c, db, '2026-09-04', A, A.wip, [{ itemId: I.p1624, quantity: 0.3, batch: { code: 'RSV-1624-B' } }]);
   // PL-12X2250X12050: quarantine only.
   await receipt(c, db, '2026-09-05', A.qua, [{ itemId: I.p3003, quantity: 50, batch: { code: 'RSV-3003-Q' } }]);
   // PL-16X1600X12350: a rejected batch and a small good one.
@@ -257,12 +266,12 @@ async function seedStock(db, c, A, I) {
   await BATCH.setBatchStatus(db, c, await batchByCode(db, 'RSV-1643-R'), { status: 'rejected', note: 'reserve_batch_test' });
   // PL-16X2000X8000: more than the one plate wanted, in two batches.
   await receipt(c, db, '2026-09-07', A.sto, [{ itemId: I.p1625, quantity: 1, batch: { code: 'RSV-1625-A' } }]);
-  await receipt(c, db, '2026-09-08', A.wip, [{ itemId: I.p1625, quantity: 0.87434, batch: { code: 'RSV-1625-B' } }]);
+  await receiptInto(c, db, '2026-09-08', A, A.wip, [{ itemId: I.p1625, quantity: 0.87434, batch: { code: 'RSV-1625-B' } }]);
   // PL-25X1750X10850: 8 plates wanted, 3 already on hand.
   await receipt(c, db, '2026-09-09', A.sto, [{ itemId: I.p3005, quantity: 4, batch: { code: 'RSV-3005-A' } }]);
   // STUD-001: counted by quantity — 8 × 1,803 wanted, 8,000 on hand over two areas.
   await receipt(c, db, '2026-09-09', A.sto, [{ itemId: I.stud, quantity: 5000 }]);
-  await receipt(c, db, '2026-09-11', A.wip, [{ itemId: I.stud, quantity: 3000 }]);
+  await receiptInto(c, db, '2026-09-11', A, A.wip, [{ itemId: I.stud, quantity: 3000 }]);
 }
 
 /** A service call whose outcome (not its tracker) goes into the snapshot. */
@@ -353,7 +362,7 @@ try {
   // Between the runs: newer facts on the shelf.
   const between = [];
   between.push(await outcome(() => receipt(c, conn, '2026-07-01', A.sto, [{ itemId: I.p1621, quantity: 2, batch: { code: 'RSV-1621-OLD' } }])));
-  between.push(await outcome(() => receipt(c, conn, '2026-09-20', A.wip, [{ itemId: I.p1722, quantity: 0.2, batch: { code: 'RSV-1722-A' } }])));
+  between.push(await outcome(() => receiptInto(c, conn, '2026-09-20', A, A.wip, [{ itemId: I.p1722, quantity: 0.2, batch: { code: 'RSV-1722-A' } }])));
   const [[firstRes]] = await conn.query("SELECT id FROM cf_stock_reservations WHERE id > ? AND item_id = ? AND status = 'active' ORDER BY id LIMIT 1 OFFSET 3", [since, I.p1624]);
   if (firstRes) between.push(await outcome(() => REL.releaseReservation(conn, c, firstRes.id)));
   between.push(await outcome(() => REL.issueRequirement(conn, c, q1641[0].id)));

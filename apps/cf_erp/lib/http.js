@@ -19,7 +19,7 @@ export const PERM = {
   production: 'cf_erp_production_manage',   // machines, shifts, operations, timing rules, flows and their waits
   inventoryView: 'cf_erp_inventory_view',   // see stocking areas, stock, batches and movements
   inventory: 'cf_erp_inventory_manage',     // stocking areas, receipts, issues, transfers, counts, scrap, batches
-  purchaseApprove: 'cf_erp_purchase_approve', // approve / reject purchase requests (init.sql §39); raising and RFQs use inventory manage
+  purchaseApprove: 'cf_erp_purchase_approve', // approve / reject purchase requests (init.sql §39); quotes and POs use cf_erp_purchase (2026-10-19)
   plateChangeApprove: 'cf_erp_plate_change_approve', // MD APPROVAL (label since §71): plate changes / substitutes (init.sql §62, §68); admin and MD.
   // §73: purchase orders, acceptances, rate changes, close short … are approved in the Management inbox, each by its own
   // tag — approvalService.APPROVAL_TYPES (cf_erp_approve_*).
@@ -29,7 +29,7 @@ export const PERM = {
   // §79: the roles of the stores chain (Need → MR → Stores → Purchase → Management → GRN). Each screen also takes the
   // older inventory tags, so nobody loses a screen they had.
   stores: 'cf_erp_stores',                  // Stores: the MR inbox (take from stock, raise the PR), New MR, To reorder, stock
-  purchase: 'cf_erp_purchase',              // Purchase: purchase requests (quotes, vendors), purchase orders
+  purchase: 'cf_erp_purchase',              // Purchase: PR quotes / vendors, raising and changing POs, close short, cancel, plate-change checklist (2026-10-19: these need it; inventory manage no longer opens them)
   maintenance: 'cf_erp_maintenance',        // Maintenance (§82): machines board, faults, maintenance orders and their MRs
 };
 

@@ -21,7 +21,8 @@
  *   the main path     raise → the MR screen (take from stock) → the PR (vendor columns, quotes) → raise PO →
  *                     MD approval → a PO line's date moved → the reads → the planner (snapshot, a refused save, a save)
  *                     (§71, 2026-10-18: the MR stock check, skip, the boards and release-excess are gone — 404)
- *   permissions       403 for every write without cf_erp_inventory_manage; approve needs cf_erp_approve_purchase_order
+ *   permissions       MR / GRN writes need cf_erp_inventory_manage (Stores); the PR's vendors, quotes, raising and changing a PO
+ *                     and close short need cf_erp_purchase — Stores is refused them (2026-10-19); approve needs cf_erp_approve_purchase_order
  *                     (§73: the Management inbox; requester ≠ approver); close short is asked, then approved; the planner its own grant
  *   tenant isolation  404 for another company's MR, PR, vendor column, PO, order and line
  *   errors            every problem at once, naming order, item and purchase order
@@ -139,9 +140,12 @@ const mint = (companyId, userId, perms, role = 'operator') => signToken({ id: us
 const SEE = ['cf_erp_inventory_view', 'cf_erp_orders_view', 'cf_erp_production_view'];
 const T_MANAGER = mint(COMPANY, userA?.id, [...SEE, 'cf_erp_inventory_manage', 'cf_erp_production_manage']);
 const T_VIEWER = mint(COMPANY, userA?.id, SEE);
+// Purchase (2026-10-19): the PR's vendors and quotes, raising / changing / closing POs — cf_erp_purchase, not inventory manage.
+const T_BUYER = mint(COMPANY, userA?.id, [...SEE, 'cf_erp_purchase']);
+const T_BUYER_ONLY = mint(COMPANY, userA?.id, ['cf_erp_purchase']);
 const T_NONE = mint(COMPANY, userA?.id, ['cf_erp_orders_view']);
 const APPROVE_PO = ['cf_erp_approve_purchase_order', 'cf_erp_approve_po_close_short'];
-const T_B = mint(COMPANY_B, userB?.id ?? userA?.id, [...SEE, 'cf_erp_inventory_manage', 'cf_erp_production_manage', ...APPROVE_PO]);
+const T_B = mint(COMPANY_B, userB?.id ?? userA?.id, [...SEE, 'cf_erp_inventory_manage', 'cf_erp_purchase', 'cf_erp_production_manage', ...APPROVE_PO]);
 // Management (§73): sees purchasing and approves POs and closing them short — through the approvals inbox.
 const T_MD = mint(COMPANY, userMd?.id ?? userA?.id, [...SEE, ...APPROVE_PO]);
 const examples = {};
@@ -218,26 +222,32 @@ try {
   const plB = gl(r.json, fx.B).id;
   r = await call('POST', `/purchase-requests/${prqId}/vendors`, { token: T_VIEWER, body: { supplierId: fx.S1 } });
   ok('adding a vendor without the manage grant → 403', r.status === 403);
-  await call('POST', `/purchase-requests/${prqId}/vendors`, { body: { supplierId: fx.S1 } });
-  r = await call('POST', `/purchase-requests/${prqId}/vendors`, { body: { supplierId: fx.S2 }, as: 'addVendor' });
+  r = await call('POST', `/purchase-requests/${prqId}/vendors`, { body: { supplierId: fx.S1 } });
+  ok('Stores (inventory manage, no cf_erp_purchase) adding a vendor → 403 naming cf_erp_purchase', r.status === 403 && /cf_erp_purchase/.test(r.json?.message ?? ''), `${r.status} ${r.text.slice(0, 120)}`);
+  await call('POST', `/purchase-requests/${prqId}/vendors`, { token: T_BUYER, body: { supplierId: fx.S1 } });
+  r = await call('POST', `/purchase-requests/${prqId}/vendors`, { token: T_BUYER, body: { supplierId: fx.S2 }, as: 'addVendor' });
   ok('two vendor columns', r.status === 200 && r.json.vendors.length === 2, J(r.json?.vendors));
   const v1 = r.json.vendors.find((v) => v.supplier.id === fx.S1).id; const v2 = r.json.vendors.find((v) => v.supplier.id === fx.S2).id;
-  r = await call('PUT', `/purchase-request-vendors/${v1}/quotes`, { body: { quotes: [{ lineId: plB, rate: 100, deliveryDays: 9 }] }, as: 'quotes' });
-  ok('vendor 1 quotes B: ₹100, 9 days', r.status === 200 && r.json.vendors.find((v) => v.id === v1).quotes[plB].rate === 100, J(r.json?.vendors));
-  r = await call('PUT', `/purchase-request-vendors/${v2}/quotes`, { body: { quotes: [{ lineId: plB, rate: 110, deliveryDays: 23, remark: 'ex-works' }] } });
+  r = await call('PUT', `/purchase-request-vendors/${v1}/quotes`, { body: { quotes: [{ lineId: plB, rate: 99 }] } });
+  ok('Stores typing a quote → 403', r.status === 403);
+  r = await call('PUT', `/purchase-request-vendors/${v1}/quotes`, { token: T_BUYER_ONLY, body: { quotes: [{ lineId: plB, rate: 100, deliveryDays: 9 }] }, as: 'quotes' });
+  ok('vendor 1 quotes B: ₹100, 9 days — typed by a user holding ONLY cf_erp_purchase', r.status === 200 && r.json.vendors.find((v) => v.id === v1).quotes[plB].rate === 100, J(r.json?.vendors));
+  r = await call('PUT', `/purchase-request-vendors/${v2}/quotes`, { token: T_BUYER, body: { quotes: [{ lineId: plB, rate: 110, deliveryDays: 23, remark: 'ex-works' }] } });
   ok('vendor 2 quotes B: ₹110, 23 days, a remark', r.status === 200 && r.json.vendors.find((v) => v.id === v2).quotes[plB].remark === 'ex-works');
 
   /* ───────────── 4 ───────────── */
   section('4. Raise PO per vendor column, then MD approval');
   r = await call('POST', `/purchase-request-vendors/${v1}/purchase-orders`, { token: T_VIEWER, body: { lines: [{ lineId: plB, quantity: 3 }] } });
   ok('raising a PO without the manage grant → 403', r.status === 403);
-  r = await call('POST', `/purchase-request-vendors/${v1}/purchase-orders`, { body: { lines: [{ lineId: plB, quantity: 99 }, { lineId: gl((await call('GET', `/purchase-requests/${prqId}`)).json, fx.C).id, quantity: 1 }] }, as: 'raisePoRefused' });
+  r = await call('POST', `/purchase-request-vendors/${v1}/purchase-orders`, { body: { lines: [{ lineId: plB, quantity: 3 }] } });
+  ok('Stores raising a PO → 403', r.status === 403);
+  r = await call('POST', `/purchase-request-vendors/${v1}/purchase-orders`, { token: T_BUYER, body: { lines: [{ lineId: plB, quantity: 99 }, { lineId: gl((await call('GET', `/purchase-requests/${prqId}`)).json, fx.C).id, quantity: 1 }] }, as: 'raisePoRefused' });
   ok('every problem at once (too much, a line the vendor did not quote) → 422', r.status === 422 && r.json.problems.length === 2, J(r.json));
-  r = await call('POST', `/purchase-request-vendors/${v1}/purchase-orders`, { body: { lines: [{ lineId: plB, quantity: 3 }] }, as: 'raisePo' });
+  r = await call('POST', `/purchase-request-vendors/${v1}/purchase-orders`, { token: T_BUYER, body: { lines: [{ lineId: plB, quantity: 3 }] }, as: 'raisePo' });
   ok('vendor 1: a PO for 3 of B at ₹100, due today + 9 days, PENDING MD APPROVAL', r.status === 200 && r.json.purchaseOrder.stage === 'pending_approval' && r.json.purchaseOrder.lines[0].quantity === 3
     && r.json.purchaseOrder.lines[0].unitPrice === 100 && String(r.json.purchaseOrder.lines[0].expectedDate).slice(0, 10) === D(9), J(r.json?.purchaseOrder));
   const po1 = r.json.purchaseOrder.id;
-  r = await call('POST', `/purchase-request-vendors/${v2}/purchase-orders`, { body: { lines: [{ lineId: plB, quantity: 1 }] } });
+  r = await call('POST', `/purchase-request-vendors/${v2}/purchase-orders`, { token: T_BUYER, body: { lines: [{ lineId: plB, quantity: 1 }] } });
   const po2 = r.json.purchaseOrder.id;
   const poLine2 = r.json.purchaseOrder.lines[0].id;
   ok('vendor 2: the last 1 of B → the PR line is fully ordered', r.status === 200 && gl(r.json.purchaseRequest, fx.B).poRaised === 4 && gl(r.json.purchaseRequest, fx.B).open === 0, J(r.json?.purchaseRequest?.lines));
@@ -250,7 +260,11 @@ try {
   r = await call('POST', `/purchase-orders/${po2}/approve`, { token: T_MD, body: {} });
   r = await call('GET', `/requisitions/${prId}`, { token: T_VIEWER });
   ok('…the MR line B is covered, last delivery on the later PO', byItem(r.json, fx.B).status === 'covered' && byItem(r.json, fx.B).cover.lastDate === D(23), J(byItem(r.json, fx.B)?.cover));
-  r = await call('PUT', `/purchase-lines/${poLine2}`, { body: { expectedDate: D(30) }, as: 'purchaseLineDate' });
+  r = await call('PUT', `/purchase-lines/${poLine2}`, { body: { expectedDate: D(30) } });
+  ok('Stores moving a line date on a supplier PO → 403 naming cf_erp_purchase', r.status === 403 && /cf_erp_purchase/.test(r.json?.message ?? ''), `${r.status} ${r.text.slice(0, 160)}`);
+  r = await call('GET', `/purchase-orders/${po2}`, { token: T_BUYER_ONLY });
+  ok('a user holding ONLY cf_erp_purchase reads the PO → 200', r.status === 200 && r.json.id === po2, `${r.status}`);
+  r = await call('PUT', `/purchase-lines/${poLine2}`, { token: T_BUYER, body: { expectedDate: D(30) }, as: 'purchaseLineDate' });
   ok('PUT a PO line\'s date (the existing route) → 200', r.status === 200 && r.json.lines[0].orders[0].prLineId === lineB, J(r.json?.lines?.[0]?.orders));
 
   /* ───────────── 5 ───────────── */
@@ -305,7 +319,7 @@ try {
   ok('planning without cf_erp_production_manage → 403', r.status === 403);
   r = await call('PUT', '/planner/entries', { body: { entries: [{ unitKey: fx.O1.line.unitKey, shipDate: PL.periodFloor(D(30)), pinned: true }] }, as: 'plannerSave' });
   ok('in its week → 200', r.status === 200 && r.json.entries[fx.O1.line.unitKey].shipDate === PL.periodFloor(D(30)), J(r.json));
-  r = await call('PUT', `/purchase-lines/${poLine2}`, { body: { expectedDate: D(45) }, as: 'purchaseLineDateMoved' });
+  r = await call('PUT', `/purchase-lines/${poLine2}`, { token: T_BUYER, body: { expectedDate: D(45) }, as: 'purchaseLineDateMoved' });
   ok('the PUT itself answers with the planned unit it made late (no planner read needed)', r.status === 200 && r.json.plannedUnits.late === 1 && r.json.plannedUnits.units[0].unitKey === fx.O1.line.unitKey
     && r.json.plannedUnits.units[0].wasDate === D(30) && r.json.plannedUnits.units[0].readyDate === D(45) && r.json.plannedUnits.units[0].order.id === fx.O1.id, J(r.json?.plannedUnits));
   if (examples.purchaseLineDateMoved) examples.purchaseLineDateMoved.response = { '…': 'the purchase order, as before', plannedUnits: r.json.plannedUnits };
@@ -345,7 +359,9 @@ try {
   section('8. Close short');
   r = await call('POST', `/purchase-orders/${po1}/close`, { token: T_VIEWER, body: { reason: 'mill short' } });
   ok('closing without the manage grant → 403', r.status === 403);
-  r = await call('POST', `/purchase-orders/${po1}/close`, { body: { reason: 'mill short' }, as: 'closeShort' });
+  r = await call('POST', `/purchase-orders/${po1}/close`, { body: { reason: 'mill short' } });
+  ok('Stores asking to close a supplier PO short → 403', r.status === 403);
+  r = await call('POST', `/purchase-orders/${po1}/close`, { token: T_BUYER, body: { reason: 'mill short' }, as: 'closeShort' });
   ok('asking to close short → 200: nothing changes yet, it waits for Management (§73)', r.status === 200 && r.json.stage !== 'closed_short' && r.json.pendingApprovals.some((a) => a.type === 'po_close_short'), J(r.json?.pendingApprovals));
   r = await call('GET', '/approvals?type=po_close_short', { token: T_MD });
   const ask = r.json.rows.find((a) => a.subject.id === po1);

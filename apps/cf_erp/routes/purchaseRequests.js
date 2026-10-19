@@ -18,12 +18,12 @@
  *   POST   /purchase-request-vendors/:id/purchase-orders { lines: [{ lineId, quantity }], addToPoId?, notes? }
  *                                                              → { purchaseOrder (pending Management approval), purchaseRequest }
  * Reading needs inventory view, Stores or Purchase; saving an MR needs inventory manage or Stores (§79: MRs go to STORES);
- * the PR routes need inventory manage or Purchase.
+ * the PR routes (vendors, quotes, raise PO) need cf_erp_purchase (2026-10-19; inventory manage opened them before).
  * The MD's approval and the close are on routes/purchase.js (POST /purchase-orders/:id/approve | /close).
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guardAny, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
   listMrs, mrScreen, saveMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
 } from '../services/purchaseRequestService.js';
@@ -31,10 +31,11 @@ import {
 const router = Router();
 const id = (req) => intParam(req.params.id);
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
-// §79: MRs are Stores' (cf_erp_stores), PRs are Purchase's (cf_erp_purchase); the inventory tags still open both.
+// §79: MRs are Stores' (cf_erp_stores, or inventory manage). The PR's vendors, quotes and raising its PO are PURCHASE's
+// alone (user, 2026-10-19: Stores raises the PR, Purchase buys) — inventory manage no longer opens them.
 const view = guardAny(PERM.inventoryView, PERM.stores, PERM.purchase);
 const mrManage = guardAny(PERM.inventory, PERM.stores);
-const manage = guardAny(PERM.inventory, PERM.purchase);
+const manage = guard(PERM.purchase);
 const body = (req) => req.body ?? {};
 const company = (req) => ctx(req).companyId;
 

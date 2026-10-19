@@ -12,7 +12,7 @@
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { loadMaster, LOCKED_ORDER_STATUSES, revisedOrderMessage, latestRevisionSql } from './records.js';
-import { requireArea, shapeArea } from './stockingAreaService.js';
+import { requireArea, shapeArea, receivingRefusal } from './stockingAreaService.js';
 import { requireBatch, checkBatchValues, createBatch, ownerOf } from './batchService.js';
 import { generate } from '../modules/codegen/index.js';
 import { wantsPage, pageArgs, orderBy, pageOf, countsBy } from '../lib/listing.js';
@@ -280,7 +280,10 @@ async function planLine(db, c, type, l, n, header, getArea, problems, { fromProd
   const pick = (k) => (blank(l[k]) ? header[k] : l[k]);
   if (type === 'receipt') {
     const to = await getArea(pick('toAreaId'), P, 'goes into', { inbound: true });
-    if (to) plan.legs.push({ area: to, sign: 1 });
+    // Goods from outside land in a store or quarantine (stockingAreaService.RECEIVING_PURPOSES); production's own work does not.
+    const refused = to && !fromProduction ? receivingRefusal(to) : null;
+    if (refused) P(refused);
+    else if (to) plan.legs.push({ area: to, sign: 1 });
   } else if (type === 'issue' || type === 'scrap' || type === 'return') {
     const from = await getArea(pick('fromAreaId'), P, 'comes from', { inbound: false });
     if (from && type === 'issue' && from.purpose === 'quarantine') P(`${from.code} holds stock in quarantine — move it to storage before issuing it.`);

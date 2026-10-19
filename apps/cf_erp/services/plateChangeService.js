@@ -949,7 +949,7 @@ export async function withdrawChange(db, c, id, input = {}) {
  * request is DONE (applied); unticking one takes it back to approved.
  */
 export async function tickChecklist(db, c, id, input = {}) {
-  if (!c.canTick) throw forbidden('Ticking the buyer checklist needs the stock and buying permission (cf_erp_inventory_manage).');
+  if (!c.canTick) throw forbidden('Ticking the buyer checklist needs the Purchase permission (cf_erp_purchase).');
   const r = await requireRequest(db, c.companyId, id, { lock: true });
   if (!['approved', 'applied'].includes(r.status)) throw invalid('NOT_APPROVED', `${r.code} is ${STATUS_LABEL[r.status]?.toLowerCase() ?? r.status} — only an approved change has a checklist.`);
   const list = parseJson(r.checklist_json) ?? { items: [], open: 0 };

@@ -8,6 +8,19 @@ import { conflict, notFound, assertNoProblems } from '../lib/errors.js';
 import { loadMachine, requireMachine } from './records.js';
 
 export const PURPOSES = ['storage', 'wip', 'quarantine', 'dispatch', 'scrap'];   // scrap: §67
+
+/**
+ * WHERE GOODS FROM OUTSIDE MAY BE RECEIVED (2026-10-19): a store, or quarantine to be inspected. Production takes plates
+ * only from storage / WIP, so a receipt into the dispatch yard, a WIP bay or a scrap bay could never be used (plates were
+ * received into the dispatch yard on the walkthrough). One rule for every receipt that brings goods IN — the GRN
+ * (purchaseService.receiveLine), Stock / Movements › Receive and the customer's material (stockService.postMovement).
+ * Production's own finished work (postMovement's fromProduction) and transfers between areas are not receipts from outside.
+ */
+export const RECEIVING_PURPOSES = ['storage', 'quarantine'];
+/** The sentence refusing a receipt into this area, or null when it may receive. */
+export const receivingRefusal = (a) => (a && !RECEIVING_PURPOSES.includes(a.purpose)
+  ? `${a.code} is a ${a.purpose} area — goods coming in go into a storage area (or quarantine for inspection); move them on with a transfer.`
+  : null);
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const blank = (v) => v == null || String(v).trim() === '';
 

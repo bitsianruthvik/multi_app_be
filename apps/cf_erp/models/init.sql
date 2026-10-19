@@ -8065,3 +8065,62 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
              AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME IN ('nest_grade_rule', 'nest_custom_plates')) = 2,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §92  PURCHASE PERMISSIONS — quotes and purchase orders need cf_erp_purchase (2026-10-19)
+-- The same text as TM/s92_purchase_perms.sql. Grants only, no schema. Guarded and idempotent:
+-- safe to re-run (every INSERT is NOT EXISTS).
+--
+-- From 2026-10-19 the backend asks cf_erp_purchase (not cf_erp_inventory_manage) for: a PR's vendors, quotes and raising
+-- its PO; making / changing a PO and its lines, sending it for approval, asking to close it short, cancelling it; the
+-- plate-change buyer checklist. Stores (inventory manage / cf_erp_stores) keeps MRs, the PR it raises, GRNs, and on the
+-- customer's own ₹0 PO its dates, close and cancel.
+--
+-- What this grants (scoped to each company's cf_erp app, never global):
+--   1. the feature + capability cf_erp_purchase (made by §79 already; made here only if missing);
+--   2. cf_erp_purchase to every company's role named Purchase / Purchaser / Buyer / Procurement (any case), if such a
+--      role exists;
+--   3. on Placebo (company 30005), again to "tester" and "MD" — §79 granted them; repeated in case §79's grant is missing.
+-- Then it LISTS (does not change) every role that holds cf_erp_inventory_manage but not cf_erp_purchase: those roles
+-- lose PR quotes and PO editing. Grant them cf_erp_purchase in Admin › Roles if they do buy. Users log in again to see a
+-- new grant (the permissions are in the token).
+-- ============================================================================
+
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: Purchase (purchase requests, quotes, POs)', 'cf_erp_purchase', 'frontend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_purchase' AND f.deleted_at IS NULL);
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag = 'cf_erp_purchase' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = 'cf_erp_purchase' AND fc.deleted_at IS NULL)
+ LIMIT 1;
+
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_purchase' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND r.id IS NOT NULL AND fc.capability_id IS NOT NULL
+   AND (LOWER(TRIM(r.name)) IN ('purchase', 'purchaser', 'buyer', 'procurement')
+        OR (a.company_id = 30005 AND LOWER(TRIM(r.name)) IN ('tester', 'md')))
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+-- Report: roles that hold inventory manage but not Purchase (they lose quotes and PO editing). Read only.
+SELECT r.company_id, r.id AS role_id, r.name AS role_name, 'has cf_erp_inventory_manage, not cf_erp_purchase' AS note
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN role_capability rc ON rc.role_id = r.id AND rc.app_id = a.id AND rc.deleted_at IS NULL
+  JOIN features_capability fc ON fc.capability_id = rc.capability_id AND fc.name = 'cf_erp_inventory_manage' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability y
+       JOIN features_capability fy ON fy.capability_id = y.capability_id AND fy.name = 'cf_erp_purchase' AND fy.deleted_at IS NULL
+      WHERE y.role_id = r.id AND y.app_id = a.id AND y.deleted_at IS NULL)
+ ORDER BY r.company_id, r.name;
+
+SELECT IF((SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL AND name = 'cf_erp_purchase') >= 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

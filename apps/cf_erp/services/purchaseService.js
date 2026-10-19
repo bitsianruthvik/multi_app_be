@@ -51,6 +51,7 @@ import { countsBy, likeOf, orderBy, pageArgs, pageOf, wantsPage } from '../lib/l
 import { generate } from '../modules/codegen/index.js';
 import { availability, plannedLines, plannedMaterialOfLines } from './releaseService.js';
 import { postMovement } from './stockService.js';
+import { RECEIVING_PURPOSES } from './stockingAreaService.js';
 import { checkSubstitute, recordSubstitute } from './customerMaterialService.js';
 import {
   CURRENCY, readPrice, readCurrency, round2, round4, num, lastPricesPaid, listPricesOf, measuresOf, perUnitPrice,
@@ -1305,7 +1306,7 @@ export async function receiveLine(db, c, lineId, input = {}) {
     // A purchase lands in a STORE (or quarantine, to be inspected): production takes plates only from storage / WIP,
     // so goods booked into the dispatch yard or a scrap bay could never be used (SO260014, 2026-10-18).
     const [[area]] = await db.query('SELECT code, purpose FROM cf_stocking_areas WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(input.stockingAreaId)]);
-    if (area && !['storage', 'quarantine'].includes(area.purpose)) problems.push(`${area.code} is a ${area.purpose} area — goods from a purchase go into a store (or quarantine for inspection).`);
+    if (area && !RECEIVING_PURPOSES.includes(area.purpose)) problems.push(`${area.code} is a ${area.purpose} area — goods from a purchase go into a store (or quarantine for inspection).`);
   }
   // §68: a DIFFERENT item than the line — only on a customer's PO, with a reason, as a plate change for the MD.
   const substitute = blank(input.substituteItemId) ? null : await checkSubstitute(db, c.companyId, l, input, problems);

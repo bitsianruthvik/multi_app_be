@@ -4,13 +4,14 @@
  *
  *   GET  /orders/:orderId/lines/:lineId/nesting/plate-changes   the line's gate (is a PO covering it? is it held?)
  *                                                                and its requests, newest first      orders view
- *   GET  /plate-changes?status=pending|open|done|all            across orders (the Buying area)     approve OR buying manage
- *   GET  /plate-changes/:id                                     one request, with its events        orders view OR approve OR buying manage
+ *   GET  /plate-changes?status=pending|open|done|all            across orders (the Buying area)     approve OR Purchase OR inventory manage
+ *   GET  /plate-changes/:id                                     one request, with its events        orders view OR approve OR Purchase OR inventory manage
  *   POST /plate-changes/:id/approve   { note? }                 save it, sync the requisition, write the buyer checklist
  *                                                                                                      approve (not one's own unless admin)
  *   POST /plate-changes/:id/reject    { note }                  the note is required                 approve
  *   POST /plate-changes/:id/withdraw  { note? }                 the person who asked (or an approver / admin)   orders manage OR approve
- *   POST /plate-changes/:id/checklist { key, done }             the buyer ticks one purchase-order action        buying manage
+ *   POST /plate-changes/:id/checklist { key, done }             the buyer ticks one purchase-order action        cf_erp_purchase (2026-10-19: the
+ *                                                                POs are Purchase's; inventory manage ticked it before)
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
@@ -31,7 +32,7 @@ export const viewerOf = (req) => ({
   ...ctx(req),
   userName: req.user?.name ?? req.user?.email ?? null,
   canApprove: isPermitted(req.user, PERM.plateChangeApprove),
-  canTick: isPermitted(req.user, PERM.inventory),
+  canTick: isPermitted(req.user, PERM.purchase),
   canManage: isPermitted(req.user, PERM.orders),
   isAdmin: String(req.user?.role ?? '').toLowerCase() === 'admin',
 });
@@ -44,10 +45,10 @@ router.get('/orders/:orderId/lines/:lineId/nesting/plate-changes', guard(PERM.or
     return lineChanges(pool, v, lineId);
   }));
 
-router.get('/plate-changes', guardAny(PERM.plateChangeApprove, PERM.inventory),
+router.get('/plate-changes', guardAny(PERM.plateChangeApprove, PERM.purchase, PERM.inventory),
   handle((req) => listChanges(pool, viewerOf(req), req.query ?? {})));
 
-router.get('/plate-changes/:id', guardAny(PERM.ordersView, PERM.plateChangeApprove, PERM.inventory),
+router.get('/plate-changes/:id', guardAny(PERM.ordersView, PERM.plateChangeApprove, PERM.purchase, PERM.inventory),
   handle((req) => getChange(pool, viewerOf(req), id(req))));
 
 router.post('/plate-changes/:id/approve', guard(PERM.plateChangeApprove),
@@ -69,7 +70,7 @@ router.post('/plate-changes/:id/reject', guard(PERM.plateChangeApprove),
 router.post('/plate-changes/:id/withdraw', guardAny(PERM.orders, PERM.plateChangeApprove),
   handle((req) => withTransaction((db) => withdrawChange(db, viewerOf(req), id(req), req.body ?? {}))));
 
-router.post('/plate-changes/:id/checklist', guard(PERM.inventory),
+router.post('/plate-changes/:id/checklist', guard(PERM.purchase),
   handle((req) => withTransaction((db) => tickChecklist(db, viewerOf(req), id(req), req.body ?? {}))));
 
 export default router;
