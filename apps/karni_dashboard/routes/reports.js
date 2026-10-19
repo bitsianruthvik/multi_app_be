@@ -4,6 +4,7 @@ import { protect } from '../../../core/middleware/authmiddleware.js';
 import * as reports from '../services/reportService.js';
 import { insights, act, history } from '../services/insightService.js';
 import * as alerts from '../services/alertService.js';
+import * as queries from '../services/queryService.js';
 
 /**
  * The screens' side: a platform login with access to this app (protect checks
@@ -56,7 +57,15 @@ router.get('/purchase-orders', protect, wrap((req) => reports.purchaseOrders(cid
 router.get('/production', protect, wrap((req) => reports.production(cid(req), req.query)));
 router.get('/inventory', protect, wrap((req) => reports.inventory(cid(req), req.query)));
 router.get('/inventory/item/:itemCode', protect, wrap((req) => reports.inventoryItem(cid(req), req.params.itemCode)));
-router.get('/saved-reports', protect, wrap((req) => reports.savedReports(cid(req))));
+router.get('/saved-reports', protect, wrap(async (req) => {
+  const d = await reports.savedReports(cid(req));
+  return { ...d, runner: await queries.runnerState(cid(req)), reports: d.reports.map((x) => ({ ...x, runnable: queries.runnable(x.sql).ok })) };
+}));
+/** Run a saved SAP query: queued here, run by the connector on Karni's server (read-only database user). */
+const sendErr = (res, err) => res.status(err.status || 500).json({ error: err.message });
+router.get('/saved-reports/:id', protect, (req, res) => queries.reportDetail(cid(req), req.params.id).then((d) => res.json(d), (e) => sendErr(res, e)));
+router.post('/saved-reports/:id/run', protect, (req, res) => queries.queueRun(cid(req), req.params.id, req.body?.params, req.user).then((d) => res.status(201).json(d), (e) => sendErr(res, e)));
+router.get('/query-runs/:runId', protect, (req, res) => queries.getRun(cid(req), Number(req.params.runId)).then((d) => res.json(d), (e) => sendErr(res, e)));
 
 /** Approve or revoke a connector — the company's admins only. */
 for (const [action, status] of [['approve', 'approved'], ['revoke', 'revoked']]) {

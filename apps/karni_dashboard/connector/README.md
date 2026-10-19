@@ -38,6 +38,28 @@ usual choice is a Windows Task Scheduler task for this user, every 10 minutes, r
 runs only while the user is signed in (a disconnected Remote Desktop session counts as signed in;
 signing out stops it).
 
+## Saved reports (running SAP Query Manager queries)
+
+The Service Layer cannot run a saved query without saving it into SAP first, so `run.ps1` runs
+them on the HANA database itself, after each sync until 9 minutes past its start (checking every
+10 seconds). Three locks keep it read-only: a HANA user with SELECT rights only (Karni's SAP partner
+creates it), a `SET TRANSACTION READ ONLY` transaction that is always rolled back, and
+`Assert-SelectOnly` (one SELECT, or a SQLScript of DECLARE / := around SELECTs run as
+`DO BEGIN … END`; CALL / EXEC and any write keyword are refused — the backend refuses the same
+before it queues a run). Reports that call a stored procedure are not run.
+
+Setup, once the partner has created the user (needs the HANA ODBC driver `HDBODBC`, part of the SAP
+client; check with `Get-OdbcDriver`):
+
+```powershell
+$d = "$env:USERPROFILE\karni_connector"
+curl.exe -s -o "$d\setup-db.ps1" https://multi-app-be-svpc.onrender.com/api/karni/karni_dashboard/connector/files/setup-db.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$d\setup-db.ps1" -Server <hana-host>:<sql-port> -User <read-only user>
+```
+
+It updates `run.ps1`, stores the password in `db.pw` (DPAPI) and tests a read-only connection.
+Without it, `run.ps1` only tells the dashboard "not set up" and the sync works as before.
+
 ## Notes
 
 - Windows PowerShell 5.1 reads a `.ps1` without a BOM as ANSI: keep these files plain ASCII.

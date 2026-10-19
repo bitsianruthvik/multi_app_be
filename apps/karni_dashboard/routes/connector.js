@@ -6,6 +6,7 @@ import { pool } from '../../../db.js';
 import { DATASETS, byKey, pathFor, keyOf, dateOf, flatten } from '../lib/datasets.js';
 import { invalidate } from '../services/reportService.js';
 import { afterSync } from '../services/alertService.js';
+import { claimJobs, saveResult } from '../services/queryService.js';
 import { logger } from '../../../core/utils/logger.js';
 
 /**
@@ -36,7 +37,7 @@ function needCompany(req, res) {
 /** The connector's scripts, for setup on the customer's machine. No secrets in them. */
 const CONNECTOR_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'connector');
 router.get('/connector/files/:name', (req, res) => {
-  if (!['run.ps1', 'setup.ps1'].includes(req.params.name)) return res.status(404).end();
+  if (!['run.ps1', 'setup.ps1', 'setup-db.ps1'].includes(req.params.name)) return res.status(404).end();
   res.type('text/plain').sendFile(path.join(CONNECTOR_DIR, req.params.name));
 });
 
@@ -150,6 +151,15 @@ router.post('/connector/report', connectorAuth, async (req, res) => {
   res.json({ ok: true });
   // After the reply: bring the insight states up to date and send instant alerts.
   afterSync(cid).catch((err) => logger.error({ err, cid }, 'karni_dashboard: afterSync failed'));
+});
+
+/** Saved SAP queries waiting to run. The connector says whether it has its read-only database user. */
+router.get('/connector/query-jobs', connectorAuth, async (req, res) => {
+  res.json({ jobs: await claimJobs(req.company.id, String(req.query.runner || ''), req.query.message) });
+});
+
+router.post('/connector/query-result', connectorAuth, async (req, res) => {
+  res.json(await saveResult(req.company.id, req.body));
 });
 
 export default router;

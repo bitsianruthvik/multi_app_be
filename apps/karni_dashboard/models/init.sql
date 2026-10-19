@@ -126,4 +126,28 @@ CREATE TABLE IF NOT EXISTS kd_settings (
   PRIMARY KEY (company_id, k)
 );
 
+-- §9 Saved SAP queries run on demand: the connector runs the SELECT on Karni's
+-- server with a read-only database user and sends the result back.
+CREATE TABLE IF NOT EXISTS kd_query_runs (
+  id                BIGINT AUTO_INCREMENT PRIMARY KEY,
+  company_id        BIGINT       NOT NULL,
+  query_id          VARCHAR(40)  NOT NULL,
+  query_name        VARCHAR(250) NOT NULL,
+  params            JSON         NULL,
+  sql_text          MEDIUMTEXT   NOT NULL,
+  kind              VARCHAR(10)  NOT NULL DEFAULT 'select',
+  status            VARCHAR(10)  NOT NULL DEFAULT 'queued',
+  requested_by      BIGINT       NULL,
+  requested_by_name VARCHAR(120) NULL,
+  requested_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at        DATETIME     NULL,
+  finished_at       DATETIME     NULL,
+  row_count         INT          NULL,
+  truncated         TINYINT(1)   NOT NULL DEFAULT 0,
+  result            LONGTEXT     NULL,
+  error             TEXT         NULL,
+  KEY ix_kd_query_runs_status (company_id, status),
+  KEY ix_kd_query_runs_query (company_id, query_id, id)
+);
+
 SELECT 'SCHEMA-OK' AS karni_dashboard;
