@@ -20,6 +20,11 @@
  *
  * IDEMPOTENT: a standard whose current version has nothing the drawing settles is skipped, so a second run does
  * nothing (it reads the new version and finds only what needs a person). Prints "local" or "PRODUCTION" first.
+ * Two things broke that on production 2026-10-19 (fixed): the copy dropped the rows' section picks (treeCopyService
+ * did not carry cut_stock_id), and one fill pass left values only the filled flows ask for — so a second run copied
+ * again and lost the sections. Now the new version is filled until the drawing settles nothing more on it
+ * (standardGapFixService.fillUntilSettled), and a copy that would hold nothing new is rolled back.
+ * Repair of the versions those runs wrote: rdso-standard-repair.mjs.
  */
 import fs from 'fs';
 import path from 'path';
@@ -61,7 +66,7 @@ const ro = {
 const only = arg('standards') ? arg('standards').split(',').map((s) => s.trim()).filter(Boolean) : null;
 const bomDir = path.join(BE, '..', 'drawing_bom', 'out');
 const res = await checkStandards(COMMIT ? pool : ro, COMPANY, { only, bomDir });
-const out = await fixStandards({ pool, companyId: COMPANY, userId: arg('user') ? Number(arg('user')) : null, standards: res.standards, commit: COMMIT, sectionClass: SECTION_CLASS, log: console.log });
+const out = await fixStandards({ pool, companyId: COMPANY, userId: arg('user') ? Number(arg('user')) : null, standards: res.standards, commit: COMMIT, sectionClass: SECTION_CLASS, bomDir, log: console.log });
 console.log(`\n${out.fixed} standard(s) ${COMMIT ? 'given a new version' : 'would get a new version'}; ${out.skipped} with nothing the drawing settles.${COMMIT ? '' : ' Nothing written — --commit writes.'}`);
 await pool.end();
 process.exit(out.failed ? 1 : 0);

@@ -17,6 +17,10 @@
  *   5  values and flows on a version's rows: only what is empty is filled, a typed value stays; twice = once
  *   6  dry run cannot write (the read-only wrapper refuses a write)
  *   7  the importer fills what the drawing settles on a fresh import (a TEST- number), and says it
+ *   8  production 2026-10-19: a flow the fix gives asks a value the drawing settles — filled in the SAME run (passes
+ *      until settled); a second --commit run writes nothing, a third dry run plans nothing
+ *   9  a copied version carries every row's section bar, flow, values and own rules (treeCopyService)
+ *  10  a copy that would hold nothing new (everything counted was refused / already there) makes no version
  */
 import fs from 'fs';
 import path from 'path';
@@ -35,7 +39,7 @@ const RUN = Date.now().toString(36).toUpperCase();
 const BOM_DIR = path.join(BE, '..', 'drawing_bom', 'out');
 
 let pass = 0, failed = 0;
-const ok = (label, cond) => { if (cond) pass += 1; else { failed += 1; console.error('FAIL', label); } };
+const ok = (label, cond) => { if (cond) { pass += 1; if (process.env.VERBOSE) console.log('ok', label); } else { failed += 1; console.error('FAIL', label); } };
 
 // 1 --------------------------------------------------------------------------------------------------------------
 {
@@ -168,6 +172,101 @@ try {
   ok(`7 the import says what it filled (${gf?.error ?? `${gf?.sections} sections`})`, gf && !gf.error && gf.sections === 3);
   const fresh = await G.checkStandards(conn, COMPANY, { only: [`TEST-GAPS-${RUN}`], bomDir: BOM_DIR });
   ok('7 … and the imported version has only what needs a person left', fresh.standards[0] && F.fillableCount(fresh.standards[0], { sectionClass: 'BR' }) === 0 && fresh.standards[0].gaps.sections.length === 1);
+
+  // 8 ------------------------------------------------------------------------------------------------------------
+  // Production 2026-10-19: run 1 gave the x-frame a flow that asks a value the drawing settles; that value was left for
+  // run 2, which copied the version again — and the copy dropped the 6 section bars, so run 3 planned them again.
+  // Here: a flow made to ask SPAN_LENGTH (the drawing's span) is given to the two bracing assemblies of the local
+  // RDSO/B-11751R3; fix --commit, again --commit, then a dry run.
+  const STD2 = 'RDSO/B-11751R3';
+  const [[fl8]] = await conn.query(
+    `SELECT st.flow_id FROM cf_operation_flow_steps st
+       JOIN cf_operation_machine_rules r ON r.company_id = st.company_id AND r.operation_id = st.operation_id AND r.deleted_at IS NULL AND r.eligible = 1
+       JOIN cf_operation_flows f ON f.id = st.flow_id AND f.status = 'active' AND f.deleted_at IS NULL AND f.owner_order_line_id IS NULL
+      WHERE st.company_id = ? AND st.deleted_at IS NULL ORDER BY st.flow_id DESC LIMIT 1`, [COMPANY]);
+  await conn.query(
+    `UPDATE cf_operation_machine_rules r JOIN cf_operation_flow_steps st ON st.operation_id = r.operation_id AND st.company_id = r.company_id AND st.deleted_at IS NULL
+        SET r.work_expression = 'item.SPAN_LENGTH * 0 + 3' WHERE r.company_id = ? AND st.flow_id = ? AND r.eligible = 1 AND r.deleted_at IS NULL`, [COMPANY, fl8.flow_id]);
+  const c8 = await G.checkStandards(conn, COMPANY, { only: [STD2], bomDir: BOM_DIR });
+  const s8 = c8.standards[0];
+  let given8 = 0;
+  for (const f of s8.gaps.flows) if (/^[^›]+ › (Bottom lateral bracing|Ixf intermediate x-frame)$/.test(f.path) && !f.derive) { f.derive = { flowId: Number(fl8.flow_id), code: 'TEST', how: 'test' }; given8 += 1; }
+  ok('8 the local RDSO/B-11751R3: 2 assemblies with no flow, 6 section parts with no section', given8 === 2 && s8.gaps.sections.length === 6);
+  const vCount = async () => Number((await conn.query('SELECT COUNT(*) AS n FROM cf_standard_drawing_versions WHERE standard_id = ? AND deleted_at IS NULL', [s8.standardId]))[0][0].n);
+  const v0 = await vCount();
+  const r1 = await F.fixStandards({ pool, conn, companyId: COMPANY, standards: c8.standards, commit: true, sectionClass: 'BR', bomDir: BOM_DIR, log: () => {} });
+  const w1 = r1.results[0];
+  ok(`8 run 1 writes one version, filled until settled (${w1?.filled?.passes} passes: ${w1?.filled?.values} values, ${w1?.filled?.sections} sections, ${w1?.filled?.flows} flows)`,
+    r1.fixed === 1 && w1.filled.passes >= 2 && w1.filled.sections === 6 && w1.filled.left === 0 && (await vCount()) === v0 + 1);
+  const c8b = await G.checkStandards(conn, COMPANY, { only: [STD2], bomDir: BOM_DIR });
+  ok('8 … the new version: nothing the drawing settles is left (the values its new flows ask included)', c8b.standards[0].versionId === w1.versionId && F.fillableCount(c8b.standards[0], { sectionClass: 'BR' }) === 0);
+  ok('8 … its section parts hold their bars', c8b.standards[0].gaps.sections.length === 0);
+  const r2 = await F.fixStandards({ pool, conn, companyId: COMPANY, standards: c8b.standards, commit: true, sectionClass: 'BR', bomDir: BOM_DIR, log: () => {} });
+  ok('8 run 2 (--commit) writes nothing: no new version', r2.fixed === 0 && r2.skipped === 1 && (await vCount()) === v0 + 1);
+  const c8c = await G.checkStandards(ro, COMPANY, { only: [STD2], bomDir: BOM_DIR });
+  const r3 = await F.fixStandards({ pool, companyId: COMPANY, standards: c8c.standards, commit: false, sectionClass: 'BR', bomDir: BOM_DIR, log: () => {} });
+  ok('8 run 3 (dry) plans nothing', r3.fixed === 0 && r3.skipped === 1);
+
+  // 9 ------------------------------------------------------------------------------------------------------------
+  // The copy carries every row's section, flow, values and own rules: a copy of the filled version, row by row.
+  const rowsOf = async (root) => {
+    const t = await (await imp('apps/cf_erp/services/bomService.js')).explode(conn, COMPANY, root, { withCut: true });
+    const list = []; const walk = (n, p) => { if (n.kind === 'temporary') list.push({ id: Number(n.id), path: p }); n.children.forEach((k, i) => walk(k, `${p}/${k.lineNo ?? i}:${k.role ?? ''}`)); }; walk(t.root, 'ROOT');
+    const ids = list.map((x) => x.id);
+    const [m] = await conn.query('SELECT id, cut_stock_id, default_flow_id FROM cf_master_records WHERE id IN (?)', [ids]);
+    const [v] = await conn.query("SELECT subject_id, specification_id, value_number, value_text, option_id, value_bool FROM cf_spec_values WHERE subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL ORDER BY subject_id, specification_id", [ids]);
+    const [a] = await conn.query("SELECT subject_id, specification_id, capture_at, is_required, value_rule, formula_id, origin FROM cf_spec_assignments WHERE subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL ORDER BY subject_id, specification_id, capture_at", [ids]);
+    const by = (rows, id) => JSON.stringify(rows.filter((r) => Number(r.subject_id) === id).map(({ subject_id: _s, ...r }) => r));
+    return list.map((x) => { const mm = m.find((r) => Number(r.id) === x.id); return `${x.path}|${mm.cut_stock_id}|${mm.default_flow_id}|${by(v, x.id)}|${by(a, x.id)}`; });
+  };
+  const [[v8]] = await conn.query('SELECT * FROM cf_standard_drawing_versions WHERE id = ?', [w1.versionId]);
+  const cp = await F.copyVersion(conn, { companyId: COMPANY, userId: null }, s8.standardId, w1.versionId, { note: 'test copy' });
+  const before9 = await rowsOf(Number(v8.root_item_id));
+  const after9 = await rowsOf(cp.rootId);
+  ok(`9 a copied version holds every row's section, flow, values and rules (${after9.length} rows, ${after9.filter((r) => r.split('|')[1] !== 'null').length} with a section)`,
+    before9.length > 30 && JSON.stringify(before9) === JSON.stringify(after9) && before9.filter((r) => r.split('|')[1] !== 'null').length === 6);
+
+  // 10 -----------------------------------------------------------------------------------------------------------
+  // A check that counts something the fill then cannot write (a flow for a row that has one meanwhile) makes no version.
+  const c10 = await G.checkStandards(conn, COMPANY, { only: [STD2], bomDir: BOM_DIR });
+  const withFlow = after9.length ? (await conn.query('SELECT id, default_flow_id FROM cf_master_records WHERE id = ?', [cp.rootId]))[0][0] : null;
+  const fake = { ...c10.standards[0], gaps: { ...c10.standards[0].gaps, values: [], sections: [], quantities: [], flows: [{ itemId: withFlow.id, path: 'root', derive: { flowId: Number(fl8.flow_id), code: 'TEST', how: 'test' } }] } };
+  const v10 = await vCount();
+  const r10 = await F.fixStandards({ pool, conn, companyId: COMPANY, standards: [fake], commit: true, sectionClass: 'BR', bomDir: BOM_DIR, log: () => {} });
+  ok('10 a copy that would hold nothing new is undone: no version', withFlow.default_flow_id != null && r10.fixed === 0 && r10.skipped === 1 && (await vCount()) === v10);
+
+  // 11 -----------------------------------------------------------------------------------------------------------
+  // The repair (rdso-standard-repair.mjs) of production's state: v2 filled, v3 a copy of it that LOST the bars (as the
+  // old copy did), current. → v4 = v3 + v2's bars, current; v1–v3 untouched; a second run writes nothing.
+  const R = await imp('apps/cf_erp/services/standardVersionRepairService.js');
+  const STD3 = 'RDSO/B-11754R3';
+  const c11 = await G.checkStandards(conn, COMPANY, { only: [STD3], bomDir: BOM_DIR });
+  const s11 = c11.standards[0];
+  const w11 = (await F.fixStandards({ pool, conn, companyId: COMPANY, standards: c11.standards, commit: true, sectionClass: 'BR', bomDir: BOM_DIR, log: () => {} })).results[0];
+  const v3 = await F.copyVersion(conn, { companyId: COMPANY, userId: null }, s11.standardId, w11.versionId, { note: `Gaps filled from the drawing (test) over v${w11.versionNo}; section bars BR: 0 values, 0 sections, 0 flows` });
+  const [lostNow] = await conn.query('UPDATE cf_master_records SET cut_stock_id = NULL WHERE company_id = ? AND id IN (?) AND cut_stock_id IS NOT NULL', [COMPANY, [...v3.idMap.values()]]);
+  const v11Count = async () => Number((await conn.query('SELECT COUNT(*) AS n FROM cf_standard_drawing_versions WHERE standard_id = ? AND deleted_at IS NULL', [s11.standardId]))[0][0].n);
+  const [[v1Row]] = await conn.query('SELECT root_item_id FROM cf_standard_drawing_versions WHERE id = ?', [s11.versionId]);
+  const [[v2Row]] = await conn.query('SELECT root_item_id FROM cf_standard_drawing_versions WHERE id = ?', [w11.versionId]);
+  const olds = async () => JSON.stringify([await rowsOf(Number(v1Row.root_item_id)), await rowsOf(Number(v2Row.root_item_id)), await rowsOf(v3.rootId)]);
+  const oldSig11 = await olds();
+  const broken = (await G.checkStandards(conn, COMPANY, { only: [STD3], bomDir: BOM_DIR })).standards[0];
+  ok(`11 the broken state: v3 current, its ${lostNow.affectedRows} bars gone, the fix would plan them again`, lostNow.affectedRows === 5 && broken.versionId === v3.versionId && F.fillableCount(broken, { sectionClass: 'BR' }) === 5);
+  const dry11 = await R.repairStandards({ read: ro, companyId: COMPANY, only: [STD3], sectionClass: 'BR', commit: false, bomDir: BOM_DIR, log: () => {} });
+  ok('11 the repair\'s dry run plans 5 bars restored and nothing else to fill', dry11.repaired === 1 && dry11.results[0].planned?.restore === 5 && dry11.results[0].planned?.fill === 0);
+  const n0 = await v11Count();
+  const rep = await R.repairStandards({ read: conn, conn, companyId: COMPANY, only: [STD3], sectionClass: 'BR', commit: true, bomDir: BOM_DIR, log: () => {} });
+  const r11 = rep.results[0];
+  const [[cur11]] = await conn.query('SELECT current_version_id FROM cf_standard_drawings WHERE id = ?', [s11.standardId]);
+  ok(`11 the repair writes v4 (${r11.error ?? `${r11.restored} restored`}) and makes it current`, rep.repaired === 1 && r11.restored === 5 && r11.versionNo === v3.versionNo + 1 && Number(cur11.current_version_id) === r11.versionId && (await v11Count()) === n0 + 1);
+  const bars2 = (await rowsOf(Number(v2Row.root_item_id))).map((r) => r.split('|')[1]);
+  const bars4 = (await rowsOf(r11.rootId)).map((r) => r.split('|')[1]);
+  ok('11 … v4 holds v2\'s bars, row for row', JSON.stringify(bars2) === JSON.stringify(bars4) && bars4.filter((b) => b !== 'null').length === 5);
+  ok('11 … v1, v2 and v3 are untouched', (await olds()) === oldSig11);
+  const again = await R.repairStandards({ read: conn, conn, companyId: COMPANY, only: [STD3], sectionClass: 'BR', commit: true, bomDir: BOM_DIR, log: () => {} });
+  ok('11 a second repair run writes nothing', again.repaired === 0 && again.ok === 1 && (await v11Count()) === n0 + 1);
+  const fixAfter = (await G.checkStandards(ro, COMPANY, { only: [STD3], bomDir: BOM_DIR })).standards[0];
+  ok('11 … and the fix plans nothing on it', F.fillableCount(fixAfter, { sectionClass: 'BR' }) === 0);
 } catch (e) {
   failed += 1;
   console.error('ERROR', e);

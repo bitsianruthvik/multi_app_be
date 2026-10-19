@@ -7,7 +7,8 @@
  *   revisionService    a revision: every line of an order copied whole into
  *                      the next revision of the order (init.sql §27)
  *
- * Both are the same deep copy — the rows, their details, their Custom BOMs and
+ * Both are the same deep copy — the rows (with their own flow and the section
+ * they are cut from), their details, their Custom BOMs and
  * lines, their specification values with the history row every value write
  * leaves, and the rules the rows carry themselves — so there is one of it,
  * here, and neither caller copies a record on its own.
@@ -73,7 +74,7 @@ export async function snapshotSubtrees(db, companyId, rootIds, copies) {
     if (!level.length) break;
     for (const part of chunk(level, ID_CHUNK)) {
       const [rows] = await db.query(
-        `SELECT m.id, m.code, m.name, m.short_name, m.description, m.classification_id, m.default_flow_id, m.status,
+        `SELECT m.id, m.code, m.name, m.short_name, m.description, m.classification_id, m.default_flow_id, m.cut_stock_id, m.status,
                 i.tracked_by, i.uom, i.source_definition_id, i.link_group,
                 b.id AS bom_id, b.status AS bom_status, b.source_bom_id, b.revision AS bom_revision, b.notes AS bom_notes
            FROM cf_master_records m
@@ -234,10 +235,13 @@ export async function writeCopies(db, c, snap, roots, { keepLine = () => true, c
   const token = markerToken();
   const marker = (srcId) => `~copy~${token}~${srcId}`;
   await insertRows(db, 'cf_master_records',
-    ['company_id', 'record_kind', 'code', 'name', 'short_name', 'description', 'classification_id', 'status', 'revision', 'default_flow_id', 'created_by'],
+    ['company_id', 'record_kind', 'code', 'name', 'short_name', 'description', 'classification_id', 'status', 'revision', 'default_flow_id', 'cut_stock_id', 'created_by'],
     srcIds.map((id) => {
       const s = snap.items.get(id);
-      return [companyId, 'item', marker(id), s.name, s.short_name, s.description, s.classification_id, 'draft', null, s.default_flow_id, c.userId];
+      // The section a part is cut from (its own pick: "Choose section", the standards' gap fix) goes with it. Until
+      // 2026-10-19 it did not, and every copy — a standard's next version, a line made from a standard, a revision,
+      // a paste — came out with its section parts back to "no section".
+      return [companyId, 'item', marker(id), s.name, s.short_name, s.description, s.classification_id, 'draft', null, s.default_flow_id, s.cut_stock_id ?? null, c.userId];
     }), rows);
   const [born] = await db.query(
     'SELECT id, code FROM cf_master_records WHERE company_id = ? AND code_active LIKE ? AND deleted_at IS NULL',

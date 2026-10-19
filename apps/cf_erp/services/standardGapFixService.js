@@ -19,10 +19,14 @@
  * Both run inside the caller's transaction. Round trips: copyVersion ~ a dozen + one per tree level; fill: a few +
  * one setValues per row with values (each ~8 reads; ~25 rows on an RDSO span).
  */
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { snapshotSubtrees, writeCopies, copyDrawingLinks } from './treeCopyService.js';
 import { invalid } from '../lib/errors.js';
 
 const COPY_CHUNK = 1000;
+/** TM/drawing_bom/out — the drawing sets the gaps are derived from (the scripts pass the same folder). */
+export const DEFAULT_BOM_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..', 'drawing_bom', 'out');
 const blank = (v) => v == null || String(v).trim() === '';
 
 /** A version's tree, copied as the next version of its standard (now the current one). → { versionId, versionNo, rootId, idMap } */
@@ -138,6 +142,48 @@ export async function fillVersionGaps(db, c, entry, idMap = null, { sectionClass
   return out;
 }
 
+/**
+ * Fill a version until the drawing settles nothing more on it. ONE pass is not enough: a pass can make new gaps the
+ * drawing settles — a row given a flow asks the values that flow reads (production 2026-10-19: the x-frame given
+ * BRACING asked SURFACE_AREA, which its parts' sizes give), and only a fresh look at the filled rows sees them. Left
+ * for the next run, that one value made it copy the version again — so a second --commit run wrote a version for
+ * every standard. Each pass re-reads the version's gaps (lib/standardGaps) on `db` (inside the caller's transaction)
+ * and fills its own rows; it stops when nothing is left to fill, when a pass wrote nothing (what is left was refused —
+ * said in `problems`), or after `maxPasses`. `first`: { entry, idMap } — pass 1 from a check already in hand.
+ * `version`: { id, standard_id, version_no, root_item_id, number }.
+ * → { flows, sections, values, passes, left (fillable gaps still there), skipped: [words], problems: [words] }
+ */
+export async function fillUntilSettled(db, c, version, { sectionClass = null, bom = null, bomDir = DEFAULT_BOM_DIR, first = null, maxPasses = 5 } = {}) {
+  const { versionGaps, gapReaders } = await import('../lib/standardGaps.js');
+  const out = { flows: 0, sections: 0, values: 0, passes: 0, left: 0, skipped: [], problems: [] };
+  const problems = new Set();
+  let readers = null;
+  for (let pass = 1; pass <= maxPasses + 1; pass += 1) {
+    let entry; let idMap = null;
+    if (pass === 1 && first) ({ entry, idMap } = first);
+    else {
+      readers ??= await gapReaders(db, c.companyId);
+      ({ versions: [entry] } = await versionGaps(db, c.companyId, [version], { bom, bomDir, ...readers }));
+    }
+    const n = entry ? fillableCount(entry, { sectionClass }) : 0;
+    out.left = n;
+    if (!n || pass > maxPasses) { if (entry) out.skipped = skippedOf(entry, { sectionClass }); break; }
+    const f = await fillVersionGaps(db, c, entry, idMap, { sectionClass });
+    out.passes = pass;
+    out.flows += f.flows; out.sections += f.sections; out.values += f.values;
+    for (const p of f.problems) problems.add(p);
+    out.skipped = f.skipped;
+    if (!(f.flows + f.sections + f.values)) break;                       // nothing more would come of another pass
+  }
+  out.problems = [...problems];
+  return out;
+}
+
+/** The words of what needs a person on a version (what fillVersionGaps lists as skipped), without filling anything. */
+function skippedOf(entry, { sectionClass = null } = {}) {
+  return planLines(entry, { sectionClass }).filter((l) => /^\s*\(person\)/.test(l)).map((l) => l.trim());
+}
+
 /** How much of a version's gaps the drawing settles (with the class given). */
 export function fillableCount(entry, { sectionClass = null } = {}) {
   const g = entry.gaps;
@@ -168,7 +214,7 @@ export function planLines(entry, { sectionClass = null } = {}) {
  * has something the drawing settles, a new version with it filled — one transaction per standard. Dry run: the plan.
  * → { fixed, skipped, failed, results: [{ number, versionId?, versionNo?, filled? }] }
  */
-export async function fixStandards({ pool, companyId, userId = null, standards, commit = false, sectionClass = null, log = () => {}, conn: given = null }) {
+export async function fixStandards({ pool, companyId, userId = null, standards, commit = false, sectionClass = null, bomDir = DEFAULT_BOM_DIR, log = () => {}, conn: given = null }) {
   const out = { fixed: 0, skipped: 0, failed: 0, results: [] };
   for (const s of standards) {
     if (!s.current) continue;
@@ -178,16 +224,29 @@ export async function fixStandards({ pool, companyId, userId = null, standards, 
     for (const l of planLines(s, { sectionClass })) log(l);
     if (!commit) { out.fixed += 1; out.results.push({ number: s.number, planned: n }); continue; }
     const conn = given ?? await pool.getConnection();
+    // A caller's connection (the test) is already in a transaction: this standard is undone to a savepoint instead.
+    const SP = 'std_gap_fix';
     try {
-      if (!given) await conn.beginTransaction();
+      if (!given) await conn.beginTransaction(); else await conn.query(`SAVEPOINT ${SP}`);
       const c = { companyId, userId };
       const note = `Gaps filled from the drawing (rdso-standard-fix ${new Date().toISOString().slice(0, 10)}) over v${s.versionNo}${sectionClass ? `; section bars ${sectionClass}` : ''}`;
       const v = await copyVersion(conn, c, s.standardId, s.versionId, { note });
-      const filled = await fillVersionGaps(conn, c, s, v.idMap, { sectionClass });
+      // Pass 1 from the check in hand (on the copy's rows), then the new version re-read until it is settled — so the
+      // next run finds nothing the drawing settles and writes nothing (strict idempotency).
+      const filled = await fillUntilSettled(conn, c, { id: v.versionId, standard_id: s.standardId, version_no: v.versionNo, root_item_id: v.rootId, number: s.number },
+        { sectionClass, bomDir, first: { entry: s, idMap: v.idMap } });
+      if (!(filled.values + filled.sections + filled.flows)) {
+        // Everything the check counted was refused (or was already there): a copy with nothing new is no version.
+        if (!given) await conn.rollback(); else await conn.query(`ROLLBACK TO SAVEPOINT ${SP}`);
+        log(`  nothing could be written — no version made${filled.problems.length ? `\n  refused:\n    ${filled.problems.join('\n    ')}` : ''}`);
+        out.skipped += 1;
+        out.results.push({ number: s.number, skipped: true, refused: filled.problems });
+        continue;
+      }
       await conn.query('UPDATE cf_standard_drawing_versions SET note = ? WHERE company_id = ? AND id = ?',
         [`${note}: ${filled.values} values, ${filled.sections} sections, ${filled.flows} flows${filled.problems.length ? `; ${filled.problems.length} refused` : ''}`.slice(0, 500), companyId, v.versionId]);
-      if (!given) await conn.commit();
-      log(`  WRITTEN: version ${v.versionNo} (#${v.versionId}) — ${filled.values} values, ${filled.sections} sections, ${filled.flows} flows${filled.problems.length ? `\n  refused:\n    ${filled.problems.join('\n    ')}` : ''}`);
+      if (!given) await conn.commit(); else await conn.query(`RELEASE SAVEPOINT ${SP}`);
+      log(`  WRITTEN: version ${v.versionNo} (#${v.versionId}) — ${filled.values} values, ${filled.sections} sections, ${filled.flows} flows${filled.passes > 1 ? ` (${filled.passes} passes)` : ''}${filled.left ? ` — ${filled.left} still fillable, refused` : ''}${filled.problems.length ? `\n  refused:\n    ${filled.problems.join('\n    ')}` : ''}`);
       out.fixed += 1;
       out.results.push({ number: s.number, versionId: v.versionId, versionNo: v.versionNo, rootId: v.rootId, filled });
     } catch (err) {
@@ -220,5 +279,6 @@ export async function fillImportedGaps(db, c, { standardId, bom = null, sectionC
   const readers = await gapReaders(db, c.companyId);
   const g = await versionGaps(db, c.companyId, [v], { bom, ...readers });
   const entry = g.versions[0];
-  return { ...(await fillVersionGaps(db, c, entry, null, { sectionClass })), before: entry.total };
+  // Until settled (fillUntilSettled): a flow given here asks values the drawing may settle too.
+  return { ...(await fillUntilSettled(db, c, v, { sectionClass, bom, first: { entry, idMap: null } })), before: entry.total };
 }
