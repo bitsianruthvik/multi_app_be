@@ -274,7 +274,13 @@ try {
   if (Number(ownCol.n)) {
     const [[hadRow]] = await db.query('SELECT approve_own_requests AS v FROM cf_company_settings WHERE company_id = ?', [COMPANY]);
     if (hadRow) {
-      await db.query('UPDATE cf_company_settings SET approve_own_requests = 1 WHERE company_id = ?', [COMPANY]);
+      // The switch on the Approvals page (PUT /approvals/settings, 2026-10-19): only an admin or a full approver.
+      const partial = await refusal(() => AP.setApprovesOwnRequests(db, c, { ownAllowed: true }, { can: (t) => t === 'cf_erp_approve_order_acceptance', isAdmin: false }));
+      ok('the switch: someone who decides only some kinds may not change it', partial?.status === 403);
+      const bad = await refusal(() => AP.setApprovesOwnRequests(db, c, { ownAllowed: 'yes' }, { can: all, isAdmin: false }));
+      ok('the switch: it takes true or false', bad?.code === 'INVALID');
+      const turned = await AP.setApprovesOwnRequests(db, c, { ownAllowed: true }, { can: all, isAdmin: false });
+      ok('the switch: a full approver turns it on', turned.ownAllowed === true && AP.canSetOwnRequests({ can: all, isAdmin: false }) && AP.canSetOwnRequests({ can: () => false, isAdmin: true }));
       ok('switch on: the asker may decide their own', (await AP.approvesOwnRequests(db, COMPANY)) === true
         && (await AP.listApprovals(db, COMPANY, (t) => t === 'cf_erp_approve_order_acceptance', {})).ownAllowed === true);
       await db.query('UPDATE cf_company_settings SET approve_own_requests = ? WHERE company_id = ?', [Number(hadRow.v) || 0, COMPANY]);

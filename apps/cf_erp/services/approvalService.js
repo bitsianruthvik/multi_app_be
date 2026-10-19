@@ -64,6 +64,29 @@ export async function approvesOwnRequests(db, companyId) {
   } catch { return false; }
 }
 
+/** Who may turn approve_own_requests on or off: an admin, or a person who may decide EVERY type (Management / MD). */
+export const canSetOwnRequests = (who = { can: () => false, isAdmin: false }) => !!who.isAdmin || APPROVAL_PERMS.every((tag) => who.can(tag));
+
+/**
+ * PUT /approvals/settings { ownAllowed } — the switch on the Approvals page (2026-10-19; before it was a database column
+ * only). Off = the four-eyes rule: somebody else decides what you asked for.
+ */
+export async function setApprovesOwnRequests(db, c, input = {}, who = { can: () => false, isAdmin: false }) {
+  if (!canSetOwnRequests(who)) throw new CfError(403, 'FORBIDDEN', 'Only an admin, or someone who may decide every kind of approval, changes this.');
+  if (typeof input.ownAllowed !== 'boolean') throw invalid('INVALID', 'Say ownAllowed: true or false.');
+  try {
+    await db.query(
+      `INSERT INTO cf_company_settings (company_id, approve_own_requests, updated_by) VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE approve_own_requests = VALUES(approve_own_requests), updated_by = VALUES(updated_by)`,
+      [c.companyId, input.ownAllowed ? 1 : 0, c.userId ?? null],
+    );
+  } catch (e) {
+    if (e?.errno === 1054) throw invalid('NOT_READY', 'This database does not have the setting yet (init.sql §78).');
+    throw e;
+  }
+  return { ownAllowed: await approvesOwnRequests(db, c.companyId) };
+}
+
 /** The types a person may decide: `can(tag)` answers for the person (admins pass every tag). */
 export const typesFor = (can) => APPROVAL_TYPE_KEYS.filter((k) => can(APPROVAL_TYPES[k].perm));
 
