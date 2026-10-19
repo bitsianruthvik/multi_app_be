@@ -21,6 +21,10 @@
  *      until settled); a second --commit run writes nothing, a third dry run plans nothing
  *   9  a copied version carries every row's section bar, flow, values and own rules (treeCopyService)
  *  10  a copy that would hold nothing new (everything counted was refused / already there) makes no version
+ *  11  the repair of production's broken state (rdso-standard-repair.mjs)
+ *  12  the user's decision on RDSO/B-516 (rdso-b516-angles.mjs, standardSectionDecisionService): a TEST copy of B-516
+ *      with no ISA 100 x 75 x 8 in the catalog → 24 bars made like ISA 100 x 100 x 10 equal to the catalog's own, a
+ *      new version with the E250 BR bar, THICKNESS 8, SECTION_AREA 1336 on the 5 angles, the WEIGHTs back; twice = once
  */
 import fs from 'fs';
 import path from 'path';
@@ -267,6 +271,79 @@ try {
   ok('11 a second repair run writes nothing', again.repaired === 0 && again.ok === 1 && (await v11Count()) === n0 + 1);
   const fixAfter = (await G.checkStandards(ro, COMPANY, { only: [STD3], bomDir: BOM_DIR })).standards[0];
   ok('11 … and the fix plans nothing on it', F.fillableCount(fixAfter, { sectionClass: 'BR' }) === 0);
+
+  // 12 -----------------------------------------------------------------------------------------------------------
+  // The user's decision on RDSO/B-516 (rdso-b516-angles.mjs): "L 100x75 (thickness not shown)" is ISA 100 x 75 x 8.
+  // A fresh import of RDSO_516 (a TEST- number), settled as production's was (the rolled-up WEIGHTs gone), and a
+  // catalog with NO ISA 100 x 75 x 8 (the local bars hidden) → the 24 bars made like ISA 100 x 100 x 10 — the same
+  // codes, names and steel the hidden ones have —, a new version with the decision; twice = once; dry run after: nothing.
+  const D = await imp('apps/cf_erp/services/standardSectionDecisionService.js');
+  const bom12 = JSON.parse(fs.readFileSync(path.join(BOM_DIR, 'RDSO_516', 'bom.json'), 'utf8'));
+  const NUM12 = `TEST-B516-${RUN}`;
+  bom12.drawing = { ...bom12.drawing, number: NUM12, revision: null };
+  const dxf12 = path.join(BOM_DIR, 'RDSO_516', 'dxf');
+  const imp12 = await STD.importStandard(conn, { companyId: COMPANY, userId: null }, { bom: bom12, apply: true,
+    files: fs.readdirSync(dxf12).filter((f) => /\.dxf$/i.test(f)).map((name) => ({ name, text: fs.readFileSync(path.join(dxf12, name)).toString('latin1') })) });
+  const dec = { ...D.B516_ANGLES, number: NUM12 };
+  const [[s12]] = await conn.query('SELECT s.id, s.current_version_id, v.root_item_id FROM cf_standard_drawings s JOIN cf_standard_drawing_versions v ON v.id = s.current_version_id WHERE s.id = ?', [imp12.standardId]);
+  // Production's state: the assemblies' rolled-up WEIGHT removed by the settle (the angles have none).
+  const t12 = await (await imp('apps/cf_erp/services/bomService.js')).explode(conn, COMPANY, Number(s12.root_item_id));
+  const asm = []; const w12 = (n) => { if ((n.children ?? []).length) asm.push(Number(n.id)); (n.children ?? []).forEach(w12); }; w12(t12.root);
+  const [dropped] = await conn.query(
+    `UPDATE cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'WEIGHT' SET v.deleted_at = NOW()
+      WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND v.source = 'rollup' AND v.deleted_at IS NULL
+        AND v.subject_id IN (SELECT id FROM (SELECT b.parent_id AS id FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id JOIN cf_master_records m ON m.id = l.child_id
+                                              WHERE m.name LIKE '%angle%' AND b.parent_id IN (?)) x UNION SELECT ?)`, [COMPANY, asm, asm, Number(s12.root_item_id)]);
+  // No ISA 100 x 75 x 8 in the catalog: the local ones hidden, kept to compare.
+  const { sectionNearest } = await imp('apps/cf_erp/routes/cutting.js');
+  const hidden = (await sectionNearest(conn, COMPANY, { search: 'ISA 100 x 75 x 8' })).exact.filter((b) => /^ISA/.test(b.name));
+  const steelOf = async (ids) => {
+    const [r] = await conn.query(
+      `SELECT m.id, m.code, m.name, m.classification_id, m.short_name, m.status, i.uom, i.tracked_by, i.sourcing, i.hsn_code, i.gst_rate,
+              GROUP_CONCAT(CONCAT(s.code, '=', COALESCE(ROUND(v.value_number, 3), o.value, v.value_text)) ORDER BY s.code SEPARATOR ' ') AS vals
+         FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id
+         LEFT JOIN cf_spec_values v ON v.subject_type = 'master' AND v.subject_id = m.id AND v.deleted_at IS NULL
+         LEFT JOIN cf_specifications s ON s.id = v.specification_id AND s.code IN ('DEPTH','WIDTH','THICKNESS','SECTION_AREA','LENGTH','GRADE','IMPACT_CLASS','WEIGHT','DENSITY','MATERIAL')
+         LEFT JOIN cf_spec_options o ON o.id = v.option_id
+        WHERE m.id IN (?) AND s.id IS NOT NULL GROUP BY m.id ORDER BY m.code`, [ids]);
+    return r.map(({ id: _i, ...x }) => JSON.stringify(x));
+  };
+  const hiddenSig = hidden.length ? await steelOf(hidden.map((b) => b.id)) : [];
+  if (hidden.length) await conn.query('UPDATE cf_master_records SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [COMPANY, hidden.map((b) => b.id)]);
+  ok(`12 the TEST copy of RDSO/B-516 imported, its 3 rolled-up WEIGHTs removed as on production (${dropped.affectedRows}); the ${hidden.length} local ISA 100 x 75 x 8 bars hidden`, !!s12 && dropped.affectedRows === 3 && hidden.length === 24);
+  const v1Sig = JSON.stringify(await rowsOf(Number(s12.root_item_id)));
+  const dry12 = await D.applyDecision({ read: ro, companyId: COMPANY, decision: dec, bom: bom12, commit: false, bomDir: BOM_DIR });
+  ok('12 dry run: 24 bars to make, 5 rows, nothing written', dry12.planned?.bars === 24 && dry12.planned?.rows === 5 && dry12.rows === 5 && !dry12.written);
+  const logs12 = [];
+  const out12 = await D.applyDecision({ read: conn, conn, companyId: COMPANY, decision: dec, bom: bom12, commit: true, bomDir: BOM_DIR, log: (l) => logs12.push(l) });
+  ok(`12 --commit: 24 bars made, a new version current (${out12.error ?? `v${out12.versionNo}`})`, out12.written && out12.catalog.created === 24 && out12.versionNo === 2);
+  const made = (await sectionNearest(conn, COMPANY, { search: 'ISA 100 x 75 x 8' })).exact.filter((b) => /^ISA/.test(b.name));
+  const madeSig = await steelOf(made.map((b) => b.id));
+  ok('12 … the bars are what the catalog had: codes, names, place, unit, tracking, short name, HSN/GST, size, area 1336, WEIGHT', made.length === 24 && JSON.stringify(madeSig) === JSON.stringify(hiddenSig));
+  ok('12 … ISA-100X75X8X12000-E250BR among them, 10.488 kg/m (1336 mm² × 7850)', madeSig.some((x) => /"ISA-100X75X8X12000-E250BR"/.test(x) && /SECTION_AREA=1336\.000/.test(x) && /WEIGHT=125\.85[0-9]/.test(x)));
+  const [[cur12]] = await conn.query('SELECT s.current_version_id, s.notes, v.made_from, v.note, v.weight_kg FROM cf_standard_drawings s JOIN cf_standard_drawing_versions v ON v.id = s.current_version_id WHERE s.id = ?', [s12.id]);
+  ok('12 … made_from decision, the note says the decision', Number(cur12.current_version_id) === out12.versionId && cur12.made_from === 'decision' && /ISA 100 x 75 x 8/.test(cur12.note) && /sister RDSO drawings use 8/.test(cur12.note));
+  ok('12 … the standard\'s notes carry the decision', /Decision 2026-10-19 \(N2\).*ISA 100 x 75 x 8/.test(cur12.notes ?? ''));
+  const bar12 = made.find((b) => b.code === 'ISA-100X75X8X12000-E250BR');
+  ok('12 the 5 angles: the E250 BR 12000 bar, THICKNESS 8, SECTION_AREA 1336, WEIGHT = 1336 × L × 7850', out12.angles.length === 5 && out12.angles.every((r) => r.cut === Number(bar12?.id) && Number(r.thickness) === 8 && Number(r.area) === 1336
+    && Math.abs(Number(r.weight) - (1336 * r.lengthMm * 7850) / 1e9) < 0.01));
+  const wOf = (re) => out12.weights.find((w) => re.test(w.path.split(' › ').pop()))?.weight?.value ?? null;
+  const xf12 = wOf(/^X-frame \(riveted/); const hz12 = wOf(/^X-frame horizontals/);
+  ok(`12 the WEIGHTs the engine dropped are back: X-frame ${xf12}, horizontals ${hz12}, top ${out12.rootWeight}`, xf12 > 80 && Math.abs(hz12 - 4 * (1336 * 1215 * 7850) / 1e9) < 0.01 && out12.rootWeight > 760 && Math.abs(Number(cur12.weight_kg) - out12.rootWeight) < 0.01);
+  const [lines12] = await conn.query('SELECT role, notes FROM cf_bom_lines WHERE company_id = ? AND id IN (?)', [COMPANY, out12.angles.map((r) => r.lineId)]);
+  ok('12 the BOM lines say 100 x 75 x 8 and the decision (no open N2)', lines12.length === 5 && lines12.some((l) => l.role === 'X-frame diagonal angle 100 x 75 x 8')
+    && lines12.every((l) => !/thickness not shown/.test(l.role ?? '') && !/NEEDS DECISION N2/.test(l.notes ?? '') && /DECIDED N2/.test(l.notes ?? '')));
+  ok('12 v1 untouched', JSON.stringify(await rowsOf(Number(s12.root_item_id))) === v1Sig);
+  const vers12 = async () => Number((await conn.query('SELECT COUNT(*) AS n FROM cf_standard_drawing_versions WHERE standard_id = ? AND deleted_at IS NULL', [s12.id]))[0][0].n);
+  const again12 = await D.applyDecision({ read: conn, conn, companyId: COMPANY, decision: dec, bom: bom12, commit: true, bomDir: BOM_DIR });
+  const made2 = (await sectionNearest(conn, COMPANY, { search: 'ISA 100 x 75 x 8' })).exact.filter((b) => /^ISA/.test(b.name));
+  ok('12 a second --commit writes nothing (no version, no bar)', !again12.written && again12.catalog.created === 0 && again12.catalog.reused === 24 && (await vers12()) === 2 && made2.length === 24);
+  const dry12b = await D.applyDecision({ read: ro, companyId: COMPANY, decision: dec, bom: bom12, commit: false, bomDir: BOM_DIR });
+  ok('12 a dry run after plans nothing', !dry12b.planned && !dry12b.written && dry12b.catalog.planned === 0);
+  const fix12 = (await G.checkStandards(ro, COMPANY, { only: [NUM12], bomDir: BOM_DIR })).standards[0];
+  ok('12 … the gap check finds no section without a bar on it', fix12 && fix12.gaps.sections.length === 0);
+  const rep12 = await R.repairStandards({ read: ro, companyId: COMPANY, only: [NUM12], sectionClass: 'BR', commit: false, bomDir: BOM_DIR });
+  ok('12 … and the repair leaves it as it is', rep12.ok === 1 && rep12.repaired === 0 && rep12.refused === 0);
 } catch (e) {
   failed += 1;
   console.error('ERROR', e);
