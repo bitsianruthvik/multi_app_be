@@ -8040,16 +8040,16 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = D
 -- §90  AI NESTING — GRADE / IMPACT RULE and CUSTOM PLATE SIZES (2026-10-19)
 -- The same text as TM/s90.sql. Additive and guarded: safe to re-run. Two company settings (Setup › Cutting):
 --
---   cf_company_settings.nest_grade_rule     which plate may carry a piece (lib/plateGrade.js): NULL / 'warn' = the check is
---                                           shown, never refused (the default);
---                                           'better' = the piece's grade, its impact class or a better one
---                                           (A < BR < BO/B0 < C); 'exact' = grade and impact class exactly;
+--   cf_company_settings.nest_grade_rule     which plate may carry a piece (lib/plateGrade.js): NULL / 'exact' (the
+--                                           default) = grade and impact class exactly; 'warn' = the check is
+--                                           shown, never refused; 'better' = the piece's grade, its impact class or a better one
+--                                           (A < BR < BO/B0 < C);
 --                                           'higher' = a higher grade of the same family may stand in, impact as 'better'.
 --   cf_company_settings.nest_custom_plates  the AI may propose ONE custom plate size per steel, within the mill's
 --                                           sizes (services/nestCustomPlate.js), added to the catalog when that
 --                                           nesting is used. JSON { on, maxLength, maxWidth, minLength, minWidth, step }
 --                                           (mm; a blank limit = the catalog's own range). NULL = off.
--- The code works without these columns (rule 'warn', no custom sizes): one failed read per plan read.
+-- The code works without these columns (rule 'exact', no custom sizes): one failed read per plan read.
 -- ============================================================================
 
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS

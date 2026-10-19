@@ -211,7 +211,7 @@ export async function getShopRules(db, companyId) {
     maxPlateSizes: s.maxPlateSizes ?? null,
     maxPlateSizesDefault: 2,
     sizesSchema: !!s.sizesSchema,
-    // §90: which plate may carry a piece (null = 'warn': the 'better' check shown, never refused) and the custom plate sizes
+    // §90: which plate may carry a piece (null = DEFAULT_GRADE_RULE, 'exact') and the custom plate sizes
     // the AI may propose ({ on, maxLength, maxWidth, minLength, minWidth, step }; on false / null = off).
     plateSchema: !!s.plateSchema,
     gradeRule: s.gradeRule ?? null,
@@ -259,7 +259,7 @@ export async function saveShopRules(db, c, input = {}) {
   if (input.gradeRule !== undefined || input.customPlates !== undefined) {
     if (!s.plateSchema) throw conflict('SCHEMA_MISSING', 'The grade rule and custom plate sizes need init.sql §90 (TM/s90.sql) applied to this database first.');
     const rule = input.gradeRule == null || input.gradeRule === '' ? null : String(input.gradeRule).toLowerCase();
-    if (rule != null && !GRADE_RULES.includes(rule)) throw bad(`Grade rule: one of ${GRADE_RULES.join(', ')}, or blank for the default (warn).`);
+    if (rule != null && !GRADE_RULES.includes(rule)) throw bad(`Grade rule: one of ${GRADE_RULES.join(', ')}, or blank for the default (exact).`);
     const cp = input.customPlates === undefined ? { value: s.customPlates == null ? null : (typeof s.customPlates === 'string' ? s.customPlates : JSON.stringify(s.customPlates)), problems: [] } : customPlateInput(input.customPlates);
     if (cp.problems.length) throw bad(`Custom plate sizes: ${cp.problems.join(' ')}`);
     await db.query(

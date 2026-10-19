@@ -108,7 +108,9 @@ try {
   attachNodeCache(conn);
   section('Fixture');
   const fx = await F.buildPlateRulesFixture(conn, { company: COMPANY, parts: [['A', 12, 1200, 400, 4, 'E350', 'BR'], ['B', 12, 900, 300, 4, 'E350', 'BO'], ['C', 16, 800, 400, 2, 'E350', 'BR']] });
-  await F.setPlateRules(conn, COMPANY, { gradeRule: null, customPlates: null });
+  // This suite is about custom sizes, not grades: the rule is pinned to 'better' so the 12 mm BR and BO pieces are one
+  // steel (under the default 'exact' each class is its own steel, with its own custom size — nest_grade_check covers that).
+  await F.setPlateRules(conn, COMPANY, { gradeRule: 'better', customPlates: null });
   console.log(`  ${fx.tag}: line ${fx.lineId}`);
   const plan = (input = {}) => N.planNesting(conn, COMPANY, fx.lineId, input);
   const nests = (p) => p.groups.flatMap((g) => g.nests);

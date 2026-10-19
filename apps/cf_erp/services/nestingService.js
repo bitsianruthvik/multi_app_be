@@ -117,7 +117,7 @@ import { measurePlates } from './nestMeasure.js';
 // The shop's cutting habits (init.sql §75): spacing over the cut settings, the rim and rotations the packers get.
 import { shopRuleRows, withShopSpacing, shopRimOf, rotationsOf } from './shopRules.js';
 import { plateCosts, ratePerKg, costRulesFor, layoutScore, extentOf, COST_DEFAULTS } from './nestCost.js';
-import { ruleOf, fits as gradeFits, platesForAll, needWords, gradeRelation, gradeCheck, impactRank as impactRankOf, blocks as blocksGrade, IMPACT_ORDER_WORDS } from '../lib/plateGrade.js';
+import { ruleOf, fits as gradeFits, platesForAll, needWords, gradeRelation, gradeCheck, impactRank as impactRankOf, blocks as blocksGrade, IMPACT_ORDER_WORDS, DEFAULT_GRADE_RULE } from '../lib/plateGrade.js';
 import { customPlateSetting, customLimits, proposeCustomSize } from './nestCustomPlate.js';
 // Exact outline checks for two parts whose BOXES conflict (pairVerdict): one rule for the proposal and the accept.
 import { toPolygon, polygonsOverlap, polygonsDistance } from '../lib/polyGeom.js';
@@ -1727,13 +1727,13 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
    * GRADE AND IMPACT CLASS (2026-10-19, item 22; lib/plateGrade.js). A steel group is one thickness, grade and
    * material — its pieces may still ask for different impact classes (RDSO orders: BR), and a plate of the wrong
    * class must never be chosen. Each group's plates are those that hold EVERY piece of it by the company's rule
-   * (`gradeRule`: exact grade, impact equal or better by default); when no plate holds them all, the group is split
+   * (`gradeRule`: exactly the piece's grade and impact class by default); when no plate holds them all, the group is split
    * by the plates each piece may go on (`|BR`, `|BO` on the key). A piece only plates that state no impact class may
    * carry is nested on those, and said (`notes`). The common case — one class, or none asked — keeps its key.
    */
-  // 'warn' (the default until a company picks a rule): the plates are not narrowed by impact class — accept and the
+  // 'warn' (a company's choice; the default is 'exact'): the plates are not narrowed by impact class — accept and the
   // Compare tab say what does not match.
-  const gradeRule = settingRows.gradeRule ?? 'warn';
+  const gradeRule = settingRows.gradeRule ?? DEFAULT_GRADE_RULE;
   for (const g of blocksGrade(gradeRule) ? [...byGroup.values()] : []) {
     const steel = gradeSheets(plates, g, gradeRule);
     const all = platesForAll(steel, g.cutPlates.map((cp) => cp.steel), gradeRule);
@@ -2908,7 +2908,7 @@ export async function acceptNesting(db, c, orderLineId, plan = {}, { allowLeftOv
   // nests already hold it all, and accepting just clears old automatic lots.
   const submitted = flattenNests(plan, required.size && !additionsIn.length ? problems : []);
   // §90 (item 22): which plate may carry which piece, by the company's grade / impact rule.
-  const gradeRule = settingRows.gradeRule ?? 'warn';
+  const gradeRule = settingRows.gradeRule ?? DEFAULT_GRADE_RULE;
   // §90 (item 20): a plate of a CUSTOM size the AI proposed (no catalog plate yet) is checked on a stand-in plate of
   // that size; the catalog plate is made (or found) only once the whole layout has passed — below, before the writes.
   const customs = customStandIns(submitted, { line, cpById, plates, plateById, settingRows, gradeRule, problems });
@@ -2979,7 +2979,7 @@ export async function acceptNesting(db, c, orderLineId, plan = {}, { allowLeftOv
       return { lotNo: il?.lotNo, plateCode: il?.full?.plateCode ?? nameOf(pl ?? {}), plate: pl?.steel ?? { grade: il?.full?.grade }, pieces: (pcs ?? []).map((p) => { const cp = cpById.get(Number(p.cutPlateId)); return { cutPlateId: p.cutPlateId, code: cp ? nameOf(cp) : null, steel: cp?.steel ?? {} }; }) };
     }),
   ], gradeRule);
-  // 'warn' (the default): said in gradeCheck, never refused.
+  // 'warn' (a company's choice): said in gradeCheck, never refused.
   for (const m of blocksGrade(gradeRule) ? graded.mismatches.filter((x) => x.code === 'IMPACT') : []) {
     problems.push(`Plate ${m.lotNo ?? '?'} (${m.plateCode}, ${m.plate}): ${plural(m.pieces, 'piece', 'pieces')} of ${m.cutPlateCode} need ${m.need} — ${m.why}. Nest ${m.pieces === 1 ? 'it' : 'them'} on a plate of that impact class${gradeRule === 'exact' ? '' : ' or better'} (${IMPACT_ORDER_WORDS}).`);
   }

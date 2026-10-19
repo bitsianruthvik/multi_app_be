@@ -9,8 +9,8 @@
  * unless the row overrides it — nesting reads that one value, never the order again. A catalog plate carries GRADE
  * and IMPACT_CLASS the same way (E350 BO / E350 BR: two plates of one size).
  *
- * THE RULE (company setting `cf_company_settings.nest_grade_rule`, init.sql §90; NULL = 'warn'):
- *   'warn'    the check of 'better', shown — never refused, the AI's plates not narrowed (the DEFAULT)
+ * THE RULE (company setting `cf_company_settings.nest_grade_rule`, init.sql §90; NULL = 'exact', the default):
+ *   'warn'    the check of 'better', shown — never refused, the AI's plates not narrowed (a company's choice)
  *   'better'  the plate's grade is the piece's grade; its impact class is the piece's or a BETTER one
  *   'exact'   the plate's grade and impact class are exactly the piece's
  *   'higher'  a HIGHER grade of the same family may stand in (E350 for E250), impact as 'better'
@@ -30,12 +30,12 @@
 
 export const GRADE_RULES = Object.freeze(['warn', 'better', 'exact', 'higher']);
 /**
- * 'warn' (the DEFAULT, 2026-10-19 — the impact order is not confirmed by the user yet, and saved layouts already put BO
- * pieces on BR plates): the check is worked out as 'better' and SHOWN (accept's gradeCheck, the Compare tab, upload notes),
- * but nothing is refused and the AI's plate choice is not narrowed by it. 'better' / 'exact' / 'higher' block.
+ * The DEFAULT is 'exact' (the user, 2026-10-19: "BO/BR, don't allow for now" — a BR piece never on a BO plate nor the
+ * reverse). 'warn' works the check out as 'better' and SHOWS it (accept's gradeCheck, the Compare tab, upload notes) but
+ * refuses nothing and does not narrow the AI's plates — a company may pick it in Setup › Cutting.
  */
-export const DEFAULT_GRADE_RULE = 'warn';
-/** Does this rule refuse (and narrow the AI's plates)? Only once a company picked one in Setup › Cutting. */
+export const DEFAULT_GRADE_RULE = 'exact';
+/** Does this rule refuse (and narrow the AI's plates)? Every rule but 'warn'. */
 export const blocks = (rule) => ruleOf(rule) !== 'warn';
 
 /** Rank of each impact class: higher = tested colder / harder. Aliases share a rank. */
@@ -105,7 +105,7 @@ export function fits(plate, piece, rule = DEFAULT_GRADE_RULE) {
       ok: false, sure: true, code: 'IMPACT', substitute: null,
       why: i === 'better'
         ? `the plate is ${impactKey(plate.impactClass)} and the piece needs exactly ${impactKey(piece.impactClass)} (Setup › Cutting: exact impact class)`
-        : `the plate is ${impactKey(plate.impactClass)} and the piece needs ${impactKey(piece.impactClass)}${i === 'worse' ? ' or better' : ''}`,
+        : `the plate is ${impactKey(plate.impactClass)} and the piece needs ${impactKey(piece.impactClass)}${i === 'worse' && R !== 'exact' ? ' or better' : ''}`,
     };
   }
   if (i === 'unknown') return { ok: true, sure: false, code: 'IMPACT_UNKNOWN', substitute: g === 'higher' ? 'grade' : null, why: `the piece needs ${impactKey(piece.impactClass)} and the plate does not state an impact class` };

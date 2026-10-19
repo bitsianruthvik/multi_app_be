@@ -106,7 +106,7 @@ import {
 import { measurePlates } from './nestMeasure.js';
 import { memoryRun, blocksLineWrites } from './nestRunService.js';
 import { missingPlatesOf } from './nestPlateCatalogService.js';
-import { fits as gradeFits, needWords, blocks as blocksGrade, IMPACT_ORDER_WORDS } from '../lib/plateGrade.js';
+import { fits as gradeFits, needWords, blocks as blocksGrade, IMPACT_ORDER_WORDS, DEFAULT_GRADE_RULE } from '../lib/plateGrade.js';
 import { untrackedOfLine, effectiveUntracked, shrunkUntracked } from '../lib/nestUntracked.js';
 
 export { savedLotsOf, isUploadedPiece };
@@ -388,9 +388,9 @@ function resolvePlate({ file, nest, placed, ctx }) {
     const mixed = new Set(steels.map((s) => norm(s.impactClass)).filter((v) => v != null)).size > 1;
     if (same.length >= 1 && same.length < hits.length && !mixed) { hits = same; byImpact = true; }
     // §90: pieces of mixed classes on one nest — the ONE plate of that size that holds every one of them (BR and BO
-    // pieces: the BO plate, under the default rule) is the plate; still more than one, the file has to name it.
+    // pieces: the BO plate under 'better'; under the default 'exact' none holds both) is the plate; else the file names it.
     if (mixed && hits.length > 1) {
-      const rule = ctx.settingRows?.gradeRule ?? 'warn';
+      const rule = ctx.settingRows?.gradeRule ?? DEFAULT_GRADE_RULE;
       const all = hits.filter((p) => steels.every((s) => { const v = gradeFits(p.steel, s, rule); return v.ok && v.sure; }));
       if (all.length === 1) { hits = all; byImpact = true; }
     }
@@ -790,7 +790,7 @@ function prepareFile(file, ctx, choices) {
     // ---- the steel has to agree, part by part ---------------------------------
     if (plate) {
       const thinner = new Map();                      // cut plate id → { cp, parts } — ProNest: a piece cut from the next plate up
-      const gradeRule = ctx.settingRows?.gradeRule ?? 'warn';
+      const gradeRule = ctx.settingRows?.gradeRule ?? DEFAULT_GRADE_RULE;
       const impactUnknown = new Set();                // the classes asked of a plate that states none
       const impactWarn = new Map();                   // 'warn': cut piece code → what does not match (said, not refused)
       for (const pl of placed) {

@@ -75,9 +75,10 @@ try {
   section('1. The rule (lib/plateGrade.js)');
   {
     const P = (grade, impactClass) => ({ grade, impactClass });
-    ok('default: a BO plate holds a BR piece (BO is tested colder) — a better class, said as a substitute', J(G.fits(P('E350', 'BO'), P('E350', 'BR'))) === J({ ok: true, sure: true, code: null, substitute: 'impact', why: null }));
-    const worse = G.fits(P('E350', 'BR'), P('E350', 'BO'));
-    ok('default: a BR plate never holds a BO piece — a definite mismatch, in words', worse.ok === false && worse.sure === true && worse.code === 'IMPACT' && worse.why === 'the plate is BR and the piece needs BO or better', J(worse));
+    ok("the DEFAULT ('exact', the user 2026-10-19: \"BO/BR, don't allow for now\"): BO and BR never stand in for each other, either way", G.fits(P('E350', 'BO'), P('E350', 'BR')).ok === false && G.fits(P('E350', 'BR'), P('E350', 'BO')).ok === false && G.fits(P('E350', 'BR'), P('E350', 'BO')).why === 'the plate is BR and the piece needs BO' && G.fits(P('E350', 'BR'), P('E350', 'BR')).ok === true);
+    ok("'better': a BO plate holds a BR piece (BO is tested colder) — a better class, said as a substitute", J(G.fits(P('E350', 'BO'), P('E350', 'BR'), 'better')) === J({ ok: true, sure: true, code: null, substitute: 'impact', why: null }));
+    const worse = G.fits(P('E350', 'BR'), P('E350', 'BO'), 'better');
+    ok("'better': a BR plate never holds a BO piece — a definite mismatch, in words", worse.ok === false && worse.sure === true && worse.code === 'IMPACT' && worse.why === 'the plate is BR and the piece needs BO or better', J(worse));
     ok('B0 (zero) and BO (letter) are the same class; an option label "BO — no impact test" reads as BO', G.fits(P('E350', 'B0'), P('E350', 'BO')).ok && G.fits(P('E350', 'BO — no impact test'), P('E350', 'B0')).ok && G.impactRank('C') > G.impactRank('BO') && G.impactRank('BO') > G.impactRank('BR') && G.impactRank('BR') > G.impactRank('A'));
     ok("'exact': a better class is refused too", G.fits(P('E350', 'BO'), P('E350', 'BR'), 'exact').ok === false && /exactly BR/.test(G.fits(P('E350', 'BO'), P('E350', 'BR'), 'exact').why));
     const unk = G.fits(P('E350', null), P('E350', 'BR'));
@@ -86,12 +87,13 @@ try {
     ok("grade: exact by default (E350 plate, E250 piece refused); 'higher' lets E350 stand in for E250, never E250 for E350, never another family",
       G.fits(P('E350', 'BR'), P('E250', 'BR')).code === 'GRADE' && G.fits(P('E350', 'BR'), P('E250', 'BR'), 'higher').ok && G.fits(P('E250', 'BR'), P('E350', 'BR'), 'higher').ok === false && G.fits(P('S355', 'BR'), P('E250', 'BR'), 'higher').ok === false);
     ok('a class not in the order is only ever itself', G.fits(P('E350', 'XX'), P('E350', 'BR')).ok === false && G.fits(P('E350', 'XX'), P('E350', 'XX')).ok === true);
-    ok("ruleOf: anything else is the default ('warn'); only 'warn' does not block", G.ruleOf(null) === 'warn' && G.ruleOf('EXACT') === 'exact' && G.ruleOf('nonsense') === 'warn' && !G.blocks(null) && G.blocks('better') && G.blocks('exact') && G.blocks('higher'));
+    ok("ruleOf: anything else is the default ('exact'); only 'warn' does not block", G.ruleOf(null) === 'exact' && G.ruleOf('EXACT') === 'exact' && G.ruleOf('nonsense') === 'exact' && G.blocks(null) && !G.blocks('warn') && G.blocks('better') && G.blocks('exact') && G.blocks('higher'));
     ok("'warn' checks as 'better' (the same verdicts) and its gradeCheck says it does not block", J(G.fits({ grade: 'E350', impactClass: 'BR' }, { grade: 'E350', impactClass: 'BO' }, 'warn')) === J(G.fits({ grade: 'E350', impactClass: 'BR' }, { grade: 'E350', impactClass: 'BO' }, 'better')) && G.gradeCheck([], 'warn').blocking === false && G.gradeCheck([], 'better').blocking === true);
     const plates = [{ id: 1, steel: P('E350', 'BR') }, { id: 2, steel: P('E350', 'BO') }, { id: 3, steel: P('E350', null) }];
     ok('platesForAll: BR + BO pieces → only the BO plate; a BO piece with only BR / blank plates → the blank one, not sure',
-      J(G.platesForAll(plates, [P('E350', 'BR'), P('E350', 'BO')]).plates.map((p) => p.id)) === '[2]'
-      && J(G.platesForAll([plates[0], plates[2]], [P('E350', 'BO')])) === J({ plates: [plates[2]], sure: false }));
+      J(G.platesForAll(plates, [P('E350', 'BR'), P('E350', 'BO')], 'better').plates.map((p) => p.id)) === '[2]'
+      && J(G.platesForAll([plates[0], plates[2]], [P('E350', 'BO')], 'better')) === J({ plates: [plates[2]], sure: false })
+      && G.platesForAll(plates, [P('E350', 'BR'), P('E350', 'BO')]).plates.every((p) => p.id === 3));
     const check = G.gradeCheck([
       { lotNo: 'N-001', plateCode: 'PL-BR', plate: P('E350', 'BR'), pieces: [{ cutPlateId: 7, code: 'CP-7', steel: P('E350', 'BO') }, { cutPlateId: 7, code: 'CP-7', steel: P('E350', 'BO') }, { cutPlateId: 8, code: 'CP-8', steel: P('E350', 'BR') }] },
       { lotNo: 'N-002', plateCode: 'PL-X', plate: P('E350', null), pieces: [{ cutPlateId: 8, code: 'CP-8', steel: P('E350', 'BR') }] },
@@ -112,8 +114,29 @@ try {
   const nestsOf = (p) => p.groups.flatMap((g) => g.nests.map((n) => ({ g, n, plate: fx.sfxOfPlate(n.plateItemId), cuts: [...new Set(n.pieces.map((x) => fx.sfxOfCut(x.cutPlateId)))] })));
 
   /* ───────────── 1b ───────────── */
-  section("1b. The DEFAULT ('warn'): the check is said, nothing refused, the AI's plates not narrowed");
+  section("1a. The DEFAULT ('exact'): BR and BO each on their own plates, a mismatch refused both ways");
   {
+    const p = await plan();
+    const keys = p.groups.map((g) => g.key);
+    const all = nestsOf(p);
+    ok('the 12 mm steel is split by class (…|BR, …|BO): the BR pieces on the BR plate only, the BO pieces on the BO plate only',
+      keys.includes(`12|E350|${fx.MS.toUpperCase()}|BR`) && keys.includes(`12|E350|${fx.MS.toUpperCase()}|BO`)
+      && all.filter((x) => x.cuts.includes('A')).every((x) => x.plate === 'P12R') && all.filter((x) => x.cuts.includes('B')).every((x) => x.plate === 'P12O') && all.some((x) => x.cuts.includes('A')) && all.some((x) => x.cuts.includes('B')), J([keys, all.map((x) => [x.plate, x.cuts])]));
+    for (const [sfx, to] of [['A', 'P12O'], ['B', 'P12R']]) {
+      const t = structuredClone(p);
+      for (const g of t.groups) for (const n of g.nests) if (n.pieces.some((x) => x.cutPlateId === fx.cut[sfx])) { n.plateItemId = fx.plates[to]; n.plateCode = fx.plateCode[to]; }
+      const e = await refusal(() => N.acceptNesting(conn, c, fx.lineId, t, { allowLeftOver: true }));
+      ok(`accept: the ${sfx === 'A' ? 'BR' : 'BO'} pieces moved onto the ${sfx === 'A' ? 'BO' : 'BR'} plate — refused, naming plate, piece and both classes`, said(e, fx.plateCode[to], fx.code(sfx), `need E350 ${sfx === 'A' ? 'BR' : 'BO'}`, sfx === 'A' ? 'the plate is BO and the piece needs exactly BR' : 'the plate is BR and the piece needs BO.'), textOf(e));
+    }
+    const text = D.makeNestDxf({ plate: { length: 6000, width: 2000 }, parts: [0, 1].map((i) => ({ rect: { length: fx.want.A.len, width: fx.want.A.wid }, x: 50 + i * 1300, y: 50, label: fx.code('A') })) });
+    const r = await U.uploadNestFiles(conn, c, fx.lineId, { files: [{ filename: `${fx.tag}-X1_12mm_6000x2000.dxf`, file: Buffer.from(text, 'latin1').toString('base64'), plateCode: fx.plateCode.P12O }] });
+    const errs = r.files.flatMap((f) => f.errors ?? []);
+    ok('upload: BR pieces on the BO plate — PART_WRONG_IMPACT, cannot be saved', errs.some((x) => x.code === 'PART_WRONG_IMPACT' && x.message.includes(fx.code('A')) && x.message.includes(fx.plateCode.P12O)) && r.canSave === false, J(errs.map((x) => x.message)));
+  }
+
+  section("1b. 'warn' (a company's choice): the check is said, nothing refused, the AI's plates not narrowed");
+  {
+    await F.setPlateRules(conn, COMPANY, { gradeRule: 'warn' });
     const p = await plan();
     const g12 = p.groups.find((g) => g.thickness === 12);
     ok('no split by class; both 12 mm plates are candidates; no piece refused for its class', p.groups.filter((g) => g.thickness === 12).length === 1 && g12.key === `12|E350|${fx.MS.toUpperCase()}` && [fx.plates.P12R, fx.plates.P12O].every((id) => g12.candidates.some((x) => x.plateItemId === id)) && !p.problems.some((t) => /impact class/.test(t)), J([p.groups.map((g) => g.key), g12?.candidates]));
@@ -258,9 +281,9 @@ try {
     ok('Setup › Cutting saves it and reads it back (with the rules and the order of classes)', saved.gradeRule === 'exact' && saved.plateSchema === true && J(saved.gradeRules) === J(['warn', 'better', 'exact', 'higher']) && /BR/.test(saved.impactOrder), J([saved.gradeRule, saved.gradeRules]));
     ok('…and nesting reads it', (await N.cutSettingRows(conn, COMPANY)).gradeRule === 'exact');
     const bad = await refusal(() => S.saveShopRules(conn, c, { gradeRule: 'sometimes' }));
-    ok('a rule that is not one of the three is refused in words', said(bad, 'Grade rule: one of warn, better, exact, higher'), textOf(bad));
+    ok('a rule that is not one of the three is refused in words', said(bad, 'Grade rule: one of warn, better, exact, higher', 'default (exact)'), textOf(bad));
     const back = await S.saveShopRules(conn, c, { gradeRule: null });
-    ok("blank = the default ('warn') again", back.gradeRule === null && (await N.cutSettingRows(conn, COMPANY)).gradeRule === 'warn');
+    ok("blank = the default ('exact') again", back.gradeRule === null && (await N.cutSettingRows(conn, COMPANY)).gradeRule === 'exact');
   }
 } catch (e) {
   failed += 1; fails.push(`crashed: ${e.message}`);

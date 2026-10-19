@@ -409,7 +409,7 @@ section('9. The setting in the database: saved, read back, laid over the cut set
   ok('without §75: cutSettingRows answers the old query (4 statements: the §90, §83 and §75 ones failed), the band unchanged', rows.length === 1 && m2.calls === 4 && pickCutSettings(rows, 12).seqGapMinMm === 5);
   const m3 = missing(['nest_max_plate_sizes']);
   const rows3 = await cutSettingRows(m3, 1);
-  ok('with §75 but without §83: cutSettingRows (3 statements: the §90 and §83 ones failed), no limit read — the default (2) applies; the grade rule is the default, no custom sizes', rows3.length === 1 && m3.calls === 3 && rows3.maxPlateSizes === undefined && rows3.gradeRule === 'warn' && rows3.customPlates === null);
+  ok('with §75 but without §83: cutSettingRows (3 statements: the §90 and §83 ones failed), no limit read — the default (2) applies; the grade rule is the default, no custom sizes', rows3.length === 1 && m3.calls === 3 && rows3.maxPlateSizes === undefined && rows3.gradeRule === 'exact' && rows3.customPlates === null);
   let db = null;
   try {
     const { pool } = await import('../../apps/cf_erp/lib/db.js');
