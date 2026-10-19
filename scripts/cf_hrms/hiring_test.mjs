@@ -109,7 +109,7 @@ const FY = dateParts(on).fy;
 
 /* ── what "as it was found" means ─────────────────────────────────────────── */
 const tablesLike = async (pattern) => (await pool.query(
-  'SELECT TABLE_NAME AS t FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? ORDER BY TABLE_NAME', [pattern]))[0].map((r) => r.t);
+  'SELECT TABLE_NAME AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE ? AND COLUMN_NAME IN (\x27company_id\x27, \x27deleted_at\x27) GROUP BY TABLE_NAME HAVING COUNT(*) = 2 ORDER BY TABLE_NAME', [pattern]))[0].map((r) => r.t);
 const WATCHED = [...await tablesLike('hrms\\_%'), ...await tablesLike('cf\\_code\\_%')];
 const rowCounts = async () => {
   const out = {};

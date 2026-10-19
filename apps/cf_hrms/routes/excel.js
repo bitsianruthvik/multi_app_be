@@ -14,7 +14,8 @@
  *
  * <entity> is one of: departments, locations, roles, positions, employees, holidays, shifts,
  * library-kras, library-responsibilities, library-kpis, library-skills, library-qualifications,
- * library-authorities, actuals (spec §19.3: one row per person × KPI × slot of `?periodId=`;
+ * library-authorities, pay-salaries and pay-items (spec §25.2: payroll upload + cf_hrms_pay_view; pay-items takes
+ * `?runId=` on the download, the preview and the apply), actuals (spec §19.3: one row per person × KPI × slot of `?periodId=`;
  * the upload needs performance upload), leave-balances (spec §22.5: HR's opening balances, one
  * row per person for the leave year of `?year=`; the upload needs leave edit — leave has no upload right). Each is its own route, so each carries its own right (ACCESS.md):
  * the download needs the area's `view`, the upload the area's `upload` (and `view`).
@@ -26,6 +27,8 @@
  * SCOPE: a login limited to its department downloads only what is inside it, and
  * an upload row outside it is a problem. What belongs to no department
  * (locations, roles, holidays, shifts, the libraries) it may download but not upload.
+ * Payroll's files (downloadWholeCompany: pay-salaries, pay-items) are everybody's pay: such a
+ * login neither downloads nor uploads them (payroll belongs to the whole company).
  *
  * The apply is ONE transaction. An upload never removes a record.
  */
@@ -56,10 +59,11 @@ router.get('/excel/entities', guard(PERM.signedIn), handle(async (req) => listEn
 for (const def of ENTITIES) {
   const whole = def.wholeCompany ? [companyWide(`${def.label} belong to the whole company. Your access covers your own department only — you can download this file, not upload it.`)] : [];
   const upload = guard(def.uploadRight, {
-    also: [def.viewRight],
+    also: [def.viewRight, ...(def.alsoRights ?? [])],
     ...(def.entity === 'employees' ? { note: 'a file with NEW rows also needs cf_hrms_employee_bulk_add; contact columns only with cf_hrms_contact_view' } : {}),
   });
-  router.get(`/excel/${def.entity}/workbook`, guard(def.viewRight), handle(async (req) => downloadWorkbook(pool, ctx(req), def, await envOf(req))));
+  const wholeDownload = def.downloadWholeCompany ? [companyWide(`${def.label} belong to the whole company. Your access covers your own department only.`)] : [];
+  router.get(`/excel/${def.entity}/workbook`, guard(def.viewRight, def.alsoRights ? { also: def.alsoRights } : {}), ...wholeDownload, handle(async (req) => downloadWorkbook(pool, ctx(req), def, await envOf(req))));
   router.post(`/excel/${def.entity}/preview`, upload, ...whole, handle(async (req) => previewUpload(pool, ctx(req), def, req.body ?? {}, await envOf(req))));
   router.post(`/excel/${def.entity}/apply`, upload, ...whole, handle(async (req) => {
     const env = await envOf(req);

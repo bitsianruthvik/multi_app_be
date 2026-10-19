@@ -285,7 +285,7 @@ try {
   const OLD_KEYS = ['id', 'leaveTypeId', 'leaveTypeCode', 'leaveTypeName', 'isPaid', 'sortOrder', 'basis', 'days', 'accrual', 'daysWorkedPerLeaveDay', 'prorateOnJoining', 'allowedInProbation',
     'waitDaysAfterJoining', 'carryForward', 'carryForwardCapDays', 'encashable', 'encashCapDays', 'maxDaysAtOnce', 'minNoticeDays', 'halfDayAllowed', 'countDaysOffBetween', 'proofAfterDays',
     'appliesTo', 'maxTimesInService', 'expiresAfterDays', 'negativeBalanceAllowed', 'notes'];
-  const NEW_KEYS = ['joiningCutoffDay', 'creditInArrears', 'noticeTiers', 'notWithLeaveTypeIds'];
+  const NEW_KEYS = ['joiningCutoffDay', 'creditInArrears', 'noticeTiers', 'notWithLeaveTypeIds', 'minPresentDaysForCredit']; // §28.4 added the last
   ok(JSON.stringify(Object.keys(ra)) === JSON.stringify([...OLD_KEYS, ...NEW_KEYS, 'summary']), 'a rule: the old fields in their order, then the new ones, then the sentence', JSON.stringify(Object.keys(ra)));
   const e1 = await caught(() => LEAVE.updatePolicy(conn, c, made.id, { rules: [{ leaveTypeId: t1.id, basis: 'PER_YEAR', accrual: 'MONTHLY', days: 6, notWithLeaveTypeIds: [t1.id] }] }));
   ok(e1?.status === 422 && e1.problems?.some((p) => p === `${TAG} Casual: it cannot be "not next to" itself.`), '422: not next to itself, in words, by leave type', JSON.stringify(e1?.problems));

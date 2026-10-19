@@ -160,7 +160,10 @@ export function intParam(value, name = 'id') {
  */
 export function dateParam(value, name = 'on') {
   if (value === undefined || value === null || value === '') {
-    return new Date().toISOString().slice(0, 10);
+    // The server's local date, as every write's "today" is (positionService.today):
+    // a UTC date here made a change written after local midnight invisible until UTC caught up.
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
   const s = String(value).slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(Date.parse(s))) {

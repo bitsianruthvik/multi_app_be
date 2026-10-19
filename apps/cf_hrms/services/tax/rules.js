@@ -42,7 +42,7 @@ export function rulesFromRows(rows, year, regime) {
       const row = map.get(key);
       return row ? { note: row.sourceNote, url: row.sourceUrl, verified: row.verified } : { note: '', url: '', verified: false };
     },
-    unverified: [...map.entries()].filter(([, r]) => !r.verified).map(([k]) => k),
+    unverified: [...map.entries()].filter(([, r]) => !r.verified).map(([k]) => k).sort(), // sorted: the DB and the seed list rows in different orders
   };
 }
 

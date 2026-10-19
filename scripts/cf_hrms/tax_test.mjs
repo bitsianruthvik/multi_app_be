@@ -170,6 +170,35 @@ section('[2] Surcharge, its marginal relief, the new-regime cap');
   const o = tax(Y1, 'OLD', pay(60050000));
   const nw = tax(Y1, 'NEW', pay(60075000));
   ok(o.surchargeRate === 37 && o.totalTax === 25379250 && nw.surchargeRate === 25 && nw.totalTax === 22854000, 'at 6 Cr: OLD 37% → 2,53,79,250; NEW capped at 25% → 2,28,54,000', `${show(o)} | ${show(nw)}`);
+
+  // Dividends: the surcharge on the tax on dividend income is at most 15% (Finance Act 2026, First
+  // Schedule Part I-A / I-B, Paragraph F). The dividends' tax = the top slice of the slab income.
+  // NEW, salary 2,50,75,000 − 75,000 = 2,50,00,000 + dividends 50,00,000 = taxable 3,00,00,000.
+  //   Slab tax 3,00,000 + 2,76,00,000×30% = 85,80,000. Dividends' tax (top slice) 50,00,000×30% = 15,00,000.
+  //   Surcharge 25%: (85,80,000 − 15,00,000)×25% = 17,70,000 + 15,00,000×15% = 2,25,000 → 19,95,000
+  //   (21,45,000 without the cap). Marginal relief at 2 Cr: limit 55,80,000×1.15 + 1,00,00,000 = 1,64,17,000 — not hit.
+  //   Cess 4% of 1,05,75,000 = 4,23,000; total 1,09,98,000.
+  for (const Y of [Y1, Y2]) {
+    r = tax(Y, 'NEW', { ...pay(25075000), otherIncome: { dividends: 5000000 } });
+    ok(r.taxableIncome === 30000000 && r.surchargeRate === 25 && r.surchargeDividend.tax === 1500000 && r.surchargeDividend.rate === 15 && r.surcharge === 1995000 && r.totalTax === 10998000,
+      `${Y} NEW 3 Cr with 50 L dividends: surcharge 25% on the rest, 15% on the dividends' 15,00,000 → 19,95,000; total 1,09,98,000`, show(r));
+  }
+  //   Without dividends the same 3 Cr pays the full 25%: 85,80,000×25% = 21,45,000; cess 4,29,000; total 1,11,54,000.
+  r = tax(Y1, 'NEW', pay(30075000));
+  ok(r.surcharge === 2145000 && r.totalTax === 11154000 && r.surchargeDividend.tax === 0, 'the same 3 Cr as salary only: the full 25% → 1,11,54,000', show(r));
+  // OLD, salary 5,00,50,000 − 50,000 = 5,00,00,000 + dividends 1,00,00,000 = taxable 6,00,00,000.
+  //   Slab tax 1,12,500 + 5,90,00,000×30% = 1,78,12,500. Dividends' tax 1,00,00,000×30% = 30,00,000.
+  //   Surcharge 37%: 1,48,12,500×37% = 54,80,625 + 30,00,000×15% = 4,50,000 → 59,30,625.
+  //   Relief at 5 Cr: limit 1,48,12,500×1.25 + 1,00,00,000 = 2,85,15,625; 2,37,43,125 is below — none.
+  //   Cess 4% of 2,37,43,125 = 9,49,725; total 2,46,92,850.
+  r = tax(Y1, 'OLD', { ...pay(50050000), otherIncome: { dividends: 10000000 } });
+  ok(r.surchargeRate === 37 && r.surchargeDividend.tax === 3000000 && r.surcharge === 5930625 && r.totalTax === 24692850,
+    'OLD 6 Cr with 1 Cr dividends: 37% on the rest, 15% on the dividends\' 30,00,000 → surcharge 59,30,625; total 2,46,92,850', show(r));
+  // Between 1 and 2 Cr the band is 15% already — the cap changes nothing.
+  //   NEW 1,00,75,000 − 75,000 + 50,00,000 dividends = 1,50,00,000: 3,00,000 + 1,26,00,000×30% = 40,80,000;
+  //   15% = 6,12,000; cess 1,87,680; total 48,79,680.
+  r = tax(Y1, 'NEW', { ...pay(10075000), otherIncome: { dividends: 5000000 } });
+  ok(r.surchargeRate === 15 && r.surcharge === 612000 && r.totalTax === 4879680 && r.surchargeDividend.tax === 0, 'NEW 1.5 Cr with dividends: 15% band, the cap changes nothing → 48,79,680', show(r));
 }
 
 /* ══ 3. exemptions, deductions, refusals ════════════════════════════════ */

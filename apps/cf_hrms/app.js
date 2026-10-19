@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import indexRoutes from './routes/index.js';
 import codegenModule from '../cf_erp/modules/codegen/index.js';
 import { PERM } from './lib/http.js';
+import { startNightly } from './services/attendance/scheduler.js';
 // Side effect: registers employee codes and letter references with the code generator.
 import {
   EMPLOYEE_ENTITY, HIRING_ENTITY, DEPARTMENT_ENTITY, ROLE_ENTITY, POSITION_ENTITY, LOCATION_ENTITY,
@@ -72,6 +73,9 @@ export default {
     server.use('/api/:companySlug/cf_hrms', codegenModule.createRouter({
       viewPerm: PERM.setup.view, managePerm: PERM.setup.edit, entityTypes: [DEPARTMENT_ENTITY, ROLE_ENTITY, POSITION_ENTITY, LOCATION_ENTITY, EMPLOYEE_ENTITY, HIRING_ENTITY],
     }));
+    // Attendance (spec §28.2): the nightly run for yesterday — in the real server only, never in a
+    // test script that mounts these routes (services/attendance/scheduler.js says why it is restart-safe).
+    if (/[\\/]index\.js$/.test(process.argv[1] ?? '')) startNightly();
   },
 
   // Nothing executes these — apps/_loader.js ignores the field and push-to-prod

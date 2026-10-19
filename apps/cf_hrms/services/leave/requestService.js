@@ -38,7 +38,7 @@ import { EMPLOYEE_IN_DEPARTMENTS_SQL } from '../accessScope.js';
 import {
   makeCalendar, countDays, isDate, addDays, daysBetween, spanText, dayText, daysWords, daysOffPhrase, MAX_RANGE_DAYS,
 } from './days.js';
-import { balanceOf, leaveYearOf, yearOfKey, yearFromStart, plain } from './balance.js';
+import { balanceOf, leaveYearOf, yearOfKey, yearFromStart, plain, presentBetween } from './balance.js';
 
 const iso = (v) => (v == null ? null : (v instanceof Date ? v.toISOString() : new Date(v).toISOString()));
 const num = (v) => (v == null ? null : Math.round(Number(v) * 100) / 100);
@@ -151,6 +151,9 @@ export async function loadWorlds(db, companyId, employeeIds, { on = todayText() 
     : [[]];
 
   const byEmployee = (rows) => { const m = new Map(); for (const r of rows) { const l = m.get(r.employee_id) ?? []; l.push(r); m.set(r.employee_id, l); } return m; };
+  // §28.4: once the company's attendance is live, what it recorded — present days by month (and by
+  // day, for one person's own reads) — for EL's present days and ML's days worked.
+  const attendanceBy = await loadAttendance(db, companyId, ids);
   const openingsBy = byEmployee(openingRows);
   const requestsBy = byEmployee(requestRows);
 
@@ -185,6 +188,7 @@ export async function loadWorlds(db, companyId, employeeIds, { on = todayText() 
       // §23.1: nothing is earned before the policy takes effect.
       effectiveFrom: effective.policy ? (effectiveFromOf.get(effective.policy.id) ?? null) : null,
       calendar,
+      attendance: attendanceBy.get(e.id) ?? null,
       openings,
       requests: (requestsBy.get(e.id) ?? []).map((r) => ({
         id: r.id, leaveTypeId: r.leave_type_id, leaveTypeName: r.lt_name, from: dateText(r.from_date), to: dateText(r.to_date),
@@ -193,6 +197,31 @@ export async function loadWorlds(db, companyId, employeeIds, { on = todayText() 
     });
   }
   return worlds;
+}
+
+/**
+ * Attendance for the balances (§28.4): Map<employeeId, { liveFrom, presentByMonth, presentByDay | null }>,
+ * empty when the company's attendance is not live. By day only for a handful of people (one person's
+ * reads), so the balances grid of the whole company stays one aggregate query.
+ */
+async function loadAttendance(db, companyId, ids) {
+  const out = new Map();
+  const [[s]] = await db.query('SELECT live_from FROM hrms_attendance_settings WHERE company_id = ?', [companyId]);
+  const liveFrom = dateText(s?.live_from);
+  if (!liveFrom || !ids.length) return out;
+  const [months] = await db.query(
+    `SELECT employee_id, DATE_FORMAT(attendance_date, '%Y-%m') AS m, SUM(present_value) AS p FROM hrms_attendance_records
+      WHERE company_id = ? AND employee_id IN (?) AND deleted_at IS NULL AND attendance_date >= ? GROUP BY employee_id, m`, [companyId, ids, liveFrom]);
+  let days = [];
+  if (ids.length <= 5) {
+    [days] = await db.query(
+      `SELECT employee_id, attendance_date, present_value FROM hrms_attendance_records
+        WHERE company_id = ? AND employee_id IN (?) AND deleted_at IS NULL AND attendance_date >= ? AND present_value > 0`, [companyId, ids, liveFrom]);
+  }
+  for (const id of ids) out.set(id, { liveFrom, presentByMonth: new Map(), presentByDay: ids.length <= 5 ? new Map() : null });
+  for (const r of months) out.get(r.employee_id)?.presentByMonth.set(r.m, Number(r.p) || 0);
+  for (const r of days) out.get(r.employee_id)?.presentByDay?.set(dateText(r.attendance_date), Number(r.present_value) || 0);
+  return out;
 }
 
 async function worldOf(db, companyId, employeeId) {
@@ -229,7 +258,7 @@ function balanceFor(w, rule, { year, asOf, excludeRequestId = null }) {
     rule, year, startsMonth: w.startsMonth, joinDate: w.employee.joinDate, asOf,
     openings: w.openings.get(rule.leaveTypeId) ?? new Map(),
     requests: w.requests.filter((r) => r.leaveTypeId === rule.leaveTypeId),
-    calendar: w.calendar, excludeRequestId, effectiveFrom: w.effectiveFrom ?? null,
+    calendar: w.calendar, excludeRequestId, effectiveFrom: w.effectiveFrom ?? null, attendance: w.attendance ?? null,
   });
   let cannotWhy = null;
   const g = genderOf(w.employee.gender);
@@ -418,7 +447,25 @@ export function checkAsk(w, type, ask, { mode = 'preview', excludeRequestId = nu
     checks.push(noteOf('SHORT_NOTICE', `Asked ${ahead === 0 ? 'on the day' : `${daysWords(ahead)} ahead`}. ${tiered ? `For ${daysWords(counted.quantity)} the policy asks for ${daysWords(notice)} ahead.` : `The policy asks for ${daysWords(notice)} ahead.`}`));
   }
   const attendance = attendanceSentences(rule.notes);
-  if (attendance) checks.push(noteOf('ATTENDANCE', `Attendance is not recorded yet, so this is assumed and must be checked by HR: ${attendance}`));
+  const live = w.attendance?.liveFrom && w.attendance.liveFrom <= ask.from ? w.attendance : null;
+  if (attendance && !live) checks.push(noteOf('ATTENDANCE', `Attendance is not recorded yet, so this is assumed and must be checked by HR: ${attendance}`));
+  else if (live && (attendance || rule.minPresentDaysForCredit)) {
+    // §28.4: attendance is live — what it says, instead of an assumption.
+    // "80 days worked" or "worked at least 80 days".
+    const m = /(\d+)\s+days?\s+worked|worked\s+(?:at\s+least\s+|for\s+)?(\d+)\s+days?/i.exec(String(rule.notes ?? ''));
+    const worked = m ? [m[0], m[1] ?? m[2]] : null;
+    if (worked) {
+      const from12 = addDays(ask.from, -365);
+      const since = from12 < live.liveFrom ? live.liveFrom : from12;
+      const n = presentBetween(live, since, addDays(ask.from, -1));
+      const need = Number(worked[1]);
+      checks.push(noteOf('ATTENDANCE', `Attendance shows ${plain(n)} day${n === 1 ? '' : 's'} worked from ${dayText(since, true)} to ${dayText(addDays(ask.from, -1), true)}${since > from12 ? ` (attendance is recorded from ${dayText(live.liveFrom, true)}; earlier months must be checked by HR)` : ''}; the policy asks for ${need}.`));
+    } else if (rule.minPresentDaysForCredit) {
+      checks.push(noteOf('ATTENDANCE', `Attendance is live: a month is credited only when it has ${rule.minPresentDaysForCredit} present days, and the balance above already counts that.`));
+    } else {
+      checks.push(noteOf('ATTENDANCE', `Attendance is live from ${dayText(live.liveFrom, true)}; HR checks this against it: ${attendance}`));
+    }
+  }
   if (!rule.allowedInProbation) checks.push(noteOf('PROBATION', `${rule.leaveTypeName} is not meant for probation. Probation is not recorded here, so check it.`));
   const proof = rule.proofAfterDays === null || rule.proofAfterDays === undefined ? null : Number(rule.proofAfterDays);
   if (proof !== null && counted.quantity > proof) {
@@ -493,7 +540,7 @@ async function isAboveOrApprover(db, companyId, w, approverId, employeeId) {
 
 const REQUEST_SELECT = `
   SELECT r.id, r.employee_id, r.leave_type_id, r.from_date, r.to_date, r.half_day, r.quantity, r.reason, r.status,
-         r.approver_employee_id, r.created_at, r.decided_at, r.decided_by, r.decision_note, r.cancel_note, r.raised_by_hr, r.days_json,
+         r.approver_employee_id, r.created_at, r.decided_at, r.decided_by, r.decision_note, r.cancel_note, r.raised_by_hr, r.raised_by_system, r.days_json,
          lt.code AS lt_code, lt.name AS lt_name, lt.is_paid AS lt_is_paid, u.name AS decided_by_name
     FROM hrms_leave_requests r
     JOIN hrms_leave_types lt ON lt.company_id = r.company_id AND lt.id = r.leave_type_id
@@ -540,6 +587,8 @@ function shapeRequest(row, persons, can) {
     decisionNote: row.decision_note ?? null,
     cancelNote: row.cancel_note ?? null,
     raisedByHr: Boolean(row.raised_by_hr),
+    // §28.3: taken by the attendance rules (a penalty), never asked for; waived on the Penalties screen.
+    raisedBySystem: Boolean(row.raised_by_system),
     can,
   };
 }
@@ -595,8 +644,13 @@ async function previewOf(db, companyId, employeeId, ask) {
   const result = checkAsk(w, type, ask, { mode: 'preview' });
   const { approverId } = await approverChain(db, companyId, w);
   const persons = await loadPersons(db, companyId, [approverId]);
+  // §28.4: what attendance already recorded on those days (asking for leave already taken).
+  const [att] = ask.to >= ask.from ? await db.query(
+    'SELECT attendance_date, status, status_reason FROM hrms_attendance_records WHERE company_id = ? AND employee_id = ? AND deleted_at IS NULL AND attendance_date BETWEEN ? AND ? ORDER BY attendance_date',
+    [companyId, employeeId, ask.from, ask.to]) : [[]];
   return {
     days: result.days,
+    attendance: att.map((a) => ({ date: dateText(a.attendance_date), status: a.status, why: a.status_reason ?? null })),
     quantity: result.quantity,
     balance: { before: result.before, after: result.after, why: result.balance?.why ?? '' },
     checks: result.checks,
@@ -670,6 +724,7 @@ export async function cancelMine(conn, c, id, body = {}, requestId = null) {
   const me = await myEmployeeId(conn, c);
   const row = await requestRow(conn, c.companyId, id, { lock: true });
   if (row.employee_id !== me) throw notFound('That leave request');
+  if (row.raised_by_system) throw conflict('SYSTEM_REQUEST', 'This leave was taken by the attendance rules (a penalty). HR or your manager can waive the penalty; that gives the day back.');
   const today = todayText();
   if (row.status === 'APPROVED' && dateText(row.from_date) <= today) {
     throw conflict('ALREADY_STARTED', 'This leave has started, so it cannot be cancelled here. Ask HR.');
@@ -681,6 +736,8 @@ export async function cancelMine(conn, c, id, body = {}, requestId = null) {
 async function writeCancel(conn, c, row, note, viewer, requestId) {
   await conn.query("UPDATE hrms_leave_requests SET status = 'CANCELLED', cancel_note = ? WHERE company_id = ? AND id = ?", [note || null, c.companyId, row.id]);
   await audit(conn, c, 'hrms_leave_requests', row.id, 'UPDATE', { status: row.status }, { status: 'CANCELLED', cancelNote: note || null }, requestId);
+  // §28.4: an approved leave marked days; cancelling it processes them again.
+  if (row.status === 'APPROVED') await attendanceAfterLeave(conn, c, row);
   const fresh = await requestRow(conn, c.companyId, row.id);
   return { request: (await shapeRows(conn, c.companyId, [fresh], viewer))[0] };
 }
@@ -702,6 +759,7 @@ export async function submitForPerson(conn, c, body = {}, viewer = null, request
 /** POST /leave/requests/:id/cancel — HR, any time, with a note. */
 export async function cancelByHr(conn, c, id, body = {}, viewer = null, requestId = null) {
   const row = await requestRow(conn, c.companyId, id, { lock: true });
+  if (row.raised_by_system) throw conflict('SYSTEM_REQUEST', 'This leave was taken by the attendance rules (a penalty). Waive the penalty on Attendance › Penalties; that gives the day back.');
   if (row.status !== 'PENDING' && row.status !== 'APPROVED') throw conflict('NOT_OPEN', `This request is already ${STATUS_WORDS[row.status]}.`);
   const note = String(body.note ?? '').trim();
   if (!note) throw invalid('NOTE_NEEDED', 'Say why it is cancelled.');
@@ -859,6 +917,7 @@ export async function decide(conn, c, viewer, id, verdict, body = {}, requestId 
     [status, c.userId, note || null, c.companyId, row.id],
   );
   await audit(conn, c, 'hrms_leave_requests', row.id, verdict === 'APPROVE' ? 'APPROVE' : 'UPDATE', { status: 'PENDING' }, { status, decisionNote: note || null }, requestId);
+  if (verdict === 'APPROVE') await attendanceAfterLeave(conn, c, row);
   const fresh = await requestRow(conn, c.companyId, row.id);
   const [request] = await shapeRowsWith(conn, c.companyId, [fresh], viewer, reach);
   return { request };
@@ -906,6 +965,58 @@ export async function myApprovals(db, c, viewer, { status = 'PENDING' } = {}) {
     };
   });
   return { items, counts: { pending: Number(count?.n ?? 0) } };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Attendance (§28.3, §28.4)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** Approved leave marks days LEAVE; a cancelled one gives them back. The attendance module decides whether it is live. */
+async function attendanceAfterLeave(conn, c, row) {
+  try {
+    const { reprocess } = await import('../attendance/process.js');
+    await reprocess(conn, c, [row.employee_id], dateText(row.from_date), dateText(row.to_date), 'LEAVE');
+  } catch (err) {
+    // The leave decision stands whatever attendance makes of it; the nightly run catches up.
+    console.warn(`[cf_hrms] attendance after leave ${row.id}: ${err.message}`);
+  }
+}
+
+/**
+ * A SYSTEM leave request (§28.3): a penalty's leave deduction. It goes through the same checks
+ * as any request (the balance, the type in the policy, half days, overlaps) and, when nothing
+ * BLOCKs, is written APPROVED with raised_by_system = 1 — so the balance is the one truth.
+ * @param ask { leaveTypeId, from, to?, halfDay?, reason }
+ * @returns { request: { id, quantity } } | { blocked: true, problems: string[] }
+ */
+export async function raiseSystemRequest(conn, c, employeeId, ask, { requestId = null } = {}) {
+  const w = await worldOf(conn, c.companyId, employeeId);
+  const [[type]] = await conn.query('SELECT id, code, name, is_paid FROM hrms_leave_types WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, ask.leaveTypeId]);
+  if (!type) return { blocked: true, problems: ['That leave type is not there.'] };
+  const full = { leaveTypeId: Number(ask.leaveTypeId), from: ask.from, to: ask.to ?? ask.from, halfDay: ask.halfDay ?? null, reason: String(ask.reason ?? '').slice(0, 2000) };
+  const result = checkAsk(w, type, full, { mode: 'preview' });
+  const blocks = result.checks.filter((x) => x.level === 'BLOCK');
+  if (blocks.length) return { blocked: true, problems: blocks.map((b) => b.text) };
+  const [ins] = await conn.query(
+    `INSERT INTO hrms_leave_requests
+       (company_id, employee_id, leave_type_id, from_date, to_date, quantity, reason, status, approver_employee_id, half_day, days_json,
+        raised_by_hr, raised_by_system, decided_by, decided_at, approved_at, decision_note, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'APPROVED', NULL, ?, ?, 0, 1, ?, NOW(), NOW(), 'Taken by the attendance rules', ?)`,
+    [c.companyId, employeeId, full.leaveTypeId, full.from, full.to, result.quantity, full.reason, full.halfDay, JSON.stringify(result.days), c.userId ?? null, c.userId ?? null],
+  );
+  await audit(conn, c, 'hrms_leave_requests', ins.insertId, 'CREATE', null, {
+    employeeId, leaveTypeId: full.leaveTypeId, from: full.from, to: full.to, halfDay: full.halfDay, quantity: result.quantity, status: 'APPROVED', raisedBySystem: true,
+  }, requestId);
+  return { request: { id: ins.insertId, quantity: result.quantity } };
+}
+
+/** Cancel a SYSTEM leave request (its penalty was waived or reversed): the day goes back to the balance. */
+export async function cancelSystemRequest(conn, c, id, note, requestId = null) {
+  const [[row]] = await conn.query('SELECT id, status, raised_by_system FROM hrms_leave_requests WHERE company_id = ? AND id = ? FOR UPDATE', [c.companyId, id]);
+  if (!row || !row.raised_by_system || row.status !== 'APPROVED') return false;
+  await conn.query("UPDATE hrms_leave_requests SET status = 'CANCELLED', cancel_note = ? WHERE company_id = ? AND id = ?", [String(note ?? '').slice(0, 2000) || null, c.companyId, id]);
+  await audit(conn, c, 'hrms_leave_requests', id, 'UPDATE', { status: 'APPROVED' }, { status: 'CANCELLED', cancelNote: note ?? null, raisedBySystem: true }, requestId);
+  return true;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1006,5 +1117,5 @@ export async function setOpening(conn, c, body = {}, requestId = null, { source 
 export default {
   loadPersons, loadWorlds, balancesOf, asOfFor, readAsk, checkAsk, summaryOfAsk, approverChain, employeeIdOfLogin,
   myLeave, previewMine, submitMine, cancelMine, previewForPerson, submitForPerson, cancelByHr, listRequests, requestEmployeeId,
-  approvalDetail, readRequest, decide, myApprovals, balancesGrid, setOpening,
+  approvalDetail, readRequest, decide, myApprovals, balancesGrid, setOpening, raiseSystemRequest, cancelSystemRequest,
 };

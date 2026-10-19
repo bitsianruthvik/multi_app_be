@@ -1,7 +1,7 @@
 /**
  * access.js — THE CATALOGUE OF RIGHTS. (TM/CF_HRMS_HIRING_SPEC.md §12.1, §12.2.)
  *
- * One tag = one thing a person may do. Nine areas, each with up to four rights
+ * One tag = one thing a person may do. Eleven areas, each with up to four rights
  * (view, edit, remove, upload), and seven named rights. Everything else in the
  * app that speaks of rights reads this file: the `PERM` object the routes are
  * guarded with (lib/http.js), the ready-made roles, the migration of the old
@@ -32,6 +32,12 @@ export const AREAS = [
   // Spec §18 (2026-10-15). Added after companies were set up: scripts/setup-access.mjs grants it to
   // the ready-made roles of an existing company once (LATE_AREAS below), and nothing else.
   { key: 'performance', label: 'Performance', screens: ['Plans', 'A person’s plan', 'Periods', 'Actuals', 'Reviews and check-ins', 'Actions'], rights: ['view', 'edit', 'remove', 'upload'] },
+  // Spec §25.2 (2026-10-19): running payroll. Salary AMOUNTS also need the named right cf_hrms_pay_view.
+  // A late area like performance: setup-access grants it to the ready-made roles of an existing company once.
+  { key: 'payroll', label: 'Payroll', screens: ['Payroll runs', 'Salaries', 'Salary structures', 'Pay components', 'Statutory settings'], rights: ['view', 'edit', 'remove', 'upload'] },
+  // Spec §28 (2026-10-19): attendance — the day board, the muster, requests, penalties, policies, devices,
+  // imports, closing a month. A late area: setup-access grants it to the ready-made roles of an existing company once.
+  { key: 'attendance', label: 'Attendance', screens: ['Today', 'Month (muster)', 'Requests', 'Penalties', 'Attendance policies', 'Devices and API keys', 'Imports', 'Close month'], rights: ['view', 'edit', 'remove', 'upload'] },
 ];
 
 export const areaTag = (area, right) => `cf_hrms_${area}_${right}`;
@@ -86,13 +92,13 @@ export const TEMPLATES = [
   },
   {
     key: 'HR_EXECUTIVE', label: 'HR executive', platformName: 'HR executive', scope: 'COMPANY', locked: false,
-    description: 'Sees everything; changes employees, hiring, positions and documents; creates employees. Cannot remove, upload, change the setup or close an employee.',
-    tags: [...views(everyArea), ...edits(['employees', 'hiring', 'positions', 'documents', 'performance']), named('employeeCreate'), named('contactView'), named('payView'), named('selfView')],
+    description: 'Sees everything; changes employees, hiring, positions, documents, performance and payroll; creates employees. Cannot remove, upload, change the setup or close an employee.',
+    tags: [...views(everyArea), ...edits(['employees', 'hiring', 'positions', 'documents', 'performance', 'payroll', 'attendance']), named('employeeCreate'), named('contactView'), named('payView'), named('selfView')],
   },
   {
     key: 'DEPARTMENT_HEAD', label: 'Department head', platformName: 'Department head', scope: 'DEPARTMENT', locked: false,
     description: 'Sees the organisation and the people of their own department and below; changes the positions there.',
-    tags: [...views(['org', 'roles', 'positions', 'employees', 'time', 'leave', 'performance']), ...edits(['positions', 'performance']), named('contactView'), named('selfView')],
+    tags: [...views(['org', 'roles', 'positions', 'employees', 'time', 'leave', 'performance', 'attendance']), ...edits(['positions', 'performance']), named('contactView'), named('selfView')],
   },
   {
     key: 'EMPLOYEE', label: 'Employee', platformName: 'Employee', scope: 'DEPARTMENT', locked: true,
@@ -108,7 +114,7 @@ export const TEMPLATES = [
  * the tags of these areas its template holds — once per role and area, marked
  * in the audit log, so a right somebody later takes away is not handed back.
  */
-export const LATE_AREAS = ['performance'];
+export const LATE_AREAS = ['performance', 'payroll', 'attendance'];
 export const lateAreaTags = (area) => {
   const a = AREAS.find((x) => x.key === area);
   return a ? a.rights.map((r) => areaTag(a.key, r)) : [];
@@ -135,7 +141,9 @@ export const OLD_TAG_MAP = {
   cf_hrms_documents_generate: [...T('documents', 'view', 'edit')],
   cf_hrms_leave_view: [areaTag('leave', 'view')],
   cf_hrms_leave_manage: [...T('leave', 'edit', 'remove')],
-  cf_hrms_attendance_view: [],
+  // Since §28 `cf_hrms_attendance_view` is also the name of the attendance area's view right, so — like
+  // leave_view — it keeps its name. attendance_manage stays mapped to nothing (it never opened a screen).
+  cf_hrms_attendance_view: [areaTag('attendance', 'view')],
   cf_hrms_attendance_manage: [],
   cf_hrms_import_manage: [],
   cf_hrms_self_view: [named('selfView')],

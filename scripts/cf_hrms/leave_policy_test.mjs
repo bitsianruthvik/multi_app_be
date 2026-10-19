@@ -70,7 +70,7 @@ const [[other]] = await pool.query('SELECT id, name FROM companies WHERE id <> ?
 const OTHER = other.id;
 
 const hrmsTables = (await pool.query(
-  "SELECT TABLE_NAME AS t FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'hrms\\_%' ORDER BY TABLE_NAME"))[0].map((r) => r.t);
+  /* company tables only (global ones, e.g. hrms_tax_rules, have no company_id) */ "SELECT TABLE_NAME AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'hrms\\_%' AND COLUMN_NAME IN ('company_id', 'deleted_at') GROUP BY TABLE_NAME HAVING COUNT(*) = 2 ORDER BY TABLE_NAME"))[0].map((r) => r.t);
 const snapshot = async () => {
   const out = {};
   for (const t of hrmsTables) {

@@ -425,7 +425,7 @@ try {
   };
   const BALANCE_KEYS = ['leaveTypeId', 'code', 'name', 'isPaid', 'limited', 'opening', 'earned', 'taken', 'held', 'available', 'why', 'rule', 'halfDayAllowed', 'canAsk'];
   const PERSON_KEYS = ['employeeId', 'name', 'employeeCode', 'positionTitle', 'departmentName'];
-  const REQUEST_KEYS = ['id', 'person', 'leaveType', 'from', 'to', 'halfDay', 'quantity', 'reason', 'status', 'approver', 'submittedAt', 'decidedAt', 'decidedBy', 'decisionNote', 'cancelNote', 'raisedByHr', 'can'];
+  const REQUEST_KEYS = ['id', 'person', 'leaveType', 'from', 'to', 'halfDay', 'quantity', 'reason', 'status', 'approver', 'submittedAt', 'decidedAt', 'decidedBy', 'decisionNote', 'cancelNote', 'raisedByHr', 'raisedBySystem', 'can']; // raisedBySystem: §28.3
 
   /* ══ 5. the routes ════════════════════════════════════════════════════════ */
   section('[5] My leave, preview, submit');
@@ -447,7 +447,7 @@ try {
     ok(nobody.status === 403 && nobody.json.code === 'NOT_LINKED', 'a login without an employee has no leave of its own: 403 NOT_LINKED');
 
     const pv = await call(U.E, 'POST', '/user/me/leave/preview', ask(LT.cl, day(0), day(2)));
-    ok(pv.status === 200 && same(keys(pv.json), ['days', 'quantity', 'balance', 'checks', 'approver', 'canSubmit', 'summary']) && pv.json.quantity === 3 && pv.json.canSubmit
+    ok(pv.status === 200 && same(keys(pv.json), ['days', 'attendance', 'quantity', 'balance', 'checks', 'approver', 'canSubmit', 'summary']) && pv.json.quantity === 3 && pv.json.canSubmit
       && pv.json.balance.before === 12 && pv.json.balance.after === 9 && pv.json.approver.employeeId === E.m && pv.json.days.length === 3
       && same(keys(pv.json.days[0]), ['date', 'weekday', 'counts', 'amount', 'why']) && /^3 days of .* Casual leave, .*\. 9 left after this\.$/.test(pv.json.summary),
     'POST /user/me/leave/preview -> Preview: the days, 12 -> 9, the approver, the summary', JSON.stringify(pv.json).slice(0, 400));

@@ -26,7 +26,17 @@
  *   the same from ruleData.js without a database (tests).
  *   Rule keys: regime, slabs, standard_deduction, rebate, surcharge, cess, ded_80c, ded_80ccd1b,
  *   ded_80ccd2, ded_80d, ded_24b, ded_80e, ded_80tta, ded_80ttb, ded_80g, exempt_hra, exempt_lta,
- *   exempt_gratuity, exempt_leave_encashment, professional_tax, forms, rounding, tds_rounding.
+ *   exempt_gratuity, exempt_leave_encashment, professional_tax, forms, rounding, tds_rounding;
+ *   the RETURN (itr.js, spec §25.6): house_property, capital_gains, rebate_special, itr_forms,
+ *   interest_234, return_filing, regime_option, late_fee.
+ *
+ * THE RETURN (itr.js): computeReturn — the person's own ITR worked out from the employer part
+ *   and what they add (interest, dividends, house property, capital gains, deductions, taxes paid),
+ *   both regimes, ITR-1 / ITR-2 by the year's conditions, interest 234A/B/C (estimate), the fee,
+ *   payable or refund, and the schedules. Engine additions used only by the return: dividends,
+ *   let-out house property (30%, interest, loss set-off / carry forward by regime), capital gains
+ *   at special rates (111A / 112 / 112A, the unused nil slab, the 15% surcharge cap) and the
+ *   rebate never covering what rebate_special leaves out.
  *
  * HOW TO ADD A YEAR
  *   1. Read that year's Finance Act (First Schedule), the Act's sections and the Rules; note
@@ -43,5 +53,6 @@
  */
 export { computeTax, compareRegimes, slabTaxOf, roundTo, inr } from './engine.js';
 export { projectYear } from './project.js';
+export { computeReturn, selectForm, interestEstimate, engineInput, salaryBlock, monthsOrPart } from './itr.js';
 export { loadTaxRules, loadTaxYear, rulesFromRows, rulesFromSeed, ageBandFor, isMetro, yearBounds, REGIMES, AGE_BANDS } from './rules.js';
 export { TAX_RULE_ROWS, SEEDED_YEARS } from './ruleData.js';

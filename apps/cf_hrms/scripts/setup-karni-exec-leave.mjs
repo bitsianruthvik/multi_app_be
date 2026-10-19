@@ -70,7 +70,7 @@ export const RULES = [
     notes: 'Tell the reporting manager and HR before the working day starts. Regularise it within 2 working days of returning, or it becomes leave without pay. HR may ask for a medical certificate for repeated sick leave.',
   },
   {
-    type: 'EL', basis: 'PER_YEAR', accrual: 'MONTHLY', creditInArrears: true, days: 15,
+    type: 'EL', basis: 'PER_YEAR', accrual: 'MONTHLY', creditInArrears: true, days: 15, minPresentDaysForCredit: 20,
     waitDaysAfterJoining: 90, allowedInProbation: false, halfDayAllowed: true,
     noticeTiers: [{ upToDays: 3, days: 7 }, { upToDays: 7, days: 30 }, { upToDays: null, days: 45 }],
     carryForward: 'NONE', encashable: true,

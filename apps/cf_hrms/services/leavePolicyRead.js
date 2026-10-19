@@ -38,6 +38,8 @@ export const RULE_DEFAULTS = {
   expiresAfterDays: null, negativeBalanceAllowed: false, notes: null,
   // §23.1 — all off by default, so a rule without them reads and behaves as before.
   joiningCutoffDay: null, creditInArrears: false, noticeTiers: null, notWithLeaveTypeIds: [],
+  // §28.4 — a MONTHLY credit needs this many present days in the month, once attendance is live.
+  minPresentDaysForCredit: null,
 };
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -67,6 +69,7 @@ export function applicability(rule) {
     // §23.1: a MONTHLY rule always skips a late joining month; the others only when they prorate.
     joiningCutoffDay: yearly && ['UPFRONT', 'ON_REQUEST', 'HALF_YEARLY', 'MONTHLY'].includes(accrual),
     creditInArrears: yearly && accrual === 'MONTHLY',
+    minPresentDaysForCredit: yearly && accrual === 'MONTHLY',
     carryForward: banked && !earnedByWork,
     encashable: banked,
     expiresAfterDays: earnedByWork,
@@ -123,6 +126,9 @@ export function summaryOf(rule, type = null, { typeNames = null } = {}) {
   } else {
     out.push(d === null ? 'Given at the start of the year.' : `${cap(days(d))} a year, all given at the start of the year.`);
   }
+
+  const needPresent = num(r.minPresentDaysForCredit);
+  if (a.minPresentDaysForCredit && needPresent) out.push(`A month is credited only when it has at least ${needPresent} present day${needPresent === 1 ? '' : 's'} (read from attendance once it is live).`);
 
   // ── who it is for ──
   if (r.appliesTo === 'WOMEN') out.push('For women.');
@@ -279,6 +285,7 @@ export function shapeRule(r, typeNames = null) {
     creditInArrears: Boolean(r.credit_in_arrears),
     noticeTiers: tiersOf(r.notice_tiers_json),
     notWithLeaveTypeIds: idsOf(r.not_with_json),
+    minPresentDaysForCredit: num(r.min_present_days_for_credit),
   };
   return { ...rule, summary: summaryOf(rule, { code: r.lt_code, name: r.lt_name }, { typeNames }) };
 }

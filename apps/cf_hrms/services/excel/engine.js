@@ -7,6 +7,9 @@
  *   entity, label, area                     'positions', 'Positions', 'positions'
  *   list                                    which list its download follows (lib/listFilters.js) and how to read it
  *   wholeCompany                            true when its records belong to no department
+ *   downloadWholeCompany                    true when even the download is for whole-company logins only (payroll)
+ *   alsoRights                              named rights the download and the upload need as well
+ *                                           (pay-salaries, pay-items: cf_hrms_pay_view)
  *   idsFirst                                true: on an upload, `load` is told the ids in the
  *                                           file's hidden column (env.fileIds) and loads just
  *                                           those records (actuals: rows that are not one
@@ -82,7 +85,8 @@ function listsOf(state) {
  * @param env { can(tag), scope: { all, departmentIds }, userName, company: { id, name }, query }
  */
 export async function downloadWorkbook(db, c, def, env) {
-  const state = await def.load(db, c, env);
+  // `purpose`: an entity that audits a read (pay-salaries) does so on the download, not on every preview.
+  const state = await def.load(db, c, { ...env, purpose: 'download' });
   const columns = def.columns(state, env);
   let rows = [];
   if (!['1', 'true', 'yes'].includes(String(env.query?.blank ?? '').toLowerCase())) {
@@ -308,8 +312,8 @@ export async function applyUpload(db, c, def, body, env) {
 export function listEntities(env) {
   return ENTITIES.map((d) => ({
     entity: d.entity, label: d.label, area: d.area,
-    canDownload: env.can(d.viewRight),
-    canUpload: env.can(d.uploadRight) && (env.scope.all || !d.wholeCompany),
+    canDownload: env.can(d.viewRight) && (d.alsoRights ?? []).every((t) => env.can(t)) && (env.scope.all || !d.downloadWholeCompany),
+    canUpload: env.can(d.uploadRight) && (d.alsoRights ?? []).every((t) => env.can(t)) && (env.scope.all || !d.wholeCompany),
   }));
 }
 

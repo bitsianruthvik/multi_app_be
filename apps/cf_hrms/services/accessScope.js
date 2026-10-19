@@ -187,6 +187,9 @@ const EMPLOYEE_ROW = {
   employeeDocument: 'hrms_employee_documents',
   assignment: 'hrms_work_assignments',
   leaveRequest: 'hrms_leave_requests',
+  // §28: an attendance request (regularization) and a penalty both hang off a person.
+  attendanceRequest: 'hrms_attendance_regularizations',
+  attendancePenalty: 'hrms_attendance_penalties',
 };
 const ASSIGNMENT_ROW = {
   assignmentContext: 'hrms_work_assignment_contexts',

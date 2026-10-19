@@ -54,6 +54,11 @@ import {
 } from '../services/teamScopeService.js';
 import { myPlans, myActualHistory, myScorecard } from '../services/performance/planService.js';
 import { myReviews, myReview, writeMyPart, finishMyPart, markMyActionDone } from '../services/performance/reviewService.js';
+import { myPay } from '../services/payroll/payrollService.js';
+import { myPayslips, payslipRow } from '../services/payroll/runService.js';
+import { payslipPdf, letterheadOf, payslipFileName } from '../services/payroll/payslip.js';
+import { HrmsError } from '../lib/errors.js';
+import * as ATT from '../services/attendance/requests.js';
 
 const router = Router();
 
@@ -195,6 +200,29 @@ router.post('/user/me/leave', guard(PERM.selfView), handle((req) => tx(req, (db,
 router.post('/user/me/leave/:id/cancel', guard(PERM.selfView), handle((req) => tx(req, (db, c) => cancelMine(db, c, intParam(req.params.id), req.body ?? {}, reqId(req)))));
 
 /**
+ * MY PAY (spec §25.2). My own salary and my released payslips — the employee is the login's,
+ * never an id from the client; a payslip id of somebody else's reads as not found. My own pay
+ * needs no pay right and writes no audit row (only reads of ANOTHER person's salary do).
+ *
+ *   GET /user/me/pay                      { employee, salary, upcoming, history }
+ *   GET /user/me/payslips                 { payslips: [{ id, month, label, net, releasedAt }] }
+ *   GET /user/me/payslips/:id/file        { fileName, mimeType, contentBase64 } — the PDF
+ */
+async function myEmployee(req) {
+  const id = await employeeIdOfLogin(pool, ctx(req));
+  if (!id) throw new HrmsError(403, 'NOT_LINKED', 'This login is not linked to an employee, so it has no pay of its own.');
+  return id;
+}
+router.get('/user/me/pay', guard(PERM.selfView), handle(async (req) => myPay(pool, ctx(req), await myEmployee(req))));
+router.get('/user/me/payslips', guard(PERM.selfView), handle(async (req) => myPayslips(pool, ctx(req), await myEmployee(req))));
+router.get('/user/me/payslips/:id/file', guard(PERM.selfView), handle(async (req) => {
+  const c = ctx(req);
+  const p = await payslipRow(pool, c, intParam(req.params.id), { employeeId: await myEmployee(req) });
+  const buffer = await payslipPdf(p.snapshot, await letterheadOf(pool, c.companyId));
+  return { fileName: payslipFileName(p.snapshot), mimeType: 'application/pdf', contentBase64: buffer.toString('base64') };
+}));
+
+/**
  * APPROVALS — everything waiting for this login to decide, of every kind.
  *
  *   GET  /user/me/approvals?status=PENDING|DECIDED     { items: ApprovalItem[], counts: { pending } }
@@ -210,10 +238,10 @@ router.post('/user/me/leave/:id/cancel', guard(PERM.selfView), handle((req) => t
  * ONE ENTRY PER KIND. Today only `leave`. Another kind of approval adds an entry —
  * its feed, its read and its decide — and the list, the counts and the routes follow.
  */
-async function viewerOf(req) {
+async function viewerOf(req, right = PERM.leave.edit) {
   const c = ctx(req);
   let hr = null;
-  if (can(req, PERM.leave.edit)) {
+  if (can(req, right)) {
     const scope = await scopeOf(req);
     hr = scope.all ? { all: true } : { departmentIds: scope.departmentIds };
   }
@@ -221,24 +249,31 @@ async function viewerOf(req) {
 }
 const APPROVAL_KINDS = {
   leave: {
+    right: PERM.leave.edit,
     feed: (c, viewer, status) => myApprovals(pool, c, viewer, { status }),
     read: (c, viewer, itemId) => approvalDetail(pool, c, viewer, itemId),
     decide: (db, c, viewer, itemId, verdict, body, requestId) => decide(db, c, viewer, itemId, verdict, body, requestId),
   },
+  // Spec §28.5: correct a day, short permission, on duty — HR's reach is attendance edit.
+  attendance: {
+    right: PERM.attendance.edit,
+    feed: (c, viewer, status) => ATT.myApprovals(pool, c, viewer, { status }),
+    read: (c, viewer, itemId) => ATT.approvalDetail(pool, c, viewer, itemId),
+    decide: (db, c, viewer, itemId, verdict, body, requestId) => ATT.decide(db, c, viewer, itemId, verdict, body, requestId),
+  },
 };
 router.get('/user/me/approvals', guard(PERM.selfView), handle(async (req) => {
   const c = ctx(req);
-  const viewer = await viewerOf(req);
   const status = String(req.query.status ?? 'PENDING').toUpperCase() === 'DECIDED' ? 'DECIDED' : 'PENDING';
-  const feeds = await Promise.all(Object.values(APPROVAL_KINDS).map((k) => k.feed(c, viewer, status)));
+  const feeds = await Promise.all(Object.values(APPROVAL_KINDS).map(async (k) => k.feed(c, await viewerOf(req, k.right), status)));
   const items = feeds.flatMap((f) => f.items).sort((a, b) => (status === 'PENDING' ? String(a.submittedAt).localeCompare(String(b.submittedAt)) : 0));
   return { items, counts: { pending: feeds.reduce((s, f) => s + f.counts.pending, 0) } };
 }));
 for (const [kind, k] of Object.entries(APPROVAL_KINDS)) {
-  router.get(`/user/me/approvals/${kind}/:id`, guard(PERM.selfView), handle(async (req) => k.read(ctx(req), await viewerOf(req), intParam(req.params.id))));
+  router.get(`/user/me/approvals/${kind}/:id`, guard(PERM.selfView), handle(async (req) => k.read(ctx(req), await viewerOf(req, k.right), intParam(req.params.id))));
   for (const [path, verdict] of [['approve', 'APPROVE'], ['reject', 'REJECT']]) {
     router.post(`/user/me/approvals/${kind}/:id/${path}`, guard(PERM.selfView), handle(async (req) => {
-      const viewer = await viewerOf(req);
+      const viewer = await viewerOf(req, k.right);
       return tx(req, (db, c) => k.decide(db, c, viewer, intParam(req.params.id), verdict, req.body ?? {}, reqId(req)));
     }));
   }

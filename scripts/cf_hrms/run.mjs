@@ -116,9 +116,43 @@ const AREAS = {
     suites: ['command_bar_test', 'job_history_test', 'label_test'],
     paths: [`${H}/services/commands/**`, `${H}/routes/commands.js`],
   },
+  payroll: {
+    suites: ['payroll_test'],
+    paths: [`${H}/services/payroll/**`, `${H}/routes/payroll.js`, `${H}/scripts/apply-payroll-schema.mjs`, `${H}/scripts/setup-payroll.mjs`, `${H}/scripts/demo-payroll.mjs`,
+      `${H}/services/excel/entities/paySalaries.js`, `${H}/services/excel/entities/payItems.js`, `${H}/routes/self.js`, `${H}/services/letterRenderer.js`, `${H}/services/render/roleJd.js`],
+  },
   excel: {
     suites: ['excel_test'],
     paths: [`${H}/services/excel/**`, `${H}/routes/excel.js`],
+  },
+  tax: {
+    suites: ['tax_test'],
+    paths: [`${H}/services/tax/**`, `${H}/scripts/apply-tax-schema.mjs`, `${H}/scripts/seed-tax-rules.mjs`, 'scripts/cf_hrms/tax_test.mjs'],
+  },
+  // Income tax in payroll (spec §25.4, P2): the run's TDS comes from services/tax and services/payroll, so either runs it,
+  // and a change to it runs payroll_test (the run) too.
+  payrolltax: {
+    suites: ['payroll_tax_test', 'payroll_test'],
+    paths: [`${H}/services/payrollTax/**`, `${H}/routes/tax.js`, `${H}/services/payroll/**`, `${H}/services/tax/**`, `${H}/scripts/apply-payroll-tax-schema.mjs`,
+      `${H}/scripts/demo-payroll.mjs`, 'scripts/cf_hrms/payroll_tax_test.mjs'],
+  },
+  // The ITR helper (spec §25.6): the return-level rules live in services/tax too, so a tax change runs it.
+  itr: {
+    suites: ['itr_test', 'tax_test'],
+    paths: [`${H}/services/itr/**`, `${H}/services/tax/**`, `${H}/routes/itr.js`, `${H}/scripts/apply-itr-schema.mjs`, 'scripts/cf_hrms/itr_test.mjs'],
+  },
+  // Spec §28. Attendance reads leave (requests, balances) and leave reads attendance (present days), so each runs the other.
+  attendance: {
+    suites: ['attendance_test', 'leave_request_test', 'leave_rules_test'],
+    paths: [`${H}/services/attendance/**`, `${H}/routes/attendance.js`, `${H}/routes/selfAttendance.js`, `${H}/routes/iclock.js`, `${H}/routes/integrations.js`,
+      `${H}/scripts/apply-attendance-schema.mjs`, `${H}/scripts/demo-attendance.mjs`, 'scripts/cf_hrms/sim-iclock.mjs', `${H}/services/leave/**`, `${H}/services/leavePolicy*.js`],
+  },
+  // Payroll extras P3a (spec §25.5): statutory return files, perquisites, Form 10E, NPS in TDS. They read the payroll,
+  // the tax engine and attendance, so a change to any of those runs it too.
+  extras: {
+    suites: ['payroll_extras_test'],
+    paths: [`${H}/services/payrollExtras/**`, `${H}/routes/payrollExtras.js`, `${H}/services/tax/**`, `${H}/services/payrollTax/**`, `${H}/services/payroll/**`,
+      `${H}/services/attendance/month.js`, `${H}/scripts/apply-payroll-extras-schema.mjs`, 'scripts/cf_hrms/payroll_extras_test.mjs'],
   },
 };
 

@@ -16,11 +16,12 @@
  *      and its own cf_hrms app only;
  *   3. every other role of the company that holds old cf_hrms tags gets the new
  *      rights those map to, and an access role named after it;
- *   4. AN AREA ADDED LATER (lib/access.js LATE_AREAS — 'performance', spec §18):
+ *   4. AN AREA ADDED LATER (lib/access.js LATE_AREAS — 'performance', spec §18; 'payroll', spec §25):
  *      each ready-made role that was set up before it existed gets exactly the
- *      tags of that area its template holds (HR manager all four, HR executive
- *      and Department head view + edit; Owner holds everything anyway; Employee
- *      none) — once: an audit row (request_id 'late-area:<area>') marks the role,
+ *      tags of that area its template holds (performance: HR manager all four, HR
+ *      executive and Department head view + edit; payroll: HR manager all four, HR
+ *      executive view + edit, Department head none; Owner holds everything anyway;
+ *      Employee none) — once: an audit row (request_id 'late-area:<area>') marks the role,
  *      so a later run never hands back a right somebody took away. Nothing else
  *      about any role changes; roles that are not ready-made get nothing.
  *

@@ -211,6 +211,7 @@ export function readRule(input, typeName, problems, { leaveTypeId = null, typeNa
   r.proofAfterDays = n('proofAfterDays', 'the days after which proof is needed', { min: 0, max: 366 });
   r.maxTimesInService = n('maxTimesInService', 'the number of times in service', { min: 1, max: 100, whole: true });
   r.expiresAfterDays = n('expiresAfterDays', 'the days it must be used within', { min: 1, max: 3650, whole: true });
+  r.minPresentDaysForCredit = n('minPresentDaysForCredit', 'the present days a month needs to be credited', { min: 1, max: 31, whole: true });
   r.joiningCutoffDay = n('joiningCutoffDay', 'the day of the month after which a joining month does not count', { min: 1, max: 30, whole: true });
 
   // ── the notice by length (§23.1): steps from the shortest leave to the longest, the last open ──
@@ -290,6 +291,7 @@ export function readRule(input, typeName, problems, { leaveTypeId = null, typeNa
   // The joining cut-off means something to a MONTHLY rule, or to one that prorates on joining.
   if (!a.joiningCutoffDay || (r.accrual !== 'MONTHLY' && !r.prorateOnJoining)) r.joiningCutoffDay = null;
   if (!a.creditInArrears) r.creditInArrears = false;
+  if (!a.minPresentDaysForCredit) r.minPresentDaysForCredit = null;
   // The notice by length replaces the one notice.
   if (r.noticeTiers) r.minNoticeDays = 0;
 
@@ -310,6 +312,7 @@ const RULE_COLUMNS = {
   countDaysOffBetween: 'count_days_off_between', proofAfterDays: 'proof_after_days', appliesTo: 'applies_to',
   maxTimesInService: 'max_times_in_service', expiresAfterDays: 'expires_after_days', negativeBalanceAllowed: 'negative_balance_allowed', notes: 'notes',
   joiningCutoffDay: 'joining_cutoff_day', creditInArrears: 'credit_in_arrears', noticeTiers: 'notice_tiers_json', notWithLeaveTypeIds: 'not_with_json',
+  minPresentDaysForCredit: 'min_present_days_for_credit',
 };
 
 /** A rule value as its column stores it: a flag as 1/0, a list as JSON (an empty list as NULL). */

@@ -103,7 +103,48 @@ const s = (n) => (n === 1 ? '' : 's');
  * With none of these set, every accrual counts exactly as before.
  * @returns { amount, limited, text, estimated }
  */
-export function earnedOf(rule, { year, joinDate = null, asOf = null, calendar = null, effectiveFrom = null }) {
+/* ══ attendance, once it is live (§28.4) ══════════════════════════════════════
+ * `attendance` = { liveFrom: 'YYYY-MM-DD' | null, presentByMonth: Map<'YYYY-MM', days>, presentByDay?: Map<date, 0.5|1> }
+ * — what the caller read from hrms_attendance_records. Without it (or before liveFrom) every
+ * rule reads exactly as before.
+ */
+
+/** Days present from `from` to `to` (both included), by day when known, else by whole months. */
+export function presentBetween(attendance, from, to) {
+  if (!attendance || !from || !to || to < from) return 0;
+  if (attendance.presentByDay) {
+    let n = 0;
+    for (const [d, v] of attendance.presentByDay) if (d >= from && d <= to) n += Number(v) || 0;
+    return r2(n);
+  }
+  let n = 0;
+  for (const [m, v] of attendance.presentByMonth ?? new Map()) if (m >= from.slice(0, 7) && m <= to.slice(0, 7)) n += Number(v) || 0;
+  return r2(n);
+}
+
+/**
+ * MONTHLY + `minPresentDaysForCredit`: which of the credited months (indices first … first+count−1)
+ * are WITHHELD — a month fully on or after "live from", already over by `until`, with fewer
+ * present days than the rule asks. A month attendance does not fully cover is credited as before.
+ * @returns { withheld: string[] ('YYYY-MM'), text }
+ */
+export function presentGate(rule, attendance, first, count, until) {
+  const need = Number(rule.minPresentDaysForCredit) || 0;
+  if (!need || !attendance?.liveFrom || count <= 0) return { withheld: [], text: '' };
+  const withheld = [];
+  const said = [];
+  for (let i = first; i < first + count; i += 1) {
+    const start = monthStart(i);
+    const m = start.slice(0, 7);
+    const end = addDays(monthStart(i + 1), -1);
+    if (start < attendance.liveFrom || end >= until) continue;
+    const present = Number(attendance.presentByMonth?.get(m) ?? 0);
+    if (present < need) { withheld.push(m); said.push(`${MONTH_NAMES[Number(m.slice(5, 7)) - 1]} ${m.slice(0, 4)} (${plain(present)} present days)`); }
+  }
+  return { withheld, text: withheld.length ? ` · not credited for ${said.join(', ')}: ${need} present days are needed` : '' };
+}
+
+export function earnedOf(rule, { year, joinDate = null, asOf = null, calendar = null, effectiveFrom = null, attendance = null }) {
   const days = rule.days === null || rule.days === undefined ? null : Number(rule.days);
   if (rule.basis === 'UNLIMITED_UNPAID') return { amount: 0, limited: false, text: 'Unpaid, with no fixed limit' };
   if (rule.basis === 'PER_EVENT') return { amount: days ?? 0, limited: days !== null, text: days === null ? 'Given each time it is needed' : `${plain(days)} each time` };
@@ -150,13 +191,15 @@ export function earnedOf(rule, { year, joinDate = null, asOf = null, calendar = 
       if (eff) from = Math.max(from, monthIndex(eff));
       const to = monthIndex(until) - 1;
       const months = joinDate && until < joinDate ? 0 : Math.max(0, to - from + 1);
-      const amount = Math.min(days, r2(per * months));
-      return { amount, limited: true, text: `${plain(per)} a month, credited at the start of the next month${effWords}, ${plain(amount)} so far` };
+      const gate = presentGate(rule, attendance, from, months, until);
+      const amount = Math.min(days, r2(per * (months - gate.withheld.length)));
+      return { amount, limited: true, text: `${plain(per)} a month, credited at the start of the next month${effWords}, ${plain(amount)} so far${gate.text}` };
     }
     const startDate = startIsJoin ? joinDate : (startIsEff ? eff : year.from);
     const months = until < startDate ? 0 : Math.max(0, monthIndex(until) - first + 1);
-    const amount = Math.min(days, r2(per * months));
-    return { amount, limited: true, text: `${plain(per)} a month${effWords}, ${plain(amount)} so far` };
+    const gate = presentGate(rule, attendance, first, months, until);
+    const amount = Math.min(days, r2(per * (months - gate.withheld.length)));
+    return { amount, limited: true, text: `${plain(per)} a month${effWords}, ${plain(amount)} so far${gate.text}` };
   }
 
   if (rule.accrual === 'HALF_YEARLY') {
@@ -193,6 +236,18 @@ export function earnedOf(rule, { year, joinDate = null, asOf = null, calendar = 
     const start = startIsJoin ? joinDate : (startIsEff ? eff : year.from);
     const dayBefore = asOf === null ? year.to : addDays(asOf, -1);
     const end = dayBefore > year.to ? year.to : dayBefore;
+    const live = attendance?.liveFrom && attendance.liveFrom <= end ? attendance.liveFrom : null;
+    if (live) {
+      // §28.4: from "attendance is live" the days present are counted; before it, the shift calendar estimates.
+      const before = calendar && start < live ? workingDaysBetween(calendar, start, addDays(live, -1)) : 0;
+      const recorded = presentBetween(attendance, start > live ? start : live, end);
+      const worked = r2(before + recorded);
+      const amount = per > 0 ? Math.min(days, floorHalf(worked / per)) : 0;
+      return {
+        amount, limited: true, estimated: before > 0,
+        text: `${plain(amount)} from ${plain(worked)} day${worked === 1 ? '' : 's'} worked (${plain(recorded)} present by attendance from ${dayText(live, true)}${before ? `, ${before} estimated from the shift calendar before it` : ''})`,
+      };
+    }
     const worked = calendar ? workingDaysBetween(calendar, start, end) : 0;
     const amount = per > 0 ? Math.min(days, floorHalf(worked / per)) : 0;
     return {
@@ -222,7 +277,7 @@ const sum = (rows) => r2(rows.reduce((s, r) => s + Number(r.quantity || 0), 0));
  * @param effectiveFrom the policy's `effective_from` ('YYYY-MM-DD' | null): nothing is earned before it
  * @returns { balance: Balance (without canAsk), info: { floor, fullDays, perOccasion, timesUsed, timesHeld, maxTimes } }
  */
-export function balanceOf({ rule, year, startsMonth = 1, joinDate = null, asOf = null, openings = new Map(), requests = [], calendar = null, excludeRequestId = null, effectiveFrom = null }) {
+export function balanceOf({ rule, year, startsMonth = 1, joinDate = null, asOf = null, openings = new Map(), requests = [], calendar = null, excludeRequestId = null, effectiveFrom = null, attendance = null }) {
   const reqs = requests.filter((r) => r.id !== excludeRequestId);
   const inYear = (y) => reqs.filter((r) => yearOfRequest(r, startsMonth) === y.key);
   const taken = (y) => sum(inYear(y).filter((r) => r.status === 'APPROVED'));
@@ -271,12 +326,12 @@ export function balanceOf({ rule, year, startsMonth = 1, joinDate = null, asOf =
     if (effectiveFrom && prev.to < effectiveFrom) return { value: 0, text: null };
     const active = openings.has(prev.key) || reqs.some((r) => yearOfRequest(r, startsMonth) === prev.key);
     if (!active) return { value: 0, text: null };
-    const closing = r2(openingOf(prev, depth + 1).value + earnedOf(rule, { year: prev, joinDate, asOf: null, calendar, effectiveFrom }).amount - taken(prev) - held(prev));
+    const closing = r2(openingOf(prev, depth + 1).value + earnedOf(rule, { year: prev, joinDate, asOf: null, calendar, effectiveFrom, attendance }).amount - taken(prev) - held(prev));
     const carried = carries === 'ALL' ? closing : Math.min(closing, cap);
     return { value: r2(carried), text: carried ? `${plain(carried)} carried from ${prev.key}` : null };
   };
   const opening = openingOf(year, 0);
-  const earned = earnedOf(rule, { year, joinDate, asOf, calendar, effectiveFrom });
+  const earned = earnedOf(rule, { year, joinDate, asOf, calendar, effectiveFrom, attendance });
   if (!earned.limited) {
     return {
       balance: { ...base, limited: false, opening: opening.value, earned: 0, taken: tk, held: hd, available: null, why: words([earned.text, opening.text, ...tail]) },
@@ -291,4 +346,4 @@ export function balanceOf({ rule, year, startsMonth = 1, joinDate = null, asOf =
   };
 }
 
-export default { yearFromStart, leaveYearOf, yearOfKey, previousYear, earnedOf, balanceOf, plain };
+export default { yearFromStart, leaveYearOf, yearOfKey, previousYear, earnedOf, balanceOf, plain, presentGate, presentBetween };

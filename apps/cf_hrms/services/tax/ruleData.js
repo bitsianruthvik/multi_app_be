@@ -34,6 +34,14 @@ const URL = {
   financeAct2026: 'https://egazette.gov.in/WriteReadData/2026/271439.pdf',
   rules2026: 'https://www.incometax.gov.in/iec/foportal/sites/default/files/2026-03/En-Notified-IT-Rules-2026-20-03-2026.pdf',
   art276: 'https://legislative.gov.in/constitution-of-india/',
+  notif45: 'https://www.incometax.gov.in/iec/foportal/sites/default/files/2026-04/Notification%20No.45_2026.pdf',
+  s71: 'https://www.incometaxindia.gov.in/w/section-71-128',
+  s115bac: 'https://www.incometaxindia.gov.in/w/section-115bac-7',
+  s112A: 'https://www.incometaxindia.gov.in/w/section-112a-65',
+  s87A: 'https://www.incometaxindia.gov.in/w/section-87a-30',
+  s234C: 'https://www.incometaxindia.gov.in/w/section-234c-40',
+  s139: 'https://www.incometaxindia.gov.in/w/section-139-93',
+  rules2026Gazette: 'https://www.incometaxindia.gov.in/documents/d/guest/en-notified-it-rules-2026-20-03-2026-pdf',
 };
 
 /* ── Shared shapes ─────────────────────────────────────────────────────── */
@@ -69,8 +77,8 @@ function yearRows(year, law, src) {
   add('NEW', 'rebate', { section: law.rebate, incomeLimit: 1200000, maxRebate: 60000, marginalRelief: true, residentOnly: true }, src.rebateNew);
   add('OLD', 'rebate', { section: law.rebate, incomeLimit: 500000, maxRebate: 12500, marginalRelief: false, residentOnly: true }, src.rebateOld);
 
-  add('NEW', 'surcharge', { bands: SURCHARGE_BANDS, maxRate: 25, marginalRelief: true }, src.surchargeNew);
-  add('OLD', 'surcharge', { bands: SURCHARGE_BANDS, maxRate: null, marginalRelief: true }, src.surchargeOld);
+  add('NEW', 'surcharge', { bands: SURCHARGE_BANDS, maxRate: 25, marginalRelief: true, dividendCap: 15 }, src.surchargeNew);
+  add('OLD', 'surcharge', { bands: SURCHARGE_BANDS, maxRate: null, marginalRelief: true, dividendCap: 15 }, src.surchargeOld);
 
   both('cess', { rate: 4, name: 'Health and Education Cess' }, src.cess);
 
@@ -102,6 +110,36 @@ function yearRows(year, law, src) {
   both('forms', law.forms, src.forms);
   both('rounding', { taxableIncomeTo: 10, taxPayableTo: 10, section: law.rounding }, src.rounding);
   both('tds_rounding', { monthlyTdsTo: 1 }, ['Monthly TDS to the nearest rupee: the common practice of TDS software and the TRACES statements. The law rounds the year\'s tax payable to ₹10 (rounding rule); no official text found that sets the rounding of a monthly instalment.', URL.circular24of2022, 0]);
+
+  /* ── The RETURN's rules (the ITR helper, §25.6): what the employer side never needs ── */
+  const r = law.ret;
+  const hp = { section: r.hp, standardDeductionPct: 30, standardDeductionSection: r.hp30, interestSection: r.hpInterest, carryForwardYears: 8, carryForwardNote: r.hpCarry };
+  add('OLD', 'house_property', { ...hp, lossSetOffAllowed: true, lossSetOffLimit: 200000, lossSetOffSection: r.hpSetOff, carryForwardAllowed: true }, src.hpOld);
+  add('NEW', 'house_property', { ...hp, lossSetOffAllowed: false, lossSetOffLimit: 0, lossSetOffSection: r.hpSetOff, carryForwardAllowed: r.hpNewCarry, lossRefusal: r.hpNewRefusal }, src.hpNew);
+  both('capital_gains', {
+    stcgEquity: { section: r.s111A, rate: 20 }, ltcgEquity: { section: r.s112A, rate: 12.5, exemption: 125000 }, ltcgOther: { section: r.s112, rate: 12.5 },
+    basicExemptionAdjust: true, shortfallSection: r.shortfall, surchargeCap: 15,
+  }, src.cg);
+  add('NEW', 'rebate_special', { excluded: ['111A', '112', '112A'], names: r.cgNames, text: r.rebateSpecialNew }, src.rebateSpecialNew);
+  add('OLD', 'rebate_special', { excluded: ['112A'], names: r.cgNames, text: r.rebateSpecialOld }, src.rebateSpecialOld);
+  both('itr_forms', {
+    published: r.formsPublished, note: r.formsNote,
+    ITR1: { name: r.itr1Name, maxTotalIncome: 5000000, maxHouseProperties: r.itr1MaxHouses, ltcg112aMax: 125000, ltcg112aSection: r.s112A, agriculturalIncomeMax: 5000, residentOnly: true },
+    ITR2: { name: r.itr2Name },
+  }, src.itrForms);
+  both('interest_234', {
+    sections: r.interestSections, ratePerMonth: 1, roundBaseDownTo: 100, roundingRule: r.rule119A,
+    advanceTaxThreshold: 10000, thresholdSection: r.s208, bPct: 90, seniorExempt: true,
+    seniorNote: `A resident senior citizen with no business income pays no advance tax (${r.s207}), so no interest under ${r.interestSections.b} or ${r.interestSections.c}.`,
+    cgNote: `${r.interestSections.c}: tax on capital gains or dividends that came after an instalment date counts only from the next instalment (proviso); this estimate counts all income from the start of the year, so it may be higher than the portal's.`,
+    instalments: [{ by: '06-15', cumPct: 15, safePct: 12, months: 3 }, { by: '09-15', cumPct: 45, safePct: 36, months: 3 }, { by: '12-15', cumPct: 75, safePct: 75, months: 3 }, { by: '03-15', cumPct: 100, safePct: 100, months: 1 }],
+  }, src.interest);
+  both('return_filing', { dueDate: r.dueDate, dueSection: r.dueSection, filedFrom: r.filedFrom }, src.due);
+  both('regime_option', {
+    oldRegimeNeedsDueDate: true, oldRegimeSection: r.oldRegimeSection,
+    oldRegimeNote: `After the due date only the new regime can be used (${r.oldRegimeSection}).`,
+  }, src.regimeOption);
+  both('late_fee', { section: r.s234F, fee: 5000, smallIncomeFee: 1000, smallIncomeLimit: 500000 }, src.lateFee);
   return rows;
 }
 
@@ -122,6 +160,18 @@ const ROWS_2025_26 = yearRows('2025-26', {
     previousEmployer: { number: '12B', label: 'Form 12B' },
     annualStatement: { number: '26AS', label: 'Form 26AS (with the AIS)' },
   },
+  ret: {
+    hp: 'sections 22–24', hp30: 'section 24(a)', hpInterest: 'section 24(b)', hpSetOff: 'section 71(3A)',
+    hpCarry: 'section 71B: against house-property income only, for 8 years, in a return filed by the due date',
+    hpNewCarry: false, hpNewRefusal: 'in the new regime a house-property loss is not set off against any other head (section 115BAC(2)(ii)(b)) and is not carried forward — it is "deemed to have been given full effect" (section 115BAC(3)).',
+    s111A: 'section 111A', s112A: 'section 112A', s112: 'section 112', shortfall: 'provisos to sections 111A(1), 112(1) and 112A(2)', cgNames: { '111A': '111A', 112: '112', '112A': '112A' },
+    rebateSpecialNew: 'section 87A second proviso (Finance Act 2025): in the new regime the rebate cannot exceed the tax at the slab rates of section 115BAC(1A), so it never covers tax at special rates (111A, 112, 112A).',
+    rebateSpecialOld: 'section 112A(6): the rebate under section 87A is not given on tax on section 112A gains.',
+    formsPublished: true, formsNote: 'ITR-1 and ITR-2 for AY 2026-27 (income of FY 2025-26), Income-tax Act 1961, filed in 2026.',
+    itr1Name: 'ITR-1 (Sahaj)', itr2Name: 'ITR-2', itr1MaxHouses: 2,
+    interestSections: { a: 'section 234A', b: 'section 234B', c: 'section 234C' }, rule119A: 'rule 119A', s208: 'section 208', s207: 'section 207(2)',
+    dueDate: '2026-07-31', dueSection: 'section 139(1) Explanation 2', filedFrom: '2026-04-01', oldRegimeSection: 'section 115BAC(6) proviso', s234F: 'section 234F',
+  },
 }, {
   regimeNew: ['Rates in section 115BAC(1A) are the default rates unless the option under 115BAC(6) is exercised — Memorandum to the Finance Bill 2026, Part A.I, para 2.', URL.memo2026],
   regimeOld: ['Opting out of the new regime (section 115BAC(6)); a salaried person chooses each year with the return — Memorandum to the Finance Bill 2026, Part A.I.', URL.memo2026],
@@ -130,8 +180,8 @@ const ROWS_2025_26 = yearRows('2025-26', {
   std: ['CBDT ITR-1 validation rules AY 2026-27: standard deduction u/s 16(ia) up to ₹75,000 (new regime) / ₹50,000 (old regime).', URL.itr1Rules],
   rebateNew: ['Section 87A as amended by the Finance Act 2025: up to ₹60,000 where total income ≤ ₹12,00,000 (incometax.gov.in AY 2026-27); marginal relief — CBDT ITR-1 validation rule 191: no rebate above ₹12,70,590.', URL.itr1Rules],
   rebateOld: ['Section 87A, old regime: up to ₹12,500 where total income ≤ ₹5,00,000, no marginal relief (incometax.gov.in AY 2026-27; ITR-1 validation rule 192).', URL.itdSalaried],
-  surchargeNew: ['incometax.gov.in AY 2026-27: 10% > ₹50 L, 15% > ₹1 Cr, 25% > ₹2 Cr, capped at 25% in the new regime; marginal relief at each threshold. Memorandum to the Finance Bill 2026, Part A.I(1).', URL.itdSalaried],
-  surchargeOld: ['incometax.gov.in AY 2026-27: 10% > ₹50 L, 15% > ₹1 Cr, 25% > ₹2 Cr, 37% > ₹5 Cr (old regime); marginal relief at each threshold.', URL.itdSalaried],
+  surchargeNew: ['incometax.gov.in AY 2026-27: 10% > ₹50 L, 15% > ₹1 Cr, 25% > ₹2 Cr, capped at 25% in the new regime; marginal relief at each threshold. Memorandum to the Finance Bill 2026, Part A.I(1). Dividend cap: surcharge on the income-tax on dividend income (and 111A/112/112A gains) at most 15% — Finance Act 2026 First Schedule Part I-A, Paragraph F (since Finance Act 2022).', URL.itdSalaried],
+  surchargeOld: ['incometax.gov.in AY 2026-27: 10% > ₹50 L, 15% > ₹1 Cr, 25% > ₹2 Cr, 37% > ₹5 Cr (old regime); marginal relief at each threshold. Dividend cap: surcharge on the income-tax on dividend income (and 111A/112/112A gains) at most 15% — Finance Act 2026 First Schedule Part I-A, Paragraph F (since Finance Act 2022).', URL.itdSalaried],
   cess: ['Memorandum to the Finance Bill 2026, Part A.I(3): Health and Education Cess 4% of income-tax including surcharge for AY 2026-27; no marginal relief on cess.', URL.memo2026],
   s80c: ['incometax.gov.in AY 2026-27: 80C (with 80CCC and 80CCD(1)) combined ₹1,50,000, old regime only.', URL.itdSalaried],
   s80ccd1b: ['incometax.gov.in AY 2026-27: 80CCD(1B) ₹50,000 over and above 80C, old regime only.', URL.itdSalaried],
@@ -149,6 +199,16 @@ const ROWS_2025_26 = yearRows('2025-26', {
   pt: ['Section 16(iii): tax on employment within Article 276(2) of the Constitution (at most ₹2,500 a year) — CBDT Circular 24/2022 para 5.4.3. New regime: ITR-1 validation rule 168 (must be 0). Note: the ITR utility accepts up to ₹5,000 (validation rule 37 of ITR-2).', URL.circular24of2022],
   forms: ['Form 16 (rule 31), 24Q (rule 31A), 12BA (rule 26A(2)), 12B (rule 26A(1)) — TRACES forms page; Form 12BB under section 192 and Form 26AS/AIS — incometax.gov.in AY 2026-27.', URL.tracesForms],
   rounding: ['Total income rounded to the nearest ₹10 (section 288A; CBDT Circular 24/2022 para 9.1); any amount payable or refundable to the nearest ₹10, 5 and above up (section 288B).', URL.sec288B],
+  hpOld: ['Section 24(a) 30% of the annual value, 24(b) interest (let out: in full; self-occupied ₹2,00,000); section 71(3A) loss set off against other heads at most ₹2,00,000; section 71B carry forward 8 years against house-property income.', URL.s71],
+  hpNew: ['Section 115BAC(2)(i): no 24(b) for a self-occupied house; (2)(ii)(b): no set-off of a house-property loss with any other head; (3): such loss deemed given full effect (not carried forward). ITR-1 validation rule 160 / ITR-2 rule 264 (AY 2026-27).', URL.s115bac],
+  cg: ['Section 111A: 20% for transfers on/after 23-7-2024; 112A: 12.5% on gains above ₹1,25,000; 112: 12.5% (land/building bought before 23-7-2024 may use 20% with indexation — not modelled); the resident basic-exemption shortfall provisos. Surcharge cap of 15% on these gains (First Schedule) not re-read.', URL.s112A],
+  rebateSpecialNew: ['Section 87A second proviso (Finance Act 2025, w.e.f. 1-4-2026): the rebate shall not exceed the tax at the rates of 115BAC(1A); Memorandum to the Finance Bill 2025: no rebate on tax at special rates (111A, 112 …). The ₹12 lakh limit is on total income incl. gains (ITR-2 validation rule 484).', URL.s87A],
+  rebateSpecialOld: ['Section 112A(6): the 87A rebate is allowed from the tax on total income as reduced by the tax on 112A gains; no bar for 111A / 112 tax in the old regime.', URL.s112A],
+  itrForms: ['Notification 45/2026 (ITR-1, 30-3-2026): resident other than RNOR, total income up to ₹50 lakh, salary, TWO house properties, other sources, LTCG u/s 112A up to ₹1.25 lakh, agricultural income up to ₹5,000; not for a director, unlisted shares, foreign assets, 194N TDS, deferred ESOP tax; no STCG, no losses brought or carried forward (portal help). ITR-2: Notification 46/2026.', URL.notif45],
+  interest: ['Sections 234A, 234B (advance tax below 90% of assessed tax, 1% a month from 1 April), 234C (15/45/75/100% by 15 Jun/Sep/Dec/Mar, 12%/36% safe, 3/3/3/1 months), 208 (₹10,000), 207(2) (resident senior, no business). Rule 119A (base down to ₹100, part month = month) not read in the 1962 text; the 2026 Rules (rule 269) say the same.', URL.s234C],
+  due: ['Section 139(1) Explanation 2 as substituted by the Finance Act 2026 s.5: "any other assessee" 31 July → 31-7-2026 for AY 2026-27; no extension for non-audit cases found (Circular 7/2026 extends audit cases only).', URL.s139],
+  regimeOption: ['Section 115BAC(6) proviso: a person without business income leaves the new regime only in a return filed by the due date under 139(1). Not re-read in the Act text for this release.', URL.s115bac, 0],
+  lateFee: ['Section 234F: ₹5,000 for a return after the due date, ₹1,000 if total income does not exceed ₹5 lakh. Not re-read in the Act text for this release.', URL.s139, 0],
 });
 
 /* ── 2026-27 (tax year 2026-27), Income-tax Act, 2025 ───────────────────── */
@@ -169,6 +229,18 @@ const ROWS_2026_27 = yearRows('2026-27', {
     previousEmployer: { number: '122', label: 'Form 122 (was Form 12B)' },
     annualStatement: { number: '168', label: 'Form 168 — Annual Information Statement (was Form 26AS)' },
   },
+  ret: {
+    hp: 'sections 20–22, was 22–24', hp30: 'section 22(1)(a), was 24(a)', hpInterest: 'section 22(1)(b), was 24(b)', hpSetOff: 'section 109(1)(b), was 71(3A)',
+    hpCarry: 'section 110, was 71B: against house-property income only, for 8 tax years',
+    hpNewCarry: false, hpNewRefusal: 'in the new regime a house-property loss is not set off against any other head (section 202(2)(b)(ii)) and is not carried forward — it is "deemed to have been given full effect" (section 202(3)).',
+    s111A: 'section 196, was 111A', s112A: 'section 198, was 112A', s112: 'section 197, was 112', shortfall: 'sections 196(2), 197(2), 198(3)', cgNames: { '111A': '196 (was 111A)', 112: '197 (was 112)', '112A': '198 (was 112A)' },
+    rebateSpecialNew: 'section 156(3), was 87A: in the new regime the rebate cannot exceed the tax at the rates of section 202(1), so it never covers tax at special rates (sections 196, 197, 198).',
+    rebateSpecialOld: 'section 198(7), was 112A(6): the rebate under section 156 is not given on tax on section 198 gains.',
+    formsPublished: false, formsNote: 'Income-tax Rules 2026 rule 164 keeps the names (ITR-1 Sahaj, ITR-2 …) and sets who may use them for the tax year from 1 April 2026; the forms themselves, their JSON schemas and utilities are not published yet (to be notified before the due date; filed from April 2027).',
+    itr1Name: 'ITR-1 (Sahaj)', itr2Name: 'ITR-2', itr1MaxHouses: 2,
+    interestSections: { a: 'section 423 (was 234A)', b: 'section 424 (was 234B)', c: 'section 425 (was 234C)' }, rule119A: 'rule 269 (was 119A)', s208: 'section 404 (was 208)', s207: 'section 403(3) (was 207(2))',
+    dueDate: '2027-07-31', dueSection: 'section 263(1)(c), was 139(1)', filedFrom: '2027-04-01', oldRegimeSection: 'section 202(4), was 115BAC(6)', s234F: 'the late fee of the 2025 Act (was 234F)',
+  },
 }, {
   regimeNew: ['Income-tax Act 2025 section 202(1): the default rates unless the option under 202(4) is exercised (a salaried person: with the return). Memorandum to the Finance Bill 2026, Part A.II, para 2.', URL.act2025],
   regimeOld: ['Income-tax Act 2025 section 202(4)(b); rates then in Part I-B of the First Schedule (Finance Act 2026).', URL.act2025],
@@ -177,8 +249,8 @@ const ROWS_2026_27 = yearRows('2026-27', {
   std: ['Income-tax Act 2025 section 19(1) Table Sl. 2: ₹75,000 or the salary if less where tax is under 202(1); ₹50,000 in any other case.', URL.act2025],
   rebateNew: ['Income-tax Act 2025 section 156(2)–(3): 100% of tax or ₹60,000 where income ≤ ₹12 lakh; above it, the tax over (income − ₹12 lakh) is given up (marginal relief).', URL.act2025],
   rebateOld: ['Income-tax Act 2025 section 156(1): 100% of tax or ₹12,500 where total income ≤ ₹5,00,000.', URL.act2025],
-  surchargeNew: ['Finance Act 2026 First Schedule (Part I-B para A(4), Part III) and Memorandum Part A.II: 10% / 15% / 25%; for income under section 202 the 37% band does not apply (restricted to 25%); marginal relief.', URL.financeAct2026],
-  surchargeOld: ['Finance Act 2026 First Schedule Part I-B, Paragraph A(4): 10% > ₹50 L, 15% > ₹1 Cr, 25% > ₹2 Cr, 37% > ₹5 Cr; marginal relief (para 5).', URL.financeAct2026],
+  surchargeNew: ['Finance Act 2026 First Schedule (Part I-B para A(4), Part III) and Memorandum Part A.II: 10% / 15% / 25%; for income under section 202 the 37% band does not apply (restricted to 25%); marginal relief. Dividend cap: surcharge on the income-tax on dividend income (and gains under s.196/197/198) at most 15% — Part I-B, Paragraph F, and s.3(4)(b) table.', URL.financeAct2026],
+  surchargeOld: ['Finance Act 2026 First Schedule Part I-B, Paragraph A(4): 10% > ₹50 L, 15% > ₹1 Cr, 25% > ₹2 Cr, 37% > ₹5 Cr; marginal relief (para 5). Dividend cap: surcharge on the income-tax on dividend income (and gains under s.196/197/198) at most 15% — Part I-B, Paragraph F.', URL.financeAct2026],
   cess: ['Finance Act 2026 section 2 (Health and Education Cess at 4% of income-tax and surcharge); Memorandum Part A.II: no marginal relief on cess.', URL.financeAct2026],
   s80c: ['Income-tax Act 2025 section 123: the aggregate of the sums in Schedule XV up to ₹1,50,000.', URL.act2025],
   s80ccd1b: ['Income-tax Act 2025 section 124(3): own NPS contribution up to ₹50,000 (not again under section 123).', URL.act2025],
@@ -196,10 +268,130 @@ const ROWS_2026_27 = yearRows('2026-27', {
   pt: ['Income-tax Act 2025 section 19(1) Table Sl. 1: tax on employment under Article 276(2) of the Constitution (at most ₹2,500 a year); not in the new regime (202(2)(a)(iv)).', URL.act2025],
   forms: ['Income-tax Rules 2026: Form 122 and 123 (rule 204), 124 (rule 205, claims under section 392(5)(b)), 130 (rule 215, certificate under section 395 for salary under 392), 138 (rule 219, quarterly statement under 397(3)(b)), 168 (rule 245, Annual Information Statement). Corrigendum notifications to the Rules (e.g. 64/2026) not checked.', URL.rules2026],
   rounding: ['Income-tax Act 2025 section 516: total income and any amount payable or refundable rounded to the nearest multiple of ₹10 (5 and above up), paise ignored.', URL.act2025],
+  hpOld: ['Income-tax Act 2025 s.21(3) (municipal taxes paid), s.22(1)(a) 30%, 22(1)(b) interest, 22(2) self-occupied ₹2,00,000; s.109(1)(b) loss set off against other heads up to 200000; s.110 carry forward 8 tax years.', URL.act2025],
+  hpNew: ['Income-tax Act 2025 s.202(2)(a)(v): no s.22(1)(b) interest for a self-occupied house; 202(2)(b)(ii): no set-off of a house-property loss with any other head; 202(3): deemed given full effect.', URL.act2025],
+  cg: ['Income-tax Act 2025 s.196 (was 111A) 20%, s.197 (was 112) 12.5%, s.198 (was 112A) 12.5% above 125000; shortfall s.196(2), 197(2), 198(3). Surcharge cap 15% carried from the 1961 Schedule (not re-read).', URL.act2025],
+  rebateSpecialNew: ['Income-tax Act 2025 s.156(2)–(3): new regime rebate up to 60000 where total income ≤ 12 lakh, with marginal relief, and not exceeding the tax at the rates of s.202(1).', URL.act2025],
+  rebateSpecialOld: ['Income-tax Act 2025 s.198(7) (was 112A(6)): the s.156 rebate from the tax on total income as reduced by the tax on s.198 gains.', URL.act2025],
+  itrForms: ['Income-tax Rules 2026 rule 164(2)–(4): ITR-1 for a resident other than RNOR, at most two house properties, LTCG u/s 198 up to 125000, agricultural income up to 5000, total income up to fifty lakh; not a director, no unlisted shares, no foreign assets/income; ITR-2 otherwise (no business income). Forms and schemas not yet published (portal FAQ Q11).', URL.rules2026Gazette],
+  interest: ['Income-tax Act 2025 s.423 (was 234A), s.424 (was 234B; below 90% of assessed tax, from 1 April), s.425 (was 234C; 15/45/75/100%, 12%/36% safe, CG and dividend carve-out), s.404 (₹10,000), s.403(3) (resident senior); Rules 2026 rule 269: part month = month, amount down to a multiple of 100.', URL.act2025],
+  due: ['Income-tax Act 2025 s.263(1)(c) as substituted by the Finance Act 2026 s.66: "any other assessee" 31st July → 31-7-2027 for tax year 2026-27.', URL.financeAct2026],
+  regimeOption: ['Income-tax Act 2025 s.202(4): the option to leave the new regime, for a person without business income, with the return filed by the due date. Carried from the 1961 rule; not re-read.', URL.act2025, 0],
+  lateFee: ['The late-filing fee of the 2025 Act (was 234F: ₹5,000, ₹1,000 if income ≤ ₹5 lakh). Its section and amounts not read in the 2025 Act — carried from the 1961 Act.', URL.act2025, 0],
 });
 
+/* ── PAYROLL's rules (income tax in payroll, §25.4 P2): no PAN, declarations, deposit, return ──
+ * Read 2026-10-20. The same in both regimes of a year (they are about deducting, not about the tax). */
+const PAYROLL_URL = {
+  rules2026: URL.rules2026,
+  act2025: URL.act2025,
+  circular24of2022: URL.circular24of2022,
+  protean: 'https://tinpan.proteantech.in/downloads/e-tds/eTDS-download-regular.html',
+};
+function payrollRows(year, p) {
+  const rows = [];
+  const both = (rule_key, value, [source_note, source_url, verified = 1]) => {
+    for (const regime of ['OLD', 'NEW']) rows.push({ tax_year: year, regime, rule_key, value, source_note, source_url, verified });
+  };
+  // No PAN: the year's tax at the higher of the average rate and 20% (a salary has no rate of its own);
+  // nothing when the income is below the taxable limit (the tax worked out is nil).
+  both('tds_no_pan', { rate: 20, section: p.noPanSection, method: 'AVERAGE_RATE_OR_RATE', nilWhenNoTax: true, returnRemark: 'C' }, p.noPanSrc);
+  both('declarations', { form: p.declForm, landlordPanAbove: 100000, landlordPanSection: p.declSection, lenderPanRequired: 'when the lender is not a financial institution or the employer' }, p.declSrc);
+  both('tds_deposit', { dueDay: 7, marchDue: '04-30', section: p.depositSection }, p.depositSrc);
+  both('tds_return', {
+    form: p.returnForm, quarterDue: { Q1: '07-31', Q2: '10-31', Q3: '01-31', Q4: '05-31' }, section: p.returnSection,
+    sectionCode: p.sectionCode, higherRateRemark: 'C', certificateDue: '06-15', certificateSection: p.certSection,
+    rpu: p.rpu, fileFormat: p.fileFormat,
+  }, p.returnSrc);
+  return rows;
+}
+const PAYROLL_ROWS = [
+  ...payrollRows('2025-26', {
+    noPanSection: 'section 206AA', declForm: 'Form 12BB (rule 26C)', declSection: 'rule 26C, section 192(2D)', depositSection: 'rule 30(2)', returnForm: 'Form 24Q', returnSection: 'rule 31A',
+    sectionCode: '92B', certSection: 'rule 31 (Form 16)', rpu: 'Protean RPU 6.0 (statements up to FY 2025-26)', fileFormat: 'File Format for Form No. 24Q, Version 7.5 (Q4) — the ^-delimited text the FVU 9.5 validates',
+    noPanSrc: ['CBDT Circular 24/2022 para 4.9.2 (salary): where income computed for TDS is below the taxable limit no tax is deducted; else the average rate, and 20% if the average rate is below 20%. Section 206AA. Cess: para 4.9 is silent; para 2.3 adds 4% cess to income tax (the "no cess on 20%" reading is only in secondary sources — not used).', PAYROLL_URL.circular24of2022],
+    declSrc: ['Form 12BB (rule 26C) as reproduced in CBDT Circular 24/2022 Annexure IIa: landlord PAN when the aggregate rent paid in the year exceeds ₹1,00,000; lender name, address and PAN for home-loan interest.', PAYROLL_URL.circular24of2022],
+    depositSrc: ['Rule 30(2) of the 1962 Rules (CBDT Circular 24/2022 para 4.4): TDS on salary deposited by the 7th of the next month; for March by 30 April.', PAYROLL_URL.circular24of2022],
+    returnSrc: ['Rule 31A: Form 24Q quarterly — 31 Jul, 31 Oct, 31 Jan, 31 May; section code 92B (non-government employees); Form 16 by 15 June (Circular 24/2022 paras 4.6, 4.10.1). Protean e-TDS downloads page: RPU 6.0 / FVU 9.5 up to FY 2025-26.', PAYROLL_URL.protean],
+  }),
+  ...payrollRows('2026-27', {
+    noPanSection: 'section 397(2)(b)(i), was 206AA', declForm: 'Form 124 (rule 205), was 12BB', declSection: 'rule 205(2), section 392(5)(b)', depositSection: 'rule 218(2), was rule 30', returnForm: 'Form 138 (was 24Q)', returnSection: 'rule 219, was 31A',
+    sectionCode: '1002', certSection: 'rule 215 (Form 130)', rpu: 'Protean RPU 1.2 (tax year 2026-27 onward)', fileFormat: 'File Format for Form Number 138 (24Q) Q1 to Q3, Version 1.2 (22-07-2026); the Q4 format (Annexure II) is "expected to be released soon" on the Protean page',
+    noPanSrc: ['Income-tax Act 2025 section 397(2)(b)(i): no PAN → the higher of the rate in the provision, the rates in force, or 20%. Salary has no rate of its own (section 392(1): the average rate), so the 1961 method of Circular 24/2022 para 4.9.2 (average rate vs 20%, nil below the taxable limit) is carried; no 2026 salary circular found. Form 138 Annexure I remark "C" for the higher rate under 397(2).', PAYROLL_URL.act2025],
+    declSrc: ['Income-tax Rules 2026 rule 205(2) and Form 124 Note 3: name, address and PAN of the landlord where the aggregate rent paid in the tax year exceeds ₹1,00,000 (and the relationship, and Aadhaar on the form); lender name, address and PAN for interest under house property.', PAYROLL_URL.rules2026],
+    depositSrc: ['Income-tax Rules 2026 rule 218(2): a deductor other than a government office pays within 7 days from the end of the month; for March by 30 April.', PAYROLL_URL.rules2026],
+    returnSrc: ['Income-tax Rules 2026 rule 219: Form 138 due 31 Jul, 31 Oct, 31 Jan and 31 May; rule 215: Form 130 by 15 June. Section code 1002 (payments to employees other than Govt. employees, s.392) — Protean file format for Form 138 v1.2, Annexure 2. RPU 1.2 / FVU 1.2 for tax year 2026-27 (Protean e-TDS downloads page).', PAYROLL_URL.protean],
+  }),
+];
+
+/* ── PAYROLL EXTRAS' rules (P3a, §25.5): relief for arrears (Form 10E / Form 39), perquisites ──
+ * Read 2026-10-20. The same in both regimes of a year (relief u/s 89 / 157 is not excluded by the new
+ * regime: it is not in the lists of section 115BAC(2) / 202(2)). */
+const EXTRAS_URL = {
+  rules2026: URL.rules2026,
+  act2025: URL.act2025,
+  circular24of2022: URL.circular24of2022,
+  rule21A: 'https://www.incometaxindia.gov.in/w/rule-21a',
+  form10eHelp: 'https://www.incometax.gov.in/iec/foportal/help/statutory-forms/popular-form/form10e-um',
+};
+function extrasRows(year, x) {
+  const rows = [];
+  const both = (rule_key, value, [source_note, source_url, verified = 1]) => {
+    for (const regime of ['OLD', 'NEW']) rows.push({ tax_year: year, regime, rule_key, value, source_note, source_url, verified });
+  };
+  both('relief_arrears', x.relief, x.reliefSrc);
+  if (x.perquisites) both('perquisites', x.perquisites, x.perquisitesSrc);
+  return rows;
+}
+const ACCOMMODATION_BANDS = [
+  { key: 'ABOVE_40L', words: 'a city of more than 40 lakh people', pct: 10 },
+  { key: '15L_TO_40L', words: 'a city of more than 15 lakh and up to 40 lakh people', pct: 7.5 },
+  { key: 'UP_TO_15L', words: 'any other place', pct: 5 },
+];
+const SBI_URL = 'https://sbi.bank.in/web/business/information/interest-rates-perquisite-calculation';
+const EXTRAS_ROWS = [
+  ...extrasRows('2025-26', {
+    perquisites: {
+      section: 'section 17(2)', rule: 'rule 3 of the Income-tax Rules, 1962', statement: 'Form 12BA',
+      specifiedEmployee: { monetarySalaryAbove: 400000, section: 'section 17(2)(iii), rule 3C (Notification 133/2025)' },
+      car: { mixed: { small: { employerPays: 1800, employeePays: 600 }, large: { employerPays: 2400, employeePays: 900 } }, chauffeur: 900, wearAndTearPct: 10, electricAsSmall: false, otherConveyanceLess: 900 },
+      accommodation: { census: 2011, bands: ACCOMMODATION_BANDS, leasedPct: 10, hotelPct: 24, hotelFreeDays: 15, furniturePct: 10, transferDays: 90 },
+      loan: { smallLoansUpTo: 20000, medicalExempt: true, medicalRule: 'rule 3A', sbiRateDate: '2025-04-01', sbiRates: { HOUSING: 8.25, CAR: 9.2, PERSONAL: 10.3, EDUCATION: 9.9, OTHER: 10.3 },
+        sbiNote: 'SBI publishes ranges (by credit score or scheme); these are the LOWEST rate of each range on 1-4-2025 (home 8.25%, car 9.20–10.15%, personal 10.30–15.30%, education 9.90–10.90%). Set the rate the company uses on a loan where it differs.' },
+      gift: { nilBelow: 5000, note: 'the whole amount once the year\'s gifts reach the threshold — the common reading; some read it as only the excess' },
+      meal: { perMeal: 50 },
+    },
+    perquisitesSrc: ['Rule 3 of the 1962 Rules as in CBDT Circular 24/2022 (car Table II: ₹1,800 / ₹2,400 employer pays, ₹600 / ₹900 employee pays, chauffeur ₹900, wear and tear 10%; loans at the SBI rate on the 1st day of the year on the month-end balance, nil up to ₹20,000 and for rule 3A diseases; gifts nil below ₹5,000; credit card and club less official use and recovery). Accommodation as substituted by Notification 65/2023 from 1-9-2023 (2011 census: 10% > 40 lakh, 7.5% 15–40 lakh, 5% else; leased: lower of rent and 10%; hotel 24%; furniture 10%) — read in CBDT Circular 3/2025 on a THIRD-PARTY copy (the official PDF refused to open). Specified-employee limit ₹4,00,000 (rule 3C, Notification 133/2025) from a secondary source only. SBI rates on 1-4-2025 from SBI\'s perquisite-rate page (' + SBI_URL + '). Not verified: the accommodation table and rule 3C were not read on an official site; the gift threshold reading.', URL.circular24of2022, 0],
+    relief: {
+      section: 'section 89(1)', rule: 'rule 21A(2) of the Income-tax Rules, 1962', formNumber: '10E', formLabel: 'Form 10E', formRule: 'rule 21AA',
+      employerSection: 'section 192(2A)', newRegimeAllowed: true,
+      employerNote: 'The employer may give this relief in the TDS when the employee furnishes these particulars in Form 10E (section 192(2A), rule 21AA). The employee files Form 10E online on the e-filing portal before the return; without it the relief claimed in the return is not allowed.',
+    },
+    reliefSrc: ['Rule 21A(2)(a)–(d) of the 1962 Rules (incometaxindia.gov.in): tax on the additional salary in the year of receipt (total income − the same income reduced by it) less the aggregate, for each year it relates to, of tax on that year\'s total income increased by it − tax on that year\'s total income; relief when the first is more. Rule 21AA: particulars in Form 10E to the employer; s.192(2A) via CBDT Circular 24/2022 paras 3.5.1–3.5.2. Form 10E filing before the return: incometax.gov.in Form 10E help. Annexure I / Table "A" wording read on a third-party copy of the pre-2024 form (the official PDF did not open); the form was amended by the IT (Eighth Amendment) Rules 2024 — check the portal\'s current form.', EXTRAS_URL.rule21A],
+  }),
+  ...extrasRows('2026-27', {
+    perquisites: {
+      section: 'section 17(1), was 17(2)', rule: 'rule 15 of the Income-tax Rules, 2026, was rule 3', statement: 'Form 123 (was Form 12BA)',
+      specifiedEmployee: { monetarySalaryAbove: 400000, section: 'section 17(1)(c), rule 17' },
+      car: { mixed: { small: { employerPays: 5000, employeePays: 2000 }, large: { employerPays: 7000, employeePays: 3000 } }, chauffeur: 3000, wearAndTearPct: 10, electricAsSmall: true, otherConveyanceLess: 3000 },
+      accommodation: { census: 2011, bands: ACCOMMODATION_BANDS, leasedPct: 10, hotelPct: 24, hotelFreeDays: 15, furniturePct: 10, transferDays: 90 },
+      loan: { smallLoansUpTo: 200000, medicalExempt: true, medicalRule: 'rule 18', sbiRateDate: '2026-04-01', sbiRates: { HOUSING: 7.25, CAR: 8.7, PERSONAL: 10, EDUCATION: 8.9, OTHER: 10 },
+        sbiNote: 'SBI publishes ranges (by credit score or scheme); these are the LOWEST rate of each range on 1-4-2026 (home 7.25%, car 8.70–9.85%, personal 10.00–15.00%, education 8.90–9.90%). Set the rate the company uses on a loan where it differs.' },
+      gift: { nilBelow: 15000, note: 'the whole amount once the year\'s gifts reach the threshold — the common reading; some read it as only the excess' },
+      meal: { perMeal: 200 },
+    },
+    perquisitesSrc: ['Income-tax Act 2025 s.17(1); Income-tax Rules 2026 rule 15 (G.S.R. 198(E), Gazette pp. 1541–1547): Table II car ₹5,000 / ₹7,000 (up to 1.6 L or ELECTRIC / above) employer pays, ₹2,000 / ₹3,000 employee pays, chauffeur ₹3,000, wear and tear 10% (15(3)(d)); Table I accommodation 10% / 7.5% / 5% by 2011 population (> 40 lakh, 15–40 lakh, else), leased lower of rent and 10%, hotel 24%, furniture 10% (15(2)(e)); Table IV loans at the SBI rate on the 1st day of the tax year on the month-end balance, nil up to ₹2,00,000 and for rule 18 diseases; gifts nil below ₹15,000; credit card and club less official use (15(5)(b)) and recovery; meals ₹200. Specified employee ₹4,00,000 (rule 17). SBI rates on 1-4-2026: SBI\'s perquisite-rate page (' + SBI_URL + '); SBI gives ranges — the lowest is seeded.', URL.rules2026, 1],
+    relief: {
+      section: 'section 157(1), was 89(1)', rule: 'rule 73 (Table Sl. 1) of the Income-tax Rules, 2026, was rule 21A', formNumber: '39', formLabel: 'Form No. 39 (was Form 10E)', formRule: 'rule 73(3)',
+      employerSection: 'section 392(4)(a)(ii), was 192(2A)', newRegimeAllowed: true,
+      employerNote: 'The employer may take this relief into account in the TDS when the employee furnishes the particulars of Form No. 39 (section 392(4)(a)(ii); rule 73(4)). To claim it the employee furnishes Form No. 39 on or before the due date of the return (rule 73(3), section 263(1)(c)).',
+    },
+    reliefSrc: ['Income-tax Act 2025 s.157 ("Relief when salary, etc., is paid in arrears or in advance"); s.202(2) does not list it. Income-tax Rules 2026 rule 73 Table Sl. 1: relief = A − B where A = C − D (tax on total income of the relevant tax year − tax on it reduced by the additional salary) and B = the sum of E = F − G for each earlier tax year (tax on that year\'s income increased by it − tax on that year\'s income); rule 73(3) Form No. 39 by the due date u/s 263(1)(c); rule 73(4) to the employer; s.392(4)(a)(ii). Form No. 39 Part B item 3 rows (i) A–G and (ii)–(viii) read in the notified Rules.', EXTRAS_URL.rules2026],
+  }),
+];
+
 /** Every seed row: { tax_year, regime, rule_key, value, source_note, source_url, verified }. */
-export const TAX_RULE_ROWS = [...ROWS_2025_26, ...ROWS_2026_27];
+export const TAX_RULE_ROWS = [...ROWS_2025_26, ...ROWS_2026_27, ...PAYROLL_ROWS, ...EXTRAS_ROWS];
 
 /** The years the seed covers. */
 export const SEEDED_YEARS = ['2025-26', '2026-27'];

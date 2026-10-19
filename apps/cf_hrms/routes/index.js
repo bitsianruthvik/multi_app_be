@@ -21,6 +21,12 @@ import codegenGateRoutes from './codegen.js';
 import excelRoutes from './excel.js';
 import commandRoutes from './commands.js';
 import performanceRoutes from './performance.js';
+import payrollRoutes from './payroll.js';
+import itrRoutes from './itr.js';
+import taxRoutes from './tax.js';
+import attendanceRoutes from './attendance.js';
+import selfAttendanceRoutes from './selfAttendance.js';
+import payrollExtrasRoutes from './payrollExtras.js';
 
 const router = Router();
 
@@ -137,5 +143,17 @@ router.use(excelRoutes);
 router.use(commandRoutes);
 // Performance plans (spec §18): settings, periods, plans (routes/performance.js).
 router.use(performanceRoutes);
+// Payroll (spec §25.2): components, structures, salaries, runs, payslips (routes/payroll.js).
+router.use(payrollRoutes);
+// Attendance (spec §28): HR's screens (routes/attendance.js); My attendance and a manager's team
+// (routes/selfAttendance.js). The device push and the integration API are mounted by the server's index.js.
+router.use(attendanceRoutes);
+router.use(selfAttendanceRoutes);
+// My tax › File my return (spec §25.6, P4): the person's own return, private to them (routes/itr.js).
+router.use(itrRoutes);
+// Income tax in payroll (spec §25.4, P2): HR's Tax screens and the person's My tax (routes/tax.js).
+router.use(taxRoutes);
+// Payroll extras P3a (spec §25.5): statutory return files, perquisites, Form 10E (routes/payrollExtras.js).
+router.use(payrollExtrasRoutes);
 
 export default router;

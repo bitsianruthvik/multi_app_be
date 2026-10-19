@@ -24,6 +24,9 @@ import jobsStatusRoute from "./core/jobs/jobsStatusRoute.js";
 import schemaRoutes from "./core/routes/schemaRoutes.js";
 import appsRoutes from "./core/routes/appsRoutes.js";
 import { createProcessGuard } from "./core/utils/processGuard.js";
+// CF_HRMS attendance (spec §28): the ZKTeco/eSSL ADMS push and the punch API, outside /api/:company/:app.
+import iclockRoutes from "./apps/cf_hrms/routes/iclock.js";
+import attendanceIntegrationRoutes from "./apps/cf_hrms/routes/integrations.js";
 
 dotenv.config();
 
@@ -40,6 +43,11 @@ const app = express();
 const guard = createProcessGuard({ beforeExit: () => pool.end() });
 guard.start();
 app.use(guard.track);
+
+// Biometric devices push to /iclock/* at the server ROOT (the ADMS protocol fixes the path) and send
+// plain text — so this comes BEFORE the JSON / form parsers; the router reads its own body. A device is
+// known only by its registered serial (apps/cf_hrms/routes/iclock.js).
+app.use("/iclock", iclockRoutes);
 
 // Increase payload size limit for audio uploads (50MB)
 app.use(express.json({ limit: "50mb" }));
@@ -169,6 +177,9 @@ app.get("/health", async (req, res) => {
 // API Routes
 // =====================
 app.use("/api/public", publicLimiter, publicApiRoute);
+// Punches from other devices and middleware, by a per-company API key (no company slug in the path, so
+// before appContext, which would read "integrations" as a company). Rate-limited inside.
+app.use("/api/integrations", attendanceIntegrationRoutes);
 app.use("/api", appContext);
 
 // Company-level auth (no app slug required) — must be before the app-scoped routes
