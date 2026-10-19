@@ -629,6 +629,18 @@ export async function setOrderStatus(db, c, id, status, opts = {}) {
     const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_production_releases WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [c.companyId, id]);
     if (Number(n)) throw invalid('RELEASED', `${o.code} has ${n} line${Number(n) === 1 ? '' : 's'} released to production — take ${Number(n) === 1 ? 'it' : 'them'} back (while nothing has started) before cancelling.`);
   }
+  // §74 (user, 2026-10-19): a customer order with accepted terms closes only when FULLY PAID — every milestone billed and
+  // every invoice paid — by hand (the header's Close) exactly as on the Orders board (orderBoardService.closeIfDone).
+  if (status === 'closed' && o.order_type === 'customer') {
+    const { paidUp } = await import('./billingService.js');
+    const p = await paidUp(db, c.companyId, id);
+    if (!p.fullyPaid) {
+      const rupees = (n) => `₹${Number(n).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+      const left = Number(p.outstanding) > 0.5 ? `${rupees(p.outstanding)} is still to be received`
+        : Number(p.due) > 0 ? `${rupees(p.due)} is due to be billed` : 'milestones are still to be billed';
+      throw invalid('NOT_FULLY_PAID', `${o.code} is not fully paid yet — ${left}. It closes once every milestone is billed and every invoice is paid (Accounts › Billing).`, { outstanding: p.outstanding ?? 0, due: p.due ?? 0 });
+    }
+  }
   // A closed order's leftover reservations are let go, so the stock is free
   // again — the material it never used, and anything made for it that was never
   // shipped (it is still on the dispatch shelf; closing only unclaims it).

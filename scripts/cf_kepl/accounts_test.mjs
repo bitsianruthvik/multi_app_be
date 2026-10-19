@@ -36,6 +36,7 @@ const ACC = await imp('apps/cf_erp/services/acceptanceService.js');
 const AP = await imp('apps/cf_erp/services/approvalService.js');
 const BOARD = await imp('apps/cf_erp/services/orderBoardService.js');
 const BILL = await imp('apps/cf_erp/services/billingService.js');
+const SO = await imp('apps/cf_erp/services/salesOrderService.js');
 const RC = await imp('apps/cf_erp/services/receiptService.js');
 const COST = await imp('apps/cf_erp/services/costingService.js');
 const INV = await imp('apps/cf_erp/services/invoiceService.js');
@@ -398,6 +399,8 @@ try {
   ok('every stage done, everything shipped — but not paid: still open', tick2.orderClosed === false && oA.status === 'confirmed');
   const ob = await BOARD.orderBoard(db, COMPANY, { search: tag });
   const obA = ob.lanes.flatMap((l) => l.cards).find((x) => x.id === A.id);
+  const handClose = await SO.setOrderStatus(db, c, A.id, 'closed', { fromRoute: true }).then(() => null, (e) => e);
+  ok('the header Close is refused too while not fully paid (§74, 2026-10-19)', handClose?.code === 'NOT_FULLY_PAID', String(handClose?.message));
   ok('the orders board says what is owed and offers no Close yet', obA.lane === 'post_production' && obA.canClose === false && obA.facts.payment && !obA.facts.payment.fullyPaid, j(obA.facts.payment));
   // A year on: everything is due; one invoice of all of it, paid in full.
   const later = BILL.addMonths(T, 13);

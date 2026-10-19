@@ -412,9 +412,12 @@ try {
   ok('…the board keeps it in Post-production, every stage done, no Close yet, and says what is to come', c1?.lane === 'post_production' && c1.stagesDone === 2 && c1.canClose === false && !!c1.facts.payment && c1.facts.payment.fullyPaid === false, j(c1?.facts?.payment));
   events = await ACC.orderEvents(db, COMPANY, O1.id);
   ok('no "order_closed" event yet', !events.some((e) => e.type === 'order_closed'));
-  await SO.setOrderStatus(db, c, O1.id, 'closed', { fromRoute: true });
+  // §74 (user, 2026-10-19): the header's Close checks payment too — not fully paid, refused in words.
+  const notPaid = await refusal(() => SO.setOrderStatus(db, c, O1.id, 'closed', { fromRoute: true }));
+  ok('closing by hand (the status route) while not fully paid is refused, saying what is owed', notPaid?.code === 'NOT_FULLY_PAID' && /not fully paid/.test(notPaid?.message ?? ''), j(notPaid));
+  await db.query("UPDATE cf_sales_orders SET status = 'closed' WHERE id = ?", [O1.id]);   // (paid elsewhere — accounts_test drives that)
   board = await BOARD.orderBoard(db, COMPANY, { search: tag });
-  ok('closed by hand (the status route), the board shows it Closed', card(board, O1.id)?.lane === 'closed');
+  ok('closed, the board shows it Closed', card(board, O1.id)?.lane === 'closed');
   ok('the lanes are the seven, in order', board.lanes.map((l) => l.key).join(',') === 'inquiry,pending_approval,material,in_production,dispatched,post_production,closed');
   ok('laneOf: an inquiry with nothing pending is Inquiry', BOARD.laneOf({ status: 'inquiry', acceptancePending: false }) === 'inquiry');
 
