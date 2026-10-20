@@ -575,7 +575,7 @@ How to read the tables below:
 | `GET /attendance/month/workbook` | `cf_hrms_attendance_view` | narrowed to the login’s department |
 | `GET /attendance/summary` | `cf_hrms_attendance_view` | narrowed to the login’s department |
 | `GET /attendance/people/:id` | `cf_hrms_attendance_view` | scope: the person |
-| `PUT /attendance/days` | `cf_hrms_attendance_edit` | scope: the person |
+| `PUT /attendance/days` | `cf_hrms_attendance_edit` | scope: the person; never the login’s own day |
 | `POST /attendance/process` | `cf_hrms_attendance_edit` | a department-scoped login processes its own people only |
 | `GET /attendance/requests` | `cf_hrms_attendance_view` | narrowed to the login’s department |
 | `POST /attendance/requests` | `cf_hrms_attendance_edit` | scope: the person |
@@ -591,20 +591,20 @@ How to read the tables below:
 | `PUT /attendance/policies/:id` | `cf_hrms_attendance_edit` | whole-company logins only; archiving it also needs cf_hrms_attendance_remove |
 | `DELETE /attendance/policies/:id` | `cf_hrms_attendance_remove` | whole-company logins only |
 | `PUT /attendance/policy-assignments` | `cf_hrms_attendance_edit` | whole-company logins only; clearing one (policyId: null) also needs cf_hrms_attendance_remove |
-| `GET /attendance/devices` | `cf_hrms_attendance_view` |  |
+| `GET /attendance/devices` | `cf_hrms_attendance_view` | serials masked without cf_hrms_attendance_edit |
 | `POST /attendance/devices` | `cf_hrms_attendance_edit` | whole-company logins only |
 | `PUT /attendance/devices/:id` | `cf_hrms_attendance_edit` | whole-company logins only |
 | `DELETE /attendance/devices/:id` | `cf_hrms_attendance_remove` | whole-company logins only |
 | `GET /attendance/device-users` | `cf_hrms_attendance_view` |  |
 | `PUT /attendance/device-users` | `cf_hrms_attendance_edit` | whole-company logins only; taking one off (employeeId: null) also needs cf_hrms_attendance_remove |
 | `POST /attendance/device-users/auto` | `cf_hrms_attendance_edit` | whole-company logins only |
-| `GET /attendance/unmapped` | `cf_hrms_attendance_view` |  |
+| `GET /attendance/unmapped` | `cf_hrms_attendance_view` | serials masked without cf_hrms_attendance_edit |
 | `GET /attendance/api-keys` | `cf_hrms_attendance_view` |  |
 | `POST /attendance/api-keys` | `cf_hrms_attendance_edit` | the Owner only |
 | `POST /attendance/api-keys/:id/revoke` | `cf_hrms_attendance_edit` | the Owner only |
 | `GET /attendance/imports/template` | `cf_hrms_attendance_upload` **and** `cf_hrms_attendance_view` |  |
 | `POST /attendance/imports/:kind/preview` | `cf_hrms_attendance_upload` **and** `cf_hrms_attendance_view` | whole-company logins only |
-| `POST /attendance/imports/:kind/apply` | `cf_hrms_attendance_upload` **and** `cf_hrms_attendance_view` | whole-company logins only |
+| `POST /attendance/imports/:kind/apply` | `cf_hrms_attendance_upload` **and** `cf_hrms_attendance_view` | whole-company logins only; a days file never sets the login’s own days |
 | `GET /attendance/settings` | `cf_hrms_attendance_view` |  |
 | `PUT /attendance/settings` | `cf_hrms_attendance_edit` | whole-company logins only |
 | `GET /attendance/months` | `cf_hrms_attendance_view` |  |
