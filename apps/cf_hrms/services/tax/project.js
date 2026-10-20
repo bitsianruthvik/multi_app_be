@@ -97,7 +97,10 @@ export function projectYear(input, rules) {
     professionalTax: input.professionalTax, otherIncome: input.otherIncome, previousEmployer: input.previousEmployer,
   }, rules);
 
-  const projectedTax = computation.totalTax;
+  // Relief for arrears (Form 10E / Form No. 39, P3b): the employer may take it into account in the TDS
+  // (s.192(2A) / s.392(4)(a)(ii)) — the year's tax to deduct is the tax less the relief, never below 0.
+  const relief = input.relief && n(input.relief.amount) > 0 ? Math.min(Math.round(n(input.relief.amount)), computation.totalTax) : 0;
+  const projectedTax = computation.totalTax - relief;
   const tdsSoFar = Math.round(paid.reduce((a, m) => a + n(m.tdsDeducted), 0));
   const previousEmployerTds = Math.round(n(input.previousEmployer?.tds));
   const monthsLeft = remaining.length;
@@ -113,6 +116,10 @@ export function projectYear(input, rules) {
   }));
 
   const lines = [
+    ...(relief ? [
+      { label: `Tax for the year before relief`, amount: computation.totalTax },
+      { label: `Less: relief for arrears (${input.relief.section ?? 'section 89 / 157'}; ${input.relief.form ?? 'Form 10E / 39'} furnished — ${input.relief.employerSection ?? 's.192(2A) / s.392(4)(a)(ii)'})`, amount: -relief },
+    ] : []),
     { label: `Projected tax for the year (${paid.length} month(s) paid, ${monthsLeft} to come${oneTime.length ? `, ${oneTime.length} one-time item(s)` : ''}; ${closed ? 'proofs only' : 'declarations'})`, amount: projectedTax },
     { label: 'TDS already deducted this year', amount: -tdsSoFar },
     ...(previousEmployerTds ? [{ label: `TDS by the previous employer (${computation.forms.previousEmployer.label})`, amount: -previousEmployerTds }] : []),
@@ -120,5 +127,5 @@ export function projectYear(input, rules) {
     { label: balance > 0 ? `This month: ${inr(balance)} ÷ ${monthsLeft} month(s) left, to the rupee` : `This month: nothing — ${excess ? `${inr(excess)} more than the year's tax is already deducted; it comes back as a refund on the return` : 'the year\'s tax is already deducted'}`, amount: thisMonthTds },
   ];
 
-  return { computation, projectedTax, tdsSoFar, previousEmployerTds, monthsLeft, balance, thisMonthTds, schedule, excess, proofsStatus: closed ? 'CLOSED' : 'OPEN', lines };
+  return { relief, computation, projectedTax, tdsSoFar, previousEmployerTds, monthsLeft, balance, thisMonthTds, schedule, excess, proofsStatus: closed ? 'CLOSED' : 'OPEN', lines };
 }

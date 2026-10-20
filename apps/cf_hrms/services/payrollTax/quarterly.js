@@ -29,6 +29,29 @@ import { monthBounds } from '../payroll/proration.js';
 const FROZEN = ['LOCKED', 'RELEASED', 'PAID'];
 const ddmmyyyy = (iso) => (iso ? `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}` : '');
 
+/**
+ * Rows to challans (pure): each row (an amount) goes to one challan; the largest rows first, each into the challan
+ * with the least room left that still holds it; a row no challan holds goes to the one with the most room left
+ * (and that challan is then over: the caller says so). -> { of: [challan index per row | null], allocated: [per challan] }
+ */
+export function allocateRows(amounts, rooms) {
+  const of = amounts.map(() => null);
+  const allocated = rooms.map(() => 0);
+  if (!rooms.length) return { of, allocated };
+  const order = amounts.map((a, i) => i).sort((x, y) => amounts[y] - amounts[x] || x - y);
+  for (const i of order) {
+    let best = null;
+    for (let k = 0; k < rooms.length; k += 1) {
+      const left = rooms[k] - allocated[k];
+      if (amounts[i] <= left + 0.5 && (best == null || left < rooms[best] - allocated[best])) best = k;
+    }
+    if (best == null) best = rooms.reduce((b, r, k) => (r - allocated[k] > rooms[b] - allocated[b] ? k : b), 0);
+    of[i] = best;
+    allocated[best] = Math.round((allocated[best] + amounts[i]) * 100) / 100;
+  }
+  return { of, allocated };
+}
+
 export async function quarterData(db, c, year, quarter) {
   const q = String(quarter).toUpperCase();
   if (!QUARTERS.includes(q)) throw bad('The quarter is Q1, Q2, Q3 or Q4.');
@@ -67,14 +90,18 @@ export async function quarterData(db, c, year, quarter) {
     else if (m.balance > 0.5) V('ERROR', `${m.label}: the challans pay ₹${m.deposited.toLocaleString('en-IN')} of ₹${m.deducted.toLocaleString('en-IN')} deducted.`);
     else if (m.deposited - m.deducted > 0.5) V('WARNING', `${m.label}: the challans pay ₹${(m.deposited - m.deducted).toLocaleString('en-IN')} more than was deducted (the rest stays unallocated).`);
     for (const ch of mine) if (ch.depositDate > m.due) V('WARNING', `${m.label}: challan ${ch.challanSerial} was deposited on ${ch.depositDate}, after the due date ${m.due} — interest is due.`);
-    // Allocate the month's rows to its challans, in order, by the tax each one paid.
-    let ci = 0;
-    for (const p of rows) {
+    // Allocate the month's rows to its challans by what each one paid (tax + surcharge + cess): the largest row first,
+    // into the challan with the least room that still holds it (P3b review: the last challan took the overflow).
+    const fit = allocateRows(rows.map((p) => n(p.tds_amount)), mine.map((ch) => ch.tax + ch.surcharge + ch.cess));
+    for (const [k, ch] of mine.entries()) {
+      const room = ch.tax + ch.surcharge + ch.cess;
+      if (fit.allocated[k] > room + 0.5) V('ERROR', `${m.label}: challan ${ch.challanSerial} paid ₹${room.toLocaleString('en-IN')} (tax + surcharge + cess) but ₹${fit.allocated[k].toLocaleString('en-IN')} of deductions cannot be fitted into the month's challans without it — the RPU refuses a challan whose deductee rows are more than it paid. Record the missing deposit or correct the challans.`);
+    }
+    for (const [ri, p] of rows.entries()) {
       const pan = pans.get(p.employee_id);
       const ps = panStatus(pan);
       const tax = JSON.parse(typeof p.tax_json === 'string' ? p.tax_json : JSON.stringify(p.tax_json ?? {}));
-      while (ci < mine.length - 1 && mine[ci].allocated + n(p.tds_amount) > mine[ci].tax + mine[ci].surcharge + mine[ci].cess + 0.5) ci += 1;
-      const ch = mine[ci] ?? null;
+      const ch = fit.of[ri] == null ? null : mine[fit.of[ri]];
       if (ch) ch.allocated += n(p.tds_amount);
       const paidOn = monthBounds(p.period_month).to;
       const row = {
@@ -115,8 +142,8 @@ export async function quarterData(db, c, year, quarter) {
         standardDeduction: k.standardDeduction, professionalTax: k.professionalTax, incomeFromSalary: k.incomeFromSalary,
         houseProperty: k.houseProperty, otherIncome: k.otherIncome, grossTotalIncome: k.grossTotalIncome,
         deductions: Object.fromEntries((k.deductions ?? []).map((d) => [d.key, d.allowed])), totalDeductions: k.totalDeductions,
-        taxableIncome: k.taxableIncome, taxOnIncome: k.taxBeforeRebate, rebate: k.rebate, surcharge: k.surcharge, cess: k.cess, relief89: 0, netTax: k.totalTax,
-        tdsCurrent: a.tds, tdsPrevious: money(n(a.previousEmployer?.tds)), shortfall: money(k.totalTax - a.tds - n(a.previousEmployer?.tds)),
+        taxableIncome: k.taxableIncome, taxOnIncome: k.taxBeforeRebate, rebate: k.rebate, surcharge: k.surcharge, cess: k.cess, relief89: money(n(a.relief)), netTax: money(k.totalTax - n(a.relief)),
+        tdsCurrent: a.tds, tdsPrevious: money(n(a.previousEmployer?.tds)), shortfall: money(k.totalTax - n(a.relief) - a.tds - n(a.previousEmployer?.tds)),
         rentOver1Lakh: landlords.reduce((s, x) => s + x.counted, 0) > 100000 ? 'Y' : 'N', landlords: landlords.length,
         rows,
       });
@@ -192,7 +219,7 @@ export async function quarterWorkbook(db, c, year, quarter) {
     ], d.annexureII.map((a) => ({
       code: a.employee.code, pan: a.pan, name: a.employee.name, from: ddmmyyyy(a.periodFrom), to: ddmmyyyy(a.periodTo), opt: a.optingOut, gross: a.grossSalary, perq: a.perquisites, prev: a.previousEmployerSalary,
       ex: a.exemptions, hra: a.hraExempt, std: a.standardDeduction, pt: a.professionalTax, sal: a.incomeFromSalary, hp: a.houseProperty, os: a.otherIncome, gti: a.grossTotalIncome,
-      ...Object.fromEntries(keys.map(([k]) => [k, a.deductions[k] ?? 0])), ded: a.totalDeductions, ti: a.taxableIncome, tax: a.taxOnIncome, rebate: a.rebate, sur: a.surcharge, cess: a.cess, relief: 0, net: a.netTax,
+      ...Object.fromEntries(keys.map(([k]) => [k, a.deductions[k] ?? 0])), ded: a.totalDeductions, ti: a.taxableIncome, tax: a.taxOnIncome, rebate: a.rebate, sur: a.surcharge, cess: a.cess, relief: a.relief89, net: a.netTax,
       tdsC: a.tdsCurrent, tdsP: a.tdsPrevious, short: a.shortfall, rent: a.rentOver1Lakh, landlords: a.landlords,
     })));
   }

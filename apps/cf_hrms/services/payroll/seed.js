@@ -39,6 +39,18 @@ export const READY_MADE_COMPONENTS = [
   // (payrollTax/runTax.js). Put it in a structure with e.g. round(10% of BASIC), or round(14% of (BASIC + DA))
   // when the structure has DA — the limit is 14% of Basic + DA in the new regime, 10% in the old one.
   ['NPS_ER', 'NPS (employer)', 'EMPLOYER_CONTRIBUTION', 'YES', 'NPS_80CCD2', 0, 0, 0, 'MONTHLY', 1, null],
+  // P3b (spec §25.5): the full and final, attendance and claims. Paid as one-time lines by the run (never by a
+  // structure), none in the PF or ESI wage. Gratuity and leave encashment carry their exemption rules (the engine
+  // gives the least of received, the formula of the settlement and the cap); notice pay is profits in lieu of salary.
+  ['NOTICE_PAY', 'Notice pay', 'EARNING', 'YES', null, 0, 0, 0, 'YEARLY', 0, null],
+  ['NOTICE_REC', 'Notice pay recovery', 'DEDUCTION', 'NO', null, 0, 0, 0, 'YEARLY', 0, null],
+  ['LEAVE_ENC', 'Leave encashment', 'EARNING', 'PARTLY', 'LEAVE_ENCASHMENT', 0, 0, 0, 'YEARLY', 0, null],
+  ['GRATUITY', 'Gratuity', 'EARNING', 'PARTLY', 'GRATUITY', 0, 0, 0, 'YEARLY', 0, null],
+  ['ATT_PENALTY', 'Attendance penalty', 'DEDUCTION', 'NO', null, 0, 0, 0, 'MONTHLY', 0, null],
+  ['REIMB', 'Reimbursement', 'REIMBURSEMENT', 'NO', null, 0, 0, 0, 'MONTHLY', 0, null],
+  ['REIMB_TAX', 'Reimbursement (taxable)', 'REIMBURSEMENT', 'YES', null, 0, 0, 0, 'MONTHLY', 0, null],
+  ['REIMB_LTA', 'Leave travel (claimed)', 'REIMBURSEMENT', 'PARTLY', 'LTA', 0, 0, 0, 'MONTHLY', 0, null],
+  ['FLEXI_PAY', 'Flexible benefit balance', 'EARNING', 'YES', null, 0, 0, 0, 'YEARLY', 0, null],
 ].map(([code, name, kind, taxable, exemptionRule, inPf, inEsi, inGratuity, frequency, prorate, statutoryKey], i) => ({
   code, name, kind, taxable, exemptionRule, inPfWage: inPf, inEsiWage: inEsi, inGratuityWage: inGratuity, frequency, prorateOnLop: prorate, statutoryKey, sortOrder: (i + 1) * 10,
 }));

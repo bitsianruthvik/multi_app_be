@@ -248,6 +248,9 @@ try {
   await db.query("UPDATE hrms_tax_settings SET deleted_at = NOW() WHERE company_id = ? AND tax_year IN ('2025-26', '2026-27') AND deleted_at IS NULL", [COMPANY]);
   await db.query('UPDATE hrms_pay_perquisites SET deleted_at = NOW() WHERE company_id = ? AND deleted_at IS NULL', [COMPANY]);
   await db.query('UPDATE hrms_tax_relief_10e SET deleted_at = NOW() WHERE company_id = ? AND deleted_at IS NULL', [COMPANY]);
+  // P3b: claim types (a flexible balance is paid in March) and the payroll policy of the company: out of the way too.
+  await db.query('UPDATE hrms_pay_claim_types SET deleted_at = NOW() WHERE company_id = ? AND deleted_at IS NULL', [COMPANY]);
+  await db.query('UPDATE hrms_pay_policy SET deleted_at = NOW() WHERE company_id = ? AND deleted_at IS NULL', [COMPANY]);
 
   await setupAccess(db, COMPANY, { apply: true });
   const roleByKey = Object.fromEntries((await q('SELECT role_id, template_key FROM hrms_access_roles WHERE company_id = ? AND deleted_at IS NULL AND template_key IS NOT NULL', [COMPANY])).map((r) => [r.template_key, r.role_id]));
@@ -339,9 +342,11 @@ try {
   ok(pa[E.N].tds === 10387, 'NPS: N’s April TDS = 1,24,640 ÷ 12 = 10,387 (the employer’s NPS counted in salary and deducted under 80CCD(2) up to 14% of Basic)', JSON.stringify(pa[E.N].tax ?? pa[E.N].tds));
   // The run's LOP for A: two days (as an approved unpaid leave would give) — the ECR reads the run's LOP days.
   await db.query('UPDATE hrms_pay_run_people SET lop_days = 2 WHERE company_id = ? AND run_id = ? AND employee_id = ? AND deleted_at IS NULL', [COMPANY, aprRun.id, E.A]);
+  // B's run paid 27 of 30 days (3 LOP) — what a run reading the closed attendance month pays (P3b review: the files take the RUN's days).
+  await db.query('UPDATE hrms_pay_run_people SET lop_days = 3, payable_days = 27 WHERE company_id = ? AND run_id = ? AND employee_id = ? AND deleted_at IS NULL', [COMPANY, aprRun.id, E.B]);
   // Attendance CLOSED for April 2025 with B's NCP 3 / ESI days 27 (live in that month's summary).
   const had = await one('SELECT id FROM hrms_attendance_months WHERE company_id = ? AND period_month = ?', [COMPANY, '2025-04']);
-  const summary = JSON.stringify({ month: '2025-04', from: '2025-04-01', to: '2025-04-30', calendarDays: 30, live: true, liveFrom: '2025-04-01', people: [{ employeeId: E.B, ncpDays: 3, esiDays: 27, lopDays: 3, payableDays: 27 }] });
+  const summary = JSON.stringify({ month: '2025-04', from: '2025-04-01', to: '2025-04-30', calendarDays: 30, live: true, liveFrom: '2025-04-01', people: [{ employeeId: E.B, ncpDays: 3, esiDays: 27, lopDays: 3, payableDays: 27 }, { employeeId: E.A, ncpDays: 1, esiDays: 29, lopDays: 1, payableDays: 29 }] });
   if (had) await db.query("UPDATE hrms_attendance_months SET status = 'CLOSED', summary_json = ?, closed_at = NOW(), deleted_at = NULL WHERE id = ?", [summary, had.id]);
   else await db.query("INSERT INTO hrms_attendance_months (company_id, period_month, status, summary_json, closed_at) VALUES (?, '2025-04', 'CLOSED', ?, NOW())", [COMPANY, summary]);
 
@@ -356,7 +361,9 @@ try {
   const expA = '100000000001#~#RAVI KUMAR#~#40000#~#15000#~#15000#~#15000#~#1800#~#1250#~#550#~#2#~#0';
   const expB = '100000000002#~#SITA DEVI#~#17000#~#8500#~#8500#~#8500#~#1020#~#708#~#312#~#3#~#0';
   ok(rA && ecrLine(rA) === expA && rA.ncpFrom === 'RUN', 'A: EPF wages capped at 15,000, EPS 1,250, ER 550, NCP 2 from the run', rA ? ecrLine(rA) : 'no row');
-  ok(rB && ecrLine(rB) === expB && rB.ncpFrom === 'ATTENDANCE', 'B: 8,500, EE 1,020, EPS 708, ER 312, NCP 3 from the closed attendance month', rB ? ecrLine(rB) : 'no row');
+  ok(rB && ecrLine(rB) === expB && rB.ncpFrom === 'RUN', 'B: 8,500, EE 1,020, EPS 708, ER 312, NCP 3 — the run’s LOP (the run read the closed month)', rB ? ecrLine(rB) : 'no row');
+  ok(ret.validation.some((v) => v.level === 'WARNING' && v.kind === 'PF' && v.employee?.id === E.A && /closed attendance has 1 NCP days, the run paid 2/.test(v.what)) && !ret.validation.some((v) => v.kind === 'PF' && v.employee?.id === E.B && /closed attendance has/.test(v.what)),
+    'review fix: A’s closed attendance (1 NCP day) differs from the run (2 LOP days) — flagged; B agrees — not flagged');
   const rC = row(ret.pf.rows, E.C);
   ok(rC && !rC.uan && ret.validation.some((v) => v.level === 'ERROR' && v.kind === 'PF' && v.employee?.id === E.C && /no UAN/.test(v.what)), 'C without a UAN: an error, named');
   const ecr = await must(U.HR, 'GET', '/payroll/returns/2025-04/files/ECR');
@@ -367,7 +374,7 @@ try {
 
   const eB = row(ret.esi.rows, E.B);
   const eC = row(ret.esi.rows, E.C);
-  ok(eB && eB.ip === '1000000002' && eB.days === 27 && eB.wages === 17000 && eB.reason === 0 && !eB.lastWorkingDay && eB.daysFrom === 'ATTENDANCE', 'ESI, B: IP 1000000002, 27 days (attendance), wages 17,000, reason 0', JSON.stringify(eB));
+  ok(eB && eB.ip === '1000000002' && eB.days === 27 && eB.wages === 17000 && eB.reason === 0 && !eB.lastWorkingDay && eB.daysFrom === 'RUN', 'ESI, B: IP 1000000002, 27 days (the run’s payable days), wages 17,000, reason 0', JSON.stringify(eB));
   const cRun = await one('SELECT esi_wage, payable_days FROM hrms_pay_run_people WHERE company_id = ? AND run_id = ? AND employee_id = ? AND deleted_at IS NULL', [COMPANY, aprRun.id, E.C]);
   ok(eC && eC.days === 20 && Number(cRun.payable_days) === 20 && eC.wages === Math.round(Number(cRun.esi_wage)) && !eC.ip && ret.validation.some((v) => v.kind === 'ESI' && v.employee?.id === E.C && /no ESI IP number/.test(v.what)), 'ESI, C (joined 11 April): 20 days, the run’s ESI wage; no IP number → an error', JSON.stringify(eC));
   ok(!row(ret.esi.rows, E.A), 'A (₹40,000) is not covered by ESI: not in the ESI file');

@@ -77,7 +77,8 @@ export function computePerson(input) {
   for (const item of input.oneTime ?? []) {
     const c = comp(item.code);
     if (!c) { warnings.push(`A one-time item uses ${item.code}, which is not a component any more.`); continue; }
-    push(c, money(item.amount), item.note ? `one-time: ${item.note}` : 'one-time item', { source: 'ONE_TIME' });
+    // P3b: overtime and penalties (ATTENDANCE), the full and final (SETTLEMENT), claims (CLAIM) come in the same way.
+    push(c, money(item.amount), item.basis ?? (item.note ? `one-time: ${item.note}` : 'one-time item'), { source: item.source ?? 'ONE_TIME' });
   }
   const arrearsComp = byKey('ARREARS');
   let arrearsPfBase = 0;
@@ -107,9 +108,12 @@ export function computePerson(input) {
   const esiEe = esiAll.employee ? pushKey('ESI_EE', esiAll.employee, esiAll.basis, { source: 'STATUTORY' }) : false;
   const esiEr = esiAll.employer ? pushKey('ESI_ER', esiAll.employer, `${S.ESI?.employerRate}% of ${esiAll.wage.toLocaleString('en-IN')}`, { source: 'STATUTORY' }) : false;
   const esi = { ...esiAll, employee: esiEe ? esiAll.employee : 0, employer: esiEr ? esiAll.employer : 0 };
-  const pt = ptFor({ gross, settings: S.PT, month: input.month });
+  // Professional tax is on the month's salary: the full and final's own amounts (gratuity, leave encashment, notice
+  // pay …) are left out of its slab, and a person paid only a settlement in a month after leaving pays none, nor LWF.
+  const settlementGross = money(earnings.filter((l) => l.source === 'SETTLEMENT').reduce((s, l) => s + l.amount, 0));
+  const pt = input.settlementOnly ? { amount: 0 } : ptFor({ gross: money(gross - settlementGross), settings: S.PT, month: input.month });
   if (pt.amount) pushKey('PT', pt.amount, pt.basis, { source: 'STATUTORY' });
-  const lwf = lwfFor({ month: input.month, paid: gross > 0, settings: S.LWF });
+  const lwf = input.settlementOnly ? { employee: 0, employer: 0 } : lwfFor({ month: input.month, paid: gross > 0, settings: S.LWF });
   if (lwf.employee) pushKey('LWF_EE', lwf.employee, lwf.basis, { source: 'STATUTORY' });
   if (lwf.employer) pushKey('LWF_ER', lwf.employer, lwf.basis, { source: 'STATUTORY' });
   // TDS: services/payroll/tds.js (HR's override, a TDS item, or the tax engine).

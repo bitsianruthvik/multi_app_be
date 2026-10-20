@@ -14,7 +14,7 @@
  * The NEW regime refuses most of these: the engine says so, line by line (refused[]).
  */
 import { notFound } from '../../lib/errors.js';
-import { audit, bad, refuse, text, n, money, today, json, stamp, dateText, PAN_RE, TAN_RE, yearMonths, monthsBetween, employeeRow } from './common.js';
+import { audit, bad, refuse, text, n, money, today, json, stamp, dateText, PAN_RE, TAN_RE, yearMonths, monthsBetween, employeeRow, assertNotOwn } from './common.js';
 import { yearSettings } from './settings.js';
 import { profileOf } from './profiles.js';
 import { shapeFile } from './files.js';
@@ -190,7 +190,8 @@ export async function listLines(db, c, employeeId, year, { rules }) {
 }
 
 const mustDeclare = async (db, c, employeeId, year, by) => {
-  if (by === 'HR') return;
+  // HR may declare for a person outside the window — never for themselves (P3b review): their own goes through My tax.
+  if (by === 'HR') { await assertNotOwn(db, c, employeeId, 'tax declaration'); return; }
   const can = await canDeclare(db, c.companyId, employeeId, year);
   if (!can.open) {
     throw refuse('WINDOW_CLOSED', can.window.state === 'NOT_YET'

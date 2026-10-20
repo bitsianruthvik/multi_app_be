@@ -96,8 +96,8 @@ export function partBRows(a, forms) {
     R('15', 'Surcharge, wherever applicable', k.surcharge);
     R('16', 'Health and education cess', k.cess);
     R('17', 'Tax payable (13+15+16-14)', k.totalTax);
-    R('18', 'Less: Relief under section 89 (attach details)', 0);
-    R('19', 'Net tax payable (17-18)', k.totalTax);
+    R('18', 'Less: Relief under section 89 (attach details)', n(a.relief));
+    R('19', 'Net tax payable (17-18)', k.totalTax - n(a.relief));
   } else {
     R('A', 'Whether opting out of taxation under section 202(1)?', null, { text: optOut });
     R('1', 'Salary', null, { head: true });
@@ -141,10 +141,10 @@ export function partBRows(a, forms) {
     R('15', 'Surcharge, wherever applicable', k.surcharge);
     R('16', 'Health and education cess', k.cess);
     R('17', 'Tax payable (13+15+16-14)', k.totalTax);
-    R('18', 'Less: Relief under section 157', 0);
+    R('18', 'Less: Relief under section 157', n(a.relief));
     R('19', 'Less: Tax deducted at source as per Form No. 122', n(a.previousEmployer?.tds));
     R('20', 'Less: Tax collected at source as per Form No. 122', 0);
-    R('21', 'Net tax payable (17-18-19-20)', k.totalTax - n(a.previousEmployer?.tds));
+    R('21', 'Net tax payable (17-18-19-20)', k.totalTax - n(a.relief) - n(a.previousEmployer?.tds));
   }
   return rows;
 }
@@ -222,9 +222,12 @@ export async function partBPdf(s) {
     doc.y = y0 + 18;
     for (const p of s.perquisites) {
       const y = doc.y;
-      doc.font('Helvetica').text(safe(`Other benefit or amenity — ${p.name}`), L + 3, y, { width: 230 });
-      doc.text(rs(p.value), L + 240, y, { width: 90, align: 'right' }); doc.text('0', L + 335, y, { width: 70, align: 'right' }); doc.text(rs(p.value), L + 410, y, { width: W - 416, align: 'right' });
-      doc.y = y + 14;
+      // P3b: the nature (with its row of the form), the value as per the rules, what the employee paid back, the taxable value.
+      const nature = p.nature ? `${p.row ? `${p.row}. ` : ''}${p.nature}` : `Other benefit or amenity — ${p.name}`;
+      doc.font('Helvetica').text(safe(nature), L + 3, y, { width: 230 });
+      const h = doc.heightOfString(safe(nature), { width: 230 });
+      doc.text(rs(p.valueAsPerRules ?? p.value), L + 240, y, { width: 90, align: 'right' }); doc.text(rs(p.recovered ?? 0), L + 335, y, { width: 70, align: 'right' }); doc.text(rs(p.value), L + 410, y, { width: W - 416, align: 'right' });
+      doc.y = y + Math.max(14, h + 3);
     }
     doc.font('Helvetica-Bold').text(safe(`Total value of perquisites: Rs. ${rs(s.perquisiteTotal)}`), L, doc.y + 4);
   }
@@ -237,6 +240,8 @@ function snapshotOf({ a, employee, deductor, forms, year, settings }) {
   const startYear = Number(year.slice(0, 4));
   const notes = [];
   if (a.panStatus !== 'VALID') notes.push('The employee has no valid PAN on file: TDS was at the higher rate (section 206AA / 397(2)). TRACES issues Form 16 / 130 Part A only for a valid PAN.');
+  if (a.relief) notes.push(`Relief for arrears of Rs. ${rs(a.relief)} (${a.reliefRule?.section ?? 'section 89 / 157'}) from the employee's ${a.reliefRule?.form ?? 'Form 10E / 39'}.`);
+  if (a.retirement?.excess) notes.push(`Employer's contributions to PF, NPS and superannuation this year: Rs. ${rs(a.retirement.total)}; Rs. ${rs(a.retirement.excess)} above the limit is a perquisite (Form ${is130 ? '123' : '12BA'}).`);
   if (a.previousEmployer) notes.push(`Includes salary from a previous employer this year (${forms.previousEmployer}): Rs. ${rs(a.previousEmployer.taxableSalary)}, its TDS Rs. ${rs(a.previousEmployer.tds)}.`);
   return {
     version: 1, year, assessmentYear: `${startYear + 1}-${String((startYear + 2) % 100).padStart(2, '0')}`, is130, forms,
@@ -244,7 +249,7 @@ function snapshotOf({ a, employee, deductor, forms, year, settings }) {
     employee: { id: employee.id, code: employee.code, name: employee.name, pan: a.pan, designation: employee.designation ?? null },
     period: a.period, regime: a.regime, rows: partBRows(a, forms), otherTax: a.otherComputation.totalTax, totalTax: a.computation.totalTax,
     tds: { total: a.tds, ...a.tdsByQuarter }, perquisites: a.perquisites, perquisiteTotal: a.perquisiteTotal, salaryExcludingPerquisites: money(a.computation.grossSalary - a.perquisiteTotal),
-    provisional: a.provisional, notes, caReviewed: settings.caReviewed, generatedAt: new Date().toISOString(),
+    relief: n(a.relief), provisional: a.provisional, notes, caReviewed: settings.caReviewed, generatedAt: new Date().toISOString(),
   };
 }
 
@@ -329,18 +334,45 @@ export function pansInPdf(buffer) {
   scan(latin);
   const re = /stream\r?\n/g;
   let m;
+  let inflated = 0;
   while ((m = re.exec(latin))) {
+    if (inflated > PART_A_LIMITS.scanTotal) break; // enough read: a Part A is small; a bomb is not read to the end
     const start = m.index + m[0].length;
     const end = latin.indexOf('endstream', start);
     if (end < 0) break;
     try {
-      const s = zlib.inflateSync(buffer.subarray(start, end)).toString('latin1');
+      // P3b review: at most PART_A_LIMITS.stream bytes out of one stream (zlib stops and throws past it).
+      const out = zlib.inflateSync(buffer.subarray(start, end), { maxOutputLength: PART_A_LIMITS.stream });
+      inflated += out.length;
+      const s = out.toString('latin1');
       scan(s);
       scan(s.replace(/[()\\]/g, ''));
     } catch { /* not deflated */ }
     re.lastIndex = end;
   }
   return [...found];
+}
+
+/** Limits on unpacking a Part A upload (bytes, files). */
+export const PART_A_LIMITS = Object.freeze({ entry: 20 * 1024 * 1024, total: 200 * 1024 * 1024, entries: 3000, stream: 20 * 1024 * 1024, scanTotal: 60 * 1024 * 1024 });
+
+/** A ZIP entry's bytes, refused in words once it passes `max`. */
+export function readCapped(entry, max, name) {
+  return new Promise((resolve, reject) => {
+    const parts = [];
+    let size = 0;
+    let done = false;
+    const stream = entry.internalStream('nodebuffer');
+    stream.on('data', (chunk) => {
+      if (done) return;
+      size += chunk.length;
+      if (size > max) { done = true; stream.pause(); reject(bad(`${name} unpacks to more than the ${Math.round(max / 1024 / 1024)} MB allowed: not a Part A. Nothing was saved.`)); return; }
+      parts.push(Buffer.from(chunk));
+    });
+    stream.on('error', (e) => { if (!done) { done = true; reject(bad(`${name} cannot be unpacked (${e.message}).`)); } });
+    stream.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(parts)); } });
+    stream.resume();
+  });
 }
 
 /** POST /tax/:year/forms/part-a { fileName, contentBase64 } — a PDF, or a ZIP of PDFs. */
@@ -352,9 +384,17 @@ export async function uploadPartA(db, c, year, body = {}, requestId = null) {
     try { zip = await JSZip.loadAsync(buffer); } catch (e) {
       throw bad(`That ZIP cannot be opened (${e.message}). The ZIP downloaded from TRACES is locked with your TAN: open it with the TRACES PDF Converter, then upload the PDFs it makes (or a ZIP of them).`);
     }
-    for (const entry of Object.values(zip.files)) {
-      if (entry.dir || !/\.pdf$/i.test(entry.name)) continue;
-      pdfs.push({ name: entry.name.split('/').pop(), buffer: await entry.async('nodebuffer') });
+    // P3b review: each entry at most PART_A_LIMITS.entry bytes unpacked, all together at most PART_A_LIMITS.total,
+    // at most PART_A_LIMITS.entries files — read as a stream and stopped past the limit (a ZIP bomb is refused, not unpacked).
+    const entries = Object.values(zip.files).filter((e) => !e.dir && /\.pdf$/i.test(e.name));
+    if (entries.length > PART_A_LIMITS.entries) throw bad(`That ZIP has ${entries.length} PDFs; at most ${PART_A_LIMITS.entries} at a time.`);
+    let total = 0;
+    for (const entry of entries) {
+      const declared = Number(entry._data?.uncompressedSize);
+      if (Number.isFinite(declared) && declared > PART_A_LIMITS.entry) throw bad(`${entry.name} unpacks to more than ${PART_A_LIMITS.entry / 1024 / 1024} MB: not a Part A. Nothing was saved.`);
+      const buf = await readCapped(entry, Math.min(PART_A_LIMITS.entry, PART_A_LIMITS.total - total), entry.name);
+      total += buf.length;
+      pdfs.push({ name: entry.name.split('/').pop(), buffer: buf });
     }
     if (!pdfs.length) throw bad('There is no PDF in that ZIP. Upload the PDFs the TRACES PDF Converter makes.');
   } else pdfs.push({ name: fileName, buffer });

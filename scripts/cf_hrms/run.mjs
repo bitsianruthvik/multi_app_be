@@ -154,6 +154,14 @@ const AREAS = {
     paths: [`${H}/services/payrollExtras/**`, `${H}/routes/payrollExtras.js`, `${H}/services/tax/**`, `${H}/services/payrollTax/**`, `${H}/services/payroll/**`,
       `${H}/services/attendance/month.js`, `${H}/scripts/apply-payroll-extras-schema.mjs`, 'scripts/cf_hrms/payroll_extras_test.mjs'],
   },
+  // Payroll P3b (spec §25.5): full and final, claims, attendance into the run, perquisites / relief / retirement in TDS.
+  // It runs the whole payroll year through the run, the tax engine and attendance, so a change to any of them runs it.
+  exit: {
+    suites: ['payroll_exit_test'],
+    paths: [`${H}/services/payrollExit/**`, `${H}/routes/payrollExit.js`, `${H}/services/payroll/**`, `${H}/services/payrollTax/**`, `${H}/services/tax/**`,
+      `${H}/services/payrollExtras/**`, `${H}/services/attendance/month.js`, `${H}/services/attendance/settings.js`, `${H}/services/leave/requestService.js`,
+      `${H}/routes/self.js`, `${H}/scripts/apply-payroll-exit-schema.mjs`, `${H}/scripts/demo-payroll.mjs`, 'scripts/cf_hrms/payroll_exit_test.mjs'],
+  },
 };
 
 /** A change here can break any suite: --all, with the reason. */

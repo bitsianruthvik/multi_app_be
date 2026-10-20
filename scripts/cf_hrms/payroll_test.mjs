@@ -95,7 +95,7 @@ section('[0] The schema');
   try {
     ok(PAYROLL_TABLES.length === 12, 'init.sql §26 declares the twelve hrms_pay_* tables (hrms_pay_payments since 2026-10-20)', PAYROLL_TABLES.join(','));
     ok((await schemaSteps(conn)).length === 0, 'apply-payroll-schema: nothing left to do on this database (idempotent)');
-    const [cols] = await conn.query("SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'hrms_pay_%' AND DATA_TYPE = 'decimal' AND COLUMN_NAME NOT LIKE '%days%'");
+    const [cols] = await conn.query("SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'hrms_pay_%' AND DATA_TYPE = 'decimal' AND COLUMN_NAME NOT LIKE '%days%' AND COLUMN_NAME NOT LIKE '%\\_pct'"); // a rate (P3b rate_pct) is not an amount
     ok(cols.length >= 15 && cols.every((c) => Number(c.NUMERIC_PRECISION) === 14 && Number(c.NUMERIC_SCALE) === 2), 'every amount is DECIMAL(14,2)', cols.filter((c) => Number(c.NUMERIC_PRECISION) !== 14).map((c) => `${c.TABLE_NAME}.${c.COLUMN_NAME}`).join(','));
     const [del] = await conn.query("SELECT TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'hrms_pay_%' AND COLUMN_NAME = 'deleted_at'");
     ok(PAYROLL_TABLES.every((t) => del.some((d) => d.TABLE_NAME === t)), 'every payroll table of §26 is soft-deleted (deleted_at), none is hard-deleted', PAYROLL_TABLES.filter((t) => !del.some((d) => d.TABLE_NAME === t)).join(','));

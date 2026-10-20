@@ -6,7 +6,7 @@
  *   DECLARED ──upload──▶ SUBMITTED ──verify──▶ VERIFIED (accepted amount)
  *                            │      ──reject──▶ REJECTED (reason) ──upload again──▶ SUBMITTED
  */
-import { audit, bad, refuse, text, money, n, json, today } from './common.js';
+import { audit, bad, refuse, text, money, n, json, today, assertNotOwn } from './common.js';
 import { readUpload, storeFile, fileRow, fileBytes } from './files.js';
 import { lineRow, shapeLine, canProve, KINDS, filesOfLines } from './declarations.js';
 
@@ -77,6 +77,7 @@ export async function proofQueue(db, c, year, query = {}) {
 /** POST /tax/proof-lines/:id/verify { acceptedAmount? } — the declared amount when not given. */
 export async function verifyLine(db, c, lineId, body = {}, requestId = null) {
   const r = await lineRow(db, c.companyId, lineId);
+  await assertNotOwn(db, c, r.employee_id, 'tax proof');
   const declared = n(r.declared_amount);
   let accepted = declared;
   if (body.acceptedAmount !== undefined && body.acceptedAmount !== null && body.acceptedAmount !== '') {
@@ -94,6 +95,7 @@ export async function verifyLine(db, c, lineId, body = {}, requestId = null) {
 
 export async function rejectLine(db, c, lineId, body = {}, requestId = null) {
   const r = await lineRow(db, c.companyId, lineId);
+  await assertNotOwn(db, c, r.employee_id, 'tax proof');
   const reason = text(body.reason, 500);
   if (!reason || reason.length < 3) throw bad('Say why the proof is rejected — the person sees it.');
   await db.query("UPDATE hrms_tax_declaration_lines SET status = 'REJECTED', accepted_amount = NULL, reject_reason = ?, reviewed_at = NOW(), reviewed_by = ? WHERE company_id = ? AND id = ?",
@@ -108,11 +110,12 @@ export async function bulkAccept(db, c, year, body = {}, requestId = null) {
   const ids = [...new Set((Array.isArray(body.lineIds) ? body.lineIds : []).map(Number).filter((x) => Number.isInteger(x) && x > 0))];
   if (!ids.length) throw bad('Choose the proofs to accept.');
   if (ids.length > 500) throw bad('At most 500 at a time.');
-  const [rows] = await db.query(`SELECT id, status FROM hrms_tax_declaration_lines WHERE company_id = ? AND tax_year = ? AND deleted_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`, [c.companyId, year, ...ids]);
+  const [rows] = await db.query(`SELECT id, status, employee_id FROM hrms_tax_declaration_lines WHERE company_id = ? AND tax_year = ? AND deleted_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`, [c.companyId, year, ...ids]);
   const accepted = [];
   const skipped = [];
   for (const r of rows) {
     if (r.status !== 'SUBMITTED') { skipped.push({ id: r.id, why: `it is ${r.status.toLowerCase()}` }); continue; }
+    try { await assertNotOwn(db, c, r.employee_id, 'tax proof'); } catch { skipped.push({ id: r.id, why: 'it is your own — another person in HR verifies it' }); continue; }
     await verifyLine(db, c, r.id, {}, requestId);
     accepted.push(r.id);
   }

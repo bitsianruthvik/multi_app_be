@@ -27,6 +27,7 @@ import taxRoutes from './tax.js';
 import attendanceRoutes from './attendance.js';
 import selfAttendanceRoutes from './selfAttendance.js';
 import payrollExtrasRoutes from './payrollExtras.js';
+import payrollExitRoutes from './payrollExit.js';
 
 const router = Router();
 
@@ -155,5 +156,7 @@ router.use(itrRoutes);
 router.use(taxRoutes);
 // Payroll extras P3a (spec §25.5): statutory return files, perquisites, Form 10E (routes/payrollExtras.js).
 router.use(payrollExtrasRoutes);
+// Payroll P3b (spec §25.5): full and final, claims, attendance in the run, the payroll policy (routes/payrollExit.js).
+router.use(payrollExitRoutes);
 
 export default router;

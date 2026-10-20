@@ -61,7 +61,7 @@ export async function salaryContext(db, companyId, year, employeeIds) {
   const out = new Map();
   if (!employeeIds.length) return out;
   const months = yearMonths(year);
-  const world = await loadTaxWorld(db, companyId, months[11], employeeIds, { paidBefore: '9999-12' });
+  const world = await loadTaxWorld(db, companyId, months[11], employeeIds, { paidBefore: '9999-12', extras: false }); // no extras: they read this register
   const counts = (c) => c.taxable !== 'NO' && !['PERQUISITE', 'NPS_80CCD2'].includes(String(c.exemptRule ?? '').toUpperCase());
   for (const id of employeeIds) {
     const byMonth = {};

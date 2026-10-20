@@ -18,6 +18,13 @@
  * 5. the payroll of April–September 2026 is calculated (TDS by the engine), locked and released; October
  *    2026 is created and CALCULATED, not locked — open it to see the month's TDS.
  *
+ * 6. P3b (also alone: --p3b, on a database that has the rest): the ready-made claim types; a few DEMO claims
+ *    with a bill (one waiting for HR, one with the person's manager when they have one, one approved — it pays
+ *    in October 2026); with --with-leaving one person ON NOTICE (a DEMO leaving record, not closed) with a DRAFT
+ *    full and final (--clean-leaving takes only that away: exit_test expects everybody ACTIVE);
+ *    October 2026 is paid without attendance (its attendance month is not closed — the reason says DEMO) and
+ *    calculated again.
+ *
  * Everything goes through the services the screens use, in one transaction, audited with request id
  * 'demo-payroll' — which is how --clean finds exactly what this made. It removes that outright (demo
  * data on a local database, not a record) and restores the joining dates.
@@ -34,9 +41,15 @@ import { addLine } from '../services/payrollTax/declarations.js';
 import { putYearSettings } from '../services/payrollTax/settings.js';
 import { loadTaxYear } from '../services/tax/index.js';
 import { audit } from '../services/payrollTax/common.js';
+import { setupTypes, submitClaim, approveClaim, loadTypes } from '../services/payrollExit/claims.js';
+import { saveDraft } from '../services/payrollExit/settlement.js';
+import { setOverride, attendanceState } from '../services/payrollExit/attendancePay.js';
 
 const args = process.argv.slice(2);
 const CLEAN = args.includes('--clean');
+const P3B = args.includes('--p3b');
+const WITH_LEAVING = args.includes('--with-leaving');
+const CLEAN_LEAVING = args.includes('--clean-leaving');
 const slug = (args.find((a) => a.startsWith('--company=')) ?? '--company=karni').split('=')[1];
 const MARK = 'demo-payroll';
 const PLACEHOLDER_JOINING = '2026-09-30';
@@ -131,6 +144,11 @@ async function make(db, c) {
     const [[had]] = await db.query('SELECT id FROM hrms_pay_runs WHERE company_id = ? AND period_month = ? AND deleted_at IS NULL', [c.companyId, month]);
     if (had) { console.log(`  the ${month} run exists already (#${had.id}) — left as it is`); continue; }
     const { run } = await createRun(db, c, { month, note: 'DEMO payroll — sample salaries' }, MARK);
+    // Attendance live and the month not closed (the attendance demo): paid without it, with a DEMO reason.
+    if ((await attendanceState(db, c.companyId, month, run.id)).mode === 'REFUSE') {
+      const [[r]] = await db.query('SELECT * FROM hrms_pay_runs WHERE id = ?', [run.id]);
+      await setOverride(db, c, r, { reason: `DEMO — the ${month} attendance month is not closed yet` }, MARK);
+    }
     const calc = await calculateRun(db, c, run.id, MARK);
     const tds = calc.people.reduce((s, x) => s + x.tds, 0);
     if (month === OPEN_MONTH) { console.log(`  run ${month} (#${run.id}): ${calc.run.peopleCount} paid, TDS ₹${tds.toLocaleString('en-IN')} — CALCULATED, not locked`); continue; }
@@ -140,7 +158,83 @@ async function make(db, c) {
   }
 }
 
+/** P3b (spec §25.5): claims, a full and final, October without attendance. */
+async function makeExit(db, c) {
+  await seedPayroll(db, c, MARK); // the P3b ready-made components (notice pay, gratuity, leave encashment …)
+  const [[made]] = await db.query("SELECT COUNT(*) AS n FROM hrms_audit_log WHERE company_id = ? AND request_id = ? AND entity_type = 'hrms_pay_claims'", [c.companyId, MARK]);
+  if (Number(made.n)) {
+    console.log('  p3b: the DEMO claims are there already');
+    if (WITH_LEAVING) await demoLeaving(db, c);
+    return;
+  }
+  if (!(await loadTypes(db, c.companyId)).length) await setupTypes(db, c, MARK);
+  const types = Object.fromEntries((await loadTypes(db, c.companyId)).map((t) => [t.code, t]));
+  const bill = { fileName: 'demo-bill.pdf', contentBase64: Buffer.from('%PDF-1.4\n% DEMO bill\n%%EOF').toString('base64') };
+  const [people] = await db.query(
+    `SELECT e.id FROM hrms_employees e WHERE e.company_id = ? AND e.deleted_at IS NULL AND e.employment_status = 'ACTIVE'
+        AND EXISTS (SELECT 1 FROM hrms_pay_salaries s WHERE s.company_id = e.company_id AND s.employee_id = e.id AND s.deleted_at IS NULL) ORDER BY e.id LIMIT 5`, [c.companyId]);
+  if (people.length < 4) { console.log('  p3b: not enough people with a salary — skipped'); return; }
+  const day = (d) => `2026-10-${String(d).padStart(2, '0')}`;
+  const a = await submitClaim(db, c, people[0].id, { claimTypeId: types.FUEL.id, billDate: day(5), amount: 2400, description: 'DEMO — fuel for site visits', bills: [bill] }, MARK);
+  const b = await submitClaim(db, c, people[1].id, { claimTypeId: types.PHONE.id, billDate: day(8), amount: 999, description: 'DEMO — mobile bill', bills: [bill] }, MARK);
+  const d = await submitClaim(db, c, people[2].id, { claimTypeId: types.BOOKS.id, billDate: day(2), amount: 1200, description: 'DEMO — a handbook', bills: [bill] }, MARK);
+  const dd = await approveClaim(db, c, d.claim.id, { amount: 1000, note: 'DEMO — the handbook less the courier' }, MARK);
+  console.log(`  p3b: 5 claim types; 3 DEMO claims (${a.claim.statusWords}; ${b.claim.statusWords}; approved, pays in ${dd.claim.payMonthLabel})`);
+  if (WITH_LEAVING) await demoLeaving(db, c, people[3].id);
+  // October 2026: the attendance month is not closed — paid without it (DEMO), then calculated again.
+  const [[oct]] = await db.query("SELECT * FROM hrms_pay_runs WHERE company_id = ? AND period_month = ? AND deleted_at IS NULL AND status IN ('DRAFT','CALCULATED')", [c.companyId, OPEN_MONTH]);
+  if (oct) {
+    await setOverride(db, c, oct, { reason: 'DEMO — the October attendance month is not closed yet' }, MARK);
+    const calc = await calculateRun(db, c, oct.id, MARK);
+    console.log(`  p3b: October 2026 paid without attendance (DEMO reason) and calculated again — ${calc.run.totals?.claimsPaid ?? 0} claim(s) in it`);
+  }
+}
+
+/**
+ * --with-leaving: one person ON NOTICE (a DEMO leaving record, not closed: last day 31 Oct 2026) with a DRAFT full
+ * and final. It changes the company's people (one on notice), which exit_test's "everybody ACTIVE" baseline does not
+ * expect: take it away with --clean-leaving when you are done looking.
+ */
+async function demoLeaving(db, c, employeeId = null) {
+  const [[had]] = await db.query("SELECT employee_id FROM hrms_employee_exits WHERE company_id = ? AND note LIKE 'DEMO%' AND deleted_at IS NULL", [c.companyId]);
+  let leaver = had?.employee_id ?? employeeId;
+  if (!leaver) {
+    const [[p]] = await db.query(
+      `SELECT e.id FROM hrms_employees e WHERE e.company_id = ? AND e.deleted_at IS NULL AND e.employment_status = 'ACTIVE'
+          AND EXISTS (SELECT 1 FROM hrms_pay_salaries s WHERE s.company_id = e.company_id AND s.employee_id = e.id AND s.deleted_at IS NULL) ORDER BY e.id LIMIT 3, 1`, [c.companyId]);
+    leaver = p?.id;
+  }
+  if (!leaver) { console.log('  p3b: nobody to leave — skipped'); return; }
+  if (!had) {
+    const [ins] = await db.query(
+      "INSERT INTO hrms_employee_exits (company_id, employee_id, exit_type, reason_code, note, notice_date, last_working_day, status, created_by) VALUES (?, ?, 'RESIGNED', 'BETTER_JOB', 'DEMO — a sample leaving', '2026-10-01', '2026-10-31', 'OPEN', ?)",
+      [c.companyId, leaver, c.userId]);
+    await db.query("UPDATE hrms_employees SET employment_status = 'NOTICE' WHERE company_id = ? AND id = ?", [c.companyId, leaver]);
+    await audit(db, c, 'hrms_employee_exits', ins.insertId, 'CREATE', { employment_status: 'ACTIVE', employeeId: leaver, demo: true }, { status: 'OPEN', demo: 'demo-payroll leaving' }, MARK);
+  }
+  const f = await saveDraft(db, c, leaver, { noticeDays: 30, encashDays: 6, note: 'DEMO full and final' }, MARK);
+  console.log(`  p3b: a DEMO leaving (on notice, last day 31 Oct 2026) with a DRAFT full and final (settlement ₹${f.settlement?.statement?.totals?.settlement?.toLocaleString('en-IN') ?? '—'})`);
+}
+
+/** --clean-leaving (and --clean): the DEMO leaving and its full and final, nothing else. */
+async function cleanLeaving(db, companyId) {
+  const [rows] = await db.query("SELECT entity_type, entity_id, action, before_json FROM hrms_audit_log WHERE company_id = ? AND request_id = ? AND entity_type IN ('hrms_pay_settlements', 'hrms_employee_exits')", [companyId, MARK]);
+  const fnf = rows.filter((r) => r.entity_type === 'hrms_pay_settlements' && r.action === 'CREATE').map((r) => r.entity_id);
+  if (fnf.length) await db.query('DELETE FROM hrms_pay_settlements WHERE company_id = ? AND id IN (?)', [companyId, fnf]);
+  let n = 0;
+  for (const r of rows.filter((x) => x.entity_type === 'hrms_employee_exits' && x.action === 'CREATE')) {
+    const b = typeof r.before_json === 'string' ? JSON.parse(r.before_json) : r.before_json;
+    if (!b?.demo) continue;
+    await db.query("DELETE FROM hrms_employee_exits WHERE company_id = ? AND id = ? AND note LIKE 'DEMO%'", [companyId, r.entity_id]);
+    await db.query("UPDATE hrms_employees SET employment_status = 'ACTIVE' WHERE company_id = ? AND id = ? AND employment_status = 'NOTICE'", [companyId, b.employeeId]);
+    n += 1;
+  }
+  await db.query("DELETE FROM hrms_audit_log WHERE company_id = ? AND request_id = ? AND entity_type IN ('hrms_pay_settlements', 'hrms_employee_exits')", [companyId, MARK]);
+  console.log(`  removed: ${n} DEMO leaving(s) and ${fnf.length} full and final(s); the person is ACTIVE again.`);
+}
+
 async function clean(db, companyId) {
+  await cleanLeaving(db, companyId);
   const [rows] = await db.query("SELECT entity_type, entity_id, action, before_json FROM hrms_audit_log WHERE company_id = ? AND request_id = ?", [companyId, MARK]);
   const ids = (t, action = 'CREATE') => rows.filter((r) => r.entity_type === t && r.action === action).map((r) => r.entity_id);
   const runs = ids('hrms_pay_runs');
@@ -151,6 +245,8 @@ async function clean(db, companyId) {
     await db.query('DELETE FROM hrms_pay_run_people WHERE company_id = ? AND run_id IN (?)', [companyId, runs]);
     await db.query('DELETE FROM hrms_pay_items WHERE company_id = ? AND run_id IN (?)', [companyId, runs]);
     await db.query('DELETE FROM hrms_tax_tds_overrides WHERE company_id = ? AND run_id IN (?)', [companyId, runs]);
+    await db.query('DELETE FROM hrms_pay_attendance_overrides WHERE company_id = ? AND run_id IN (?)', [companyId, runs]);
+    await db.query('UPDATE hrms_pay_claims SET run_id = NULL WHERE company_id = ? AND run_id IN (?)', [companyId, runs]);
     await db.query('DELETE FROM hrms_pay_runs WHERE company_id = ? AND id IN (?)', [companyId, runs]);
     await db.query("DELETE FROM hrms_audit_log WHERE company_id = ? AND entity_type IN ('hrms_pay_runs') AND entity_id IN (?)", [companyId, runs]);
   }
@@ -158,6 +254,19 @@ async function clean(db, companyId) {
     await db.query('DELETE FROM hrms_pay_salaries WHERE company_id = ? AND id IN (?) AND reason = ?', [companyId, salaries, REASON]);
     await db.query("DELETE FROM hrms_audit_log WHERE company_id = ? AND entity_type = 'hrms_pay_salaries' AND entity_id IN (?)", [companyId, salaries]);
   }
+  // P3b: claims (bills and their files), claim types.
+  const claims = ids('hrms_pay_claims');
+  if (claims.length) {
+    const [bills] = await db.query('SELECT file_id FROM hrms_pay_claim_bills WHERE company_id = ? AND claim_id IN (?)', [companyId, claims]);
+    await db.query('DELETE FROM hrms_pay_claim_bills WHERE company_id = ? AND claim_id IN (?)', [companyId, claims]);
+    if (bills.length) {
+      await db.query('DELETE FROM hrms_tax_file_chunks WHERE company_id = ? AND file_id IN (?)', [companyId, bills.map((x) => x.file_id)]);
+      await db.query('DELETE FROM hrms_tax_files WHERE company_id = ? AND id IN (?)', [companyId, bills.map((x) => x.file_id)]);
+    }
+    await db.query('DELETE FROM hrms_pay_claims WHERE company_id = ? AND id IN (?)', [companyId, claims]);
+  }
+  const ctypes = ids('hrms_pay_claim_types');
+  if (ctypes.length) await db.query('DELETE FROM hrms_pay_claim_types WHERE company_id = ? AND id IN (?)', [companyId, ctypes]);
   // Tax: the demo's declarations (and their files), profiles, PANs, the year's settings.
   const lines = ids('hrms_tax_declaration_lines');
   if (lines.length) {
@@ -181,7 +290,7 @@ async function clean(db, companyId) {
     if (b?.demo && b.date_of_joining) { await db.query('UPDATE hrms_employees SET date_of_joining = ? WHERE company_id = ? AND id = ?', [b.date_of_joining, companyId, r.entity_id]); restored += 1; }
   }
   await db.query(`DELETE FROM hrms_audit_log WHERE company_id = ? AND request_id = ? AND entity_type IN ('hrms_pay_runs', 'hrms_pay_salaries', 'hrms_pay_salary_read', 'hrms_tax_declaration_lines', 'hrms_tax_profiles',
-    'hrms_employee_identifiers', 'hrms_tax_settings', 'hrms_employees')`, [companyId, MARK]);
+    'hrms_employee_identifiers', 'hrms_tax_settings', 'hrms_employees', 'hrms_pay_claims', 'hrms_pay_claim_types', 'hrms_pay_settlements', 'hrms_pay_attendance_overrides', 'hrms_employee_exits')`, [companyId, MARK]);
   console.log(`  removed: ${runs.length} run(s) with their people, lines and payslips; ${salaries.length} DEMO salaries; ${lines.length} declarations, ${profiles.length} tax profiles, ${pans.length} DEMO PANs, ${settings.length} tax-year settings. ${restored} joining dates put back. The payroll setup (components, structure, statutory rows) stays.`);
 }
 
@@ -198,8 +307,11 @@ async function main() {
     const [[owner]] = await conn.query("SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id WHERE u.company_id = ? AND u.deleted_at IS NULL AND LOWER(r.name) = 'admin' ORDER BY u.id LIMIT 1", [company.id]);
     console.log(`  company: ${company.name} (${company.id})${CLEAN ? '   CLEAN' : ''}\n`);
     await conn.beginTransaction();
+    const c = { companyId: company.id, userId: owner?.id ?? null, owner: true };
     if (CLEAN) await clean(conn, company.id);
-    else await make(conn, { companyId: company.id, userId: owner?.id ?? null, owner: true });
+    else if (CLEAN_LEAVING) await cleanLeaving(conn, company.id);
+    else if (P3B) await makeExit(conn, c);
+    else { await make(conn, c); await makeExit(conn, c); }
     await conn.commit();
     console.log('\n  done.\n');
   } catch (e) {

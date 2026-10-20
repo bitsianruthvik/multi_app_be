@@ -118,7 +118,12 @@ router.put('/tax/declaration-lines/:id', ...editPay, handle(async (req) => tx(re
   return DEC.updateLine(db, c, id(req), req.body ?? {}, { rules: r ? await rulesOf(r.tax_year) : null, by: 'HR', requestId: reqId(req) });
 })));
 router.delete('/tax/declaration-lines/:id', ...removePay, handle((req) => tx(req, (db, c) => DEC.removeLine(db, c, id(req), { by: 'HR', requestId: reqId(req) }))));
-router.get('/tax/:year/proofs', ...viewPay, handle((req) => PRF.proofQueue(pool, ctx(req), Y(req), req.query ?? {})));
+// P3b review: the queue shows each person's declared and accepted amounts — audited like any read of pay.
+router.get('/tax/:year/proofs', ...viewPay, handle((req) => tx(req, async (db, c) => {
+  const d = await PRF.proofQueue(db, c, Y(req), req.query ?? {});
+  if (d.lines.length) await auditSalaryRead(db, c, [...new Set(d.lines.map((l) => l.employee.id))], `tax proofs ${Y(req)}`, reqId(req));
+  return d;
+})));
 router.get('/tax/proof-files/:id', ...viewPay, handle(async (req, res) => {
   noStore(res);
   return tx(req, async (db, c) => {
@@ -158,7 +163,13 @@ router.get('/tax/:year/quarters/:quarter/workbook', ...viewPay, handle((req) => 
 })));
 
 /* ── HR: Forms 16 / 130 ─────────────────────────────────────────────── */
-router.get('/tax/:year/forms', ...viewPay, handle((req) => F16.listForms(pool, ctx(req), Y(req))));
+// P3b review: each person's tax and TDS for the year — audited.
+router.get('/tax/:year/forms', ...viewPay, handle((req) => tx(req, async (db, c) => {
+  const d = await F16.listForms(db, c, Y(req));
+  const ids = (d.people ?? d.forms ?? []).map((p) => p.employee?.id).filter(Boolean);
+  if (ids.length) await auditSalaryRead(db, c, [...new Set(ids)], `Forms 16 / 130 ${Y(req)}`, reqId(req));
+  return d;
+})));
 router.post('/tax/:year/forms/generate', ...editPay, handle((req) => tx(req, (db, c) => F16.generateForms(db, c, Y(req), req.body ?? {}, reqId(req)))));
 router.post('/tax/:year/forms/part-a', ...uploadPay, handle((req) => tx(req, (db, c) => F16.uploadPartA(db, c, Y(req), req.body ?? {}, reqId(req)))));
 router.put('/tax/:year/forms/part-a/:fileId', ...uploadPay, handle((req) => tx(req, (db, c) => F16.assignPartA(db, c, Y(req), intParam(req.params.fileId, 'fileId'), req.body ?? {}, reqId(req)))));

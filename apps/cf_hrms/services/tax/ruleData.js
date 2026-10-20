@@ -390,8 +390,57 @@ const EXTRAS_ROWS = [
   }),
 ];
 
+/* ── PAYROLL EXIT's rules (P3b, §25.5): employer retirement contributions above the limit; the full and final ──
+ * Read 2026-10-20. The same in both regimes of a year (a perquisite; gratuity and leave encashment are not in the
+ * new regime's exclusions — s.115BAC(2) / s.202(2) list neither). */
+const EXIT_URL = {
+  rule3B: 'https://www.incometaxindia.gov.in/w/rule-3b-2',
+  act2025: URL.act2025,
+  rules2026: URL.rules2026,
+  gratuityAct: 'https://labour.gov.in/sites/default/files/the_payment_of_gratuity_act_1972.pdf',
+};
+function exitRows(year, x) {
+  const rows = [];
+  const both = (rule_key, value, [source_note, source_url, verified = 1]) => {
+    for (const regime of ['OLD', 'NEW']) rows.push({ tax_year: year, regime, rule_key, value, source_note, source_url, verified });
+  };
+  both('retirement_contributions', x.retirement, x.retirementSrc);
+  both('final_settlement', x.settlement, x.settlementSrc);
+  return rows;
+}
+const SETTLEMENT = (exemptGratuity, exemptLeave) => ({
+  gratuity: {
+    eligibleYears: 5, daysPerYear: 15, divisor: 26, partYearMoreThanMonths: 6, actCeiling: 2000000,
+    act: 'Payment of Gratuity Act 1972 s.4 (Code on Social Security 2020 s.53 from 21-11-2025)', exemptSection: exemptGratuity,
+    notApplied: 'Not applied: the Code\'s 1-year eligibility of a fixed-term employee and its 50% wage rule (s.2(88)) — the wage is the components marked "in the gratuity wage".',
+  },
+  leaveEncashment: { averageMonths: 10, daysPerYear: 30, exemptSection: exemptLeave },
+});
+const EXIT_ROWS = [
+  ...exitRows('2025-26', {
+    retirement: {
+      limit: 750000, section: 'section 17(2)(vii)', accretionSection: 'section 17(2)(viia)', accretionRule: 'rule 3B',
+      funds: 'recognised provident fund, NPS (s.80CCD(1)), approved superannuation fund', statementRow: { contribution: 17, accretion: 18 },
+      pfCounts: 'the employer\'s whole PF line (EPF and EPS): CHECK with the CA whether the EPS share counts',
+    },
+    retirementSrc: ['Rule 3B of the Income-tax Rules 1962 (incometaxindia.gov.in, read 2026-10-20): TP = (PC/2) × R + (PC1 + TP1) × R, R = I / Favg, PC the contribution "in excess of seven lakh fifty thousand rupees" to the funds of s.17(2)(vii) (Finance Act 2020, from AY 2021-22); TP1 and PC1 from 1-4-2020; the part of TP1 + PC1 above the opening balance ignored (not applied here). The s.17(2)(vii) text itself was read only through rule 3B.', EXIT_URL.rule3B, 1],
+    settlement: SETTLEMENT('section 10(10)(ii) (covered by the Gratuity Act) / 10(10)(iii)', 'section 10(10AA)(ii)'),
+    settlementSrc: ['Payment of Gratuity Act 1972 s.4(1) five years, s.4(2) fifteen days\' wages a completed year or part of it above six months, monthly wage ÷ 26 × 15, s.4(3) ceiling ₹20,00,000 (S.O. 1420(E), 29-3-2018); from 21-11-2025 the Code on Social Security 2020 s.53 (S.O. 5319(E)). Leave encashment limbs of s.10(10AA)(ii): 10 months\' average salary, leave at most 30 days a year of service. NOT VERIFIED: the Act, the Code and the notifications were read on secondary sources only (labour.gov.in did not open).', EXIT_URL.gratuityAct, 0],
+  }),
+  ...exitRows('2026-27', {
+    retirement: {
+      limit: 750000, section: 'section 17(1)(h) (was 17(2)(vii))', accretionSection: 'section 17(1)(i) (was 17(2)(viia))', accretionRule: 'rule 16 of the 2026 Rules (was rule 3B)',
+      funds: 'recognised provident fund, the scheme of s.124(1) (NPS), approved superannuation fund', statementRow: { contribution: 17, accretion: 18 },
+      pfCounts: 'the employer\'s whole PF line (EPF and EPS): CHECK with the CA whether the EPS share counts',
+    },
+    retirementSrc: ['Income-tax Act 2025 s.17(1)(h): the aggregate contribution "in excess of ₹750000 in a tax year" by the employer to a recognised provident fund, the scheme of s.124(1) and an approved superannuation fund; s.17(1)(i) the annual accretion on it; Income-tax Rules 2026 rule 16: TP = (PC/2) × R + (PC1 + TP1) × R, R = I / F(avg.) (the printed PC reads "₹750000 lakhs" — a typo). Read in the official gazette PDFs.', EXIT_URL.rules2026, 1],
+    settlement: SETTLEMENT('section 19(1) Table Sl. 5 (Gratuity Act) / Sl. 6, was 10(10)', 'section 19(1) Table Sl. 14, was 10(10AA)(ii)'),
+    settlementSrc: ['Income-tax Act 2025 s.19(1) Table Sl. 5 (gratuity under the Payment of Gratuity Act 1972, "as per section 4(2) and (3)" — the Act still names the repealed 1972 Act), Sl. 6, Sl. 14 (leave encashment: ten months\' average salary, leave at most 30 days a year), read in the official PDF. The gratuity formula and ceiling: Payment of Gratuity Act s.4 / Code on Social Security 2020 s.53 (in force 21-11-2025, S.O. 5319(E)) — secondary sources only. NOT VERIFIED.', EXIT_URL.act2025, 0],
+  }),
+];
+
 /** Every seed row: { tax_year, regime, rule_key, value, source_note, source_url, verified }. */
-export const TAX_RULE_ROWS = [...ROWS_2025_26, ...ROWS_2026_27, ...PAYROLL_ROWS, ...EXTRAS_ROWS];
+export const TAX_RULE_ROWS = [...ROWS_2025_26, ...ROWS_2026_27, ...PAYROLL_ROWS, ...EXTRAS_ROWS, ...EXIT_ROWS];
 
 /** The years the seed covers. */
 export const SEEDED_YEARS = ['2025-26', '2026-27'];

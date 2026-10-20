@@ -118,6 +118,9 @@ How to read the tables below:
 | `GET /user/me/approvals/attendance/:id` | `cf_hrms_self_view` |  |
 | `POST /user/me/approvals/attendance/:id/approve` | `cf_hrms_self_view` |  |
 | `POST /user/me/approvals/attendance/:id/reject` | `cf_hrms_self_view` |  |
+| `GET /user/me/approvals/claim/:id` | `cf_hrms_self_view` |  |
+| `POST /user/me/approvals/claim/:id/approve` | `cf_hrms_self_view` |  |
+| `POST /user/me/approvals/claim/:id/reject` | `cf_hrms_self_view` |  |
 | `GET /user/me/attendance` | `cf_hrms_self_view` |  |
 | `POST /user/me/attendance/punch` | `cf_hrms_self_view` |  |
 | `POST /user/me/attendance/requests` | `cf_hrms_self_view` |  |
@@ -148,6 +151,14 @@ How to read the tables below:
 | `GET /user/me/form10e` | `cf_hrms_self_view` |  |
 | `PUT /user/me/form10e/:year` | `cf_hrms_self_view` |  |
 | `GET /user/me/form10e/:year/file` | `cf_hrms_self_view` |  |
+| `GET /user/me/claims` | `cf_hrms_self_view` |  |
+| `POST /user/me/claims` | `cf_hrms_self_view` |  |
+| `POST /user/me/claims/:id/bills` | `cf_hrms_self_view` |  |
+| `POST /user/me/claims/:id/withdraw` | `cf_hrms_self_view` |  |
+| `GET /user/me/claims/:id/bills/:fileId` | `cf_hrms_self_view` |  |
+| `GET /user/me/settlement` | `cf_hrms_self_view` |  |
+| `GET /user/me/settlement/file` | `cf_hrms_self_view` |  |
+| `GET /user/me/approvals/claim/:id/bills/:fileId` | `cf_hrms_self_view` |  |
 
 ## Organisation, time and setup lists
 
@@ -653,5 +664,31 @@ How to read the tables below:
 | `POST /tax/:year/form10e/:employeeId` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `DELETE /tax/:year/form10e/:employeeId` | `cf_hrms_payroll_remove` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `GET /tax/:year/form10e/:employeeId/file` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/policy` | `cf_hrms_payroll_view` | whole-company logins only |
+| `PUT /payroll/policy` | `cf_hrms_payroll_edit` | whole-company logins only |
+| `GET /payroll/runs/:id/attendance` | `cf_hrms_payroll_view` | whole-company logins only |
+| `POST /payroll/runs/:id/attendance-override` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `DELETE /payroll/runs/:id/attendance-override` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/settlements` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/settlements/employees/:employeeId` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/settlements/employees/:employeeId/preview` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `PUT /payroll/settlements/employees/:employeeId` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/settlements/:id/approve` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/settlements/:id/unapprove` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `DELETE /payroll/settlements/:id` | `cf_hrms_payroll_remove` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/settlements/:id/file` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/claim-types` | `cf_hrms_payroll_view` | whole-company logins only |
+| `POST /payroll/claim-types/setup` | `cf_hrms_payroll_edit` | whole-company logins only |
+| `POST /payroll/claim-types` | `cf_hrms_payroll_edit` | whole-company logins only |
+| `PUT /payroll/claim-types/:id` | `cf_hrms_payroll_edit` | whole-company logins only |
+| `DELETE /payroll/claim-types/:id` | `cf_hrms_payroll_remove` | whole-company logins only |
+| `GET /payroll/claims` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/claims/:id` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/claims/:id/approve` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/claims/:id/reject` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/claims/:id/reopen` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/claims/:id/bills/:fileId` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /tax/:year/retirement` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `PUT /tax/:year/retirement/:employeeId` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
 
-549 routes.
+586 routes.

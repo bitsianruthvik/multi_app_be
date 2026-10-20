@@ -34,11 +34,12 @@ import { loadComponents, loadStructures, shapeSalary, SALARY_COLUMNS, overrideMa
 import { breakdown } from '../payroll/structure.js';
 import { pfFor, ptFor } from '../payroll/statutory.js';
 import { monthBounds } from '../payroll/proration.js';
+import { loadExtras, personExtras } from './extras.js';
 
 const FROZEN = ['LOCKED', 'RELEASED', 'PAID'];
 
 /** Everything the TDS of `month` reads, for these people, in a few queries. */
-export async function loadTaxWorld(db, companyId, month, employeeIds, { runId = null, paidBefore = null } = {}) {
+export async function loadTaxWorld(db, companyId, month, employeeIds, { runId = null, paidBefore = null, extras = true } = {}) {
   const year = yearOf(month);
   const months = yearMonths(year);
   const ids = [...new Set(employeeIds)];
@@ -63,7 +64,7 @@ export async function loadTaxWorld(db, companyId, month, employeeIds, { runId = 
     const monthOfRun = new Map(lockedRuns.map((r) => [r.id, r.period_month]));
     const [pp] = await db.query(`SELECT id, run_id, employee_id, tds_amount FROM hrms_pay_run_people WHERE company_id = ? AND deleted_at IS NULL AND included = 1 AND run_id IN (${runIds.map(() => '?').join(',')}) AND employee_id IN (${ph})`,
       [companyId, ...runIds, ...ids]);
-    const [pl] = await db.query(`SELECT run_person_id, component_id, kind, amount FROM hrms_pay_run_lines WHERE company_id = ? AND deleted_at IS NULL AND run_id IN (${runIds.map(() => '?').join(',')}) AND employee_id IN (${ph})`,
+    const [pl] = await db.query(`SELECT run_person_id, component_id, kind, amount, source FROM hrms_pay_run_lines WHERE company_id = ? AND deleted_at IS NULL AND run_id IN (${runIds.map(() => '?').join(',')}) AND employee_id IN (${ph})`,
       [companyId, ...runIds, ...ids]);
     const byPerson = new Map();
     for (const l of pl) { if (!byPerson.has(l.run_person_id)) byPerson.set(l.run_person_id, []); byPerson.get(l.run_person_id).push(l); }
@@ -84,7 +85,11 @@ export async function loadTaxWorld(db, companyId, month, employeeIds, { runId = 
     if (!statCache.has(k)) statCache.set(k, await statutoryOn(db, companyId, on, state));
     return statCache.get(k);
   };
+  // P3b: the perquisites register, Form 10E relief, the full and final's exemption facts, LTA claims,
+  // the retirement-contribution facts (extras.js). Off for the register's own salary read (no loop).
+  const ex = extras && rules ? await loadExtras(db, companyId, year, ids, rules) : null;
   return {
+    extras: ex,
     companyId, month, monthEnd, year, months, rules, rulesMissing: reason, settings, proofsStatus: proofsStatusFor(settings, monthEnd),
     people: new Map(emps.map((e) => [e.id, { dateOfBirth: dateText(e.date_of_birth), joining: dateText(e.date_of_joining), exit: dateText(e.exit_date) }])),
     profiles, pans, cities, posting, comps, structs, paySettings, lines, paid, lockedMonths, salaries,
@@ -99,12 +104,24 @@ export function monthFromLines(lines) {
   let pt = 0;
   let pfEe = 0;
   let npsEr = 0;
+  let pfEr = 0;
+  let superannuation = 0;
   for (const l of lines) {
     const k = l.comp ?? {};
     const key = k.statutoryKey ?? l.statutoryKey ?? null;
     if (key === 'PT') pt += n(l.amount);
     if (key === 'PF_EE') pfEe += n(l.amount);
+    if (key === 'PF_ER') pfEr += n(l.amount);
     const kind = l.kind ?? k.kind;
+    // An employer contribution to an approved superannuation fund (exemption rule SUPERANNUATION): not salary
+    // within the limit, but counted toward the year's limit on retirement contributions (s.17(2)(vii) / 17(1)(h)).
+    if (kind === 'EMPLOYER_CONTRIBUTION' && String(k.exemptionRule ?? '').toUpperCase() === SUPERANNUATION_RULE) { superannuation += n(l.amount); continue; }
+    // A claim paid as a reimbursement (P3b): income when its component is taxable (REIMB_TAX), or under the
+    // leave-travel rule (REIMB_LTA, exemption rule LTA: exempt in the old regime within the block's journeys).
+    if (kind === 'REIMBURSEMENT' && l.source === 'CLAIM' && (k.taxable ?? 'NO') !== 'NO') {
+      components.push({ code: k.code ?? l.code, name: k.name ?? l.name, amount: n(l.amount), taxable: k.taxable, exemptRule: k.exemptionRule ?? null });
+      continue;
+    }
     // The employer's NPS contribution (exemption rule NPS_80CCD2): salary (s.17(1)(viii) / its 2025-Act
     // successor), then deducted under 80CCD(2) / s.124(1)–(2) up to the year's limit — see personTax.
     if (kind === 'EMPLOYER_CONTRIBUTION' && isNpsEr(k)) {
@@ -115,8 +132,9 @@ export function monthFromLines(lines) {
     if (kind !== 'EARNING') continue;
     components.push({ code: k.code ?? l.code, name: k.name ?? l.name, amount: n(l.amount), taxable: k.taxable ?? 'YES', exemptRule: k.exemptionRule ?? null });
   }
-  return { components, pt: money(pt), pfEe: money(pfEe), npsEr: money(npsEr) };
+  return { components, pt: money(pt), pfEe: money(pfEe), npsEr: money(npsEr), pfEr: money(pfEr), superannuation: money(superannuation) };
 }
+export const SUPERANNUATION_RULE = 'SUPERANNUATION';
 
 /** The exemption rule that marks the employer's NPS contribution (the ready-made component NPS_ER). */
 export const NPS_RULE = 'NPS_80CCD2';
@@ -145,9 +163,11 @@ export async function salaryMonth(world, employeeId, month) {
   const components = [];
   let pfWage = 0;
   let npsEr = 0;
+  let superannuation = 0;
   for (const l of bd.lines ?? []) {
     const k = world.comps.byCode.get(l.code);
     if (!k || k.statutoryKey || (k.frequency ?? 'MONTHLY') !== 'MONTHLY') continue;
+    if (k.kind === 'EMPLOYER_CONTRIBUTION' && String(k.exemptionRule ?? '').toUpperCase() === SUPERANNUATION_RULE) { superannuation += Math.round(n(l.monthly) * share); continue; }
     if (k.kind === 'EMPLOYER_CONTRIBUTION' && isNpsEr(k)) {
       const amount = Math.round(n(l.monthly) * share);
       components.push({ code: k.code, name: k.name, amount, taxable: 'YES', exemptRule: NPS_RULE });
@@ -162,7 +182,7 @@ export async function salaryMonth(world, employeeId, month) {
   const gross = components.filter((x) => x.exemptRule !== NPS_RULE).reduce((a, x) => a + x.amount, 0);
   const pf = pfFor({ pfWage, mode: sal.pfMode ?? 'CEILING', settings: st.PF });
   const pt = st.PT ? ptFor({ gross, settings: st.PT, month }).amount : 0;
-  return { components, pt: money(pt), pfEe: money(pf.employee ?? 0), npsEr: money(npsEr) };
+  return { components, pt: money(pt), pfEe: money(pf.employee ?? 0), npsEr: money(npsEr), pfEr: money(pf.employer ?? 0), superannuation: money(superannuation) };
 }
 
 /** The higher rate without a PAN: the year's tax at least `rate`% of the taxable income (nil stays nil). */
@@ -201,9 +221,11 @@ export async function personTax(world, employeeId, { current = null } = {}) {
   let pt = 0;
   let pfEe = 0;
   let npsEr = 0;
+  let pfEr = 0;
+  let superannuation = 0;
   const push = (m, data, kind, tds) => {
     if (!data) return;
-    pt += n(data.pt); pfEe += n(data.pfEe); npsEr += n(data.npsEr);
+    pt += n(data.pt); pfEe += n(data.pfEe); npsEr += n(data.npsEr); pfEr += n(data.pfEr); superannuation += n(data.superannuation);
     timeline.push({ month: m, kind, taxable: money(data.components.filter((x) => x.taxable !== 'NO').reduce((a, x) => a + n(x.amount), 0)), tds: money(tds ?? 0) });
   };
   for (const m of world.months) {
@@ -240,14 +262,23 @@ export async function personTax(world, employeeId, { current = null } = {}) {
   if (exemptions.hra) exemptions.hra = { ...exemptions.hra, ...m.engine };
   if (!person.dateOfBirth) warnings.push('No date of birth on file: the below-60 slabs are used.');
 
+  // P3b: perquisites (the register, retirement contributions above the limit), the full and final's
+  // exemption facts, approved LTA claims, Form 10E / 39 relief (extras.js).
+  const allComponents = [...paidMonths, ...remainingMonths].flatMap((x) => x.components);
+  const px = personExtras(world, employeeId, { contributions: { pf: pfEr, nps: npsEr, superannuation }, components: allComponents, exemptions, regime });
+  warnings.push(...px.warnings);
   const input = {
-    year: world.year, dateOfBirth: person.dateOfBirth ?? undefined,
+    year: world.year, dateOfBirth: person.dateOfBirth ?? undefined, perquisites: px.perquisites,
     paidMonths, remainingMonths, oneTime: [],
     declarations: { deductions, exemptions }, proofs: { deductions, exemptions }, proofsStatus: world.proofsStatus,
     professionalTax: money(pt), otherIncome: claims.otherIncome,
     previousEmployer: claims.previousEmployer ? { taxableSalary: money(claims.previousEmployer.taxableSalary), tds: money(claims.previousEmployer.tds), pt: money(claims.previousEmployer.pt) } : undefined,
   };
-  const proj = { OLD: projectYear({ ...input, regime: 'OLD' }, world.rules.OLD), NEW: projectYear({ ...input, regime: 'NEW' }, world.rules.NEW) };
+  // The relief of a READY Form 10E / 39 worksheet is given in the person's own regime (the worksheet was worked in it).
+  const proj = {
+    OLD: projectYear({ ...input, regime: 'OLD', relief: regime === 'OLD' ? px.relief : null }, world.rules.OLD),
+    NEW: projectYear({ ...input, regime: 'NEW', relief: regime === 'NEW' ? px.relief : null }, world.rules.NEW),
+  };
   const pan = world.pans.get(employeeId);
   const panOk = panStatus(pan) === 'VALID';
   const noPan = {
@@ -268,6 +299,7 @@ export async function personTax(world, employeeId, { current = null } = {}) {
     cheaper, saving, proofsStatus: world.proofsStatus, panStatus: panStatus(pan), noPan: noPan[regime],
     city: m.city, metro: m.metro, metroFrom: m.metroFrom, timeline, claims: claims.used, pfIn80C: money(pfEe), professionalTax: money(pt),
     previousEmployer: claims.previousEmployer, projections: proj, noPanBoth: noPan, warnings: [...warnings, ...chosen.computation.warnings],
+    perquisites: px.perquisites, retirement: px.retirement, relief: px.relief,
   };
 }
 

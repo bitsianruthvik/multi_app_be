@@ -9,6 +9,8 @@ import { n, money, today, yearMonths, quarterOf, panStatus } from './common.js';
 import { loadTaxWorld } from './runTax.js';
 import { claimsOf } from './declarations.js';
 import { metroOf } from './profiles.js';
+import { personExtras } from './extras.js';
+import { statementRows } from '../tax/perquisites.js';
 
 const HRA_SALARY_CODES = ['BASIC', 'DA'];
 
@@ -34,6 +36,8 @@ export function personActual(world, employeeId, { closed }) {
   let pt = 0;
   let pfEe = 0;
   let npsEr = 0;
+  let pfEr = 0;
+  let superannuation = 0;
   let tds = 0;
   const tdsByQuarter = { Q1: 0, Q2: 0, Q3: 0, Q4: 0 };
   const tdsByMonth = [];
@@ -42,7 +46,7 @@ export function personActual(world, employeeId, { closed }) {
       const cur = byCode.get(c.code);
       if (cur) cur.amount += n(c.amount); else byCode.set(c.code, { ...c, amount: n(c.amount) });
     }
-    pt += n(m.pt); pfEe += n(m.pfEe); npsEr += n(m.npsEr); tds += n(m.tds);
+    pt += n(m.pt); pfEe += n(m.pfEe); npsEr += n(m.npsEr); pfEr += n(m.pfEr); superannuation += n(m.superannuation); tds += n(m.tds);
     tdsByQuarter[quarterOf(m.month)] += n(m.tds);
     tdsByMonth.push({ month: m.month, gross: money(m.components.reduce((a, c) => a + n(c.amount), 0)), tds: money(m.tds) });
   }
@@ -64,20 +68,35 @@ export function personActual(world, employeeId, { closed }) {
       })),
     };
   }
-  const perquisites = components.filter((c) => String(c.exemptRule ?? '').toUpperCase() === 'PERQUISITE').map((c) => ({ name: c.name, value: money(c.amount) }));
   const salaryComponents = components.filter((c) => String(c.exemptRule ?? '').toUpperCase() !== 'PERQUISITE');
+  // P3b: the register's perquisites, the retirement contributions above the limit (paid months only), the full and
+  // final's exemption facts, LTA claims, the Form 10E / 39 relief (extras.js).
+  const px = personExtras(world, employeeId, { contributions: { pf: pfEr, nps: npsEr, superannuation }, components, exemptions, regime });
+  // Form 12BA / 123: one row per nature — nature, value as per rules, recovered, taxable.
+  const stmt = [
+    ...statementRows(px.register?.items ?? []).map((r) => ({ name: r.nature, nature: r.nature, row: r.row, valueAsPerRules: money(r.value), recovered: money(r.recovered), value: money(r.taxable) })),
+    ...components.filter((c) => String(c.exemptRule ?? '').toUpperCase() === 'PERQUISITE')
+      .map((c) => ({ name: c.name, nature: `Other benefits or amenities — ${c.name}`, row: 20, valueAsPerRules: money(c.amount), recovered: 0, value: money(c.amount) })),
+    ...(px.retirement?.perquisites ?? []).map((p) => {
+      const row = p.kind === 'ACCRETION' ? world.extras?.rules.retirement?.statementRow?.accretion : world.extras?.rules.retirement?.statementRow?.contribution;
+      return { name: p.name, nature: p.name, row: row ?? 20, valueAsPerRules: money(p.value), recovered: 0, value: money(p.value) };
+    }),
+  ].sort((x, y) => x.row - y.row);
+  const perquisites = stmt.filter((x) => x.value > 0);
   const input = {
     year: world.year, dateOfBirth: person.dateOfBirth ?? undefined, salary: { components: salaryComponents }, perquisites,
     exemptions, deductions, professionalTax: money(pt), otherIncome: claims.otherIncome,
     previousEmployer: claims.previousEmployer ? { taxableSalary: money(claims.previousEmployer.taxableSalary), tds: money(claims.previousEmployer.tds), pt: money(claims.previousEmployer.pt) } : undefined,
   };
   const comp = { OLD: computeTax({ ...input, regime: 'OLD' }, world.rules.OLD), NEW: computeTax({ ...input, regime: 'NEW' }, world.rules.NEW) };
+  const relief = px.relief ? money(Math.min(px.relief.amount, comp[regime].totalTax)) : 0;
   const months = yearMonths(world.year);
   const exit = person.exit && person.exit <= `${months[11]}-31`;
   return {
     employeeId, year: world.year, regime, other: regime === 'NEW' ? 'OLD' : 'NEW', computation: comp[regime], otherComputation: comp[regime === 'NEW' ? 'OLD' : 'NEW'],
     components: salaryComponents.map((c) => ({ code: c.code, name: c.name, amount: money(c.amount), taxable: c.taxable, exemptRule: c.exemptRule })),
-    perquisites, perquisiteTotal: money(perquisites.reduce((a, p) => a + p.value, 0)),
+    perquisites, perquisiteTotal: money(perquisites.reduce((a, p) => a + p.value, 0)), relief, reliefRule: px.relief ? { section: px.relief.section, form: px.relief.form } : null,
+    retirement: px.retirement ? { total: px.retirement.total, excess: px.retirement.excess, accretion: px.retirement.accretion, lines: px.retirement.lines } : null,
     pt: money(pt), pfEe: money(pfEe), tds: money(tds), tdsByQuarter: Object.fromEntries(Object.entries(tdsByQuarter).map(([k, v]) => [k, money(v)])), tdsByMonth,
     previousEmployer: claims.previousEmployer, claims: claims.used, proofsClosed: closed,
     period: { from: person.joining && person.joining > `${months[0]}-01` ? person.joining : `${months[0]}-01`, to: exit ? person.exit : `${months[11]}-31` },

@@ -102,6 +102,16 @@ export function monthsBetween(from, to) {
   return out;
 }
 
+/**
+ * HR never acts on their OWN tax or pay records from the HR side (P3b review): verifying their own proof, adding a
+ * declaration past the window, approving their own claim or full and final. 403 OWN_RECORD, in words.
+ */
+export async function assertNotOwn(db, c, employeeId, what) {
+  if (!c.userId || employeeId == null) return;
+  const [[e]] = await db.query('SELECT id FROM hrms_employees WHERE company_id = ? AND user_id = ? AND deleted_at IS NULL AND id = ?', [c.companyId, c.userId, employeeId]);
+  if (e) throw new HrmsError(403, 'OWN_RECORD', `This is your own ${what}: another person in HR has to do it.`);
+}
+
 /** The employee of a login, or a 403. */
 export async function myEmployeeId(db, c) {
   if (!c.userId) throw new HrmsError(403, 'NOT_LINKED', 'This login is not linked to an employee, so it has no tax of its own.');

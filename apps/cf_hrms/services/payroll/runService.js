@@ -51,6 +51,10 @@ import { monthlyTds } from './tds.js';
 import { neftCsv } from './bankFile.js';
 import { auditSalaryRead } from './payrollService.js';
 import { loadTaxWorld, monthFromLines, runSnapshot } from '../payrollTax/runTax.js';
+import { attendanceForRun, attendanceState } from '../payrollExit/attendancePay.js';
+import { policyOf, formulaValues, rateOf } from '../payrollExit/policy.js';
+import { claimsForRun, flexiForRun } from '../payrollExit/claims.js';
+import { settlementsForRun } from '../payrollExit/settlement.js';
 
 export const RUN_STATUSES = ['DRAFT', 'CALCULATED', 'LOCKED', 'RELEASED', 'PAID'];
 const OPEN = ['DRAFT', 'CALCULATED'];
@@ -141,6 +145,9 @@ export async function deleteRun(db, c, id, requestId = null) {
   await db.query('UPDATE hrms_pay_run_people SET deleted_at = NOW() WHERE company_id = ? AND run_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   await db.query('UPDATE hrms_pay_items SET deleted_at = NOW() WHERE company_id = ? AND run_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   await db.query('UPDATE hrms_tax_tds_overrides SET deleted_at = NOW() WHERE company_id = ? AND run_id = ? AND deleted_at IS NULL', [c.companyId, id]);
+  await db.query('UPDATE hrms_pay_attendance_overrides SET deleted_at = NOW() WHERE company_id = ? AND run_id = ? AND deleted_at IS NULL', [c.companyId, id]);
+  await db.query('UPDATE hrms_pay_claims SET run_id = NULL WHERE company_id = ? AND run_id = ?', [c.companyId, id]);
+  await db.query('UPDATE hrms_pay_settlements SET run_id = NULL WHERE company_id = ? AND run_id = ?', [c.companyId, id]);
   await db.query('UPDATE hrms_pay_runs SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   await audit(db, c, 'hrms_pay_runs', id, 'DELETE', shapeRun(r), null, requestId);
   return { ok: true };
@@ -175,12 +182,14 @@ function esiRateOf(b, comps) {
  * Everything a calculation reads, for a month and a set of people. Exported for the tests
  * and for arrears (which recompute an earlier month with today's salary rows).
  */
-async function loadWorld(db, companyId, month) {
+async function loadWorld(db, companyId, month, extraIds = []) {
   const b = monthBounds(month);
+  // P3b: a person whose full and final pays this month is in it even when they left before it.
+  const extra = extraIds.length ? ` OR id IN (${extraIds.map(() => '?').join(',')})` : '';
   const [emps] = await db.query(
     `SELECT id, employee_code, full_name, date_of_birth, date_of_joining, exit_date, employment_status FROM hrms_employees
-      WHERE company_id = ? AND deleted_at IS NULL AND date_of_joining <= ? AND (exit_date IS NULL OR exit_date >= ?)
-      ORDER BY full_name, id`, [companyId, b.to, b.from]);
+      WHERE company_id = ? AND deleted_at IS NULL AND ((date_of_joining <= ? AND (exit_date IS NULL OR exit_date >= ?))${extra})
+      ORDER BY full_name, id`, [companyId, b.to, b.from, ...extraIds]);
   const ids = emps.map((e) => e.id);
   const [salRows] = ids.length ? await db.query(`SELECT ${SALARY_COLUMNS} FROM hrms_pay_salaries WHERE company_id = ? AND deleted_at IS NULL AND employee_id IN (${ids.map(() => '?').join(',')}) ORDER BY effective_from, id`, [companyId, ...ids]) : [[]];
   const salaries = new Map(ids.map((id) => [id, []]));
@@ -214,7 +223,10 @@ export async function calculateRun(db, c, id, requestId = null) {
   const month = run.period_month;
   await attachRecoveries(db, c, run, requestId);
   const calculatedAt = await watermark(db, c.companyId, run);
-  const world = await loadWorld(db, c.companyId, month);
+  // P3b: approved full and final settlements and claims this month pays.
+  const settlements = await settlementsForRun(db, c.companyId, month, id);
+  const claimsDue = await claimsForRun(db, c.companyId, month, id);
+  const world = await loadWorld(db, c.companyId, month, [...settlements.keys()]);
   const { b, emps, ids, salaries, comps } = world;
 
   const statCache = new Map();
@@ -225,6 +237,13 @@ export async function calculateRun(db, c, id, requestId = null) {
   };
   const bd = breakdownCache(world, statFor);
   const lop = await lopOf(db, c.companyId, ids, b.from, b.to);
+  // P3b: attendance (spec §28.6) — the closed month's LOP, overtime and penalties when attendance is live;
+  // refused (409 ATTENDANCE_OPEN) when live and not closed, unless HR pays this run without it.
+  const att = await attendanceForRun(db, c.companyId, month, ids, id, lop);
+  const policy = await policyOf(db, c.companyId);
+  const flexi = await flexiForRun(db, c.companyId, month, emps.map((e) => ({ id: e.id, joining: dateText(e.date_of_joining), exit: dateText(e.exit_date) })));
+  const paidClaims = new Set();
+  const paidSettlements = new Set();
   const [items] = await db.query('SELECT id, employee_id, component_id, amount, note FROM hrms_pay_items WHERE company_id = ? AND run_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   const idents = await identifiersOf(db, c.companyId, ids);
   const tdsComp = comps.list.find((k) => k.statutoryKey === 'TDS') ?? null;
@@ -285,11 +304,39 @@ export async function calculateRun(db, c, id, requestId = null) {
     const sal = salaries.get(e.id) ?? [];
     const joining = dateText(e.date_of_joining);
     const exit = dateText(e.exit_date);
-    const days = monthDays({ month, joiningDate: joining, exitDate: exit, salaries: sal, lopDays: lop.get(e.id) ?? [] });
+    const attP = att.people?.get(e.id) ?? null;
+    const days = monthDays({ month, joiningDate: joining, exitDate: exit, salaries: sal, lopDays: attP ? attP.lopDates : (lop.get(e.id) ?? []) });
+    const fnf = settlements.get(e.id) ?? null;
+    const extraItems = [...(fnf?.items ?? []), ...(claimsDue.get(e.id) ?? []).map((x) => ({ ...x, source: 'CLAIM' })), ...(flexi.get(e.id) ?? []).map((x) => ({ ...x, source: 'CLAIM' }))];
+    const extraWarnings = [];
+    if (fnf) extraWarnings.push(W('SETTLEMENT', `Full and final settlement: ${fnf.items.length} item(s) in this month's pay.`));
+    if (claimsDue.get(e.id)?.length) extraWarnings.push(W('CLAIMS', `${claimsDue.get(e.id).length} approved claim(s) paid as reimbursements.`));
+    if (attP?.note && attP.note !== 'NOT_IN_MONTH') extraWarnings.push(W('ATTENDANCE', attP.note));
+    if (attP?.note === 'NOT_IN_MONTH') extraWarnings.push(W('ATTENDANCE', 'Not in the closed attendance month: LOP from approved unpaid leave only.'));
     const myItems = items.filter((i) => i.employee_id === e.id);
     const tdsItems = myItems.filter((i) => tdsComp && i.component_id === tdsComp.id);
     const otherItems = myItems.filter((i) => !(tdsComp && i.component_id === tdsComp.id));
     const id8 = idents.get(e.id) ?? {};
+    // A settlement paid in a month after the person left: no salary, no PT or LWF — only the settlement.
+    if (!days.segments.length && fnf) {
+      const lastSal = sal[sal.length - 1] ?? null;
+      const S0 = await statFor(b.from, lastSal?.stateCode ?? world.settings.stateCode);
+      const input0 = {
+        month, days, components: comps.byCode, settlementOnly: true, arrears: [], pfMode: 'NONE', esiCovered: false, noEps: true, settings: S0,
+        oneTime: [...otherItems.map((i) => ({ code: comps.byId.get(i.component_id)?.code, amount: Number(i.amount), note: i.note })).filter((i) => i.code), ...extraItems],
+      };
+      const before0 = computePerson({ ...input0, tds: 0 });
+      const current0 = monthFromLines(before0.lines.map((l) => ({ ...l, comp: comps.byCode.get(l.code) })));
+      const tds0 = await monthlyTds({ companyId: c.companyId, month, employeeId: e.id, world: taxWorld, current: current0 }, tdsItems.map((i) => ({ amount: Number(i.amount), note: i.note })));
+      const calc0 = computePerson({ ...input0, tds: tds0.amount, tdsBasis: tds0.basis });
+      warnings.push(W('SETTLEMENT_ONLY', `Left on ${longDate(exit)}: only the full and final settlement is paid this month (no salary, professional tax or LWF).`), ...extraWarnings);
+      for (const w2 of calc0.warnings) warnings.push(W('CHECK', w2));
+      if (!id8.account || !id8.ifsc) warnings.push(W('NO_BANK', 'No bank account or IFSC: add them as identifiers (BANK_ACCOUNT, IFSC). Left out of the bank file.'));
+      paidSettlements.add(fnf.id);
+      for (const x of claimsDue.get(e.id) ?? []) paidClaims.add(x.id);
+      results.push({ e, days, included: true, warnings, calc: calc0, tds: tds0, covered: false, idents: id8, salary: lastSal, otherItems, taxJson: runSnapshot(tds0.tax, tds0.source, tds0.override) });
+      continue;
+    }
     if (!days.segments.length) {
       warnings.push(W('NO_SALARY', sal.length ? `No salary for ${b.label}: the salary starts ${longDate(sal[0].effectiveFrom)}.` : 'No salary: add one on Payroll › Salaries.'));
       results.push({ e, days, included: false, warnings, calc: null, tds: { amount: 0, source: 'MANUAL' }, idents: id8, otherItems });
@@ -312,7 +359,27 @@ export async function calculateRun(db, c, id, requestId = null) {
     if (days.unsalariedDays > 0) warnings.push(W('UNSALARIED_DAYS', `${days.unsalariedDays} day${days.unsalariedDays === 1 ? '' : 's'} of ${b.label} have no salary (it starts ${longDate(sal[0]?.effectiveFrom)}): not paid.`));
     if (days.joinedMid) warnings.push(W('JOINED_MID', `Joined on ${longDate(joining)}: paid for ${days.employedDays} of ${days.daysInMonth} days.`));
     if (days.leftMid) warnings.push(W('LEFT_MID', `Left on ${longDate(exit)}: paid for ${days.employedDays} of ${days.daysInMonth} days.`));
-    if (days.lopDays > 0) warnings.push(W('LOP', `${days.lopDays} day${days.lopDays === 1 ? '' : 's'} of leave without pay (approved requests).`));
+    if (days.lopDays > 0) warnings.push(W('LOP', attP
+      ? `${days.lopDays} day${days.lopDays === 1 ? '' : 's'} of loss of pay from the closed attendance (unpaid leave ${attP.parts?.unpaidLeave ?? 0}, absent ${attP.parts?.absentLop ?? 0}, penalties ${attP.parts?.penaltyLop ?? 0}).`
+      : `${days.lopDays} day${days.lopDays === 1 ? '' : 's'} of leave without pay (approved requests).`));
+    warnings.push(...extraWarnings);
+    // Overtime (hours × the policy's multiplier × the hourly rate of the policy's formula) and penalty amounts.
+    if (attP && attP.overtime?.minutes > 0) {
+      if (attP.overtime.multiplier == null) warnings.push(W('OVERTIME', `${attP.overtime.hours} hour(s) of overtime, but the attendance policy pays none (no multiplier): not paid.`));
+      else {
+        const lastLines = (await bd(lastSeg.salary, b.from)).lines ?? [];
+        const rate = rateOf(policy.overtimeRateFormula, formulaValues(lastLines, comps.byCode.keys(), { annualCtc: lastSeg.salary.annualCtc }));
+        if (!rate.ok) warnings.push(W('OVERTIME', `Overtime of ${attP.overtime.hours} hour(s) not paid: the hourly rate (${policy.overtimeRateFormula}) cannot be worked out — ${rate.problem}`));
+        else {
+          const amount = Math.round(attP.overtime.hours * attP.overtime.multiplier * rate.value);
+          if (amount > 0) extraItems.push({ code: 'OVERTIME', amount, source: 'ATTENDANCE', basis: `${attP.overtime.hours} h × ${attP.overtime.multiplier} × ₹${rate.value.toLocaleString('en-IN')} an hour (${policy.overtimeRateFormula})` });
+        }
+      }
+    }
+    if (attP && attP.penaltyAmount > 0) {
+      const code = comps.byCode.get('ATT_PENALTY')?.status === 'ACTIVE' ? 'ATT_PENALTY' : 'OTHER_DED';
+      extraItems.push({ code, amount: attP.penaltyAmount, source: 'ATTENDANCE', basis: `attendance penalties of ${b.label}` });
+    }
     if (!id8.account || !id8.ifsc) warnings.push(W('NO_BANK', 'No bank account or IFSC: add them as identifiers (BANK_ACCOUNT, IFSC). Left out of the bank file.'));
     if (!id8.pan) warnings.push(W('NO_PAN', 'No PAN on file.'));
 
@@ -355,7 +422,7 @@ export async function calculateRun(db, c, id, requestId = null) {
 
     const personInput = {
       month, days, components: comps.byCode,
-      oneTime: otherItems.map((i) => ({ code: comps.byId.get(i.component_id)?.code, amount: Number(i.amount), note: i.note })).filter((i) => i.code),
+      oneTime: [...otherItems.map((i) => ({ code: comps.byId.get(i.component_id)?.code, amount: Number(i.amount), note: i.note })).filter((i) => i.code), ...extraItems],
       arrears, pfMode: lastSeg.salary.pfMode, esiCovered: covered, noEps, settings: S,
     };
     // The month without TDS first: its earnings, PT and PF are what the tax engine counts for this month.
@@ -368,6 +435,8 @@ export async function calculateRun(db, c, id, requestId = null) {
     if (tds.tax && !tds.tax.available) warnings.push(W('TDS_NO_RULES', tds.tax.warnings?.[0] ?? 'The TDS could not be worked out.'));
     for (const w of calc.warnings) warnings.push(W('CHECK', w));
     if (calc.netPay < 0) warnings.push(W('NEGATIVE_NET', 'Net pay is below zero: lower a deduction, or move it to a later month.'));
+    if (fnf) paidSettlements.add(fnf.id);
+    for (const x of claimsDue.get(e.id) ?? []) paidClaims.add(x.id);
     results.push({ e, days, included: true, warnings, calc, tds, covered, idents: id8, salary: lastSeg.salary, otherItems, taxJson: runSnapshot(tds.tax, tds.source, tds.override) });
   }
 
@@ -409,6 +478,16 @@ export async function calculateRun(db, c, id, requestId = null) {
     const chunk = lineRows.slice(i, i + 400);
     await db.query(`INSERT INTO hrms_pay_run_lines (company_id, run_id, run_person_id, employee_id, component_id, kind, amount, full_amount, basis, source, for_month, pf_wage, esi_wage, sort_order, created_by) VALUES ${chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ')}`, chunk.flat());
   }
+  // P3b: which claims and settlements this calculation pays (a re-calculation takes them again).
+  // updated_at kept: taking a claim is the calculation's own write, not a change since it (changedSince).
+  await db.query("UPDATE hrms_pay_claims SET run_id = NULL, updated_at = updated_at WHERE company_id = ? AND run_id = ? AND status = 'APPROVED'", [c.companyId, id]);
+  await db.query("UPDATE hrms_pay_settlements SET run_id = NULL, updated_at = updated_at WHERE company_id = ? AND run_id = ? AND status = 'APPROVED'", [c.companyId, id]);
+  if (paidClaims.size) await db.query('UPDATE hrms_pay_claims SET run_id = ?, updated_at = updated_at WHERE company_id = ? AND id IN (?)', [id, c.companyId, [...paidClaims]]);
+  if (paidSettlements.size) await db.query('UPDATE hrms_pay_settlements SET run_id = ?, updated_at = updated_at WHERE company_id = ? AND id IN (?)', [id, c.companyId, [...paidSettlements]]);
+  totals.claimsPaid = paidClaims.size;
+  totals.settlementsPaid = paidSettlements.size;
+  totals.claimsWaiting = [...claimsDue.values()].flat().filter((x) => !paidClaims.has(x.id)).length;
+  totals.attendance = { mode: att.state.mode, live: att.state.live, status: att.state.status, closedAt: att.state.closedAt, override: att.state.override?.reason ?? null };
   for (const k of Object.keys(totals)) if (typeof totals[k] === 'number') totals[k] = money(totals[k]);
   // PF admin charges have a monthly minimum for the establishment.
   if (st1.PF?.adminMinimum && totals.pfEmployee > 0 && totals.pfAdmin < Number(st1.PF.adminMinimum)) totals.pfAdmin = money(st1.PF.adminMinimum);
@@ -438,7 +517,9 @@ export async function readRun(db, c, id, { audited = true, requestId = null } = 
   if (audited) await auditSalaryRead(db, c, people.filter((p) => p.included).map((p) => p.employee_id), `payroll run ${r.period_month}`, requestId);
   const stale = OPEN.includes(r.status) && r.calculated_at ? await changedSince(db, c.companyId, r) : [];
   const ownerOnlyRemove = Number(r.reopen_count) > 0 || Boolean(Number(r.ever_paid));
+  const attendance = await attendanceState(db, c.companyId, r.period_month, r.id);
   return {
+    attendance,
     run: shapeRun(r),
     people: people.map((p) => ({
       id: p.id, employee: { id: p.employee_id, code: p.employee_code, name: p.full_name, ...(seats.get(p.employee_id) ?? {}) },
@@ -455,6 +536,7 @@ export async function readRun(db, c, id, { audited = true, requestId = null } = 
     can: {
       calculate: OPEN.includes(r.status), lock: r.status === 'CALCULATED' && !stale.length, release: r.status === 'LOCKED', paid: r.status === 'RELEASED',
       reopen: FROZEN.includes(r.status) && Boolean(c.owner), remove: OPEN.includes(r.status) && (!ownerOnlyRemove || Boolean(c.owner)), bankFile: FROZEN.includes(r.status), items: OPEN.includes(r.status),
+      attendanceOverride: OPEN.includes(r.status) && attendance.live && attendance.status !== 'CLOSED',
     },
   };
 }
@@ -594,6 +676,12 @@ async function changedSince(db, companyId, r, at = r.calculated_at) {
   if (await q('SELECT COUNT(*) AS n FROM hrms_pay_runs WHERE company_id = ? AND deleted_at IS NULL AND period_month < ? AND locked_at >= ?', [companyId, r.period_month, at])) out.push('an earlier month’s payroll, locked again');
   if (await q('SELECT COUNT(*) AS n FROM hrms_tax_tds_overrides WHERE company_id = ? AND run_id = ? AND updated_at >= ?', [companyId, r.id, at])) out.push('a TDS set by hand');
   if (await q("SELECT (SELECT COUNT(*) FROM hrms_tax_declaration_lines WHERE company_id = ? AND updated_at >= ?) + (SELECT COUNT(*) FROM hrms_tax_profiles WHERE company_id = ? AND updated_at >= ?) + (SELECT COUNT(*) FROM hrms_tax_settings WHERE company_id = ? AND updated_at >= ?) + (SELECT COUNT(*) FROM hrms_employee_identifiers WHERE company_id = ? AND identifier_type = 'PAN' AND updated_at >= ?) AS n", [companyId, at, companyId, at, companyId, at, companyId, at])) out.push('a tax declaration, regime, PAN or tax setting');
+  // P3b: the attendance month (closed / re-opened), "live from", the run's "pay without attendance", settlements, claims.
+  if (await q('SELECT (SELECT COUNT(*) FROM hrms_attendance_months WHERE company_id = ? AND period_month = ? AND updated_at >= ?) + (SELECT COUNT(*) FROM hrms_attendance_settings WHERE company_id = ? AND updated_at >= ?) AS n', [companyId, r.period_month, at, companyId, at])) out.push('the attendance of the month (closed, re-opened or live from)');
+  if (await q('SELECT COUNT(*) AS n FROM hrms_pay_attendance_overrides WHERE company_id = ? AND run_id = ? AND updated_at >= ?', [companyId, r.id, at])) out.push('paying without attendance');
+  if (await q('SELECT COUNT(*) AS n FROM hrms_pay_settlements WHERE company_id = ? AND updated_at >= ? AND (pay_month <= ? OR run_id = ?)', [companyId, at, r.period_month, r.id])) out.push('a full and final settlement');
+  if (await q('SELECT COUNT(*) AS n FROM hrms_pay_claims WHERE company_id = ? AND updated_at >= ? AND (pay_month <= ? OR run_id = ?)', [companyId, at, r.period_month, r.id])) out.push('a claim');
+  if (await q('SELECT COUNT(*) AS n FROM hrms_pay_policy WHERE company_id = ? AND updated_at >= ?', [companyId, at])) out.push('the payroll policy');
   return out;
 }
 
@@ -859,6 +947,9 @@ export async function markPaid(db, c, id, body = {}, requestId = null) {
     if (kind === 'PAID') paid += 1; else recovered += 1;
   }
   await db.query("UPDATE hrms_pay_runs SET status = 'PAID', paid_at = NOW(), paid_by = ?, paid_note = ?, ever_paid = 1 WHERE company_id = ? AND id = ?", [c.userId, note, c.companyId, id]);
+  // P3b: the claims and settlements this run paid.
+  await db.query("UPDATE hrms_pay_claims SET status = 'PAID', paid_at = NOW() WHERE company_id = ? AND run_id = ? AND status = 'APPROVED'", [c.companyId, id]);
+  await db.query("UPDATE hrms_pay_settlements SET status = 'PAID', paid_at = NOW() WHERE company_id = ? AND run_id = ? AND status = 'APPROVED'", [c.companyId, id]);
   // A recovery goes to the next open run straight away (or waits for the next run made).
   let recoveryIn = null;
   if (recovered) {
@@ -886,6 +977,9 @@ export async function reopenRun(db, c, id, body = {}, requestId = null) {
   }
   const [[w]] = await db.query("SELECT COUNT(*) AS n FROM hrms_pay_payslips WHERE company_id = ? AND run_id = ? AND status = 'RELEASED' AND deleted_at IS NULL", [c.companyId, id]);
   await db.query("UPDATE hrms_pay_payslips SET status = 'WITHDRAWN' WHERE company_id = ? AND run_id = ? AND status = 'RELEASED' AND deleted_at IS NULL", [c.companyId, id]);
+  // P3b: what the run paid is due again until it is paid again.
+  await db.query("UPDATE hrms_pay_claims SET status = 'APPROVED', paid_at = NULL WHERE company_id = ? AND run_id = ? AND status = 'PAID'", [c.companyId, id]);
+  await db.query("UPDATE hrms_pay_settlements SET status = 'APPROVED', paid_at = NULL WHERE company_id = ? AND run_id = ? AND status = 'PAID'", [c.companyId, id]);
   await db.query(
     "UPDATE hrms_pay_runs SET status = 'CALCULATED', reopen_count = reopen_count + 1, reopen_note = ?, locked_at = NULL, locked_by = NULL, released_at = NULL, released_by = NULL, paid_at = NULL, paid_by = NULL WHERE company_id = ? AND id = ?",
     [reason, c.companyId, id]);

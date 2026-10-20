@@ -157,11 +157,14 @@ export async function monthReturns(db, c, month) {
     const m = /EPS\s+([\d,]+)/.exec(L.erBasis ?? '');
     const eps = m ? r0(m[1].replace(/,/g, '')) : Math.min(r0(L.PF_ER), roundBy(n(stat.PF?.epsRate ?? 8.33) * Math.min(epfWages, ceiling) / 100, stat.PF?.rounding ?? 'NEAREST'));
     const a = attPeople.get(p.employee_id);
-    const ncp = att.used && a ? n(a.ncpDays) : n(p.lop_days);
+    // NCP days are what the RUN paid (its LOP; P3b: the run reads the closed attendance month). A closed month that
+    // says otherwise (the run was paid without attendance, or calculated before the month was closed) is flagged.
+    const ncp = n(p.lop_days);
+    if (att.used && a && Math.abs(n(a.ncpDays) - ncp) >= 0.01) V('WARNING', 'PF', `${p.full_name} (${p.employee_code}): the closed attendance has ${n(a.ncpDays)} NCP days, the run paid ${ncp} LOP days — the ECR uses the run's. Calculate the run again if the attendance is right.`, { id: p.employee_id, code: p.employee_code, name: p.full_name });
     const row = {
       employee: emp, uan: uan || null, name: cleanName(p.full_name), grossWages: r0(p.gross), epfWages,
       epsWages: eps > 0 ? r0(Math.min(epfWages, ceiling)) : 0, edliWages: r0(Math.min(epfWages, ceiling)),
-      epfEe: r0(L.PF_EE), eps, epfDiff: r0(L.PF_ER) - eps, ncpDays: Math.round(ncp), refund: 0, ncpFrom: att.used && a ? 'ATTENDANCE' : 'RUN',
+      epfEe: r0(L.PF_EE), eps, epfDiff: r0(L.PF_ER) - eps, ncpDays: Math.round(ncp), refund: 0, ncpFrom: 'RUN',
     };
     if (ncp !== row.ncpDays) V('INFO', 'PF', `${emp.name} (${emp.code}): ${ncp} NCP days; the ECR takes whole days (no half days) — ${row.ncpDays}.`, emp);
     if (row.grossWages === 0 && row.ncpDays !== n(p.days_in_month)) V('WARNING', 'PF', `${emp.name} (${emp.code}): no wages, so EPFO expects NCP days = ${n(p.days_in_month)}.`, emp);
@@ -193,7 +196,9 @@ export async function monthReturns(db, c, month) {
     const emp = { id: p.employee_id, code: p.employee_code, name: p.full_name };
     const ip = String((idents.get(p.employee_id) ?? {}).esi ?? '').replace(/\s+/g, '');
     const a = attPeople.get(p.employee_id);
-    const daysRaw = att.used && a ? n(a.esiDays) : n(p.payable_days);
+    // ESI days are the days the RUN paid (payable days), flagged when the closed attendance says otherwise.
+    const daysRaw = n(p.payable_days);
+    if (att.used && a && Math.abs(n(a.esiDays) - daysRaw) >= 0.01) V('WARNING', 'ESI', `${p.full_name} (${p.employee_code}): the closed attendance has ${n(a.esiDays)} paid days, the run paid ${daysRaw} — the file uses the run's.`, { id: p.employee_id, code: p.employee_code, name: p.full_name });
     const days = Math.max(0, Math.min(31, Math.ceil(daysRaw - 1e-9)));
     const exit = dateText(p.exit_date);
     const left = Boolean(exit && exit <= monthEnd);
@@ -201,7 +206,7 @@ export async function monthReturns(db, c, month) {
     const { reason, lastWorkingDay } = esiReasonFor({ days, exit, monthEnd, lopDays: p.lop_days });
     const row = {
       employee: emp, ip: ip || null, name: cleanName(p.full_name, { dots: false }), days, daysExact: daysRaw, wages: r0(p.esi_wage),
-      reason, reasonWords: FORMATS.ESI.reasons[reason], lastWorkingDay, employeeShare: r0(L.ESI_EE), employerShare: r0(L.ESI_ER), daysFrom: att.used && a ? 'ATTENDANCE' : 'RUN',
+      reason, reasonWords: FORMATS.ESI.reasons[reason], lastWorkingDay, employeeShare: r0(L.ESI_EE), employerShare: r0(L.ESI_ER), daysFrom: 'RUN',
     };
     if (!ip) V('ERROR', 'ESI', `${emp.name} (${emp.code}): no ESI IP number — add the identifier ESI. Left out of the file.`, emp);
     else if (!/^\d{10}$/.test(ip)) V('ERROR', 'ESI', `${emp.name} (${emp.code}): the IP number “${ip}” is not 10 digits. Left out of the file.`, emp);

@@ -48,7 +48,7 @@ export async function listComponents(db, c) {
     // oneTimeOk: may be a one-time item of a run (runService.itemComponentOk).
     components: list.map((x) => ({ ...x, structureCount: n.get(x.id) ?? 0, oneTimeOk: x.status === 'ACTIVE' && (x.statutoryKey === 'TDS' || (!x.statutoryKey && x.kind !== 'EMPLOYER_CONTRIBUTION')) })),
     kinds: KINDS, statutoryKeys: STATUTORY_KEYS.map((k) => ({ key: k, label: STATUTORY_WORDS[k] })),
-    exemptionRules: ['HRA', 'LTA', 'GRATUITY', 'LEAVE_ENCASHMENT', 'PERQUISITE', 'CONVEYANCE', 'CHILDREN_EDUCATION', 'NPS_80CCD2', 'OTHER'],
+    exemptionRules: ['HRA', 'LTA', 'GRATUITY', 'LEAVE_ENCASHMENT', 'PERQUISITE', 'CONVEYANCE', 'CHILDREN_EDUCATION', 'NPS_80CCD2', 'SUPERANNUATION', 'OTHER'],
   };
 }
 

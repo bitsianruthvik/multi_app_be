@@ -59,6 +59,7 @@ import { myPayslips, payslipRow } from '../services/payroll/runService.js';
 import { payslipPdf, letterheadOf, payslipFileName } from '../services/payroll/payslip.js';
 import { HrmsError } from '../lib/errors.js';
 import * as ATT from '../services/attendance/requests.js';
+import * as CLAIMS from '../services/payrollExit/claims.js';
 
 const router = Router();
 
@@ -260,6 +261,14 @@ const APPROVAL_KINDS = {
     feed: (c, viewer, status) => ATT.myApprovals(pool, c, viewer, { status }),
     read: (c, viewer, itemId) => ATT.approvalDetail(pool, c, viewer, itemId),
     decide: (db, c, viewer, itemId, verdict, body, requestId) => ATT.decide(db, c, viewer, itemId, verdict, body, requestId),
+  },
+  // Spec §25.5 (P3b): a claim's first look by the person's manager (their first approver). HR decides the amount on
+  // Payroll › Claims, not here: this kind shows only the claims waiting for THIS login as the manager.
+  claim: {
+    right: PERM.payroll.edit,
+    feed: (c, viewer, status) => CLAIMS.managerFeed(pool, c, viewer, { status }),
+    read: (c, viewer, itemId) => CLAIMS.managerDetail(pool, c, viewer, itemId),
+    decide: (db, c, viewer, itemId, verdict, body, requestId) => CLAIMS.managerDecide(db, c, viewer, itemId, verdict, body, requestId),
   },
 };
 router.get('/user/me/approvals', guard(PERM.selfView), handle(async (req) => {
