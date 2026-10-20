@@ -24,7 +24,7 @@ import { addDays, dayText, isDate } from '../leave/days.js';
 import { settingsOf } from './settings.js';
 import { loadInputs, planDay, computeDay, processRange } from './process.js';
 import { leaveTypeNames, sentencesOf } from './policy.js';
-import { wall, day, nowIn, hm, at, toMin, monthOf, monthStart, monthEnd, monthWords, minutesWords } from './time.js';
+import { serverToday, wall, day, nowIn, hm, at, toMin, monthOf, monthStart, monthEnd, monthWords, minutesWords } from './time.js';
 
 export const KINDS = ['CORRECTION', 'SHORT_PERMISSION', 'ON_DUTY'];
 const KIND_WORDS = { CORRECTION: 'Correct a day', SHORT_PERMISSION: 'Short permission', ON_DUTY: 'On duty' };
@@ -194,7 +194,7 @@ async function hrIdsOf(db, companyId, viewer, ids) {
   if (viewer.hr.all) return new Set(ids);
   const depts = [...(viewer.hr.departmentIds ?? [])];
   if (!depts.length) return new Set();
-  const on = new Date().toISOString().slice(0, 10);
+  const on = serverToday();
   const [rows] = await db.query(`SELECT e.id FROM hrms_employees e WHERE e.company_id = ? AND e.id IN (?) AND ${EMPLOYEE_IN_DEPARTMENTS_SQL('e')}`, [companyId, ids, on, on, depts]);
   return new Set(rows.map((r) => r.id));
 }
@@ -234,7 +234,7 @@ async function readRows(db, c, ids, viewer) {
 /** ApprovalItems of kind ATTENDANCE for this login. */
 export async function myApprovals(db, c, viewer, { status = 'PENDING' } = {}) {
   const me = viewer.employeeId ?? -1;
-  const on = new Date().toISOString().slice(0, 10);
+  const on = serverToday();
   let hrSql = '0';
   const hrParams = [];
   if (viewer.hr?.all) hrSql = '1';
@@ -270,7 +270,7 @@ async function contextOf(db, c, row, request) {
     db.query(`${SELECT} AND g.employee_id = ? AND g.id <> ? AND g.attendance_date BETWEEN ? AND ? ORDER BY g.attendance_date`, [c.companyId, row.employee_id, row.id, monthStart(month), monthEnd(month)]),
     leaveTypeNames(db, c.companyId),
   ]);
-  const { people } = await loadInputs(db, c.companyId, { from: date, to: date, employeeIds: [row.employee_id], on: new Date().toISOString().slice(0, 10) });
+  const { people } = await loadInputs(db, c.companyId, { from: date, to: date, employeeIds: [row.employee_id], on: serverToday() });
   const p = people[0];
   // The punches of THIS day: inside its shift's window (a night shift runs into the next morning).
   const win = planDay(date, p?.shift ?? null, p?.holidays ?? new Map());
@@ -322,7 +322,7 @@ export async function listRequests(db, c, query = {}, scopeDeptIds = null, viewe
   if (query.q) { where.push('(e.full_name LIKE ? OR e.employee_code LIKE ?)'); const like = `%${String(query.q).slice(0, 100)}%`; params.push(like, like); }
   if (scopeDeptIds) {
     if (!scopeDeptIds.length) return { items: [] };
-    const on = new Date().toISOString().slice(0, 10);
+    const on = serverToday();
     where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, scopeDeptIds);
   }
   const [rows] = await db.query(`${SELECT} ${where.length ? `AND ${where.join(' AND ')}` : ''} ORDER BY FIELD(g.status, 'PENDING', 'APPROVED', 'REJECTED', 'CANCELLED'), g.attendance_date DESC LIMIT 1000`, params);
@@ -392,9 +392,11 @@ async function applyCorrection(conn, c, row, requestId) {
 /**
  * PUT /attendance/days { employeeId, date, status, inTime?, outTime?, note } — HR sets a day by
  * hand (source MANUAL: processing keeps it). status null gives the day back to processing.
+ * Never the login's own day (c.employeeId, from the route), as nobody decides their own request.
  */
 export async function setDayByHand(conn, c, body = {}, requestId = null) {
   const employeeId = Number(body.employeeId);
+  if (c.employeeId && employeeId === Number(c.employeeId)) throw new HrmsError(403, 'OWN_DAY', 'This is your own attendance. Someone else in HR sets your days.');
   const date = String(body.date ?? '').slice(0, 10);
   const problems = [];
   if (!Number.isInteger(employeeId) || employeeId <= 0) problems.push('Choose the person.');

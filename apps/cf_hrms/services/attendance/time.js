@@ -62,6 +62,8 @@ export function nowIn(tz = 'Asia/Kolkata', now = new Date()) {
   }
 }
 export const todayIn = (tz = 'Asia/Kolkata', now = new Date()) => nowIn(tz, now).slice(0, 10);
+/** The server's LOCAL date (Render runs with TZ=Asia/Kolkata), as every write's "today" is (positionService.today, lib/http.js dateParam). Never the UTC date. */
+export const serverToday = (now = new Date()) => day(now);
 /** UTC now as DATETIME text, for received_at / last_seen_at. */
 export const utcNow = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
 
@@ -101,4 +103,4 @@ export function minutesWords(n) {
 /** 4.5 -> "4.5 hours", 1 -> "1 hour". */
 export const hoursWords = (h) => `${Math.round(Number(h) * 100) / 100} hour${Number(h) === 1 ? '' : 's'}`;
 
-export default { wall, day, isWall, normWall, toMin, fromMin, at, hm, nowIn, todayIn, utcNow, isTimezone, monthOf, monthStart, monthEnd, daysInMonth, addMonths, monthsBetween, monthWords, minutesWords, hoursWords, MONTH_RE };
+export default { serverToday, wall, day, isWall, normWall, toMin, fromMin, at, hm, nowIn, todayIn, utcNow, isTimezone, monthOf, monthStart, monthEnd, daysInMonth, addMonths, monthsBetween, monthWords, minutesWords, hoursWords, MONTH_RE };

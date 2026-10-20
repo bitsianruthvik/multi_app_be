@@ -40,9 +40,10 @@ import { listRequests, readRequest, submitFor, decide, setDayByHand } from '../s
 import { listPenalties, waivePenalty } from '../services/attendance/penalties.js';
 import { listPolicies, readPolicy, createPolicy, updatePolicy, removePolicy, putAssignment, previewSentences } from '../services/attendance/policy.js';
 import { listDevices, createDevice, updateDevice, removeDevice, listKeys, createKey, revokeKey } from '../services/attendance/devices.js';
-import { listMappings, putMapping, autoMap, unmappedQueue } from '../services/attendance/punches.js';
+import { listMappings, putMapping, autoMap, unmappedQueue, processAfterCommit } from '../services/attendance/punches.js';
 import { template, previewImport, applyImport } from '../services/attendance/imports.js';
 import { settingsOf, putSettings } from '../services/attendance/settings.js';
+import { serverToday as localToday } from '../services/attendance/time.js';
 
 const router = Router();
 const A = PERM.attendance;
@@ -74,11 +75,14 @@ router.get('/attendance/month/workbook', guard(A.view, { note: 'narrowed to the 
 router.get('/attendance/summary', guard(A.view, { note: 'narrowed to the login’s department' }), handle(async (req) => {
   const c = ctx(req);
   const scope = await peopleFilter(req);
-  const employeeIds = scope ? await peopleIn(pool, c.companyId, { scopeDeptIds: scope, on: new Date().toISOString().slice(0, 10) }) : null;
+  const employeeIds = scope ? await peopleIn(pool, c.companyId, { scopeDeptIds: scope, on: localToday() }) : null;
   return attendanceMonth(c.companyId, monthParam(req.query.month), { db: pool, employeeIds });
 }));
 router.get('/attendance/people/:id', guard(A.view), inEmployee(), handle((req) => personMonth(pool, ctx(req), id(req), { month: req.query.month })));
-router.put('/attendance/days', guard(A.edit), inBodyPerson, handle((req) => tx(req, (db, c) => setDayByHand(db, c, req.body ?? {}, reqId(req)))));
+router.put('/attendance/days', guard(A.edit, { note: 'never the login’s own day' }), inBodyPerson, handle(async (req) => {
+  const employeeId = await employeeIdOfLogin(pool, ctx(req));
+  return tx(req, (db, c) => setDayByHand(db, { ...c, employeeId }, req.body ?? {}, reqId(req)));
+}));
 router.post('/attendance/process', guard(A.edit, { note: 'a department-scoped login processes its own people only' }), handle(async (req) => {
   const b = req.body ?? {};
   const from = String(b.from ?? '').slice(0, 10);
@@ -88,7 +92,7 @@ router.post('/attendance/process', guard(A.edit, { note: 'a department-scoped lo
   const scope = await peopleFilter(req);
   let employeeIds = Array.isArray(b.employeeIds) ? b.employeeIds.map(Number).filter((x) => Number.isInteger(x) && x > 0) : null;
   if (scope) {
-    const mine = await peopleIn(pool, ctx(req).companyId, { scopeDeptIds: scope, on: new Date().toISOString().slice(0, 10) });
+    const mine = await peopleIn(pool, ctx(req).companyId, { scopeDeptIds: scope, on: localToday() });
     employeeIds = employeeIds ? employeeIds.filter((x) => mine.includes(x)) : mine;
   }
   return tx(req, (db, c) => processRange(db, c, { from, to, employeeIds, kind: 'MANUAL', note: 'by hand' }));
@@ -130,7 +134,7 @@ router.put('/attendance/policy-assignments', guard(A.edit, { note: 'clearing one
 }));
 
 // ── devices, mapping, unmapped punches, API keys ─────────────────────────────
-router.get('/attendance/devices', guard(A.view), handle((req) => listDevices(pool, ctx(req))));
+router.get('/attendance/devices', guard(A.view, { note: 'serials masked without cf_hrms_attendance_edit' }), handle((req) => listDevices(pool, ctx(req), { canEdit: can(req, A.edit) })));
 router.post('/attendance/devices', guard(A.edit), WHOLE, handle((req) => tx(req, (db, c) => createDevice(db, c, req.body ?? {}, reqId(req)))));
 router.put('/attendance/devices/:id', guard(A.edit), WHOLE, handle((req) => tx(req, (db, c) => updateDevice(db, c, id(req), req.body ?? {}, reqId(req)))));
 router.delete('/attendance/devices/:id', guard(A.remove), WHOLE, handle((req) => tx(req, (db, c) => removeDevice(db, c, id(req), reqId(req)))));
@@ -140,15 +144,24 @@ router.put('/attendance/device-users', guard(A.edit, { note: 'taking one off (em
   return tx(req, (db, c) => putMapping(db, c, req.body ?? {}, reqId(req)));
 }));
 router.post('/attendance/device-users/auto', guard(A.edit), WHOLE, handle((req) => tx(req, (db, c) => autoMap(db, c, reqId(req)))));
-router.get('/attendance/unmapped', guard(A.view), handle((req) => unmappedQueue(pool, ctx(req))));
+router.get('/attendance/unmapped', guard(A.view, { note: 'serials masked without cf_hrms_attendance_edit' }), handle((req) => unmappedQueue(pool, ctx(req), { canEdit: can(req, A.edit) })));
 router.get('/attendance/api-keys', guard(A.view), handle((req) => listKeys(pool, ctx(req))));
 router.post('/attendance/api-keys', guard(A.edit, { note: 'the Owner only' }), handle((req) => { ownerOnly(req, 'makes an API key'); return tx(req, (db, c) => createKey(db, c, req.body ?? {}, reqId(req))); }));
 router.post('/attendance/api-keys/:id/revoke', guard(A.edit, { note: 'the Owner only' }), handle((req) => { ownerOnly(req, 'revokes an API key'); return tx(req, (db, c) => revokeKey(db, c, id(req), reqId(req))); }));
 
 // ── imports ──────────────────────────────────────────────────────────────────
 router.get('/attendance/imports/template', guard(A.upload, { also: [A.view] }), handle((req) => template(String(req.query.kind ?? 'punches'))));
-router.post('/attendance/imports/:kind/preview', guard(A.upload, { also: [A.view] }), WHOLE, handle((req) => previewImport(pool, ctx(req), String(req.params.kind), req.body ?? {})));
-router.post('/attendance/imports/:kind/apply', guard(A.upload, { also: [A.view] }), WHOLE, handle((req) => tx(req, (db, c) => applyImport(db, c, String(req.params.kind), req.body ?? {}, reqId(req)))));
+router.post('/attendance/imports/:kind/preview', guard(A.upload, { also: [A.view] }), WHOLE, handle(async (req) => {
+  const employeeId = await employeeIdOfLogin(pool, ctx(req));
+  return previewImport(pool, { ...ctx(req), employeeId }, String(req.params.kind), req.body ?? {});
+}));
+router.post('/attendance/imports/:kind/apply', guard(A.upload, { also: [A.view], note: 'a days file never sets the login’s own days' }), WHOLE, handle(async (req) => {
+  const employeeId = await employeeIdOfLogin(pool, ctx(req));
+  const out = await tx(req, (db, c) => applyImport(db, { ...c, employeeId }, String(req.params.kind), req.body ?? {}, reqId(req)));
+  // A punch file: its punches are committed; their days are processed now (an error is logged and retried, never lost).
+  if (out.toProcess?.length) out.processed = await processAfterCommit(ctx(req), out.toProcess, { what: 'IMPORT' });
+  return out;
+}));
 
 // ── settings and months ──────────────────────────────────────────────────────
 router.get('/attendance/settings', guard(A.view), handle(async (req) => ({ settings: await settingsOf(pool, ctx(req).companyId) })));

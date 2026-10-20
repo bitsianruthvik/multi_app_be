@@ -4870,7 +4870,8 @@ CREATE TABLE IF NOT EXISTS hrms_attendance_devices (
   last_seen_at     DATETIME     NULL,              -- UTC
   last_punch_at    DATETIME     NULL,              -- wall-clock of the newest punch it sent
   last_ip          VARCHAR(64)  NULL,
-  attlog_stamp     VARCHAR(40)  NULL,              -- the ADMS cursor the device last sent
+  allowed_ips_json JSON         NULL,              -- ["203.0.113.0/24", "198.51.100.7"]; empty/NULL = any address (28f)
+  attlog_stamp     VARCHAR(40)  NULL,              -- the ADMS cursor the device last sent; only ever moves forward
   operlog_stamp    VARCHAR(40)  NULL,
   device_info      VARCHAR(500) NULL,              -- what the device said about itself (INFO=…)
   notes            VARCHAR(500) NULL,
@@ -4942,6 +4943,7 @@ CREATE TABLE IF NOT EXISTS hrms_attendance_punches (
   KEY idx_hapn_employee (company_id, employee_id, punched_at),
   KEY idx_hapn_unmapped (company_id, employee_id, device_id, device_user_id),
   KEY idx_hapn_batch    (company_id, batch_id),
+  KEY idx_hapn_device_received (company_id, device_id, received_at),   -- the Devices list's "punches today" (28f)
 
   CONSTRAINT fk_hapn_company  FOREIGN KEY (company_id) REFERENCES companies(id),
   CONSTRAINT fk_hapn_device   FOREIGN KEY (company_id, device_id)   REFERENCES hrms_attendance_devices(company_id, id),
@@ -5126,6 +5128,29 @@ CREATE TABLE IF NOT EXISTS hrms_attendance_runs (
   CONSTRAINT fk_harun_creator FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Added 2026-10-20 (hardening): what a device did that HR should see on the Devices screen —
+-- IP_CHANGED (it talked from a new address), IP_REFUSED (an address outside its allow-list,
+-- at most one row per device and address an hour). Written by the iclock push; never edited.
+CREATE TABLE IF NOT EXISTS hrms_attendance_device_events (
+  id               INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT          NOT NULL,
+  device_id        INT          NOT NULL,
+  kind             VARCHAR(20)  NOT NULL,          -- IP_CHANGED | IP_REFUSED
+  ip               VARCHAR(64)  NULL,              -- the address it came from
+  previous_ip      VARCHAR(64)  NULL,              -- IP_CHANGED: the address before
+  note             VARCHAR(300) NULL,
+  occurred_at      DATETIME     NOT NULL,          -- UTC
+
+  deleted_at       DATETIME     DEFAULT NULL,
+  created_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_hadev_tenant (company_id, id),
+  KEY idx_hadev_device (company_id, device_id, occurred_at),
+
+  CONSTRAINT fk_hadev_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hadev_device  FOREIGN KEY (company_id, device_id) REFERENCES hrms_attendance_devices(company_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ----- 28a. hrms_attendance_records: what processing computes ------------------
 SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS
            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_attendance_records' AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''REGULARIZATION''%');
@@ -5254,6 +5279,16 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 -- ----- 28d. hrms_leave_policy_rules.min_present_days_for_credit -------------------
 SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_leave_policy_rules' AND COLUMN_NAME = 'min_present_days_for_credit');
 SET @sql = IF(@c = 0, 'ALTER TABLE hrms_leave_policy_rules ADD COLUMN min_present_days_for_credit TINYINT NULL AFTER credit_in_arrears', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 28f. 2026-10-20 hardening: a device's allowed addresses, the device-list index --
+-- (hrms_attendance_device_events is a CREATE above; punches already keep the sender's address in `ip`.)
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_attendance_devices' AND COLUMN_NAME = 'allowed_ips_json');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_attendance_devices ADD COLUMN allowed_ips_json JSON NULL AFTER last_ip', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_attendance_punches' AND INDEX_NAME = 'idx_hapn_device_received');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_attendance_punches ADD KEY idx_hapn_device_received (company_id, device_id, received_at)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 
@@ -5706,3 +5741,237 @@ CREATE TABLE IF NOT EXISTS hrms_tax_relief_10e (
   CONSTRAINT fk_ht10_employee FOREIGN KEY (company_id, employee_id) REFERENCES hrms_employees(company_id, id),
   CONSTRAINT fk_ht10_creator  FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 32. PAYROLL EXIT AND CLAIMS (CF_HRMS_HIRING_SPEC.md §25.5 — P3b)          ##
+-- ############################################################################
+-- Added 2026-10-20. The rest of P3: full and final settlement on leaving (§4), claims with
+-- bills (reimbursements and flexible benefits), attendance into the run (§28.6). Per company;
+-- amounts DECIMAL(14,2); soft delete; every write audited (hrms_audit_log, same transaction).
+-- services/payrollExit/ is the code, routes/payrollExit.js the routes.
+--
+--   hrms_pay_policy               the company's payroll formulas and choices that are not law:
+--                                 the overtime hourly rate, the leave-encashment day rate, the
+--                                 notice-pay day rate (formulas in the structure language), what
+--                                 happens to an unclaimed flexible balance at the year end, and
+--                                 whether a manager looks at a claim before HR. One row a company;
+--                                 none = the defaults (services/payrollExit/policy.js).
+--   hrms_pay_attendance_overrides HR's "pay without attendance" for one run, with the reason —
+--                                 attendance is live but the month is not closed.
+--   hrms_pay_settlements          a person's full and final: what was typed (inputs_json), the
+--                                 statement as last worked out (result_json), DRAFT -> APPROVED ->
+--                                 PAID. It pays in the run of pay_month (run_id once a calculation
+--                                 took it). One live settlement a person.
+--   hrms_pay_claim_types          the company's claim types: yearly limit, taxable / exempt / LTA
+--                                 (with the rule in words), bills needed, flexible (part of pay: an
+--                                 unclaimed balance is paid, taxed, at the year end).
+--   hrms_pay_claims               a person's claim; SUBMITTED (with the manager) -> RECOMMENDED
+--                                 (with HR) -> APPROVED (amount may be lower; pays in the run of
+--                                 pay_month) -> PAID; REJECTED, WITHDRAWN.
+--   hrms_pay_retirement_facts     what the payroll cannot know for the accretion on employer contributions
+--                                 above the year's limit (rule 3B): the excess and accretion of earlier
+--                                 years, the fund's rate of income. One live row a person a year.
+--   hrms_pay_claim_bills          the bills of a claim: the file is a hrms_tax_files row (purpose
+--                                 CLAIM_BILL), its bytes in hrms_tax_file_chunks, as P2's proofs.
+-- And three guarded changes to existing columns (appended ENUM values, nothing else changes):
+--   hrms_pay_run_lines.source     + 'ATTENDANCE' (overtime, penalty), 'SETTLEMENT', 'CLAIM'
+--   hrms_tax_files.purpose        + 'CLAIM_BILL'
+-- apps/cf_hrms/scripts/apply-payroll-exit-schema.mjs does exactly these (dry run by default).
+
+CREATE TABLE IF NOT EXISTS hrms_pay_policy (
+  id                     INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id             INT           NOT NULL,
+  overtime_rate_formula  VARCHAR(300)  NULL,                 -- an HOUR of overtime at 1x; NULL = (BASIC + DA) / 26 / 8
+  encash_rate_formula    VARCHAR(300)  NULL,                 -- a DAY of leave encashed; NULL = BASIC / 26
+  notice_rate_formula    VARCHAR(300)  NULL,                 -- a DAY of notice pay; NULL = GROSS / 30
+  flexi_year_end         VARCHAR(20)   NOT NULL DEFAULT 'PAY_TAXABLE',  -- PAY_TAXABLE | LAPSE
+  claims_manager_first   TINYINT(1)    NOT NULL DEFAULT 1,   -- a claim goes to the person's manager before HR
+
+  deleted_at             DATETIME      DEFAULT NULL,
+  created_at             TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at             TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by             INT           NULL,
+
+  live_company           INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, company_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hppo_tenant (company_id, id),
+  UNIQUE KEY uq_hppo_company (live_company),
+  CONSTRAINT fk_hppo_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hppo_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_pay_attendance_overrides (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  run_id        INT           NOT NULL,
+  reason        VARCHAR(500)  NOT NULL,
+
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by    INT           NULL,
+
+  live_run      INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, run_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hpao_tenant (company_id, id),
+  UNIQUE KEY uq_hpao_run (company_id, live_run),
+  CONSTRAINT fk_hpao_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpao_run     FOREIGN KEY (company_id, run_id) REFERENCES hrms_pay_runs(company_id, id),
+  CONSTRAINT fk_hpao_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_pay_settlements (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  employee_id     INT            NOT NULL,
+  exit_id         INT            NULL,                  -- hrms_employee_exits (the leaving record it settles)
+  last_day        DATE           NOT NULL,              -- the last working day it was worked out for
+  status          VARCHAR(20)    NOT NULL DEFAULT 'DRAFT',  -- DRAFT | APPROVED | PAID
+  pay_month       CHAR(7)        NULL,                  -- the run it pays in (set on approval)
+  run_id          INT            NULL,                  -- the run whose calculation took it
+  inputs_json     JSON           NULL,                  -- what HR typed: notice days, waivers, bonus, recoveries …
+  result_json     JSON           NULL,                  -- the statement as last worked out
+  net_amount      DECIMAL(14,2)  NOT NULL DEFAULT 0,    -- what the settlement adds to the last pay (may be below 0)
+  approved_at     DATETIME       NULL,
+  approved_by     INT            NULL,
+  paid_at         DATETIME       NULL,
+  note            VARCHAR(1000)  NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT            NULL,
+
+  live_employee   INT            GENERATED ALWAYS AS (IF(deleted_at IS NULL, employee_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hpfnf_tenant (company_id, id),
+  UNIQUE KEY uq_hpfnf_person (company_id, live_employee),
+  KEY idx_hpfnf_month (company_id, status, pay_month),
+  CONSTRAINT fk_hpfnf_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpfnf_employee FOREIGN KEY (company_id, employee_id) REFERENCES hrms_employees(company_id, id),
+  CONSTRAINT fk_hpfnf_exit     FOREIGN KEY (company_id, exit_id) REFERENCES hrms_employee_exits(company_id, id),
+  CONSTRAINT fk_hpfnf_run      FOREIGN KEY (company_id, run_id) REFERENCES hrms_pay_runs(company_id, id),
+  CONSTRAINT fk_hpfnf_creator  FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_pay_claim_types (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  code            VARCHAR(30)    NOT NULL,              -- FUEL, PHONE, LTA, MEALS, BOOKS …
+  name            VARCHAR(120)   NOT NULL,
+  yearly_limit    DECIMAL(14,2)  NULL,                  -- a person's limit in a tax year; NULL = none
+  tax_treatment   VARCHAR(20)    NOT NULL DEFAULT 'EXEMPT',  -- EXEMPT | TAXABLE | LTA (the leave-travel rule)
+  tax_rule        VARCHAR(500)   NULL,                  -- the rule in words ("rule 3(7)(ix): telephone …")
+  bills_needed    TINYINT(1)     NOT NULL DEFAULT 1,
+  flexible        TINYINT(1)     NOT NULL DEFAULT 0,    -- part of pay: an unclaimed balance is paid, taxed, at the year end
+  status          VARCHAR(20)    NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | INACTIVE
+  sort_order      INT            NOT NULL DEFAULT 0,
+  description     VARCHAR(500)   NULL,
+
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by      INT            NULL,
+
+  live_code       VARCHAR(30)    GENERATED ALWAYS AS (IF(deleted_at IS NULL, code, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hpct_tenant (company_id, id),
+  UNIQUE KEY uq_hpct_code (company_id, live_code),
+  CONSTRAINT fk_hpct_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpct_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_pay_claims (
+  id                 INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT            NOT NULL,
+  employee_id        INT            NOT NULL,
+  claim_type_id      INT            NOT NULL,
+  tax_year           VARCHAR(7)     NOT NULL,           -- of the bill date
+  bill_date          DATE           NOT NULL,
+  amount             DECIMAL(14,2)  NOT NULL,           -- claimed
+  approved_amount    DECIMAL(14,2)  NULL,               -- HR's (may be lower)
+  description        VARCHAR(500)   NULL,
+  journeys_json      JSON           NULL,               -- LTA: [{ from, to, startDate, endDate, mode }]
+  lta_exempt         TINYINT(1)     NULL,               -- LTA: within the journeys of the block (decided on approval)
+  lta_note           VARCHAR(300)   NULL,
+  status             VARCHAR(20)    NOT NULL DEFAULT 'SUBMITTED',  -- SUBMITTED | RECOMMENDED | APPROVED | PAID | REJECTED | WITHDRAWN
+  approver_employee_id INT          NULL,               -- the manager who looks first (NULL = straight to HR)
+  manager_note       VARCHAR(500)   NULL,
+  manager_at         DATETIME       NULL,
+  manager_by         INT            NULL,
+  decision_note      VARCHAR(500)   NULL,
+  decided_at         DATETIME       NULL,
+  decided_by         INT            NULL,
+  pay_month          CHAR(7)        NULL,               -- the run it pays in (set on approval)
+  run_id             INT            NULL,               -- the run whose calculation took it
+  paid_at            DATETIME       NULL,
+
+  deleted_at         DATETIME       DEFAULT NULL,
+  created_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT            NULL,
+
+  UNIQUE KEY uq_hpcl_tenant (company_id, id),
+  KEY idx_hpcl_person (company_id, employee_id, tax_year),
+  KEY idx_hpcl_status (company_id, status, pay_month),
+  CONSTRAINT fk_hpcl_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpcl_employee FOREIGN KEY (company_id, employee_id) REFERENCES hrms_employees(company_id, id),
+  CONSTRAINT fk_hpcl_type     FOREIGN KEY (company_id, claim_type_id) REFERENCES hrms_pay_claim_types(company_id, id),
+  CONSTRAINT fk_hpcl_run      FOREIGN KEY (company_id, run_id) REFERENCES hrms_pay_runs(company_id, id),
+  CONSTRAINT fk_hpcl_creator  FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_pay_claim_bills (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  claim_id      INT           NOT NULL,
+  file_id       INT           NOT NULL,                 -- hrms_tax_files (purpose CLAIM_BILL)
+
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by    INT           NULL,
+
+  UNIQUE KEY uq_hpcb_tenant (company_id, id),
+  KEY idx_hpcb_claim (company_id, claim_id),
+  CONSTRAINT fk_hpcb_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hpcb_claim   FOREIGN KEY (company_id, claim_id) REFERENCES hrms_pay_claims(company_id, id),
+  CONSTRAINT fk_hpcb_file    FOREIGN KEY (company_id, file_id) REFERENCES hrms_tax_files(company_id, id),
+  CONSTRAINT fk_hpcb_creator FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_pay_retirement_facts (
+  id                  INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id          INT            NOT NULL,
+  employee_id         INT            NOT NULL,
+  tax_year            VARCHAR(7)     NOT NULL,
+  previous_excess     DECIMAL(14,2)  NULL,               -- PC1: excess contributions of the years before, together
+  previous_accretion  DECIMAL(14,2)  NULL,               -- TP1: accretion taxed in the years before, together
+  rate_pct            DECIMAL(7,4)   NULL,               -- R as a %, or worked from the three below
+  fund_income         DECIMAL(14,2)  NULL,               -- I
+  fund_opening        DECIMAL(14,2)  NULL,
+  fund_closing        DECIMAL(14,2)  NULL,
+  note                VARCHAR(500)   NULL,
+
+  deleted_at          DATETIME       DEFAULT NULL,
+  created_at          TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by          INT            NULL,
+
+  person_active       INT            GENERATED ALWAYS AS (IF(deleted_at IS NULL, employee_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hprf_tenant (company_id, id),
+  UNIQUE KEY uq_hprf_person (company_id, tax_year, person_active),
+  CONSTRAINT fk_hprf_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hprf_employee FOREIGN KEY (company_id, employee_id) REFERENCES hrms_employees(company_id, id),
+  CONSTRAINT fk_hprf_creator  FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 32b. Appended ENUM values (guarded: only when the value is missing) -------------
+SET @t = (SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_pay_run_lines' AND COLUMN_NAME = 'source');
+SET @sql = IF(@t IS NOT NULL AND @t NOT LIKE '%''CLAIM''%', "ALTER TABLE hrms_pay_run_lines MODIFY COLUMN source ENUM('STRUCTURE','STATUTORY','ONE_TIME','ARREARS','TDS','ATTENDANCE','SETTLEMENT','CLAIM') NOT NULL DEFAULT 'STRUCTURE'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @t = (SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_tax_files' AND COLUMN_NAME = 'purpose');
+SET @sql = IF(@t IS NOT NULL AND @t NOT LIKE '%''CLAIM_BILL''%', "ALTER TABLE hrms_tax_files MODIFY COLUMN purpose ENUM('PROOF','PART_A','PART_B','CLAIM_BILL') NOT NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;

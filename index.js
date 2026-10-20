@@ -36,6 +36,10 @@ if (!process.env.JWT_SECRET) {
   process.exit(1);
 }
 const app = express();
+// req.ip is the CLIENT's address: Render puts exactly one proxy in front, so trust one hop of
+// X-Forwarded-For. Never `true` — that would let any client choose its own address (spoofing every
+// per-address rate limit: login, iclock, the punch API). Locally there is no proxy and no header.
+app.set("trust proxy", 1);
 
 // One request must not take the server down, and a server that goes down must say why
 // (core/utils/processGuard.js): requests in flight, slow requests, event-loop stalls, memory, at most one
@@ -48,6 +52,10 @@ app.use(guard.track);
 // plain text — so this comes BEFORE the JSON / form parsers; the router reads its own body. A device is
 // known only by its registered serial (apps/cf_hrms/routes/iclock.js).
 app.use("/iclock", iclockRoutes);
+// Punches from other devices and middleware, by a per-company API key: BEFORE the 50 MB JSON parser (the
+// router has its own 2 MB one, run after its rate limits and key check) and before appContext, which would
+// read "integrations" as a company (apps/cf_hrms/routes/integrations.js).
+app.use("/api/integrations", attendanceIntegrationRoutes);
 
 // Increase payload size limit for audio uploads (50MB)
 app.use(express.json({ limit: "50mb" }));
@@ -177,9 +185,7 @@ app.get("/health", async (req, res) => {
 // API Routes
 // =====================
 app.use("/api/public", publicLimiter, publicApiRoute);
-// Punches from other devices and middleware, by a per-company API key (no company slug in the path, so
-// before appContext, which would read "integrations" as a company). Rate-limited inside.
-app.use("/api/integrations", attendanceIntegrationRoutes);
+// (/api/integrations is mounted at the top, before the body parsers.)
 app.use("/api", appContext);
 
 // Company-level auth (no app slug required) — must be before the app-scoped routes

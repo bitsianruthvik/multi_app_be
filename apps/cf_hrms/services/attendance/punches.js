@@ -8,10 +8,15 @@
  *     punch with no device names the employee by code. No mapping -> employee_id NULL: the
  *     UNMAPPED QUEUE. Adding the mapping attaches those punches and processes their days.
  *   - Nothing from a device can do more than add punches: no edit, no delete, no command.
- *   - Each batch writes one audit row, and its days are processed (process.js) at once.
+ *   - Each batch writes one audit row, and its days are processed (process.js) at once — or, for
+ *     the device push, the API and a file (`process: false`), AFTER the punches commit
+ *     (processAfterCommit): a processing error never fails the device or loses a punch; the
+ *     days are then marked (a RETRY run) for the nightly pass, which processes them again.
  */
 import crypto from 'crypto';
 import { HrmsError, invalid, notFound, conflict } from '../../lib/errors.js';
+import { pool, withTransaction } from '../../lib/db.js';
+import { logger } from '../../../../core/utils/logger.js';
 import { audit } from '../peopleService.js';
 import { addDays } from '../leave/days.js';
 import { normWall, utcNow, wall, day, nowIn } from './time.js';
@@ -20,6 +25,8 @@ import { settingsOf, ipAllowed, metresBetween } from './settings.js';
 export const METHODS = ['FINGER', 'FACE', 'CARD', 'PASSWORD', 'PALM', 'WEB', 'MOBILE', 'IMPORT', 'API', 'OTHER'];
 export const DIRECTIONS = ['IN', 'OUT', 'UNKNOWN'];
 export const MAX_BATCH = 5000;
+
+const maskSerialText = (s) => { const t = String(s); return t.length <= 4 ? '••••' : `${'•'.repeat(Math.min(8, t.length - 4))}${t.slice(-4)}`; };
 
 export const newBatchId = (source) => `${source}-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
 
@@ -34,6 +41,8 @@ export async function mappingOf(db, companyId) {
  * @param c        { companyId, userId | null }
  * @param punches  [{ deviceUserId, at, direction?, method?, raw?, employeeId?, lat?, lng?, ip? }]
  * @param opts     { deviceId, timezone, source: ADMS | API | IMPORT | WEB, batchId, process: true }
+ *                 process false: the days are NOT processed here; `toProcess` (not enumerable) holds the
+ *                 stored punches for processAfterCommit. At most MAX_BATCH punches a call (callers slice).
  * @returns { received, inserted, duplicates, unmapped, rejected: [{ index, why }], processed }
  */
 export async function ingestPunches(conn, c, punches, { deviceId = null, timezone = 'Asia/Kolkata', source, batchId = newBatchId(source), process = true, requestId = null } = {}) {
@@ -79,8 +88,72 @@ export async function ingestPunches(conn, c, punches, { deviceId = null, timezon
   await audit(conn, c, 'hrms_attendance_punches', deviceId ?? 0, 'IMPORT', null, {
     source, batchId, received: report.received, inserted: report.inserted, duplicates: report.duplicates, unmapped: report.unmapped, rejected: report.rejected.length,
   }, requestId);
-  if (process) report.processed = await processPunchDays(conn, c, mine.filter((r) => r.employee_id != null));
+  const mapped = mine.filter((r) => r.employee_id != null);
+  if (process) report.processed = await processPunchDays(conn, c, mapped);
+  else Object.defineProperty(report, 'toProcess', { value: mapped, enumerable: false });
   return report;
+}
+
+/** For a test only: { failProcessing: true } makes processAfterCommit's processing throw. */
+export const TEST_HOOKS = { failProcessing: false };
+
+/**
+ * After the punches COMMITTED: process their days in a transaction of its own. An error is
+ * logged and the dates are marked for the nightly pass (a RETRY run, retryPending); it is never
+ * thrown — the punches are stored and the device / caller is told so. Re-running is safe
+ * (processRange is idempotent).
+ * @returns the processing report, or { failed: true, retryRunId }
+ */
+export async function processAfterCommit(c, rows, { what = 'punches' } = {}) {
+  if (!rows?.length) return null;
+  try {
+    return await withTransaction(async (conn) => {
+      if (TEST_HOOKS.failProcessing) throw new Error('processing failed (test hook)');
+      return processPunchDays(conn, c, rows);
+    });
+  } catch (err) {
+    const dates = rows.map((r) => wall(r.punched_at).slice(0, 10)).sort();
+    const from = addDays(dates[0], -1);
+    const to = dates[dates.length - 1];
+    logger.error({ err: err.message, companyId: c.companyId, what, from, to, punches: rows.length }, '[cf_hrms] attendance: punches stored, processing their days failed; marked for the nightly pass');
+    try {
+      const ids = [...new Set(rows.map((r) => r.employee_id))];
+      const retryRunId = await withTransaction(async (conn) => {
+        const [ins] = await conn.query(
+          "INSERT INTO hrms_attendance_runs (company_id, kind, from_date, to_date, started_at, note, created_by) VALUES (?, 'RETRY', ?, ?, ?, ?, NULL)",
+          [c.companyId, from, to, utcNow(), `${what}: processing failed (${String(err.message).slice(0, 150)}); people ${JSON.stringify(ids).slice(0, 300)}`]);
+        return ins.insertId;
+      });
+      return { failed: true, retryRunId };
+    } catch (err2) {
+      logger.error({ err: err2.message, companyId: c.companyId, from, to }, '[cf_hrms] attendance: could not mark the days for the nightly pass either');
+      return { failed: true, retryRunId: null };
+    }
+  }
+}
+
+/**
+ * The nightly pass (and a test): process every RETRY run of a company not yet finished, each in
+ * its own transaction; a run that fails again stays for the next pass.
+ */
+export async function retryPending(companyId) {
+  const [runs] = await pool.query(
+    "SELECT id, from_date, to_date FROM hrms_attendance_runs WHERE company_id = ? AND kind = 'RETRY' AND finished_at IS NULL AND deleted_at IS NULL ORDER BY id LIMIT 20", [companyId]);
+  const done = [];
+  for (const r of runs) {
+    try {
+      const out = await withTransaction(async (conn) => {
+        const { processRange } = await import('./process.js');
+        const rep = await processRange(conn, { companyId, userId: null }, { from: day(r.from_date), to: day(r.to_date), kind: 'BATCH', note: `retry of run ${r.id}` });
+        await conn.query('UPDATE hrms_attendance_runs SET finished_at = ?, days_written = ? WHERE company_id = ? AND id = ?', [utcNow(), rep.daysWritten, companyId, r.id]);
+        return rep;
+      });
+      done.push({ runId: r.id, days: out.daysWritten });
+    } catch (err) {
+      logger.warn({ err: err.message, companyId, runId: r.id }, '[cf_hrms] attendance: a retry failed again; the next pass tries again');
+    }
+  }
+  return done;
 }
 
 /** Process the days some punches fall on (and the day before, for a night shift that ended on them). */
@@ -184,8 +257,8 @@ export async function autoMap(conn, c, requestId = null) {
   return { made: made.length, skipped, mappings: made };
 }
 
-/** GET /attendance/unmapped — the queue: one row per (device, user number). */
-export async function unmappedQueue(db, c) {
+/** GET /attendance/unmapped — the queue: one row per (device, user number). canEdit false: serials masked. */
+export async function unmappedQueue(db, c, { canEdit = true } = {}) {
   const [rows] = await db.query(
     `SELECT p.device_id, p.device_user_id, COUNT(*) AS n, MIN(p.punched_at) AS first_at, MAX(p.punched_at) AS last_at, d.name AS device_name, d.serial_number
        FROM hrms_attendance_punches p LEFT JOIN hrms_attendance_devices d ON d.company_id = p.company_id AND d.id = p.device_id
@@ -193,7 +266,7 @@ export async function unmappedQueue(db, c) {
       GROUP BY p.device_id, p.device_user_id, d.name, d.serial_number ORDER BY last_at DESC LIMIT 500`, [c.companyId]);
   return {
     items: rows.map((r) => ({
-      deviceId: r.device_id, deviceName: r.device_name ?? 'No device', serialNumber: r.serial_number ?? null, deviceUserId: r.device_user_id,
+      deviceId: r.device_id, deviceName: r.device_name ?? 'No device', serialNumber: r.serial_number == null ? null : (canEdit ? r.serial_number : maskSerialText(r.serial_number)), deviceUserId: r.device_user_id,
       punches: Number(r.n), firstAt: wall(r.first_at), lastAt: wall(r.last_at),
     })),
   };
@@ -232,5 +305,5 @@ export async function webPunch(conn, c, employeeId, body = {}, ip = null) {
   return { punch: { at, direction }, report };
 }
 
-export default { ingestPunches, putMapping, autoMap, listMappings, unmappedQueue, webPunch, defaultUserId, mappingOf, newBatchId, processPunchDays };
+export default { ingestPunches, processAfterCommit, retryPending, putMapping, autoMap, listMappings, unmappedQueue, webPunch, defaultUserId, mappingOf, newBatchId, processPunchDays };
 export { day };

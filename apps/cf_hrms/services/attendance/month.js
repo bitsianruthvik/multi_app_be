@@ -66,7 +66,8 @@ async function compute(db, companyId, month, { employeeIds = null } = {}) {
   const to = monthEnd(month);
   const settings = await settingsOf(db, companyId);
   const today = nowIn(settings.defaultTimezone).slice(0, 10);
-  const { people } = await loadInputs(db, companyId, { from, to, employeeIds, on: today < to ? today : to });
+  // The summary reads the stored days: the people and their policy are enough (no punches, no leave).
+  const { people } = await loadInputs(db, companyId, { from, to, employeeIds, on: today < to ? today : to, summaryOnly: true });
   const ids = people.map((p) => p.employee.id);
   const base = { month, from, to, calendarDays: daysInMonth(month), live: Boolean(settings.liveFrom && settings.liveFrom <= to), liveFrom: settings.liveFrom };
   if (!ids.length) return { ...base, people: [], totals: { people: 0, present: 0, absentLop: 0, lopDays: 0, overtimeMinutes: 0, penaltyAmount: 0 } };
@@ -84,9 +85,13 @@ async function compute(db, companyId, month, { employeeIds = null } = {}) {
   const [policies] = await db.query('SELECT id, rules_json FROM hrms_attendance_policies WHERE company_id = ?', [companyId]);
   const rulesOf = new Map(policies.map((p) => [p.id, json(p.rules_json) ?? {}]));
   const totals = { people: 0, present: 0, absentLop: 0, lopDays: 0, overtimeMinutes: 0, penaltyAmount: 0 };
+  // Grouped once by person (a filter per person over every row was people × rows).
+  const group = (rows) => { const m = new Map(); for (const r of rows) { const l = m.get(r.employee_id); if (l) l.push(r); else m.set(r.employee_id, [r]); } return m; };
+  const recordsBy = group(records);
+  const penaltiesBy = group(penalties);
   const out = people.map((person) => {
     const id = person.employee.id;
-    const mine = records.filter((r) => r.employee_id === id && (!person.employee.joinDate || day(r.attendance_date) >= person.employee.joinDate) && (!person.employee.exitDate || day(r.attendance_date) <= person.employee.exitDate));
+    const mine = (recordsBy.get(id) ?? []).filter((r) => (!person.employee.joinDate || day(r.attendance_date) >= person.employee.joinDate) && (!person.employee.exitDate || day(r.attendance_date) <= person.employee.exitDate));
     const p = {
       employeeId: id, employeeCode: person.employee.code, name: person.employee.name,
       daysInEmployment: employedDays(from, to, person.employee.joinDate, person.employee.exitDate),
@@ -121,7 +126,7 @@ async function compute(db, companyId, month, { employeeIds = null } = {}) {
         if (t.is_paid) p.leave.paid += lv; else p.leave.unpaid += lv;
       }
     }
-    for (const x of penalties.filter((q) => q.employee_id === id)) {
+    for (const x of penaltiesBy.get(id) ?? []) {
       if (x.action === 'LEAVE') p.penalties.leaveDays += Number(x.quantity);
       else if (x.action === 'LOP') p.penalties.lopDays += Number(x.quantity);
       else if (x.action === 'AMOUNT') p.penalties.amount += Number(x.amount);

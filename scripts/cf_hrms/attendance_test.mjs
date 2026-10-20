@@ -28,6 +28,9 @@
  * rolled back at the end. Local only. Uses September 2026 (a past month) and "live from" 2026-09-01
  * inside the transaction, so a local demo in October does not get in the way.
  */
+import fs from 'fs';
+import http from 'http';
+import { PassThrough } from 'stream';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import mysql from 'mysql2/promise';
@@ -36,7 +39,7 @@ import { pool } from '../../db.js';
 import { signToken } from '../../core/utils/jwt.js';
 import { appContext } from '../../core/middleware/appContext.js';
 import hrmsApp from '../../apps/cf_hrms/app.js';
-import iclockRoutes from '../../apps/cf_hrms/routes/iclock.js';
+import iclockRoutes, { readCappedBody } from '../../apps/cf_hrms/routes/iclock.js';
 import integrationRoutes from '../../apps/cf_hrms/routes/integrations.js';
 import { forgetAccess } from '../../apps/cf_hrms/lib/accessContext.js';
 import { hrmsAppOf } from '../../apps/cf_hrms/services/accessGrants.js';
@@ -53,7 +56,8 @@ import * as PEN from '../../apps/cf_hrms/services/attendance/penalties.js';
 import * as PUN from '../../apps/cf_hrms/services/attendance/punches.js';
 import { attendanceMonth } from '../../apps/cf_hrms/services/attendance/month.js';
 import { schemaSteps, createStatements } from '../../apps/cf_hrms/scripts/apply-attendance-schema.mjs';
-import { simulate } from './sim-iclock.mjs';
+import { simulate, talk } from './sim-iclock.mjs';
+import { day as dayOf, serverToday } from '../../apps/cf_hrms/services/attendance/time.js';
 
 const slug = (process.argv.find((a) => a.startsWith('--company=')) || '--company=karni').split('=')[1];
 const VERBOSE = process.argv.includes('--verbose');
@@ -74,7 +78,7 @@ const t0 = Date.now();
 
 const TABLES = ['hrms_attendance_records', 'hrms_attendance_regularizations', 'hrms_attendance_punches', 'hrms_attendance_devices', 'hrms_attendance_device_users',
   'hrms_attendance_api_keys', 'hrms_attendance_settings', 'hrms_attendance_policies', 'hrms_attendance_policy_assignments', 'hrms_attendance_penalties',
-  'hrms_attendance_months', 'hrms_attendance_runs', 'hrms_leave_requests', 'hrms_leave_types', 'hrms_leave_policies', 'hrms_audit_log', 'hrms_employees',
+  'hrms_attendance_months', 'hrms_attendance_runs', 'hrms_attendance_device_events', 'hrms_leave_requests', 'hrms_leave_types', 'hrms_leave_policies', 'hrms_audit_log', 'hrms_employees',
   'hrms_positions', 'hrms_work_assignments', 'hrms_shifts', 'hrms_shift_days', 'hrms_holidays', 'users', 'app_user_access'];
 const dbCfg = { host: process.env.DB_HOST ?? 'localhost', user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: process.env.DB_NAME, port: Number(process.env.DB_PORT) || 3306 };
 async function worldCount() {
@@ -93,7 +97,7 @@ section('[0] The schema');
   const conn = await mysql.createConnection(dbCfg);
   try {
     ok((await schemaSteps(conn)).length === 0, 'apply-attendance-schema: nothing left to do here (idempotent)');
-    ok(createStatements().length === 10, 'init.sql §28 holds the ten new tables, read by the script', `${createStatements().length}`);
+    ok(createStatements().length === 11, 'init.sql §28 holds the eleven new tables (device events added 2026-10-20), read by the script', `${createStatements().length}`);
     const [[src]] = await conn.query("SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_attendance_records' AND COLUMN_NAME = 'source'");
     ok(/REGULARIZATION/.test(src.t), 'attendance rows know the source REGULARIZATION');
   } finally { await conn.end(); }
@@ -475,11 +479,13 @@ try {
     }
   }
   forgetAccess();
+  // As multi_app_be/index.js: one proxy hop trusted; the device push and the punch API BEFORE the big JSON parser.
   server = express();
+  server.set('trust proxy', 1);
   server.use('/iclock', iclockRoutes);
+  server.use('/api/integrations', integrationRoutes);
   server.use(express.json({ limit: '20mb' }));
   server.use(cookieParser());
-  server.use('/api/integrations', integrationRoutes);
   server.use('/api', appContext);
   hrmsApp.register(server);
   const listener = await new Promise((resolve) => { const l = server.listen(0, '127.0.0.1', () => resolve(l)); });
@@ -646,6 +652,176 @@ try {
     const near = await call(U.E1, 'POST', '/user/me/attendance/punch', { direction: 'IN', lat: 17.3851, lng: 78.4868 });
     ok(near.status === 200 && near.json.punch.direction === 'IN' && (await one("SELECT method, source FROM hrms_attendance_punches WHERE employee_id = ? AND source = 'WEB'", [E.e1]))?.method === 'WEB', 'inside: the punch is stored as a WEB punch', J(near.json));
     ok((await call(U.HR, 'PUT', '/attendance/settings', { webPunch: { ipAllowList: ['not an ip'] } })).status === 422, 'a bad address rule is refused');
+  }
+
+  /* ══ 7b. hardening (2026-10-20) ═════════════════════════════════════════ */
+  section('[7b] Hardening: the device door, forged punches, own days, big batches, processing after commit');
+  {
+    // A raw HTTP request that can declare a body it never sends: a server that tried to read it would hang.
+    const raw = (method, pathQ, { headers = {}, write = [], end = true, waitMs = 4000 } = {}) => new Promise((resolve) => {
+      const u = new URL(`${root}${pathQ}`);
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+      const r = http.request({ host: u.hostname, port: u.port, path: `${u.pathname}${u.search}`, method, headers }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (ch) => { body += ch; });
+        res.on('end', () => { done({ status: res.statusCode, text: body }); r.destroy(); });
+      });
+      r.on('error', (e) => done({ status: 0, error: e.code ?? e.message }));
+      for (const w of write) r.write(w);
+      if (end) r.end();
+      setTimeout(() => { done({ status: -1, error: 'no answer: the server waited for the body' }); r.destroy(); }, waitMs);
+    });
+    const SN = `${TAG}SN2`;
+    const made = await call(U.HR, 'POST', '/attendance/devices', { name: 'Gate 2', serialNumber: SN });
+    const DEV2 = made.json.device.id;
+    const countPunches = async () => Number((await one('SELECT COUNT(*) AS n FROM hrms_attendance_punches WHERE device_id = ?', [DEV2])).n);
+
+    // 1. Oversized: refused (413) from the declared length, before a byte of it is read.
+    const big = await raw('POST', `/iclock/cdata?SN=${SN}&table=ATTLOG`, { headers: { 'Content-Type': 'text/plain', 'Content-Length': String(5 * 1024 * 1024) }, write: ['7001\t2026-09-25 09:00:00\t0\t1'], end: false });
+    ok(big.status === 413 && await countPunches() === 0, 'a body declared over 1 MB is refused with 413 before it is read (the server never waits for it)', J(big));
+    // …and a body with no declared length that grows past the cap is cut off (the reader, on a stream).
+    {
+      const sent = {};
+      const res = { set: () => res, status: (n) => { sent.status = n; return res; }, type: () => res, send: (b) => { sent.body = b; return res; } };
+      const fake = new PassThrough();
+      fake.headers = {};
+      const reading = readCappedBody(fake, res, 1024);
+      fake.write(Buffer.alloc(600, 65));
+      fake.write(Buffer.alloc(600, 65));
+      ok(await reading === null && sent.status === 413, 'a body that grows past the cap while it is read is cut off with 413', J(sent));
+      const fake2 = new PassThrough();
+      fake2.headers = {};
+      const r2 = readCappedBody(fake2, res, 1024);
+      fake2.end('101\t2026-09-25 09:00:00');
+      ok(await r2 === '101\t2026-09-25 09:00:00', 'a body under the cap is read whole');
+    }
+
+    // 2. An unknown serial: 403, and its body is never read.
+    const unk = await raw('POST', `/iclock/cdata?SN=${TAG}NOPE2&table=ATTLOG`, { headers: { 'Content-Length': String(5 * 1024 * 1024) }, write: ['x'], end: false });
+    ok(unk.status === 403 && unk.text === 'Unknown device', 'an unknown serial gets 403 at once, its declared 5 MB body never read', J(unk));
+
+    // 3. Allowed addresses: enforced before the body, noted once an hour on the Devices screen.
+    ok((await call(U.HR, 'PUT', `/attendance/devices/${DEV2}`, { allowedIps: ['10.20.30.0/24', 'not-an-ip'] })).status === 422, 'a bad allowed address is refused in words');
+    const setIps = await call(U.HR, 'PUT', `/attendance/devices/${DEV2}`, { allowedIps: ['10.20.30.0/24'] });
+    ok(setIps.status === 200 && J(setIps.json.device.allowedIps) === J(['10.20.30.0/24']), 'HR sets the device’s allowed addresses', J(setIps.json?.device?.allowedIps));
+    const outside = await raw('POST', `/iclock/cdata?SN=${SN}&table=ATTLOG`, { headers: { 'Content-Length': String(5 * 1024 * 1024) }, write: ['x'], end: false });
+    const outside2 = await talk(root, 'GET', `/iclock/cdata?SN=${SN}&options=all`);
+    const refusedRows = await q("SELECT * FROM hrms_attendance_device_events WHERE device_id = ? AND kind = 'IP_REFUSED'", [DEV2]);
+    ok(outside.status === 403 && outside.text === 'Address not allowed' && outside2.status === 403 && refusedRows.length === 1 && refusedRows[0].ip === '127.0.0.1' && refusedRows[0].company_id === COMPANY,
+      'from an address outside them: 403 before the body is read; noted once (IP_REFUSED), not once per request', J([outside, outside2.status, refusedRows.length]));
+    // req.ip is the client's through ONE proxy hop (index.js: trust proxy 1): the right-most forwarded address, never one a client put first.
+    const viaProxy = await fetch(`${root}/iclock/cdata?SN=${SN}&options=all`, { headers: { 'X-Forwarded-For': '10.20.30.7' } });
+    const spoofed = await fetch(`${root}/iclock/cdata?SN=${SN}&options=all`, { headers: { 'X-Forwarded-For': '10.20.30.7, 203.0.113.9' } });
+    ok(viaProxy.status === 200 && spoofed.status === 403, 'behind one proxy hop the device’s own address is used; an address a client puts first in X-Forwarded-For is not believed', J([viaProxy.status, spoofed.status]));
+    ok(/app\.set\("trust proxy", 1\)/.test(fs.readFileSync(new URL('../../index.js', import.meta.url), 'utf8')), 'the server trusts exactly one proxy hop (index.js), never `true`');
+    await call(U.HR, 'PUT', `/attendance/devices/${DEV2}`, { allowedIps: [] });
+
+    // 4. A new address: one IP_CHANGED row, shown on the Devices screen.
+    await db.query("UPDATE hrms_attendance_devices SET last_ip = '10.1.1.1' WHERE id = ?", [DEV2]);
+    await talk(root, 'GET', `/iclock/cdata?SN=${SN}&options=all`);
+    await talk(root, 'GET', `/iclock/getrequest?SN=${SN}`);
+    const changed = await q("SELECT * FROM hrms_attendance_device_events WHERE device_id = ? AND kind = 'IP_CHANGED'", [DEV2]);
+    const devList = await call(U.HR, 'GET', '/attendance/devices');
+    const shown = devList.json?.devices?.find((d) => d.id === DEV2);
+    ok(changed.length === 1 && changed[0].previous_ip === '10.1.1.1' && changed[0].ip === '127.0.0.1' && shown?.lastIp === '127.0.0.1'
+      && shown.events.some((e) => e.kind === 'IP_CHANGED' && e.previousIp === '10.1.1.1') && devList.json.alerts >= 2,
+    'a device talking from a new address leaves one IP_CHANGED row (not one per request), listed with the device', J([changed.length, shown?.events]));
+
+    // 5. The cursor only moves forward.
+    const stampOf = async () => (await one('SELECT attlog_stamp FROM hrms_attendance_devices WHERE id = ?', [DEV2])).attlog_stamp;
+    await talk(root, 'POST', `/iclock/cdata?SN=${SN}&table=ATTLOG&Stamp=5000`, '');
+    const s1 = await stampOf();
+    await talk(root, 'POST', `/iclock/cdata?SN=${SN}&table=ATTLOG&Stamp=10`, '');
+    await talk(root, 'POST', `/iclock/cdata?SN=${SN}&table=ATTLOG&Stamp=None`, '');
+    const s2 = await stampOf();
+    await talk(root, 'POST', `/iclock/cdata?SN=${SN}&table=ATTLOG&Stamp=6000`, '');
+    const hs = await talk(root, 'GET', `/iclock/cdata?SN=${SN}&options=all`);
+    ok(s1 === '5000' && s2 === '5000' && await stampOf() === '6000' && /\nATTLOGStamp=6000\n/.test(hs.text), 'Stamp= never moves the stored cursor backwards (10 and "None" after 5000 are ignored; 6000 moves it)', J([s1, s2]));
+
+    // 6. A view-only login sees the serial masked.
+    const dhList = await call(U.DH, 'GET', '/attendance/devices');
+    const dhDev = dhList.json?.devices?.find((d) => d.id === DEV2);
+    ok(dhList.status === 200 && dhDev && dhDev.serialNumber !== SN && dhDev.serialNumber.endsWith(SN.slice(-4)) && /^•+/.test(dhDev.serialNumber) && dhDev.serialMasked && dhDev.allowedIps === null
+      && shown.serialNumber === SN && !shown.serialMasked, 'without attendance edit a serial shows as ••••+last 4 (and no allow-list); HR sees it whole', J([dhDev?.serialNumber, shown?.serialNumber]));
+    const dhQueue = await call(U.DH, 'GET', '/attendance/unmapped');
+    ok(dhQueue.status === 200 && !J(dhQueue.json).includes(`${TAG}SN1`), 'the unmapped queue masks serials for a view-only login too');
+
+    // 7. Nobody sets their own day: by hand, or by a days file.
+    const HRSELF = await login('HRSELF', roleByKey.HR_MANAGER, E.e4);
+    const own = await call(HRSELF, 'PUT', '/attendance/days', { employeeId: E.e4, date: '2026-09-10', status: 'PRESENT', note: 'I was here.' });
+    const other4 = await call(HRSELF, 'PUT', '/attendance/days', { employeeId: E.e5, date: '2026-09-10', status: 'PRESENT', note: 'Register says present.' });
+    ok(own.status === 403 && own.json?.code === 'OWN_DAY' && /your own attendance/.test(own.json.message) && other4.status === 200, 'HR cannot set their own day by hand (someone else’s, yes)', J([own.json, other4.status]));
+    const ownBook = new ExcelJS.Workbook();
+    const ows = ownBook.addWorksheet('Days');
+    ows.addRow(['Employee code', 'Date', 'Status']);
+    ows.addRow([await code(E.e4), '2026-09-11', 'P']);
+    const ownBody = { fileName: 'days.xlsx', contentBase64: Buffer.from(await ownBook.xlsx.writeBuffer()).toString('base64') };
+    const ownPre = await call(HRSELF, 'POST', '/attendance/imports/days/preview', ownBody);
+    const ownApply = await call(HRSELF, 'POST', '/attendance/imports/days/apply', { ...ownBody, skipProblemRows: true });
+    ok(ownPre.status === 200 && ownPre.json.summary.problems === 1 && /your own attendance/.test(ownPre.json.rows[0].problems[0]) && ownApply.json?.written === 0 && (await recOf(E.e4, '2026-09-11'))?.source !== 'IMPORT',
+      'nor by a days file: the row is a problem and is not written', J([ownPre.json?.rows, ownApply.json]));
+
+    // 8. Days file: the same person and date twice.
+    const dupBook = new ExcelJS.Workbook();
+    const dws = dupBook.addWorksheet('Days');
+    dws.addRow(['Employee code', 'Date', 'Status']);
+    dws.addRow([await code(E.e9), '2026-09-29', 'P']);
+    dws.addRow([await code(E.e9), '2026-09-29', 'A']);
+    const dupBody = { fileName: 'days.xlsx', contentBase64: Buffer.from(await dupBook.xlsx.writeBuffer()).toString('base64') };
+    const dupPre = await call(U.HR, 'POST', '/attendance/imports/days/preview', dupBody);
+    const dupApply = await call(U.HR, 'POST', '/attendance/imports/days/apply', dupBody);
+    const dupSkip = await call(U.HR, 'POST', '/attendance/imports/days/apply', { ...dupBody, skipProblemRows: true });
+    const dupRows = await q('SELECT id FROM hrms_attendance_records WHERE employee_id = ? AND attendance_date = ? AND deleted_at IS NULL', [E.e9, '2026-09-29']);
+    ok(dupPre.json?.summary?.problems === 1 && /Row 2 already has this person and date/.test(dupPre.json.rows[1].problems[0]) && dupApply.json?.code === 'HAS_PROBLEMS'
+      && dupSkip.status === 200 && dupSkip.json.written === 1 && dupRows.length === 1 && (await recOf(E.e9, '2026-09-29')).status === 'PRESENT',
+    'a days file with the same person and date twice: the second row is a problem (no crash, one row)', J([dupPre.json?.rows, dupSkip.json]));
+
+    // 9. A 12,000-line push (a device back after a week offline): accepted, stored in slices.
+    const lines = [];
+    for (let u = 0; u < 120; u += 1) for (let k = 0; k < 100; k += 1) lines.push(`${TAG.slice(-3)}${u}\t2026-09-${String(1 + (k % 28)).padStart(2, '0')} ${String(6 + Math.floor(k / 28)).padStart(2, '0')}:${String(u % 60).padStart(2, '0')}:00\t0\t1\t0\t0\t0`);
+    const bulk = await talk(root, 'POST', `/iclock/cdata?SN=${SN}&table=ATTLOG&Stamp=7000`, lines.join('\n'));
+    const slices = await q("SELECT after_json FROM hrms_audit_log WHERE entity_type = 'hrms_attendance_punches' AND entity_id = ? AND action = 'IMPORT'", [DEV2]);
+    ok(bulk.status === 200 && bulk.text === 'OK: 12000' && await countPunches() === 12000 && slices.length === 3, 'a 12,000-line ATTLOG push is answered "OK: 12000" and stored in 3 slices of at most 5,000 — never TOO_MANY', J([bulk, slices.length]));
+
+    // 10. The punch API: at most 5,000 in the whole call; its own small body limit; the key before the body.
+    const key2 = await call(O, 'POST', '/attendance/api-keys', { name: `${TAG} cap` });
+    const api2 = (body, rawBody = null) => fetch(`${root}/api/integrations/attendance/punches`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key2.json.secret}` }, body: rawBody ?? JSON.stringify(body) })
+      .then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }));
+    const apiCount = async () => Number((await one("SELECT COUNT(*) AS n FROM hrms_attendance_punches WHERE company_id = ? AND source = 'API'", [COMPANY])).n);
+    const before5k = await apiCount();
+    const tooMany = await api2({ punches: Array.from({ length: 5001 }, (_, i) => ({ employeeCode: `CAP${i}`, time: '2026-09-25 09:00:00' })) });
+    const tooBig = await api2(null, JSON.stringify({ punches: [], pad: 'x'.repeat(Math.round(2.2 * 1024 * 1024)) }));
+    const badKeyBig = await raw('POST', '/api/integrations/attendance/punches', { headers: { 'Content-Type': 'application/json', Authorization: 'Bearer hrk_00000000_wrongwrongwrongwrongwrong', 'Content-Length': String(3 * 1024 * 1024) }, write: ['{"punches":['], end: false });
+    ok(tooMany.status === 413 && tooMany.json?.code === 'TOO_MANY' && /At most 5000 punches in one call/.test(tooMany.json.message) && tooBig.status === 413 && tooBig.json?.code === 'TOO_LARGE' && badKeyBig.status === 401
+      && await apiCount() === before5k,
+    'the punch API: 5,001 punches in one call are refused whole (413); a body over 2 MB is 413; a wrong key is 401 before its body is read', J([tooMany, tooBig.status, badKeyBig]));
+    const ipApi = await api2({ punches: [{ employeeCode: await code(E.e9), time: '2026-09-27 09:00:00', direction: 'IN' }] });
+    const ipRow = await one("SELECT ip FROM hrms_attendance_punches WHERE company_id = ? AND source = 'API' AND punched_at = '2026-09-27 09:00:00' AND employee_id = ?", [COMPANY, E.e9]);
+    const admsIp = await one('SELECT ip FROM hrms_attendance_punches WHERE device_id = ? LIMIT 1', [DEV2]);
+    ok(ipApi.status === 200 && ipRow?.ip === '127.0.0.1' && admsIp?.ip === '127.0.0.1', 'every API and ADMS punch keeps the address it came from', J([ipRow, admsIp]));
+
+    // 11. Processing fails after the punches are stored: the punches stay, the device is told OK, the days are retried.
+    const before26 = (await recOf(E.e9, '2026-09-26'))?.status ?? null;
+    PUN.TEST_HOOKS.failProcessing = true;
+    let failed;
+    try { failed = await talk(root, 'POST', `/iclock/cdata?SN=${SN}&table=ATTLOG&Stamp=8000`, '7001\t2026-09-26 09:00:00\t0\t1\t0\t0\t0\n7001\t2026-09-26 18:00:00\t1\t1\t0\t0\t0'); } finally { PUN.TEST_HOOKS.failProcessing = false; }
+    const kept = await q("SELECT id FROM hrms_attendance_punches WHERE device_id = ? AND device_user_id = '7001' AND punched_at >= '2026-09-26 00:00:00' AND punched_at < '2026-09-27 00:00:00'", [DEV2]);
+    const retry = await one("SELECT * FROM hrms_attendance_runs WHERE company_id = ? AND kind = 'RETRY' AND finished_at IS NULL ORDER BY id DESC LIMIT 1", [COMPANY]);
+    ok(failed.status === 200 && failed.text === 'OK: 2' && kept.length === 2 && before26 !== 'PRESENT' && (await recOf(E.e9, '2026-09-26'))?.status !== 'PRESENT'
+      && retry && dayOf(retry.from_date) === '2026-09-25' && dayOf(retry.to_date) === '2026-09-26',
+    'a processing error after the commit: the device still gets "OK: 2", both punches are kept, the days are marked for a retry', J([failed, kept.length, before26, retry && [dayOf(retry.from_date), dayOf(retry.to_date)]]));
+    const retried = await PUN.retryPending(COMPANY);
+    ok(retry && retried.some((r) => r.runId === retry.id) && (await recOf(E.e9, '2026-09-26'))?.status === 'PRESENT' && Boolean((await one('SELECT finished_at FROM hrms_attendance_runs WHERE id = ?', [retry.id])).finished_at),
+      'the retry (the nightly pass) processes the day: present; the retry run is finished', J(retried));
+    PUN.TEST_HOOKS.failProcessing = true;
+    let failedApi;
+    try { failedApi = await api2({ punches: [{ employeeCode: await code(E.e9), time: '2026-09-28 09:00:00', direction: 'IN' }] }); } finally { PUN.TEST_HOOKS.failProcessing = false; }
+    ok(failedApi.status === 200 && failedApi.json.inserted === 1 && failedApi.json.toProcess === undefined, 'the punch API too: stored and answered, the processing left to the retry', J(failedApi));
+
+    // 12. "Today" is the server's local date, never the UTC one (01:00 on 20 Oct in India is still 19 Oct in UTC).
+    ok(serverToday(new Date(2026, 9, 20, 1, 0, 0)) === '2026-10-20', 'today is the local date');
   }
 
   /* ══ 8. close, rights, scope, isolation ═════════════════════════════════ */

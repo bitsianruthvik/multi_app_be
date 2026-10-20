@@ -306,8 +306,10 @@ const byEmployee = (rows, key = 'employee_id') => { const m = new Map(); for (co
 /**
  * Everything about some people for [from, to]: seats, shifts, holidays, policies, leave,
  * permissions, on-duty, punches. A fixed number of queries.
+ * summaryOnly: just the people, their seat, shift and policy (the month summary) — no punches,
+ * leave, permissions or holidays are read.
  */
-export async function loadInputs(db, companyId, { from, to, employeeIds = null, on }) {
+export async function loadInputs(db, companyId, { from, to, employeeIds = null, on, summaryOnly = false }) {
   const params = [companyId, to, from];
   let where = "e.company_id = ? AND e.deleted_at IS NULL AND (e.date_of_joining IS NULL OR e.date_of_joining <= ?) AND (e.employment_status <> 'EXITED' OR e.exit_date >= ?)";
   if (employeeIds) {
@@ -319,6 +321,19 @@ export async function loadInputs(db, companyId, { from, to, employeeIds = null, 
   if (!ids.length) return { people: [] };
   const seats = await seatsOf(db, companyId, ids, on);
   const shiftIds = [...new Set([...seats.values()].map((s) => s.shift_id).filter(Boolean))];
+  if (summaryOnly) {
+    const [shifts, index] = await Promise.all([shiftsOf(db, companyId, shiftIds), loadAttendanceIndex(db, companyId)]);
+    const people = emps.map((e) => {
+      const seat = seats.get(e.id) ?? null;
+      const shift = seat?.shift_id ? (shifts.get(seat.shift_id) ?? null) : null;
+      const effective = resolveAttendance(index, seat ? { roleId: seat.role_id, locationId: seat.location_id, departmentId: seat.department_id } : {});
+      return {
+        employee: { id: e.id, code: e.employee_code, name: e.full_name, joinDate: day(e.date_of_joining), exitDate: day(e.exit_date) },
+        seat, shift, holidays: new Map(), effective, rules: effective.policy ? effective.policy.rules : { ...RULE_DEFAULTS }, leaves: [], regs: [], punches: [],
+      };
+    });
+    return { people, index };
+  }
   const fromWall = `${addDays(from, -1)} 00:00:00`;
   const toWall = `${addDays(to, 2)} 00:00:00`;
   const [shifts, index, [leaves], [regs], [punches]] = await Promise.all([

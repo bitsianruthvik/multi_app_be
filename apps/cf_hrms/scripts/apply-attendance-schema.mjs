@@ -6,12 +6,14 @@
  *   node apply-attendance-schema.mjs --apply
  *   node apply-attendance-schema.mjs --apply --target=prod
  *
- *   1. the ten new tables (devices, device users, punches, API keys, settings, policies,
- *      policy assignments, penalties, months, runs) — their CREATE statements are READ FROM
- *      init.sql §28, so there is one definition;
+ *   1. the eleven new tables (devices, device users, punches, API keys, settings, policies,
+ *      policy assignments, penalties, months, runs, device events) — their CREATE statements are
+ *      READ FROM init.sql §28, so there is one definition;
  *   2. hrms_attendance_records: source gains REGULARIZATION; the computed columns;
  *   3. hrms_attendance_regularizations: kind, person, date, permission minutes, approver, decision;
- *   4. hrms_leave_requests.raised_by_system; hrms_leave_policy_rules.min_present_days_for_credit.
+ *   4. hrms_leave_requests.raised_by_system; hrms_leave_policy_rules.min_present_days_for_credit;
+ *   5. (2026-10-20 hardening, init.sql §28f) hrms_attendance_device_events, a device's allowed
+ *      addresses (hrms_attendance_devices.allowed_ips_json), the punches index for "punches today".
  *
  * Every new column is NULL or defaults to "off", so the old backend keeps working. One change
  * per statement (TiDB). DDL commits by itself: every step is guarded, and a second run finds
@@ -79,6 +81,13 @@ export const COLUMNS = [
   ['hrms_attendance_penalties', 'deleted_at', 'DATETIME DEFAULT NULL', null],
   ['hrms_attendance_months', 'deleted_at', 'DATETIME DEFAULT NULL', null],
   ['hrms_attendance_runs', 'deleted_at', 'DATETIME DEFAULT NULL', null],
+  ['hrms_attendance_devices', 'allowed_ips_json', 'JSON NULL', 'last_ip'],
+];
+
+/** Indexes added after a table was made: [table, index, columns]. The same as init.sql §28b / §28f. */
+export const INDEXES = [
+  ['hrms_attendance_regularizations', 'idx_hreg_person_date', '(company_id, employee_id, attendance_date)'],
+  ['hrms_attendance_punches', 'idx_hapn_device_received', '(company_id, device_id, received_at)'],
 ];
 
 const SOURCE_ENUM = "ENUM('BIOMETRIC','MANUAL','IMPORT','SYSTEM','REGULARIZATION') NOT NULL DEFAULT 'MANUAL'";
@@ -104,8 +113,9 @@ export async function schemaSteps(conn) {
     if (!await table(conn, t)) continue; // made just now by its CREATE, which has the column
     if (!await column(conn, t, c)) steps.push({ what: `add ${t}.${c}`, sql: `ALTER TABLE ${t} ADD COLUMN ${c} ${def}${after ? ` AFTER ${after}` : ''}` });
   }
-  if (!await index(conn, 'hrms_attendance_regularizations', 'idx_hreg_person_date')) {
-    steps.push({ what: 'index hrms_attendance_regularizations (person, date)', sql: 'ALTER TABLE hrms_attendance_regularizations ADD KEY idx_hreg_person_date (company_id, employee_id, attendance_date)' });
+  for (const [t, i, cols] of INDEXES) {
+    if (!await table(conn, t)) continue; // made just now by its CREATE, which has the index
+    if (!await index(conn, t, i)) steps.push({ what: `index ${t} ${i}`, sql: `ALTER TABLE ${t} ADD KEY ${i} ${cols}` });
   }
   return steps;
 }

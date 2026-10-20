@@ -22,7 +22,7 @@ import { HrmsError, invalid, notFound, conflict } from '../../lib/errors.js';
 import { audit } from '../peopleService.js';
 import { raiseSystemRequest, cancelSystemRequest } from '../leave/requestService.js';
 import { leaveTypeNames, actionWords } from './policy.js';
-import { day, monthStart, monthEnd, monthWords } from './time.js';
+import { day, monthStart, monthEnd, monthWords, serverToday } from './time.js';
 import { spanText } from '../leave/days.js';
 
 const r2 = (n) => Math.round(Number(n) * 100) / 100;
@@ -85,12 +85,17 @@ export async function reconcilePenalties(conn, c, { people, months }) {
       [c.companyId, ids, months]),
     leaveTypeNames(conn, c.companyId),
   ]);
+  // Grouped once by person and month (a filter per person and month over every row was people × months × rows).
+  const marksBy = new Map();
+  for (const m of marks) { const d = day(m.attendance_date); const k = `${m.employee_id}|${d.slice(0, 7)}`; const l = marksBy.get(k); if (l) l.push(d); else marksBy.set(k, [d]); }
+  const existingBy = new Map();
+  for (const e of existing) { const k = `${e.employee_id}|${e.period_month}`; const l = existingBy.get(k); if (l) l.push(e); else existingBy.set(k, [e]); }
   for (const person of people) {
     const lm = person.rules?.lateMarks ?? null;
     for (const month of months) {
-      const dates = marks.filter((m) => m.employee_id === person.employee.id && day(m.attendance_date).startsWith(month)).map((m) => day(m.attendance_date));
+      const dates = marksBy.get(`${person.employee.id}|${month}`) ?? [];
       const want = lm ? lateMarkBlocks(dates, lm.count, month) : [];
-      const rows = existing.filter((e) => e.employee_id === person.employee.id && e.period_month === month);
+      const rows = existingBy.get(`${person.employee.id}|${month}`) ?? [];
       const byKey = new Map(rows.map((r) => [r.source_key, r]));
       for (const b of want) {
         const why = `${lm.count} late mark${lm.count === 1 ? '' : 's'} in ${monthWords(month)} (${b.dates.map((d) => spanText(d, d)).join(', ')})`;
@@ -159,7 +164,7 @@ export async function listPenalties(db, c, query = {}, scopeDeptIds = null, { em
   if (employeeIds) { if (!employeeIds.length) return { items: [] }; where.push('p.employee_id IN (?)'); params.push(employeeIds); }
   if (scopeDeptIds) {
     if (!scopeDeptIds.length) return { items: [] };
-    const on = new Date().toISOString().slice(0, 10);
+    const on = serverToday();
     where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, scopeDeptIds);
   }
   const [[rows], names] = await Promise.all([

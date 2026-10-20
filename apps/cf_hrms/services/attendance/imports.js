@@ -10,13 +10,17 @@
  *            Stored like any punch (source IMPORT), deduplicated, and the days processed.
  *   DAYS     Employee code | Date | Status (P · A · HD · L · WO · H, or the words) | In | Out | Note
  *            — written with source IMPORT: processing does not overwrite it (except to mark approved
- *            leave); a day HR set by hand or an approved correction is kept, and said.
+ *            leave); a day HR set by hand or an approved correction is kept, and said. The same
+ *            person and date twice is a problem on the second row; the login's own days are refused
+ *            (c.employeeId, from the route) — nobody records their own attendance.
+ *   A punch file is stored in slices of MAX_BATCH; its days are processed by the route AFTER the
+ *   commit (`toProcess`, not enumerable, for punches.processAfterCommit).
  */
 import ExcelJS from 'exceljs';
 import { invalid } from '../../lib/errors.js';
 import { audit } from '../peopleService.js';
 import { isDate } from '../leave/days.js';
-import { ingestPunches, newBatchId, processPunchDays } from './punches.js';
+import { ingestPunches, newBatchId, processPunchDays, MAX_BATCH } from './punches.js';
 import { settingsOf, closedMonths } from './settings.js';
 import { normWall, at, monthOf, utcNow, nowIn } from './time.js';
 
@@ -143,6 +147,7 @@ async function plan(db, c, kind, body) {
   const s = await settingsOf(db, c.companyId);
   const closed = await closedMonths(db, c.companyId);
   const today = nowIn(s.defaultTimezone).slice(0, 10);
+  const firstRowOf = new Map(); // 'employeeId|date' -> the first row with it (a days file)
   const items = rows.map(({ row, cells }) => {
     const problems = [];
     const code = get(cells, iCode);
@@ -165,7 +170,13 @@ async function plan(db, c, kind, body) {
       };
     }
     if (!emp) problems.push(code ? `No employee has the code ${code}.` : 'Give the employee code.');
+    if (emp && c.employeeId && emp.id === Number(c.employeeId)) problems.push('This is your own attendance. Someone else in HR records your days.');
     const d = dateOf(get(cells, iDate));
+    if (emp && d) {
+      const k = `${emp.id}|${d}`;
+      if (firstRowOf.has(k)) problems.push(`Row ${firstRowOf.get(k)} already has this person and date.`);
+      else firstRowOf.set(k, row);
+    }
     if (!d) problems.push('The date cannot be read (YYYY-MM-DD).');
     const status = STATUS_OF[get(cells, iStatus).toUpperCase()];
     if (!status) problems.push('Status is P, A, HD, L, WO or H.');
@@ -204,10 +215,16 @@ export async function applyImport(conn, c, kind, body = {}, requestId = null) {
     const groups = new Map();
     for (const g of good) { const k = g.punch.deviceId ?? 0; const l = groups.get(k) ?? []; l.push(g.punch); groups.set(k, l); }
     const total = { rows: good.length, inserted: 0, duplicates: 0, unmapped: 0, skipped: bad.length };
+    const toProcess = [];
     for (const [deviceId, list] of groups) {
-      const r = await ingestPunches(conn, c, list, { deviceId: deviceId || null, timezone: list[0].timezone, source: 'IMPORT', batchId: newBatchId('IMPORT'), requestId });
-      total.inserted += r.inserted; total.duplicates += r.duplicates; total.unmapped += r.unmapped;
+      for (let i = 0; i < list.length; i += MAX_BATCH) {
+        const slice = list.slice(i, i + MAX_BATCH);
+        const r = await ingestPunches(conn, c, slice, { deviceId: deviceId || null, timezone: slice[0].timezone, source: 'IMPORT', batchId: newBatchId('IMPORT'), requestId, process: false });
+        total.inserted += r.inserted; total.duplicates += r.duplicates; total.unmapped += r.unmapped;
+        toProcess.push(...r.toProcess);
+      }
     }
+    Object.defineProperty(total, 'toProcess', { value: toProcess, enumerable: false });
     return total;
   }
   // DAYS
@@ -228,8 +245,10 @@ export async function applyImport(conn, c, kind, body = {}, requestId = null) {
                           present_value = ?, leave_value = ?, absent_value = ?, status_reason = ?, source = 'IMPORT', processed_at = ? WHERE company_id = ? AND id = ?`,
       [d.status, d.inAt, d.outAt, worked, pv, lv, av, reason, processedAt, c.companyId, old.id]);
     } else {
-      await conn.query(`INSERT INTO hrms_attendance_records (company_id, employee_id, attendance_date, status, in_time, out_time, worked_minutes, present_value, leave_value, absent_value, status_reason, source, processed_at, created_by)
+      const [ins] = await conn.query(`INSERT INTO hrms_attendance_records (company_id, employee_id, attendance_date, status, in_time, out_time, worked_minutes, present_value, leave_value, absent_value, status_reason, source, processed_at, created_by)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IMPORT', ?, ?)`, [c.companyId, d.employeeId, d.date, d.status, d.inAt, d.outAt, worked, pv, lv, av, reason, processedAt, c.userId]);
+      // Known from now on: a second row for the same person and day (refused by plan) would update, not insert again.
+      have.set(`${d.employeeId}|${d.date}`, { id: ins.insertId, employee_id: d.employeeId, attendance_date: d.date, source: 'IMPORT' });
     }
     out.written += 1;
   }

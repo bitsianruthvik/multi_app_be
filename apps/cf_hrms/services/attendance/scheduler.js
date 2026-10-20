@@ -11,6 +11,9 @@
  * latest night (the days before were already processed by punches as they came, and
  * POST /attendance/process covers any range by hand).
  *
+ * RETRIES. Days whose processing failed after their punches were stored (punches.processAfterCommit
+ * writes a RETRY run) are processed again on every pass, before the hour check.
+ *
  * Started by app.js only in the real server (index.js), never in a test script.
  * Turn it off with CF_HRMS_ATTENDANCE_NIGHTLY=off (Render: then add a cron job calling
  * POST /api/<company>/cf_hrms/attendance/process — see CF_HRMS_MANUAL.md).
@@ -20,6 +23,7 @@ import { logger } from '../../../../core/utils/logger.js';
 import { addDays } from '../leave/days.js';
 import { nowIn, utcNow } from './time.js';
 import { processRange } from './process.js';
+import { retryPending } from './punches.js';
 
 export const RUN_AFTER_HOUR = 10;
 const HOUR = 60 * 60 * 1000;
@@ -30,6 +34,12 @@ export async function nightlyPass({ now = new Date() } = {}) {
   const [companies] = await pool.query('SELECT company_id, default_timezone FROM hrms_attendance_settings WHERE live_from IS NOT NULL');
   const done = [];
   for (const s of companies) {
+    try {
+      const retried = await retryPending(s.company_id);
+      if (retried.length) done.push({ companyId: s.company_id, retried });
+    } catch (err) {
+      logger.warn({ err: err.message, companyId: s.company_id }, '[cf_hrms] attendance retries failed; the next pass tries again');
+    }
     const local = nowIn(s.default_timezone || 'Asia/Kolkata', now);
     if (Number(local.slice(11, 13)) < RUN_AFTER_HOUR) continue;
     const yesterday = addDays(local.slice(0, 10), -1);
