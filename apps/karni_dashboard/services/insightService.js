@@ -27,7 +27,7 @@ import { shared } from './reportService.js';
  * Thresholds live in LIMITS so Karni can tune them.
  */
 const {
-  load, masters, unitMap, lastSync, MASTER_SETS,
+  load, masters, unitMap, lastSync, MASTER_SETS, prodRules,
   num, day, live, lineOpen, interUnit, trade, round, todayIso, addDays, monthKey, lastMonths,
 } = shared;
 
@@ -53,7 +53,7 @@ const GRACE_S = LIMITS.graceDays * 86400;
 
 const DATASETS = [
   'invoices', 'creditNotes', 'invoiceLines', 'creditNoteLines', 'orderLines', 'deliveries', 'deliveryLines',
-  'purchaseInvoices', 'purchaseInvoiceLines', 'purchaseOrderLines', 'grpoLines', 'stock', 'productionOrders', 'productionReceipts', 'productionIssues',
+  'purchaseInvoices', 'purchaseInvoiceLines', 'purchaseOrderLines', 'grpoLines', 'stock', 'productionOrders', 'openProductionOrders', 'resources', 'productionReceipts', 'productionIssues',
   ...MASTER_SETS,
 ];
 
@@ -65,7 +65,6 @@ const L = (v) => `₹${(v / 1e5).toFixed(1)} L`;
 const short = (v) => (Math.abs(v) >= 1e7 ? `₹${(v / 1e7).toFixed(2)} Cr` : L(v));
 const bandOf = (v, steps) => steps.filter((s) => v >= s).length; // 0, 1, 2 …
 /** "SP-1", "SP - 1", "SP-01" are one machine. */
-const machineKey = (m) => String(m || '').toUpperCase().replace(/[\s_\-.]+/g, '').replace(/(\D)0+(\d)/g, '$1$2');
 const WORSE_MONEY = { pct: 20, abs: 5e5 };
 const WORSE_POINTS = { pct: 0, abs: 10 };
 
@@ -586,32 +585,31 @@ define({
   }) };
 });
 
-function machineWeeks(d, ok, upTo, filter) {
-  const names = new Map(); const m = new Map();
+/** Receipts per machine (Karni's machine names, see reportService prodRules), this week and the usual. */
+function machineWeeks(d, P, ok, upTo, filter) {
+  const m = new Map();
   for (const l of d.productionReceipts || []) {
-    if (l.BaseType !== 202 || !l.U_EVT_MACHINE || !ok(l.BPLName) || !filter(l)) continue;
+    if (l.BaseType !== 202 || !ok(l.BPLName) || !filter(l)) continue;
+    const k = P.machineOf(l);
+    if (!k) continue;
     const dd = day(l.DocDate);
     if (dd > upTo) continue;
-    const k = machineKey(l.U_EVT_MACHINE);
-    const n = names.get(k) || {}; n[l.U_EVT_MACHINE] = (n[l.U_EVT_MACHINE] || 0) + 1; names.set(k, n);
     const x = m.get(k) || { week: 0, usualMonth: 0, lines: [] };
     if (dd > addDays(upTo, -7)) x.week += num(l.Quantity);
     else if (dd > addDays(upTo, -37)) x.usualMonth += num(l.Quantity);
     if (dd > addDays(upTo, -37)) x.lines.push(l);
     m.set(k, x);
   }
-  const nameOf = (k) => Object.entries(names.get(k) || { [k]: 1 }).sort((a, b) => b[1] - a[1])[0][0];
-  return { m, nameOf };
+  return { m, nameOf: P.machineName };
 }
 
 define({
   id: 'machine-drop', area: 'Production', owner: 'Production', link: 'production', cadence: 'daily', severity: 'medium', worse: WORSE_POINTS,
-  how: `Output (production receipts, scrap left out) in the 7 days to yesterday against the machine's average week over the 30 days before. Flagged below ${100 - LIMITS.machineDropPct}% of usual, cleared above ${100 - LIMITS.machineClearPct}%. Machine names are matched ignoring spaces, dashes and leading zeros ("SP-1" = "SP - 01").`,
+  how: `Output (receipts of the production order's own item; wastage and other items left out) in the 7 days to yesterday against the machine's average week over the 30 days before. Flagged below ${100 - LIMITS.machineDropPct}% of usual, cleared above ${100 - LIMITS.machineClearPct}%. Machines are named as in Karni's machine-wise SAP report.`,
   columns: [{ key: 'machine', label: 'Machine', kind: 'text' }, { key: 'week', label: 'Last 7 days', kind: 'qty' }, { key: 'usual', label: 'Usual week', kind: 'qty' }, { key: 'pctOfUsual', label: 'Of usual', kind: 'pct' }],
   rank: { labelKey: 'machine', valueKey: 'usual', kind: 'qty' },
-}, ({ d, M, ok, upTo, held }) => {
-  const isScrap = (l) => /^SC /i.test(M.itemGroup(l.ItemCode));
-  const { m, nameOf } = machineWeeks(d, ok, upTo, (l) => !isScrap(l));
+}, ({ d, P, ok, upTo, held }) => {
+  const { m, nameOf } = machineWeeks(d, P, ok, upTo, (l) => P.kindOf(l) === 'output');
   const all = [...m.entries()].map(([k, x]) => ({ k, machine: nameOf(k), week: x.week, usual: (x.usualMonth / 30) * 7, lines: x.lines }))
     .filter((r) => r.usual >= LIMITS.machineMinWeekly).map((r) => ({ ...r, drop: (1 - r.week / r.usual) * 100 }));
   const rows = all.filter((r) => r.drop >= LIMITS.machineDropPct || (held(r.k) && r.drop >= LIMITS.machineClearPct))
@@ -626,13 +624,13 @@ define({
 
 define({
   id: 'scrap-up', area: 'Production', owner: 'Production / quality', link: 'production', cadence: 'daily', severity: 'medium', worse: { pct: 0, abs: 2 },
-  how: 'Scrap received from production (item groups starting "SC") as a share of everything the machine produced, 7 days to yesterday against the 30 days before.',
+  how: 'Wastage received against production orders (trim and other wastage, SC items) as a share of output plus wastage, 7 days to yesterday against the 30 days before.',
   columns: [{ key: 'machine', label: 'Machine', kind: 'text' }, { key: 'scrapWeek', label: 'Scrap this week', kind: 'qty' }, { key: 'rateNow', label: 'Scrap rate now', kind: 'pct' }, { key: 'rateUsual', label: 'Usual rate', kind: 'pct' }],
   rank: { labelKey: 'machine', valueKey: 'rateNow', kind: 'pct' },
-}, ({ d, M, ok, upTo }) => {
-  const isScrap = (l) => /^SC /i.test(M.itemGroup(l.ItemCode));
-  const all = machineWeeks(d, ok, upTo, () => true);
-  const scrap = machineWeeks(d, ok, upTo, isScrap);
+}, ({ d, P, ok, upTo }) => {
+  const isScrap = (l) => ['trim', 'wastage'].includes(P.kindOf(l));
+  const all = machineWeeks(d, P, ok, upTo, (l) => P.kindOf(l) !== 'other');
+  const scrap = machineWeeks(d, P, ok, upTo, isScrap);
   const rows = [...scrap.m.entries()].map(([k, s]) => {
     const a = all.m.get(k); if (!a) return null;
     const rateNow = a.week ? (s.week / a.week) * 100 : 0;
@@ -669,12 +667,13 @@ async function loadStates(companyId) {
 async function evaluate(companyId, unit, states) {
   const d = await load(companyId, DATASETS);
   const M = masters(d);
+  const P = prodRules(d, M);
   const today = todayIso();
   const out = [];
   const failed = [];
   for (const r of RULES) {
     const held = (key) => { const s = states.get(`${r.id}|${key}`); return !!s && s.status !== 'resolved'; };
-    const ctx = { d, M, unit, ok: (v) => !unit || v === unit, today, upTo: addDays(today, -1), invUnit: unitMap(d.invoiceLines), held };
+    const ctx = { d, M, P, unit, ok: (v) => !unit || v === unit, today, upTo: addDays(today, -1), invUnit: unitMap(d.invoiceLines), held };
     try {
       const res = r.compute(ctx);
       if (res) out.push({ rule: r, rows: res.rows || [], view: res.view });

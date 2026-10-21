@@ -158,10 +158,70 @@ function salesDocs(d, unit) {
     ...(d.creditNotes || []).filter((x) => trade(x) && ok(cu.get(x.DocEntry))).map((x) => ({ d: x, sign: -1, unit: cu.get(x.DocEntry) || null })),
   ];
 }
-function sumSales(docs, from, to) {
+/**
+ * Sales are the item lines' totals (invoices minus credit notes), as Karni's SAP
+ * sales reports count them: freight and other charges on the document header are
+ * not sales.
+ */
+const lineValue = (l) => l.sign * num(l.LineTotal);
+function sumSales(lines, from, to, keep = () => true) {
   let t = 0;
-  for (const { d, sign } of docs) { const x = day(d.DocDate); if (x && x >= from && x <= to) t += sign * net(d); }
+  for (const l of lines) { const x = day(l.DocDate); if (x && x >= from && x <= to && keep(l)) t += lineValue(l); }
   return round(t);
+}
+/** Inter-unit billing (IBR… / KARNI PACKAGING…), line totals, invoices minus credit notes. */
+function interUnitSales(d, inR, unit = null) {
+  const ok = unitOk(unit);
+  const lt = (list) => sumBy((list || []).filter((l) => live(l) && interUnit(l) && ok(l.BPLName) && inR(l.DocDate)), (l) => num(l.LineTotal));
+  return round(lt(d.invoiceLines) - lt(d.creditNoteLines));
+}
+
+// ── Production: the same rules as Karni's own SAP production reports ─────
+// Machine: the order's U_MACHINE, cleaned (upper case, no spaces / dashes / colons)
+// and renamed as in Karni's "Planned VS Reciept Machine Wise" query, shown by
+// the SAP resource's name when there is one.
+const MACHINE_ALIAS = { IBC2: 'BFL_1', NORD: 'LAMINATION_1', RAULIMEX: 'LAMINATION_2', PELICAN: 'PRINTING' };
+export function machineCode(raw) {
+  const k = String(raw ?? '').trim().toUpperCase().replace(/[\s:-]/g, '');
+  return k ? (MACHINE_ALIAS[k] || k) : null;
+}
+// Receipts against an order: the order's own item is output. Scrap items (SC…)
+// are wastage, split as Karni's query does: these five are trim, the rest other.
+const TRIM_ITEMS = new Set(['SC00019', 'SC00017', 'SC00001', 'SC00002', 'SC00003']);
+const RECEIPT_KIND = { output: 'Output', trim: 'Trim wastage', wastage: 'Other wastage', other: 'Other items received' };
+
+/** Orders, their unit (warehouse → business place) and machine, and what each receipt line is. */
+function prodRules(d, M) {
+  const orders = new Map((d.productionOrders || []).map((o) => [o.AbsoluteEntry, o]));
+  // The live open list is the truth about what is open; orders it no longer has were closed in SAP.
+  const openNow = d.openProductionOrders || [];
+  const haveOpenList = openNow.length > 0;
+  const openIds = new Set(openNow.map((o) => o.AbsoluteEntry));
+  for (const o of openNow) orders.set(o.AbsoluteEntry, o);
+  const rawOpen = (o) => o.ProductionOrderStatus === 'boposPlanned' || o.ProductionOrderStatus === 'boposReleased';
+  if (haveOpenList) {
+    for (const [id, o] of orders) if (rawOpen(o) && !openIds.has(id)) orders.set(id, { ...o, ProductionOrderStatus: 'boposClosed' });
+  }
+  // Unit: the business place of the order's warehouse (as Karni's reports filter), else where its receipts / issues were posted.
+  const postedUnit = new Map();
+  for (const l of [...(d.productionReceipts || []), ...(d.productionIssues || [])]) {
+    if (l.BaseType === 202 && l.BPLName && !postedUnit.has(l.BaseEntry)) postedUnit.set(l.BaseEntry, l.BPLName);
+  }
+  const unitOf = (o) => M.whs.get(o.Warehouse)?.unit || postedUnit.get(o.AbsoluteEntry) || o.U_Unit || null;
+  const names = new Map((d.resources || []).map((r) => [String(r.Code).toUpperCase(), r.Name]));
+  // "LAMINATION_1" → "Lamination 1"; short codes stay as they are ("BFL_1" → "BFL 1").
+  const pretty = (code) => code.split('_').map((w) => (w.length <= 3 ? w : w[0] + w.slice(1).toLowerCase())).join(' ');
+  const machineName = (code) => (code ? names.get(code) || pretty(code) : 'Not set');
+  const machineOfOrder = (o) => machineCode(o?.U_MACHINE);
+  const machineOf = (l) => machineOfOrder(orders.get(l.BaseEntry)) || machineCode(l.U_EVT_MACHINE);
+  const kindOf = (l) => {
+    const o = orders.get(l.BaseEntry);
+    if (o && l.ItemCode === o.ItemNo) return 'output';
+    if (TRIM_ITEMS.has(l.ItemCode)) return 'trim';
+    if (/^SC\d/i.test(l.ItemCode || '')) return 'wastage';
+    return o ? 'other' : 'output';
+  };
+  return { orders, haveOpenList, unitOf, machineOf, machineOfOrder, machineName, kindOf };
 }
 const payTotal = (p) => num(p.CashSum) + num(p.TransferSum);
 const payLive = (p) => p.CancelStatus !== 'csYes' && p.CancelStatus !== 'csCancellation';
@@ -207,12 +267,14 @@ function openDocs(docs, today, units, unit, people = {}) {
   const ok = unitOk(unit);
   const list = docs.filter((x) => isOpen(x) && ok(units.get(x.DocEntry))).map((x) => ({
     docEntry: x.DocEntry, docNum: x.DocNum, docDate: day(x.DocDate), dueDate: day(x.DocDueDate), cardCode: x.CardCode, cardName: x.CardName,
-    unit: units.get(x.DocEntry) || null, total: num(x.DocTotal), net: round(net(x)),
+    unit: units.get(x.DocEntry) || null, total: num(x.DocTotal), net: round(net(x)), interUnit: interUnit(x),
     daysOld: x.DocDate ? daysBetween(day(x.DocDate), today) : null, late: x.DocDueDate ? day(x.DocDueDate) < today : false,
     salesPerson: x.SalesPersonCode, salesPersonName: people[x.SalesPersonCode] || null,
   })).sort((a, b) => (a.docDate < b.docDate ? 1 : -1));
   return { count: list.length, value: round(sumBy(list, (r) => r.total)), late: list.filter((r) => r.late).length, rows: list };
 }
+
+const withSplit = (o) => ({ ...o, interUnitCount: o.rows.filter((r) => r.interUnit).length });
 
 // ═════════════════════════════════════════════════════════════════════════
 // Screens
@@ -241,6 +303,7 @@ export async function overview(companyId, q = {}) {
   const d = await load(companyId, [
     'invoices', 'creditNotes', 'invoiceLines', 'creditNoteLines', 'orders', 'orderLines', 'purchaseOrders', 'purchaseOrderLines',
     'purchaseInvoices', 'purchaseInvoiceLines', 'deliveryLines', 'grpoLines', 'incomingPayments', 'vendorPayments', 'productionReceipts',
+    'productionOrders', 'openProductionOrders', 'resources', ...MASTER_SETS,
   ]);
   const ok = unitOk(unit);
   const today = todayIso();
@@ -251,21 +314,21 @@ export async function overview(companyId, q = {}) {
   const prevFy = `${Number(fy.slice(0, 4)) - 1}-04-01`;
   const prevFyToday = `${Number(today.slice(0, 4)) - 1}${today.slice(4)}`;
 
-  const docs = salesDocs(d, unit);
+  const lines = salesLines(d, unit);
   const months = lastMonths(12, today);
   const salesByMonth = Object.fromEntries(months.map((m) => [m, 0]));
   const salesByDay = Object.fromEntries(daysRange(addDays(today, -29), today).map((x) => [x, 0]));
   const byCustomer = new Map();
   const byUnit = new Map();
-  for (const { d: x, sign, unit: u } of docs) {
-    const dd = day(x.DocDate); if (!dd) continue;
-    const v = sign * net(x);
+  for (const l of lines) {
+    const dd = day(l.DocDate); if (!dd) continue;
+    const v = lineValue(l);
     if (monthKey(dd) in salesByMonth) salesByMonth[monthKey(dd)] += v;
     if (dd in salesByDay) salesByDay[dd] += v;
     if (dd >= fy) {
-      const c = byCustomer.get(x.CardCode) || { cardCode: x.CardCode, cardName: x.CardName, sales: 0 };
-      c.sales += v; byCustomer.set(x.CardCode, c);
-      const uk = u || 'Not split'; byUnit.set(uk, (byUnit.get(uk) || 0) + v);
+      const c = byCustomer.get(l.CardCode) || { cardCode: l.CardCode, cardName: l.CardName, sales: 0 };
+      c.sales += v; byCustomer.set(l.CardCode, c);
+      const uk = l.BPLName || 'Not split'; byUnit.set(uk, (byUnit.get(uk) || 0) + v);
     }
   }
   const pays = (d.incomingPayments || []).filter((p) => payLive(p) && !interUnit(p) && ok(p.BPLName));
@@ -277,34 +340,39 @@ export async function overview(companyId, q = {}) {
   const pu = unitMap(d.purchaseInvoiceLines);
   const rec = ageing((d.invoices || []).filter((x) => !interUnit(x) && ok(iu.get(x.DocEntry))), today, iu);
   const pay = ageing((d.purchaseInvoices || []).filter((x) => !interUnit(x) && ok(pu.get(x.DocEntry))), today, pu);
-  const so = openDocs((d.orders || []).filter((x) => !interUnit(x)), today, unitMap(d.orderLines), unit);
-  const po = openDocs((d.purchaseOrders || []).filter((x) => !interUnit(x)), today, unitMap(d.purchaseOrderLines), unit);
+  // Open orders count as SAP counts them (inter-unit included), with the split shown.
+  const so = openDocs(d.orders || [], today, unitMap(d.orderLines), unit);
+  const po = openDocs(d.purchaseOrders || [], today, unitMap(d.purchaseOrderLines), unit);
+  const split = (o) => ({ count: o.count, customer: o.rows.filter((r) => !r.interUnit).length, interUnit: o.rows.filter((r) => r.interUnit).length, value: o.value, late: o.late });
 
   const todayLines = (list) => (list || []).filter((l) => trade(l) && ok(l.BPLName) && day(l.DocDate) === today);
   const ordersToday = todayLines(d.orderLines);
   const deliveriesToday = todayLines(d.deliveryLines);
   const grnToday = todayLines(d.grpoLines);
-  const output = (d.productionReceipts || []).filter((l) => l.BaseType === 202 && ok(l.BPLName));
+  const P = prodRules(d, masters(d));
+  const output = (d.productionReceipts || []).filter((l) => l.BaseType === 202 && ok(l.BPLName) && P.kindOf(l) === 'output');
   const outputToday = output.filter((l) => day(l.DocDate) === today);
   const outputMonth = output.filter((l) => day(l.DocDate) >= monthStart);
   const docsCount = (list) => new Set(list.map((l) => l.DocEntry)).size;
 
   return {
     asOf: await lastSync(companyId), today, fyStart: fy, unit,
-    salesToday: sumSales(docs, today, today),
-    salesMonth: sumSales(docs, monthStart, today),
-    salesPrevMonthSamePeriod: sumSales(docs, prevMonthStart, prevMonthSameDay),
-    salesFy: sumSales(docs, fy, today),
-    interUnitFy: round(
-      sumBy((d.invoices || []).filter((x) => live(x) && interUnit(x) && day(x.DocDate) >= fy), net)
-      - sumBy((d.creditNotes || []).filter((x) => live(x) && interUnit(x) && day(x.DocDate) >= fy), net)),
-    salesPrevFySamePeriod: sumSales(docs, prevFy, prevFyToday),
+    salesToday: sumSales(lines, today, today),
+    salesMonth: sumSales(lines, monthStart, today),
+    salesPrevMonthSamePeriod: sumSales(lines, prevMonthStart, prevMonthSameDay),
+    salesFy: sumSales(lines, fy, today),
+    invoicedFy: sumSales(lines, fy, today, (l) => l.sign > 0),
+    creditNotesFy: -sumSales(lines, fy, today, (l) => l.sign < 0),
+    invoicedMonth: sumSales(lines, monthStart, today, (l) => l.sign > 0),
+    creditNotesMonth: -sumSales(lines, monthStart, today, (l) => l.sign < 0),
+    interUnitFy: interUnitSales(d, (x) => day(x) >= fy, unit),
+    salesPrevFySamePeriod: sumSales(lines, prevFy, prevFyToday),
     collectionsMonth: round(sumBy(pays.filter((p) => day(p.DocDate) >= monthStart), payTotal)),
     paymentsMonth: round(sumBy(vpays.filter((p) => day(p.DocDate) >= monthStart), payTotal)),
     receivables: rec.totals.total, receivablesOverdue: round(rec.totals.total - rec.totals.notDue),
     payables: pay.totals.total, payablesOverdue: round(pay.totals.total - pay.totals.notDue),
-    openSalesOrders: { count: so.count, value: so.value, late: so.late },
-    openPurchaseOrders: { count: po.count, value: po.value, late: po.late },
+    openSalesOrders: split(so),
+    openPurchaseOrders: split(po),
     productionMonthQty: round(sumBy(outputMonth, (l) => num(l.Quantity))),
     monthly: months.map((m) => ({ month: m, sales: round(salesByMonth[m]), collections: round(collByMonth[m]) })),
     daily: Object.entries(salesByDay).map(([date, v]) => ({ date, sales: round(v) })),
@@ -330,31 +398,47 @@ export async function sales(companyId, q = {}) {
   const M = masters(d);
   const docs = salesDocs(d, unit).filter(({ d: x }) => inRange(x.DocDate, range));
   const lines = salesLines(d, unit).filter((l) => inRange(l.DocDate, range));
-  const v = ({ d: x, sign }) => sign * net(x);
-  const lv = (l) => l.sign * num(l.LineTotal);
+  // Sales = item line totals (see sumSales); the header charges (freight etc.) are listed per document.
+  const lv = lineValue;
   const lq = (l) => l.sign * num(l.Quantity);
+  const docCount = (list, keyFn) => {
+    const m = new Map();
+    for (const l of list) { const k = keyFn(l); const set = m.get(k) || new Set(); set.add(`${l.sign}:${l.DocEntry}`); m.set(k, set); }
+    return (k) => m.get(k)?.size || 0;
+  };
 
-  const byMonth = group(docs, ({ d: x }) => monthKey(day(x.DocDate)), { sales: v }).sort((a, b) => (a.key < b.key ? -1 : 1));
+  const byMonth = group(lines, (l) => monthKey(day(l.DocDate)), { sales: lv }).sort((a, b) => (a.key < b.key ? -1 : 1));
   const span = daysBetween(range.from, range.to);
   const dayList = span <= 92 ? daysRange(range.from, range.to) : [];
   const byDayMap = Object.fromEntries(dayList.map((x) => [x, 0]));
-  for (const x of docs) { const k = day(x.d.DocDate); if (k in byDayMap) byDayMap[k] += v(x); }
+  for (const l of lines) { const k = day(l.DocDate); if (k in byDayMap) byDayMap[k] += lv(l); }
 
-  const customers = group(docs, ({ d: x }) => x.CardCode, { sales: v }, ({ d: x }) => ({ cardName: x.CardName })).sort(desc('sales'));
-  const persons = group(docs, ({ d: x }) => x.SalesPersonCode ?? -1, { sales: v })
+  const custDocs = docCount(lines, (l) => l.CardCode);
+  const customers = group(lines, (l) => l.CardCode, { sales: lv }, (l) => ({ cardName: l.CardName })).sort(desc('sales'))
+    .map((c) => ({ ...c, count: custDocs(c.key) }));
+  const personDocs = docCount(lines, (l) => l.SalesPersonCode ?? -1);
+  const persons = group(lines, (l) => l.SalesPersonCode ?? -1, { sales: lv })
+    .map((p) => ({ ...p, count: personDocs(p.key) }))
     .map((p) => ({ ...p, name: M.people[p.key] || (p.key === -1 ? 'No sales employee' : `#${p.key}`) })).sort(desc('sales'));
   const items = group(lines, (l) => l.ItemCode, { sales: lv, qty: lq }, (l) => ({ itemName: l.ItemDescription, uom: M.uomOf(l), group: M.itemGroup(l.ItemCode) })).sort(desc('sales'));
   const itemGroups = group(lines, (l) => M.itemGroup(l.ItemCode), { sales: lv, qty: lq }).sort(desc('sales'));
   const byUnit = group(lines, (l) => l.BPLName || 'Not split', { sales: lv, qty: lq }).sort(desc('sales'));
-  const documents = docs.map(({ d: x, sign, unit: u }) => ({
-    kind: sign > 0 ? 'Invoice' : 'Credit note', docEntry: x.DocEntry, docNum: x.DocNum, docDate: day(x.DocDate), unit: u,
-    cardCode: x.CardCode, cardName: x.CardName, net: round(sign * net(x)), tax: round(sign * num(x.VatSum)), total: round(sign * num(x.DocTotal)),
-  })).sort((a, b) => (a.docDate < b.docDate ? 1 : a.docDate > b.docDate ? -1 : b.docNum - a.docNum));
-  const total = round(sumBy(docs, v));
-  const iuSales = sumBy((d.invoices || []).filter((x) => live(x) && interUnit(x) && inRange(x.DocDate, range)), net)
-    - sumBy((d.creditNotes || []).filter((x) => live(x) && interUnit(x) && inRange(x.DocDate, range)), net);
+  const lineSum = new Map();
+  for (const l of lines) { const k = `${l.sign}:${l.DocEntry}`; lineSum.set(k, (lineSum.get(k) || 0) + lv(l)); }
+  const documents = docs.map(({ d: x, sign, unit: u }) => {
+    const items = lineSum.get(`${sign}:${x.DocEntry}`) || 0;
+    return {
+      kind: sign > 0 ? 'Invoice' : 'Credit note', docEntry: x.DocEntry, docNum: x.DocNum, docDate: day(x.DocDate), unit: u,
+      cardCode: x.CardCode, cardName: x.CardName, net: round(items), charges: round(sign * net(x) - items),
+      tax: round(sign * num(x.VatSum)), total: round(sign * num(x.DocTotal)),
+    };
+  }).sort((a, b) => (a.docDate < b.docDate ? 1 : a.docDate > b.docDate ? -1 : b.docNum - a.docNum));
+  const total = round(sumBy(lines, lv));
+  const iuSales = interUnitSales(d, (x) => inRange(x, range), unit);
   return {
-    asOf: await lastSync(companyId), ...range, unit, total, interUnit: round(iuSales),
+    asOf: await lastSync(companyId), ...range, unit, total, interUnit: iuSales,
+    invoiced: round(sumBy(lines.filter((l) => l.sign > 0), lv)), creditNotes: round(-sumBy(lines.filter((l) => l.sign < 0), lv)),
+    charges: round(sumBy(documents, (x) => x.charges)),
     tax: round(sumBy(docs, ({ d: x, sign }) => sign * num(x.VatSum))),
     qty: round(sumBy(lines, lq)),
     documentCount: documents.length, customerCount: customers.length,
@@ -395,7 +479,8 @@ export async function salesOrders(companyId, q = {}) {
   const d = await load(companyId, ['orders', 'orderLines', 'stock', ...MASTER_SETS]);
   const M = masters(d);
   const ok = unitOk(unit);
-  const head = openDocs((d.orders || []).filter((x) => !interUnit(x)), today, unitMap(d.orderLines), unit, M.people);
+  // All open orders, as SAP counts them; inter-unit ones are flagged (and counted apart).
+  const head = openDocs(d.orders || [], today, unitMap(d.orderLines), unit, M.people);
 
   // Stock in hand per item (the unit's warehouses when a unit is chosen)
   const stockOf = new Map();
@@ -422,7 +507,7 @@ export async function salesOrders(companyId, q = {}) {
     (p) => ({ cardName: p.cardName })).map((g) => ({ cardCode: g.key, cardName: g.cardName, lines: g.count, open: g.open, value: g.value, late: g.late }))
     .sort(desc('value'));
   return {
-    asOf: await lastSync(companyId), unit, ...head,
+    asOf: await lastSync(companyId), unit, ...head, interUnitCount: head.rows.filter((r) => r.interUnit).length,
     pendingValue: round(sumBy(pending, (p) => p.value)), pendingLines: pending.length, lateLines: pending.filter((p) => p.late).length,
     itemsShort: byItem.filter((i) => i.short > 0).length,
     byItem, byCustomer, pending: pending.sort((a, b) => Number(b.late) - Number(a.late) || (a.shipDate < b.shipDate ? -1 : 1)).slice(0, 2000),
@@ -547,7 +632,7 @@ export async function purchase(companyId, q = {}) {
 
 export async function purchaseOrders(companyId, q = {}) {
   const d = await load(companyId, ['purchaseOrders', 'purchaseOrderLines']);
-  return { asOf: await lastSync(companyId), ...openDocs((d.purchaseOrders || []).filter((x) => !interUnit(x)), todayIso(), unitMap(d.purchaseOrderLines), q.unit || null) };
+  return { asOf: await lastSync(companyId), ...withSplit(openDocs(d.purchaseOrders || [], todayIso(), unitMap(d.purchaseOrderLines), q.unit || null)) };
 }
 
 // ── Production ───────────────────────────────────────────────────────────
@@ -557,33 +642,30 @@ export async function production(companyId, q = {}) {
   const unit = q.unit || null;
   const today = todayIso();
   const range = rangeOf(q, addDays(today, -29));
-  const d = await load(companyId, ['productionOrders', 'productionReceipts', 'productionIssues', ...MASTER_SETS]);
+  const d = await load(companyId, ['productionOrders', 'openProductionOrders', 'productionReceipts', 'productionIssues', 'resources', ...MASTER_SETS]);
   const M = masters(d);
   const ok = unitOk(unit);
+  const P = prodRules(d, M);
 
-  // Unit of an order: its receipts / issues carry the business place
-  const orderUnit = new Map();
-  for (const l of [...(d.productionReceipts || []), ...(d.productionIssues || [])]) {
-    if (l.BaseType === 202 && l.BPLName && !orderUnit.has(l.BaseEntry)) orderUnit.set(l.BaseEntry, l.BPLName);
-  }
   // Section of an order without U_SECTION: the routing stage most of its material was issued at.
   const stageVotes = new Map();
   for (const l of d.productionIssues || []) {
     if (l.BaseType !== 202 || !l.StgDesc) continue;
     const v = stageVotes.get(l.BaseEntry) || {}; v[l.StgDesc] = (v[l.StgDesc] || 0) + 1; stageVotes.set(l.BaseEntry, v);
   }
-  const stageOf = (id) => { const v = stageVotes.get(id); return v ? Object.entries(v).sort((a, b) => b[1] - a[1])[0][0] : null; };
-  const orders = (d.productionOrders || []).map((o) => ({
+  const stageOf = (id) => { const v = stageVotes.get(id); return v ? Object.entries(v).sort((x, y) => y[1] - x[1])[0][0] : null; };
+  const orders = [...P.orders.values()].map((o) => ({
     id: o.AbsoluteEntry, docNum: o.DocumentNumber, itemCode: o.ItemNo, itemName: o.ProductDescription, uom: o.InventoryUOM,
     status: PO_STATUS[o.ProductionOrderStatus] || o.ProductionOrderStatus, planned: num(o.PlannedQuantity), completed: num(o.CompletedQuantity),
     rejected: num(o.RejectedQuantity), postingDate: day(o.PostingDate), dueDate: day(o.DueDate), closingDate: day(o.ClosingDate),
-    machine: o.U_MACHINE || 'Not set', section: o.U_SECTION || stageOf(o.AbsoluteEntry) || 'Not set', shift: o.U_UNE_Shift || null,
-    unit: orderUnit.get(o.AbsoluteEntry) || o.U_Unit || null, salesOrder: o.ProductionOrderOriginNumber || null,
+    machine: P.machineName(P.machineOfOrder(o)), section: o.U_SECTION || stageOf(o.AbsoluteEntry) || 'Not set', shift: o.U_UNE_Shift || null,
+    unit: P.unitOf(o), salesOrder: o.ProductionOrderOriginNumber || null,
     customer: M.partners.get(o.CustomerCode)?.CardName || o.CustomerCode || null,
   })).filter((o) => o.status !== 'Cancelled' && ok(o.unit));
-  // Orders are re-read for 120 days after posting; older open ones may have been closed in SAP since.
-  const recentFrom = addDays(today, -120);
   const isOpenStatus = (o) => o.status === 'Planned' || o.status === 'Released';
+  // With SAP's live open list every open order counts, as in SAP. Until that list has
+  // synced, orders older than the 120 days we re-read may be stale, so they are set apart.
+  const recentFrom = P.haveOpenList ? '0000-00-00' : addDays(today, -120);
   const olderOpen = orders.filter((o) => isOpenStatus(o) && o.postingDate < recentFrom).length;
   const open = orders.filter((o) => isOpenStatus(o) && o.postingDate >= recentFrom).map((o) => ({
     ...o, progress: o.planned ? Math.round((o.completed / o.planned) * 1000) / 10 : 0, late: !!o.dueDate && o.dueDate < today,
@@ -591,7 +673,11 @@ export async function production(companyId, q = {}) {
   const machineSection = new Map();
   for (const o of orders) if (o.machine !== 'Not set' && !machineSection.has(o.machine)) machineSection.set(o.machine, o.section);
 
-  const receipts = (d.productionReceipts || []).filter((l) => l.BaseType === 202 && ok(l.BPLName));
+  // Receipts against orders: the order's own item is output; trim / other wastage and other items are counted apart.
+  const orderById = new Map(orders.map((o) => [o.id, o]));
+  const receiptUnit = (l) => orderById.get(l.BaseEntry)?.unit || P.unitOf(P.orders.get(l.BaseEntry) || {}) || l.BPLName;
+  const allReceipts = (d.productionReceipts || []).filter((l) => l.BaseType === 202 && ok(receiptUnit(l) || l.BPLName));
+  const receipts = allReceipts.filter((l) => P.kindOf(l) === 'output');
   // Resources (machine / labour time posted as items) are not material.
   const isResource = (code) => /resource/i.test(M.itemGroup(code));
   const issues = (d.productionIssues || []).filter((l) => l.BaseType === 202 && ok(l.BPLName) && !isResource(l.ItemCode));
@@ -600,16 +686,18 @@ export async function production(companyId, q = {}) {
   const kgItem = (code) => /^kgs?$/i.test(M.items.get(code)?.InventoryUOM || '');
   const kgLine = (l) => kg.has(l.BaseEntry) && kgItem(l.ItemCode);
   const rIn = receipts.filter((l) => inRange(l.DocDate, range));
+  const allIn = allReceipts.filter((l) => inRange(l.DocDate, range));
   const iIn = issues.filter((l) => inRange(l.DocDate, range));
   const qty = (l) => num(l.Quantity);
   const val = (l) => num(l.LineTotal);
-  const orderById = new Map(orders.map((o) => [o.id, o]));
-  const machineOf = (l) => l.U_EVT_MACHINE || orderById.get(l.BaseEntry)?.machine || 'Not set';
+  const machineOf = (l) => P.machineName(P.machineOf(l));
   const sectionOf = (l) => {
     const o = orderById.get(l.BaseEntry);
     if (o && o.section !== 'Not set') return o.section;
     return machineSection.get(machineOf(l)) || 'Not set';
   };
+  const isWaste = (l) => { const k = P.kindOf(l); return k === 'trim' || k === 'wastage'; };
+  const kindSum = (list, kind) => round(sumBy(list.filter((l) => P.kindOf(l) === kind), qty));
 
   // Output by day, split by section (stacked chart)
   const sections = [...new Set(rIn.map(sectionOf))].sort();
@@ -631,12 +719,14 @@ export async function production(companyId, q = {}) {
 
   const byMachine = group(open, (o) => o.machine, { planned: (o) => o.planned, completed: (o) => o.completed, late: (o) => (o.late ? 1 : 0) }, (o) => ({ section: o.section }));
   const outByMachine = group(rIn, machineOf, { output: qty, value: val });
+  const wasteByMachine = group(allIn.filter(isWaste), machineOf, { waste: qty });
   const yieldByMachine = group(yieldRows, (r) => r.machine, { input: (r) => r.input, output: (r) => r.output });
   const machineRows = [...new Set([...byMachine.map((m) => m.key), ...outByMachine.map((m) => m.key)])].map((name) => {
     const a = byMachine.find((m) => m.key === name) || {}; const b = outByMachine.find((m) => m.key === name) || {}; const y = yieldByMachine.find((m) => m.key === name);
+    const w = wasteByMachine.find((m) => m.key === name)?.waste || 0;
     return {
       machine: name, section: a.section || machineSection.get(name) || 'Other', openOrders: a.count || 0, planned: a.planned || 0, completed: a.completed || 0, late: a.late || 0,
-      output: b.output || 0, outputValue: b.value || 0, yield: y && y.input ? Math.round((y.output / y.input) * 1000) / 10 : null,
+      output: b.output || 0, outputValue: b.value || 0, wastage: round(w), wastagePct: (b.output || 0) + w ? Math.round((w / ((b.output || 0) + w)) * 1000) / 10 : null, yield: y && y.input ? Math.round((y.output / y.input) * 1000) / 10 : null,
     };
   }).sort(desc('output'));
 
@@ -647,6 +737,10 @@ export async function production(companyId, q = {}) {
       lateOrders: open.filter((o) => o.late).length,
       output: round(sumBy(rIn, qty)), outputValue: round(sumBy(rIn, val)), issued: round(sumBy(iIn, qty)),
       outputToday: round(sumBy(receipts.filter((l) => day(l.DocDate) === today), qty)),
+      wastageToday: round(sumBy(allReceipts.filter((l) => day(l.DocDate) === today && isWaste(l)), qty)),
+      trimWastage: kindSum(allIn, 'trim'), otherWastage: kindSum(allIn, 'wastage'), otherReceived: kindSum(allIn, 'other'),
+      wastagePct: (() => { const w = sumBy(allIn.filter(isWaste), qty); const t = w + sumBy(rIn, qty); return t ? Math.round((w / t) * 1000) / 10 : null; })(),
+      openListLive: P.haveOpenList,
       yield: (() => { const i = sumBy(yieldRows, (r) => r.input); return i ? Math.round((sumBy(yieldRows, (r) => r.output) / i) * 1000) / 10 : null; })(),
       olderOpen,
       closedInRange: orders.filter((o) => o.status === 'Closed' && inRange(o.closingDate, range)).length,
@@ -746,6 +840,6 @@ export async function savedReports(companyId) {
 
 /** Shared with the insight engine (services/insightService.js). */
 export const shared = {
-  load, masters, unitMap, lastSync, MASTER_SETS,
+  load, masters, unitMap, lastSync, MASTER_SETS, prodRules, machineCode,
   num, day, live, lineOpen, interUnit, trade, round, todayIso, addDays, monthKey, fyStart, lastMonths, payTotal, payLive,
 };

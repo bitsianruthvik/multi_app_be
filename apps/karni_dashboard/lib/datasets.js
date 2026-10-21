@@ -84,6 +84,15 @@ export const DATASETS = [
       + 'ProductionOrderStatus,PostingDate,StartDate,DueDate,ClosingDate,Warehouse,CustomerCode,ProductionOrderOriginNumber,'
       + 'InventoryUOM,U_MACHINE,U_SECTION,U_Unit,U_UNE_Shift',
   },
+  // Every order that is open NOW, whatever its age: the whole list each time, so an
+  // order closed in SAP after its 120 days drops out (productionOrders never sees that).
+  {
+    key: 'openProductionOrders', entity: 'ProductionOrders', keyField: 'AbsoluteEntry', full: true, everyMinutes: 30,
+    filter: "ProductionOrderStatus eq 'boposPlanned' or ProductionOrderStatus eq 'boposReleased'",
+    select: 'AbsoluteEntry,DocumentNumber,ItemNo,ProductDescription,PlannedQuantity,CompletedQuantity,RejectedQuantity,'
+      + 'ProductionOrderStatus,PostingDate,StartDate,DueDate,ClosingDate,Warehouse,CustomerCode,ProductionOrderOriginNumber,'
+      + 'InventoryUOM,U_MACHINE,U_SECTION,U_Unit,U_UNE_Shift',
+  },
 
   // ── Payments (no UpdateDate: re-read the last 10 days every run) ─────────
   {
@@ -121,6 +130,8 @@ export const DATASETS = [
   { key: 'itemGroups', entity: 'ItemGroups', select: 'Number,GroupName', keyField: 'Number', full: true },
   { key: 'warehouses', entity: 'Warehouses', select: 'WarehouseCode,WarehouseName,BusinessPlaceID', keyField: 'WarehouseCode', full: true },
   { key: 'businessPlaces', entity: 'BusinessPlaces', select: 'BPLID,BPLName', keyField: 'BPLID', full: true },
+  // Machines as resources (ORSC): Karni's machine reports show the resource name.
+  { key: 'resources', entity: 'Resources', select: 'Code,Name', keyField: 'Code', full: true, everyMinutes: 720 },
   { key: 'salesPersons', entity: 'SalesPersons', select: 'SalesEmployeeCode,SalesEmployeeName,Active', keyField: 'SalesEmployeeCode', full: true },
   { key: 'queryCategories', entity: 'QueryCategories', select: 'Code,Name', keyField: 'Code', full: true },
   {
