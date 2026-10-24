@@ -419,6 +419,9 @@ const WO_SELECT = `SELECT w.*, p.code AS contractor_code, p.name AS contractor_n
 const shapeWorkOrder = (w) => ({
   id: w.id,
   code: w.code,
+  // 'cells' (operations on locked pieces, this file) or 'po' (a contractor work order from a production order, run on
+  // Accounts › Work orders — contractorWorkOrderService). The old page says which (2026-10-24).
+  kind: w.kind ?? 'cells',
   status: w.status,
   contractorId: w.contractor_id,
   contractorCode: w.contractor_code,

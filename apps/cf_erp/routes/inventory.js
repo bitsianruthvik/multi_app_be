@@ -30,7 +30,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import { listAreas, createArea, updateArea, deleteArea } from '../services/stockingAreaService.js';
 // The production ledger (§45): work in progress by level, and offcut pieces with their outlines.
 import { wipStock, listOffcuts } from '../services/wipStockService.js';
@@ -66,8 +66,9 @@ router.get('/stock/view/lots', view, handle((req) => stockViewLots(pool, company
 router.get('/stock/units', view, handle((req) => listUnits(pool, company(req), req.query)));
 router.get('/stock/units/:id', view, handle((req) => unitHistory(pool, company(req), id(req))));
 router.get('/stock/losses', view, handle((req) => listLosses(pool, company(req), req.query)));
-router.get('/stock/scrap-rate', view, handle((req) => scrapRate(pool, company(req))));
-router.put('/stock/scrap-rate', manage, handle((req) => tx(req, (db, c) => setScrapRate(db, c, req.body ?? {}))));
+// The scrap rate sits on Setup › Cutting with the catalog's cutting rules (2026-10-24): catalog OR inventory.
+router.get('/stock/scrap-rate', guardAny(PERM.inventoryView, PERM.view), handle((req) => scrapRate(pool, company(req))));
+router.put('/stock/scrap-rate', guardAny(PERM.inventory, PERM.catalog), handle((req) => tx(req, (db, c) => setScrapRate(db, c, req.body ?? {}))));
 router.get('/offcuts', view, handle((req) => listOffcuts(pool, company(req), req.query)));
 router.get('/items/:id/stock', view, handle((req) => itemStock(pool, company(req), id(req))));
 router.get('/items/:id/batch-template', view, handle((req) => batchTemplate(pool, company(req), id(req))));

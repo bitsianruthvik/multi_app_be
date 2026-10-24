@@ -150,6 +150,17 @@ async function buildPlan(db, companyId, line, { lockedBoth = null, rowsMayBeDraf
   const { problems, all, detail, tree } = plan;
   if (tree.root.made === undefined) return plan;
 
+  // The made order rows with no flow, as rows (2026-10-24) — the same set the freeze checklist warns of (lockService
+  // 'flows'; cut pieces left out: their flow comes from Setup › Cutting) — so the Production step can list them, with
+  // "Give them a flow", before anyone clicks Release. Words only; the problems below are what release refuses.
+  plan.noFlowRows = [];
+  const seenNoFlow = new Set();
+  for (const n of all) {
+    if (!n.made || n.flow || n.kind !== 'temporary' || n.role === 'Cut from' || n.role === 'Raw plate' || seenNoFlow.has(n.key)) continue;
+    seenNoFlow.add(n.key);
+    plan.noFlowRows.push({ recordId: Number(n.id), lineId: n.lineId != null ? Number(n.lineId) : null, name: nameOf(n) });
+  }
+
   for (const n of all) {
     if (n.made === undefined) continue;   // a selection or a definition — already a problem
     const where = n.parentNode ? ` under ${nameOf(n.parentNode)}` : '';
@@ -1220,6 +1231,8 @@ export async function releaseCheck(db, companyId, lineId) {
     needsFinishedArea: !finished.area,
     cutPlatesNoFlow,
     cutSectionsNoFlow,
+    // The made rows release refuses for having no flow (buildPlan), for the screen's "Give them a flow".
+    noFlowRows: plan.noFlowRows ?? [],
     // No active area of the fitting purpose at all: the dialog offers to create one.
     finishedAreaPurpose: line.order_type === 'stock' ? 'storage' : 'dispatch',
     noFittingArea: areas.every((a) => a.purpose !== (line.order_type === 'stock' ? 'storage' : 'dispatch')),

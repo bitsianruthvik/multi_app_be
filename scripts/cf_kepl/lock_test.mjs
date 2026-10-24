@@ -547,6 +547,28 @@ try {
   await LOCK.lockLine(conn, c, c40.id);
   same('and it locks as 04, its girder numbered after the order\'s earlier girders (3)', [(await lineRow(conn, c40.id)).lock_position, (await livePieces(conn, c40.id))[0].code], [4, `${Cq.code}-GR-04-3`]);
 
+  // 2026-10-24: a made row frozen with NO flow — the freeze only warns (the 'flows' check), release refuses it, and the
+  // release check hands the same row to the order's Production step (noFlowRows: "Release will refuse these N rows").
+  await conn.query('SAVEPOINT noflow');
+  const Nq = await girderOrder(conn, c, f, 'N', [1]);
+  const [nLine] = Nq.lines;
+  const [[nPart]] = await conn.query(
+    'SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id WHERE i.owner_order_line_id = ? AND m.classification_id = ? AND m.deleted_at IS NULL ORDER BY m.id LIMIT 1',
+    [nLine.id, f.v.part.id],
+  );
+  await conn.query('UPDATE cf_master_records SET default_flow_id = NULL WHERE id = ?', [nPart.id]);
+  const nPlan = await LOCK.lockPlan(conn, COMPANY, nLine.id);
+  const nWarn = nPlan.checks.find((ch) => ch.key === 'flows');
+  ok('freeze: a made row with no flow is a warning with its row, and does not hold the freeze up', !!nWarn && nWarn.warning === true && (nWarn.rows ?? []).some((r) => r.recordId === Number(nPart.id)) && nPlan.canLock === true, JSON.stringify(nWarn ?? nPlan.checks.map((ch) => ch.key)));
+  await LOCK.lockLine(conn, c, nLine.id);
+  await SO.setOrderStatus(conn, c, Nq.order.id, 'confirmed');
+  const nCheck = await REL.releaseCheck(conn, COMPANY, nLine.id);
+  same('release check: the same rows as the freeze warned of (noFlowRows)', (nCheck.noFlowRows ?? []).map((r) => [r.recordId, r.name]), (nWarn?.rows ?? []).map((r) => [r.recordId, r.name]));
+  ok('... each one a problem release refuses with, so the check is not ok', !nCheck.ok && (nCheck.noFlowRows ?? []).length > 0 && (nCheck.noFlowRows ?? []).every((r) => nCheck.problems.includes(`${r.name} has no flow — say how it is made.`)), nCheck.problems.join(' | '));
+  const nErr = await refusal(() => REL.releaseLine(conn, c, nLine.id, { finishedAreaId: f.area.id }));
+  ok('... and release does refuse it (the rule is unchanged)', nErr?.code === 'NOT_READY' && (nErr.problems ?? []).some((p) => p.endsWith('has no flow — say how it is made.')), (nErr?.problems ?? [nErr?.message]).join(' | '));
+  await conn.query('ROLLBACK TO SAVEPOINT noflow');
+
   /* ---- 6. duplicates, taken codes, holes ---------------------------------------- */
   section('6. Lock refuses two pieces with one code, a code another line holds, and a rule with a hole');
   const D = await girderOrder(conn, c, f, 'D', [1]);

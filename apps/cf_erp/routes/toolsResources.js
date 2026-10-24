@@ -22,7 +22,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
   listMachineResources, setMachineResources, addMachineResource, updateMachineResource, removeMachineResource, searchResourceItems,
 } from '../services/machineResourceService.js';
@@ -35,12 +35,16 @@ const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 const company = (req) => ctx(req).companyId;
 
-router.get('/machines/:id/resources', guard(PERM.productionView), handle((req) => listMachineResources(pool, company(req), id(req))));
-router.put('/machines/:id/resources', guard(PERM.production), handle((req) => tx(req, (db, c) => setMachineResources(db, c, id(req), req.body ?? {}))));
-router.post('/machines/:id/resources', guard(PERM.production), handle((req) => tx(req, (db, c) => addMachineResource(db, c, id(req), req.body ?? {}))));
-router.put('/machine-resources/:id', guard(PERM.production), handle((req) => tx(req, (db, c) => updateMachineResource(db, c, id(req), req.body ?? {}))));
-router.delete('/machine-resources/:id', guard(PERM.production), handle((req) => tx(req, (db, c) => removeMachineResource(db, c, id(req)))));
-router.get('/resource-items', guard(PERM.productionView), handle((req) => searchResourceItems(pool, company(req), req.query)));
+// A machine's tools and spares list: production manage OR maintenance (2026-10-24) — maintenance MRs start from it
+// (maintenanceService.mrLines). The machine itself, its shifts and its values stay on production manage (machines.js).
+const resourcesView = guardAny(PERM.productionView, PERM.maintenance);
+const resourcesManage = guardAny(PERM.production, PERM.maintenance);
+router.get('/machines/:id/resources', resourcesView, handle((req) => listMachineResources(pool, company(req), id(req))));
+router.put('/machines/:id/resources', resourcesManage, handle((req) => tx(req, (db, c) => setMachineResources(db, c, id(req), req.body ?? {}))));
+router.post('/machines/:id/resources', resourcesManage, handle((req) => tx(req, (db, c) => addMachineResource(db, c, id(req), req.body ?? {}))));
+router.put('/machine-resources/:id', resourcesManage, handle((req) => tx(req, (db, c) => updateMachineResource(db, c, id(req), req.body ?? {}))));
+router.delete('/machine-resources/:id', resourcesManage, handle((req) => tx(req, (db, c) => removeMachineResource(db, c, id(req)))));
+router.get('/resource-items', resourcesView, handle((req) => searchResourceItems(pool, company(req), req.query)));
 
 router.get('/tools/items', guard(PERM.inventoryView), handle((req) => listToolItems(pool, company(req), req.query)));
 router.get('/tools/life', guard(PERM.inventoryView), handle((req) => listToolLife(pool, company(req), req.query)));

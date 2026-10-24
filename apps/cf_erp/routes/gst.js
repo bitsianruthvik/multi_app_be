@@ -23,12 +23,13 @@
  *   GET  /orders/:id/invoices             { rows, uninvoiced }
  *   POST /orders/:id/invoices             { movementIds?, invoiceId? } → Invoice (draft)
  *
- * Reads take cf_erp_orders_view, writes cf_erp_orders_manage — the tax settings
- * too (the people who invoice set them up).
+ * Reads take cf_erp_orders_view, writes cf_erp_orders_manage. The company tax details also take Accounts (2026-10-24:
+ * accounts own tax) — read with accounts view, saved with accounts manage; HSN / GST by family: catalog manage OR
+ * accounts manage.
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import { fail } from '../../../core/middleware/requirePerm.js';
 import { translateDbError } from '../lib/errors.js';
 import { getTaxSettings, putTaxSettings, GST_STATES, validateGstin } from '../services/taxService.js';
@@ -45,14 +46,18 @@ const id = (req) => intParam(req.params.id);
 const company = (req) => ctx(req).companyId;
 const view = guard(PERM.ordersView);
 const manage = guard(PERM.orders);
+/** The company's tax details and the tax look-ups: the people who invoice, Sales or Accounts. */
+const taxView = guardAny(PERM.ordersView, PERM.accountsView);
+const taxManage = guardAny(PERM.orders, PERM.accounts);
 
-router.get('/settings/tax', view, handle((req) => getTaxSettings(pool, company(req))));
-router.put('/settings/tax', manage, handle((req) => tx(req, (db, c) => putTaxSettings(db, c, req.body ?? {}))));
-router.get('/tax/states', view, handle(() => GST_STATES));
-// HSN / GST by catalog family (2026-10-18): the gaps per family and a bulk set (items + templates; catalog managers).
-router.get('/tax/families', guard(PERM.view), handle((req) => familyTaxView(pool, company(req))));
-router.put('/tax/families/:id', guard(PERM.catalog), handle((req) => tx(req, (db, c) => applyFamilyTax(db, c, id(req), req.body ?? {}))));
-router.get('/tax/validate-gstin', view, handle((req) => validateGstin(req.query.gstin)));
+router.get('/settings/tax', taxView, handle((req) => getTaxSettings(pool, company(req))));
+router.put('/settings/tax', taxManage, handle((req) => tx(req, (db, c) => putTaxSettings(db, c, req.body ?? {}))));
+router.get('/tax/states', taxView, handle(() => GST_STATES));
+// HSN / GST by catalog family (2026-10-18): the gaps per family and a bulk set (items + templates; catalog managers, and
+// accounts since 2026-10-24).
+router.get('/tax/families', guardAny(PERM.view, PERM.accountsView), handle((req) => familyTaxView(pool, company(req))));
+router.put('/tax/families/:id', guardAny(PERM.catalog, PERM.accounts), handle((req) => tx(req, (db, c) => applyFamilyTax(db, c, id(req), req.body ?? {}))));
+router.get('/tax/validate-gstin', taxView, handle((req) => validateGstin(req.query.gstin)));
 
 router.get('/invoices', view, handle((req) => listInvoices(pool, company(req), req.query)));
 router.get('/invoices/:id', view, handle((req) => getInvoice(pool, company(req), id(req))));

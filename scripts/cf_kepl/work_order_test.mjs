@@ -125,6 +125,8 @@ try {
   ok('it holds exactly the subtree\'s cells', woA.cellCount === subCells.length);
   ok('every one of them now shows A', subCells.every((cl) => ownerOf(v, cl).contractorId === A && ownerOf(v, cl).workOrderId === woA.id && ownerOf(v, cl).contractorName === `${tag} A`));
   ok('a new work order\'s due date defaults to the sales order\'s committed date', (await getWorkOrder(conn, COMPANY, woA.id)).dueDate === '2026-11-15');
+  // 2026-10-24: the older work order page says it is the older view, from the reply's kind.
+  ok('a work order of cells says its kind (cells) — the older page links across to the contractor work order', (await getWorkOrder(conn, COMPANY, woA.id)).kind === 'cells');
   const subKeys = new Set(sub.map((r) => r.key));
   const outside = v.rows.filter((r) => !subKeys.has(r.key)).slice(0, 200);
   ok('cells outside it stay in-house', cellsOf(outside).every((cl) => ownerOf(v, cl).workOrderId === null));
