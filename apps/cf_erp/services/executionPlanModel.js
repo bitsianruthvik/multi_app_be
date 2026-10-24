@@ -185,12 +185,15 @@ export function checkLinePlan(line, plan, shape, names = new Map()) {
   }
   if (problems.length) return problems;
   // Never coarser than the production order.
-  if (D.level !== 'same') {
-    const coarser = RANK[D.level] < RANK[P.level]
-      || (D.level === 'assembly' && P.level === 'assembly' && D.levelId !== P.levelId && !!shape?.below.get(D.levelId)?.has(P.levelId));
-    if (coarser) problems.push(`${L}: a dispatch unit cannot be bigger than a production order. Choose "Same as the production order" or a smaller level.`);
-  }
+  if (dispatchBigger(P, D, shape)) problems.push(`${L}: a dispatch unit cannot be bigger than a production order. Choose "Same as the production order" or a smaller level.`);
   return problems;
+}
+
+/** Whether a dispatch level is coarser than the production order it must lie inside. */
+export function dispatchBigger(P, D, shape) {
+  if (D.level === 'same') return false;
+  return RANK[D.level] < RANK[P.level]
+    || (D.level === 'assembly' && P.level === 'assembly' && D.levelId !== P.levelId && !!shape?.below.get(D.levelId)?.has(P.levelId));
 }
 
 /** How many production orders one line makes on its own (0 for a line on the 'order' level — the order counts it). */
@@ -364,4 +367,243 @@ export function sharedLevels(lines) {
   return [...by.values()]
     .map((e) => ({ ...e, onEveryLine: e.lineNos.length === withStructure }))
     .sort((a, b) => Number(b.onEveryLine) - Number(a.onEveryLine) || a.depth - b.depth || a.name.localeCompare(b.name));
+}
+
+/* ===========================================================================
+ * CHOOSE BY RESULT, AND NOTHING TO CHOOSE (user, 2026-10-24)
+ *
+ * Every option the screen offers (the two bars and each line's selects) is labelled with what it produces:
+ * "Per unit — 3 production orders (one per unit)". An option that gives exactly the same as a simpler one
+ * (order < line < unit < sub-assembly; dispatch: same < line < unit < sub-assembly) is hidden, and a note under the
+ * bar names it ("Per unit gives the same here (every line is 1 unit)"). The chosen and the saved option are never
+ * hidden. The levels refine one another (a unit lies inside its line, a sub-assembly inside its unit; a valid
+ * dispatch unit inside its production order), so the same COUNT as a simpler option means the same production
+ * orders — counts are enough.
+ *
+ * When every option gives the same as the default, there is NOTHING TO CHOOSE: the default plan is the plan, the
+ * stage is done by itself and the freeze is not held (nothingToChoose — the one answer the service, the stage mark
+ * and the freeze read). Worked out on every read, so an order that gains a line or a sub-assembly asks again.
+ * ======================================================================== */
+
+export const PRODUCTION_NAMES = Object.freeze({ order: 'Whole order', line: 'Per line', unit: 'Per unit', assembly: 'Per sub-assembly' });
+export const DISPATCH_NAMES = Object.freeze({ same: 'Same as production orders', line: 'Per line', unit: 'Per unit', assembly: 'Per sub-assembly' });
+const RANK_D = { same: 0, line: 1, unit: 2, assembly: 3 };
+const rankOf = (kind, level) => (kind === 'production' ? RANK : RANK_D)[level];
+/** A choice as one key: "line", "assembly:6094" (the screen's select value). */
+export const choiceKey = (c) => (c.level === 'assembly' ? `assembly:${c.levelId ?? ''}` : c.level);
+const defaultPlan = () => ({ production: { ...DEFAULT_PLAN.production }, dispatch: { ...DEFAULT_PLAN.dispatch } });
+const SAME = Object.freeze({ level: 'same', levelId: null });
+
+/**
+ * How many production orders and dispatch units some lines make — previewOrder's counts, without the labels.
+ * lines: [{ quantity, plan, shape }]
+ */
+export function totalsOf(lines) {
+  let production = 0;
+  let dispatch = 0;
+  const together = lines.filter((l) => l.plan.production.level === 'order');
+  if (together.length) production += 1;
+  if (together.some((l) => l.plan.dispatch.level === 'same')) dispatch += 1;
+  for (const l of lines) {
+    const pc = productionCount(l, l.plan, l.shape);
+    production += pc;
+    if (l.plan.dispatch.level === 'same') { if (l.plan.production.level !== 'order') dispatch += pc; }
+    else dispatch += dispatchCount(l, l.plan, l.shape);
+  }
+  return { production, dispatch };
+}
+
+/** Whether a sub-assembly level leaves "the rest" of a unit (production: or its final assembly). */
+const restOf = (kind, shape, levelId) => !!shape && (!!shape.outside.get(levelId) || (kind === 'production' && !!shape.hasRootFlow));
+
+/** Why an option cannot be taken on some lines, in a few words — or null. lines carry the plan WITH the option. */
+function problemOf(kind, lines) {
+  const notWhole = [];
+  const missing = [];
+  let bigger = false;
+  for (const l of lines) {
+    const c = l.plan[kind];
+    if ((c.level === 'unit' || c.level === 'assembly') && !isWhole(Number(l.quantity))) notWhole.push(l.lineNo);
+    else if (c.level === 'assembly' && !(l.shape?.levels ?? []).some((x) => x.id === c.levelId)) missing.push(l.lineNo);
+    else if (kind === 'dispatch' && dispatchBigger(l.plan.production, c, l.shape)) bigger = true;
+  }
+  const at = (nos) => `line${nos.length === 1 ? '' : 's'} ${nos.join(', ')}`;
+  if (missing.length) return `none on ${at(missing)}`;
+  if (notWhole.length) return `${at(notWhole)} ${notWhole.length === 1 ? 'is' : 'are'} not a whole quantity`;
+  if (bigger) return 'bigger than a production order';
+  return null;
+}
+
+/** One option: what it is called and what it produces. `together`: the line joins the order's one production order. */
+function optionOf(kind, c, { count, problem = null, rest = false, names, together = false }) {
+  const lvName = c.level === 'assembly' ? names.get(c.levelId) ?? 'that level' : null;
+  const name = c.level === 'assembly' ? `Per sub-assembly: ${lvName}` : (kind === 'production' ? PRODUCTION_NAMES : DISPATCH_NAMES)[c.level];
+  let label;
+  if (problem) label = `${name} — ${problem}`;
+  else if (together) label = `${name} — ${kind === 'production' ? "together with the order's other lines" : 'with the order'}`;
+  else {
+    const why = c.level === 'unit' && count > 1 ? ' (one per unit)'
+      : c.level === 'assembly' ? ` (each ${lvName}${rest ? (kind === 'production' ? ' + the rest' : ' + loose items') : ''})` : '';
+    label = `${name} — ${n(count, kind === 'production' ? 'production order' : 'dispatch unit')}${why}`;
+  }
+  return {
+    key: choiceKey(c), choice: { level: c.level, levelId: c.level === 'assembly' ? c.levelId ?? null : null },
+    name, label, count: together ? null : count, problem, hidden: false, sameAs: null,
+  };
+}
+
+/** Why `hidden` gives the same as `shown`, in a few words. ctx: { scope, follows, made, lineCount } */
+function sameBecause(kind, hidden, shown, ctx) {
+  const [coarse, fine] = rankOf(kind, hidden.choice.level) <= rankOf(kind, shown.choice.level) ? [hidden, shown] : [shown, hidden];
+  let c = coarse.choice.level;
+  const f = fine.choice.level;
+  if (c === 'same') {
+    // "Same" is the production order's level: say why the finer level gives no more than that one does.
+    const p = ctx.production?.level;
+    if (!p || p === 'assembly' || p === f || rankOf('production', p) > rankOf('dispatch', f)) {
+      return ctx.scope === 'line' ? 'it matches its production orders' : 'it matches the production orders';
+    }
+    c = p;
+  }
+  const oneLine = ctx.made === 1 ? (ctx.lineCount > 1 ? 'only one line is made' : 'the order has one line')
+    : `only line ${ctx.follows[0]?.lineNo ?? '?'} follows the order's choice`;
+  const oneUnit = ctx.scope === 'line' || ctx.follows.length === 1 ? 'the line is 1 unit' : 'every line is 1 unit';
+  if (f === 'line') return oneLine;
+  if (f === 'unit') return c === 'order' ? `${oneLine}, of 1 unit` : oneUnit;
+  if (c === 'assembly') return `the same pieces as ${coarse.name}`;
+  const holds = `one ${fine.name.replace(/^Per sub-assembly: /, '')} and nothing beside it`;
+  if (c === 'unit') return `each unit holds ${holds}`;
+  if (c === 'line') return `${oneUnit}, holding ${holds}`;
+  return `${oneLine}, of 1 unit holding ${holds}`;
+}
+
+/**
+ * Hides every option that gives the same as a simpler one (an option with a problem, or with no count of its own,
+ * is never folded). Of options that give the same, the simplest shows — or the kept (chosen / saved) ones.
+ * → the note naming what was folded in, or null.
+ */
+function fold(kind, options, keep, ctx) {
+  const valid = options.filter((o) => !o.problem && o.count != null);
+  const rootOf = new Map();
+  for (const o of valid) {
+    const r = valid.find((x) => rankOf(kind, x.choice.level) < rankOf(kind, o.choice.level) && x.count === o.count);
+    rootOf.set(o.key, r ? r.key : o.key);
+  }
+  const shownOf = new Map();
+  for (const root of new Set(rootOf.values())) {
+    const members = valid.filter((o) => rootOf.get(o.key) === root);
+    const kept = members.filter((o) => keep.has(o.key));
+    shownOf.set(root, kept.length ? kept : members.filter((o) => o.key === root));
+  }
+  const notes = [];
+  for (const o of valid) {
+    const shown = shownOf.get(rootOf.get(o.key));
+    if (shown.includes(o)) continue;
+    o.hidden = true;
+    o.sameAs = shown[0].key;
+    notes.push(`${o.name} gives the same here (${sameBecause(kind, o, shown[0], ctx)})`);
+  }
+  return notes.length ? `${notes.join('; ')}.` : null;
+}
+
+/**
+ * Every choice the screen offers, each with what it produces.
+ * lines: the MADE lines [{ lineId, lineNo, quantity, plan, source, frozen, shape }], plans as they stand (a dry
+ * run's draft). orderPlan: the order's choice.
+ * keep: { order?: [plan], lines?: Map(lineId → [plan]) } — saved plans, whose choices are never hidden (nor is the
+ * chosen one). lineCount: every live line of the order (a line from stock too), for the notes' words.
+ * → { production: { options, note }, dispatch: { options, note },
+ *     perLine: Map(lineId → { production: { options, note, asOrder }, dispatch: { options, note, asOrder } }) }
+ *   The bars' options act on the lines that follow the order (not on a line of its own, nor a frozen one).
+ */
+export function choicesOf(lines, orderPlan, { keep = {}, lineCount = lines.length } = {}) {
+  const names = new Map();
+  for (const l of lines) for (const lv of l.shape?.levels ?? []) names.set(lv.id, lv.name);
+  const follows = lines.filter((l) => l.source !== 'line' && !l.frozen);
+  const fixed = lines.filter((l) => !follows.includes(l));
+  const levelIds = sharedLevels(lines).map((x) => x.id);
+  const plain = (levels) => levels.map((level) => ({ level, levelId: null }));
+  const assemblies = (ids) => ids.map((id) => ({ level: 'assembly', levelId: id }));
+  const ctx = { scope: 'order', follows, made: lines.length, lineCount, production: orderPlan.production };
+
+  const bar = (kind, c) => {
+    const applied = follows.map((l) => ({
+      ...l, plan: kind === 'production' ? { production: c, dispatch: SAME } : { production: l.plan.production, dispatch: c },
+    }));
+    const t = totalsOf([...applied, ...fixed]);
+    return optionOf(kind, c, {
+      count: kind === 'production' ? t.production : t.dispatch,
+      problem: problemOf(kind, applied),
+      rest: c.level === 'assembly' && applied.some((l) => restOf(kind, l.shape, c.levelId)),
+      names,
+    });
+  };
+  const keyed = (plans, kind) => (plans ?? []).filter(Boolean).map((p) => choiceKey(p[kind]));
+  const orderKeep = (kind) => new Set([choiceKey(orderPlan[kind]), ...keyed(keep.order, kind)]);
+
+  const production = { options: [...plain(['order', 'line', 'unit']), ...assemblies(levelIds)].map((c) => bar('production', c)), note: null };
+  const dispatch = { options: [...plain(['same', 'line', 'unit']), ...assemblies(levelIds)].map((c) => bar('dispatch', c)), note: null };
+  if (follows.length) {
+    production.note = fold('production', production.options, orderKeep('production'), ctx);
+    dispatch.note = fold('dispatch', dispatch.options, orderKeep('dispatch'), ctx);
+  }
+
+  const perLine = new Map();
+  for (const l of lines) {
+    const own = (l.shape?.levels ?? []).map((x) => x.id);
+    const lctx = { scope: 'line', follows: [l], made: lines.length, lineCount, production: l.plan.production };
+    const prodOf = (c) => {
+      if (c.level === 'order') return optionOf('production', c, { names, together: true });
+      const ll = { ...l, plan: { production: c, dispatch: SAME } };
+      return optionOf('production', c, {
+        count: productionCount(ll, ll.plan, l.shape), problem: problemOf('production', [ll]),
+        rest: c.level === 'assembly' && restOf('production', l.shape, c.levelId), names,
+      });
+    };
+    const P = l.plan.production;
+    const dispOf = (c) => {
+      if (c.level === 'same' && P.level === 'order') return optionOf('dispatch', c, { names, together: true });
+      const ll = { ...l, plan: { production: P, dispatch: c } };
+      return optionOf('dispatch', c, {
+        count: c.level === 'same' ? productionCount(ll, ll.plan, l.shape) : dispatchCount(ll, ll.plan, l.shape),
+        problem: problemOf('dispatch', [ll]), rest: c.level === 'assembly' && restOf('dispatch', l.shape, c.levelId), names,
+      });
+    };
+    const lineKeep = (kind) => new Set([
+      ...(l.source === 'line' ? [choiceKey(l.plan[kind])] : []),
+      ...keyed(keep.lines?.get(l.lineId), kind),
+    ]);
+    const prod = [...plain(['order', 'line', 'unit']), ...assemblies(own)].map(prodOf);
+    const disp = [...plain(['same', 'line', 'unit']), ...assemblies(own)].map(dispOf);
+    // "Whole order" on a line joins the other lines — never the same as a line on its own, so never folded.
+    const prodNote = fold('production', prod.filter((o) => o.choice.level !== 'order'), lineKeep('production'), lctx);
+    const dispNote = fold('dispatch', disp, lineKeep('dispatch'), lctx);
+    const asOrderP = prod.find((o) => o.key === choiceKey(orderPlan.production)) ?? prodOf(orderPlan.production);
+    const asOrderD = dispOf(orderPlan.dispatch);
+    perLine.set(l.lineId, {
+      production: { options: prod, note: prodNote, asOrder: `As the order: ${asOrderP.label}` },
+      dispatch: { options: disp, note: dispNote, asOrder: `As the order: ${asOrderD.label}` },
+    });
+  }
+  return { production, dispatch, perLine };
+}
+
+/**
+ * NOTHING TO CHOOSE: on the default plan, every option the order offers gives exactly the default's production
+ * orders and dispatch units (e.g. one line of quantity 1 with no sub-assembly of which a unit holds more than one).
+ * Then the default plan is the plan: the stage is done by itself and Freeze design does not wait for a save.
+ * lines: the MADE lines [{ lineId, lineNo, quantity, shape }].
+ */
+export function nothingToChoose(lines, { lineCount } = {}) {
+  const base = lines.map((l) => ({ ...l, plan: defaultPlan(), source: 'default', frozen: false }));
+  const def = totalsOf(base);
+  const ch = choicesOf(base, defaultPlan(), { lineCount });
+  return ch.production.options.every((o) => !!o.problem || o.count === def.production)
+    && ch.dispatch.options.every((o) => !!o.problem || o.count === def.dispatch);
+}
+
+/** "1 production order, ships as 1 dispatch unit — nothing to choose for this order." lines: [{ quantity, plan, shape }] */
+export function planSummary(lines, nothing) {
+  const t = totalsOf(lines);
+  return `${n(t.production, 'production order')}, ships as ${n(t.dispatch, 'dispatch unit')}${nothing ? ' — nothing to choose for this order.' : '.'}`;
 }

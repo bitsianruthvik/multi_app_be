@@ -55,7 +55,7 @@ import { plannedMaterialOfLines } from './releaseService.js';
 import { availability, madeRule } from './rollOutService.js';
 import { cutPieceGaps } from './lockService.js';
 import { lineReadiness, dayWords, DATED_PO_STATUSES } from './materialReadyService.js';
-import { planRowsOf, linePlanStates } from './executionPlanService.js';
+import { planRowsOf, linePlanStates, madeOf } from './executionPlanService.js';
 
 /**
  * Backend B's section nesting state for a line — { needed, accepted } — asked
@@ -306,6 +306,11 @@ export const STAGE_CATALOGUE = [
       if (p.problems.length) {
         return { state: 'partial', detail: p.problems[0], blockers: p.problems.map((message) => ({ count: 0, message })) };
       }
+      // Nothing to choose (2026-10-24): every option gives the default's production orders — the default is the
+      // plan, done by itself (worked out on every read: a new line or sub-assembly asks again).
+      if (!p.saved && p.nothingToChoose) {
+        return { state: 'done', detail: `Nothing to choose — ${p.summary.replace(/ — nothing to choose for this order\.$/, '')}`, blockers: [] };
+      }
       if (!p.saved) {
         return {
           state: 'todo',
@@ -359,7 +364,8 @@ export const STAGE_CATALOGUE = [
       }
       // The execution plan is fixed by the freeze (§72), so lockLine REFUSES until it is saved (coordinator,
       // 2026-10-18) — on a process with the Execution plan stage. Prefilled, so saving it is one click.
-      if (ctx.planStage && ctx.plan && !ctx.plan.saved) {
+      // With nothing to choose the default is the plan, and nothing waits (2026-10-24).
+      if (ctx.planStage && ctx.plan && !ctx.plan.saved && !ctx.plan.nothingToChoose) {
         waitingOn ??= { stageKey: 'execution_plan', message: 'Save the execution plan first — it is fixed when the design is frozen.' };
         blockers.push({ count: 0, message: `Line ${L}'s design cannot be frozen until the execution plan is saved. It is filled in already — open the Execution plan step and press Save the plan.` });
       }
@@ -1588,7 +1594,9 @@ async function loadOrderContext(db, companyId, order, lines) {
 
   // Each line's execution plan against its own tree: the definitions the rows were made from are in `detail`.
   const defOf = (id) => { const d = detail.get(id); return d?.source_definition_id ? { id: Number(d.source_definition_id), name: d.source_definition_name ?? 'Level' } : null; };
-  const planBy = linePlanStates(planRows, lines, trees, defOf);
+  // The lines that make something (executionPlanService.madeOf) — what "nothing to choose" weighs.
+  const isMade = (l) => madeOf(order, { line_type: l.line_type, item_id: l.item_id, sourcing: l.item_id ? detail.get(l.item_id)?.sourcing ?? null : null });
+  const planBy = linePlanStates(planRows, lines, trees, defOf, { isMade });
 
   return { planBy, trees, detail, free, onOrder, ready, releases, lotsBy, cutPiecesBy, sectionPiecesBy, sectionBy, driftBy, leftOutBy, untrackedBy, chains, nestingBy, values, labelOf, nestSpec: nestSpec ?? null, locksBy, partById, cutClassIds, planned, requiredBy };
 }

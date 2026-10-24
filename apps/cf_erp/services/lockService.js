@@ -174,13 +174,18 @@ async function lockChecks(db, companyId, line, { refreshed = null } = {}) {
 
   // 3b. The execution plan (init.sql §72, 2026-10-18): fixed by the freeze, so it must be saved first — when the
   //     order's process has the Execution plan step. It is prefilled, so saving it is one click.
+  //     With NOTHING TO CHOOSE (2026-10-24: every option gives the default's production orders) the default is the
+  //     plan, and the freeze does not wait for a save.
   const gate = await planGate(db, companyId, line.order_id);
   if (gate.required) {
+    const planOk = gate.saved || gate.nothingToChoose;
     add({
-      key: 'execution_plan', ok: gate.saved, title: 'The execution plan is saved', stageKey: 'execution_plan',
-      detail: gate.saved ? 'Saved — it is fixed for this line when the design is frozen.' : 'Not saved yet.',
-      todo: gate.saved ? null : 'Open the Execution plan step and press Save the plan.',
-      problems: gate.saved ? [] : [SAVE_PLAN_FIRST],
+      key: 'execution_plan', ok: planOk, title: 'The execution plan is saved', stageKey: 'execution_plan',
+      detail: gate.saved ? 'Saved — it is fixed for this line when the design is frozen.'
+        : gate.nothingToChoose ? `Nothing to choose — ${gate.summary.replace(/ — nothing to choose for this order\.$/, '')}. The default plan is the plan.`
+          : 'Not saved yet.',
+      todo: planOk ? null : 'Open the Execution plan step and press Save the plan.',
+      problems: planOk ? [] : [SAVE_PLAN_FIRST],
     });
   }
 

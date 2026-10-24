@@ -10,6 +10,11 @@
  *       dryRun: nothing is written, and problems come back in the answer instead of a refusal — the screen's
  *       live preview.
  *
+ * The answer (2026-10-24, fields added): `nothingToChoose` (every option gives the default's production orders —
+ * the default is the plan, no save needed), `summary` ("1 production order, ships as 1 dispatch unit — …"),
+ * `options.production / options.dispatch` ({ options: [{ key, choice, name, label, count, problem, hidden, sameAs }],
+ * note }) and each line's `options` ({ production, dispatch }, each with `asOrder`) — choose by result.
+ *
  * A FROZEN line's plan is fixed (user: "after freeze read-only, a change then needs a revision"). Changing the
  * order's choice while a frozen line follows it PINS that line to what it had, so a frozen line never moves. An
  * order that has stopped (closed, lost, cancelled, revised) does not change at all.
@@ -23,7 +28,8 @@ import { explode } from './bomService.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
 import {
   DEFAULT_PLAN, DISPATCH_LEVELS, PRODUCTION_LEVELS, PREVIEW_LIMIT,
-  checkLinePlan, effectivePlan, levelsOf, planWords, previewOrder, samePlan, sharedLevels, templatesFor,
+  checkLinePlan, choicesOf, effectivePlan, levelsOf, nothingToChoose, planSummary, planWords, previewOrder, samePlan,
+  sharedLevels, templatesFor,
 } from './executionPlanModel.js';
 
 /** The table is §72: a database without it answers "no plan saved" rather than failing the order page. */
@@ -53,11 +59,14 @@ export const SAVE_PLAN_FIRST = 'Save the execution plan first — it is filled i
 
 /**
  * Whether Freeze design must wait for the plan (coordinator, 2026-10-18: "Freeze design REFUSES while the order has
- * no saved execution plan"): the order's process has the Execution plan stage and no plan row is saved. A process
- * without the stage, or a database without §72, does not hold the freeze. One read.
- * → { required, saved }
+ * no saved execution plan"): the order's process has the Execution plan stage and no plan row is saved — unless
+ * there is NOTHING TO CHOOSE (user, 2026-10-24: every option gives the default's production orders, so the default
+ * is the plan). A process without the stage, or a database without §72, does not hold the freeze. One read; the
+ * order is loaded (loadAll) only when it is required and not saved.
+ * → { required, saved, nothingToChoose, summary }
  */
 export async function planGate(db, companyId, orderId) {
+  let gate;
   try {
     const [[r]] = await db.query(
       `SELECT (SELECT COUNT(*) FROM cf_process_stages s JOIN cf_sales_orders o ON o.company_id = s.company_id AND o.process_id = s.process_id
@@ -65,11 +74,29 @@ export async function planGate(db, companyId, orderId) {
               (SELECT COUNT(*) FROM cf_order_execution_plans p WHERE p.company_id = ? AND p.order_id = ? AND p.deleted_at IS NULL) AS saved_rows`,
       [companyId, orderId, companyId, orderId],
     );
-    return { required: Number(r.has_stage) > 0, saved: Number(r.saved_rows) > 0 };
+    gate = { required: Number(r.has_stage) > 0, saved: Number(r.saved_rows) > 0, nothingToChoose: false, summary: null };
   } catch (e) {
-    if (planTableMissing(e)) return { required: false, saved: false };
+    if (planTableMissing(e)) return { required: false, saved: false, nothingToChoose: false, summary: null };
     throw e;
   }
+  if (gate.required && !gate.saved) {
+    const made = madeLinesOf(await loadAll(db, companyId, orderId));
+    gate.nothingToChoose = nothingToChoose(made.lines, { lineCount: made.lineCount });
+    gate.summary = planSummary(made.lines, gate.nothingToChoose);
+  }
+  return gate;
+}
+
+/** The made lines of a loaded order, as the model reads them (on the plan the rows give). */
+function madeLinesOf({ order, lines, rows, trees, defOf }) {
+  const made = lines.filter((l) => madeOf(order, l)).map((l) => {
+    const { plan, source } = effectivePlan(rows, l.id);
+    return {
+      lineId: l.id, lineNo: l.line_no, quantity: Number(l.quantity), plan, source, frozen: frozenOf(l),
+      shape: trees.get(l.id) ? levelsOf(trees.get(l.id), defOf) : null,
+    };
+  });
+  return { lines: made, lineCount: lines.length };
 }
 
 /** Every node id in some trees. */
@@ -98,13 +125,20 @@ export async function definitionsOf(db, companyId, trees) {
 
 /**
  * Each line's plan, as the process stage reads it (processService 'execution_plan'): pure, off rows and trees
- * the caller already has. lines: rows with id, line_no, quantity, locked_at.
- * → Map(lineId → { saved, source, plan, problems, words, frozen })
+ * the caller already has. lines: rows with id, line_no, quantity, locked_at. isMade(line): whether the line makes
+ * anything (madeOf) — the lines nothingToChoose weighs; without it every line counts.
+ * → Map(lineId → { saved, source, plan, problems, words, frozen, nothingToChoose, summary })
+ *   nothingToChoose and summary are the ORDER's (the same on every line).
  */
-export function linePlanStates(rows, lines, trees, defOf) {
+export function linePlanStates(rows, lines, trees, defOf, { isMade = () => true } = {}) {
   const shapes = new Map(lines.map((l) => [l.id, trees.get(l.id) ? levelsOf(trees.get(l.id), defOf) : null]));
   const names = new Map();
   for (const s of shapes.values()) for (const lv of s?.levels ?? []) names.set(lv.id, lv.name);
+  const made = lines.filter(isMade).map((l) => ({
+    lineId: l.id, lineNo: l.line_no, quantity: Number(l.quantity), plan: effectivePlan(rows, l.id).plan, shape: shapes.get(l.id),
+  }));
+  const nothing = nothingToChoose(made, { lineCount: lines.length });
+  const summary = planSummary(made, nothing);
   const out = new Map();
   for (const l of lines) {
     const { plan, source } = effectivePlan(rows, l.id);
@@ -116,6 +150,8 @@ export function linePlanStates(rows, lines, trees, defOf) {
       problems: checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shape, names),
       words: planWords(plan, { levels: [...names].map(([id, name]) => ({ id, name })) }),
       frozen: !!l.locked_at,
+      nothingToChoose: nothing,
+      summary,
     });
   }
   return out;
@@ -154,7 +190,7 @@ const frozenOf = (l) => !!l.locked_at || Number(l.releases) > 0;
 export const madeOf = (order, l) => order.order_type === 'stock' || l.line_type === 'custom' || (!!l.item_id && l.sourcing !== 'stock');
 
 /** The answer GET and PUT both give. `rows` may be the rows a dry run WOULD write. */
-function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [], dryRun = false } = {}) {
+function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [], dryRun = false, savedRows = rows } = {}) {
   const shapes = new Map(lines.map((l) => [l.id, trees.get(l.id) ? levelsOf(trees.get(l.id), defOf) : null]));
   const names = new Map();
   for (const s of shapes.values()) for (const lv of s?.levels ?? []) names.set(lv.id, lv.name);
@@ -172,8 +208,17 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
       problems: madeOf(order, l) ? checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shape, names) : [],
     };
   });
-  const preview = previewOrder(order.code, shaped.filter((l) => l.made), defOf);
+  const madeLines = shaped.filter((l) => l.made);
+  const preview = previewOrder(order.code, madeLines, defOf);
   const problems = [...extra, ...shaped.flatMap((l) => l.problems)];
+  // Choose by result (2026-10-24): every option with what it produces; the saved ones are never hidden.
+  const savedOrderRow = savedRows.find((r) => r.order_line_id == null);
+  const keep = {
+    order: savedOrderRow ? [effectivePlan([savedOrderRow], -1).plan] : [],
+    lines: new Map(savedRows.filter((r) => r.order_line_id != null).map((r) => [Number(r.order_line_id), [effectivePlan([r], r.order_line_id).plan]])),
+  };
+  const choices = choicesOf(madeLines, orderPlan, { keep, lineCount: lines.length });
+  const nothing = nothingToChoose(madeLines, { lineCount: lines.length });
   const savedRow = rows.reduce((best, r) => (!best || new Date(r.saved_at) > new Date(best.saved_at) ? r : best), null);
   // Only a line built from a template is frozen; a catalog line never is, so it does not keep the plan open.
   const freezable = lines.filter((l) => l.line_type === 'custom');
@@ -191,6 +236,11 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
     planWords: planWords(orderPlan, allLevels),
     defaults: DEFAULT_PLAN,
     choices: { production: PRODUCTION_LEVELS, dispatch: DISPATCH_LEVELS },
+    // Nothing to choose: the default plan is the plan — no save needed, the freeze does not wait (2026-10-24).
+    nothingToChoose: nothing,
+    summary: planSummary(madeLines, nothing),
+    // Each bar's options, labelled with what they produce; `hidden` ones give the same as a simpler one (`note`).
+    options: { production: choices.production, dispatch: choices.dispatch },
     lines: shaped.map((l) => ({
       lineId: l.lineId, lineNo: l.lineNo, lineType: l.lineType, quantity: l.quantity, item: l.item,
       frozen: l.frozen, released: l.released, made: l.made,
@@ -203,6 +253,8 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
       productionCount: preview.perLine.get(l.lineId)?.production ?? 0,
       dispatchCount: preview.perLine.get(l.lineId)?.dispatch ?? null,
       problems: l.problems,
+      // The line's selects, labelled like the bars (null for a line from stock).
+      options: choices.perLine.get(l.lineId) ?? null,
     })),
     levels: sharedLevels(shaped.filter((l) => l.made)).map(({ id, name, depth, lineNos, onEveryLine }) => ({ id, name, depth, lineNos, onEveryLine })),
     templates: templatesFor(shaped.filter((l) => l.made)),
@@ -293,7 +345,7 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
   }
 
   const nextRows = nextRowsOf();
-  const view = buildView({ ...loaded, rows: nextRows.map((r) => ({ ...r, saved_at: new Date(), saved_by: c.userId ?? null })) }, { dryRun, problems });
+  const view = buildView({ ...loaded, rows: nextRows.map((r) => ({ ...r, saved_at: new Date(), saved_by: c.userId ?? null })) }, { dryRun, problems, savedRows: rows });
   if (dryRun) return view;
   if (view.problems.length) throw invalid('INVALID', 'The execution plan needs attention.', { problems: view.problems });
 

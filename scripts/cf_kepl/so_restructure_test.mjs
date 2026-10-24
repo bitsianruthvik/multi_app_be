@@ -201,6 +201,19 @@ try {
   ok('the BOM levels of a span: Girder line (4 a span, level 1) and Girder segment (level 2)', !!glv && glv.depth === 1 && glv.perUnit === 4 && !!gsv && gsv.depth === 2 && gsv.perUnit > 4, JSON.stringify(lv1));
   ok('order-wide levels name the lines that have them', plan.levels.some((x) => x.id === GL && x.onEveryLine && x.lineNos.join() === '1,2'));
   ok('templates: one per line (usual) first, then whole order, per unit, per Girder line', plan.templates[0].key === 'per_line' && plan.templates.some((t) => t.key === 'whole_order') && plan.templates.some((t) => t.key === 'per_unit') && plan.templates.some((t) => t.plan.production.levelId === GL));
+  // Choose by result (2026-10-24): every option labelled with what it produces.
+  ok('two span lines: something to choose — the plan must be saved', plan.nothingToChoose === false && plan.summary === '2 production orders, ships as 2 dispatch units.', plan.summary);
+  const barLabel = (v, kind, key) => v.options[kind].options.find((o) => o.key === key);
+  eq('the production bar, labelled by result', ['order', 'line', 'unit', `assembly:${GL}`].map((k) => barLabel(plan, 'production', k)?.label),
+    ['Whole order — 1 production order', 'Per line — 2 production orders', 'Per unit — 4 production orders (one per unit)', 'Per sub-assembly: Girder line — 20 production orders (each Girder line + the rest)']);
+  ok('…none hidden (each gives something different), no note', plan.options.production.options.every((o) => !o.hidden) && plan.options.production.note === null, JSON.stringify(plan.options.production.options.filter((o) => o.hidden)));
+  eq('the dispatch bar: Per line gives the same as the production orders — hidden, named in the note', [barLabel(plan, 'dispatch', 'same').label, barLabel(plan, 'dispatch', 'line').hidden, plan.options.dispatch.note],
+    ['Same as production orders — 2 dispatch units', true, 'Per line gives the same here (it matches the production orders).']);
+  const pl2 = plan.lines.find((l) => l.lineId === L2.id).options;
+  ok('line 2 (×1): its Per unit select option is hidden — the line is 1 unit', pl2.production.options.find((o) => o.key === 'unit').hidden === true && /Per unit gives the same here \(the line is 1 unit\)/.test(pl2.production.note ?? ''), pl2.production.note);
+  ok('line 1 (×3): its Per unit shows — 3 production orders', plan.lines.find((l) => l.lineId === L1.id).options.production.options.find((o) => o.key === 'unit').label === 'Per unit — 3 production orders (one per unit)');
+  eq('…"As the order" says what it gives', pl2.production.asOrder, 'As the order: Per line — 1 production order');
+  eq('the stock line has no selects', plan.lines.find((l) => l.lineId === L3.id).options, null);
 
   const tryPlan = (body) => EP.saveExecutionPlan(conn, c, order.id, { ...body, dryRun: true });
   let d = await tryPlan({ production: { level: 'order' } });
@@ -337,6 +350,101 @@ try {
     M.effectivePlan([{ order_line_id: null, production_level: 'unit', dispatch_level: 'same' }], 5).source,
     M.effectivePlan([{ order_line_id: null, production_level: 'unit', dispatch_level: 'same' }, { order_line_id: 5, production_level: 'order', dispatch_level: 'same' }], 5).plan.production.level,
   ], ['default', 'order', 'order']);
+
+  /* ------------------------------------------------------------------------ */
+  section('6b. Nothing to choose, and choose by result — the model, pure (2026-10-24)');
+  const DEF = () => ({ production: { level: 'line', levelId: null }, dispatch: { level: 'same', levelId: null } });
+  const GL4 = { levels: [{ id: 7, name: 'Girder line', depth: 1, perUnit: 4 }], below: new Map(), outside: new Map([[7, false]]), hasRootFlow: false };
+  const GL1 = { levels: [{ id: 8, name: 'Deck', depth: 1, perUnit: 1 }], below: new Map(), outside: new Map([[8, false]]), hasRootFlow: false };
+  const ln = (id, quantity, shape = null, more = {}) => ({ lineId: id, lineNo: id, quantity, plan: DEF(), source: 'default', frozen: false, shape, ...more });
+  const shownLabels = (part) => part.options.filter((o) => !o.hidden).map((o) => o.label);
+  // One line, quantity 1.
+  let one = [ln(1, 1)];
+  let ch = M.choicesOf(one, DEF());
+  ok('one line ×1: nothing to choose', M.nothingToChoose(one) === true);
+  eq('…its sentence', M.planSummary(one, true), '1 production order, ships as 1 dispatch unit — nothing to choose for this order.');
+  eq('…the production bar shows only Per line (chosen); Whole order and Per unit folded in', shownLabels(ch.production), ['Per line — 1 production order']);
+  eq('…the note names them', ch.production.note, 'Whole order gives the same here (the order has one line); Per unit gives the same here (the line is 1 unit).');
+  eq('…the dispatch bar: only Same as production orders', [shownLabels(ch.dispatch), ch.dispatch.note],
+    [['Same as production orders — 1 dispatch unit'], 'Per line gives the same here (it matches the production orders); Per unit gives the same here (the line is 1 unit).']);
+  ok('a sub-assembly level with one to a unit and nothing beside it changes nothing', M.nothingToChoose([ln(1, 1, GL1)]) === true);
+  ok('…but with a final-assembly flow it does (the rest is a production order of its own)', M.nothingToChoose([ln(1, 1, { ...GL1, hasRootFlow: true })]) === false);
+  ok('a line of 2.5 (not whole): per unit cannot be taken, so nothing to choose', M.nothingToChoose([ln(1, 2.5)]) === true);
+  // One line, quantity 3.
+  one = [ln(1, 3)];
+  ch = M.choicesOf(one, DEF());
+  ok('one line ×3: something to choose', M.nothingToChoose(one) === false);
+  eq('…Per line and Per unit show; Whole order folded into Per line', [shownLabels(ch.production), ch.production.note],
+    [['Per line — 1 production order', 'Per unit — 3 production orders (one per unit)'], 'Whole order gives the same here (the order has one line).']);
+  // Two lines.
+  const two = [ln(1, 1), ln(2, 1)];
+  ch = M.choicesOf(two, DEF());
+  ok('two lines: something to choose (whole order 1, per line 2)', M.nothingToChoose(two) === false);
+  eq('…Per unit never shows when every line is 1 unit', [shownLabels(ch.production), ch.production.note],
+    [['Whole order — 1 production order', 'Per line — 2 production orders'], 'Per unit gives the same here (every line is 1 unit).']);
+  ok('…nor in a line\'s own select', ch.perLine.get(1).production.options.find((o) => o.key === 'unit').hidden === true);
+  eq('…a line\'s Whole order joins the other lines (never folded)', ch.perLine.get(2).production.options.find((o) => o.key === 'order').label, "Whole order — together with the order's other lines");
+  // A Girder-line level giving 4.
+  const gl = [ln(1, 1, GL4)];
+  ch = M.choicesOf(gl, DEF());
+  ok('a line ×1 with 4 Girder lines: something to choose', M.nothingToChoose(gl) === false);
+  eq('…labelled by result', shownLabels(ch.production), ['Per line — 1 production order', 'Per sub-assembly: Girder line — 4 production orders (each Girder line)']);
+  eq('…with "the rest" when a unit has more than its Girder lines', M.choicesOf([ln(1, 2, { ...GL4, outside: new Map([[7, true]]) })], DEF()).production.options.find((o) => o.key === 'assembly:7').label,
+    'Per sub-assembly: Girder line — 10 production orders (each Girder line + the rest)');
+  eq('…dispatch in dispatch units, the rest as loose items', M.choicesOf([ln(1, 2, { ...GL4, outside: new Map([[7, true]]) })], DEF()).dispatch.options.find((o) => o.key === 'assembly:7').label,
+    'Per sub-assembly: Girder line — 10 dispatch units (each Girder line + loose items)');
+  // A saved plan whose option would be hidden: never hidden.
+  const unitPlan = { production: { level: 'unit', levelId: null }, dispatch: { level: 'same', levelId: null } };
+  ch = M.choicesOf([ln(1, 1, null, { plan: unitPlan, source: 'order' })], unitPlan, { keep: { order: [unitPlan] } });
+  eq('a saved Per unit on a line of 1 stays shown (chosen and saved); the simpler ones fold into it', [shownLabels(ch.production), ch.production.options.find((o) => o.key === 'line').sameAs],
+    [['Per unit — 1 production order'], 'unit']);
+  ch = M.choicesOf([ln(1, 1)], DEF(), { keep: { order: [unitPlan] } });
+  ok('…saved but not chosen (a draft back on Per line): both show', shownLabels(ch.production).includes('Per unit — 1 production order') && shownLabels(ch.production).includes('Per line — 1 production order'), JSON.stringify(shownLabels(ch.production)));
+  ok('…and the order still has nothing to choose (worked out against the default)', M.nothingToChoose([ln(1, 1, null, { plan: unitPlan, source: 'order' })]) === true);
+  // A level a line lacks, and a dispatch bigger than a production order: shown with why, never folded.
+  ch = M.choicesOf([ln(1, 1, GL4), ln(2, 1)], DEF());
+  eq('a level missing on a line says so', ch.production.options.find((o) => o.key === 'assembly:7').label, 'Per sub-assembly: Girder line — none on line 2');
+  const perUnitProd = { production: { level: 'unit', levelId: null }, dispatch: { level: 'same', levelId: null } };
+  ch = M.choicesOf([ln(1, 3, null, { plan: perUnitProd })], perUnitProd);
+  eq('dispatch per line against production per unit: bigger than a production order', ch.dispatch.options.find((o) => o.key === 'line').label, 'Per line — bigger than a production order');
+
+  // The stage function: Freeze design does not wait when there is nothing to choose.
+  const lockKind2 = PROC.STAGE_CATALOGUE.find((k) => k.key === 'lock');
+  const clean2 = { line: { line_no: 1, line_type: 'custom' }, lock: { lockedAt: null, pieces: 0 }, values: { missing: [], required: 3 }, unresolved: [], cut: { parts: [] } };
+  eq('Freeze design is not held by an unsaved plan with nothing to choose', lockKind2.state({ ...clean2, planStage: true, plan: { saved: false, nothingToChoose: true } }).waitingOn ?? null, null);
+  const planKind = PROC.STAGE_CATALOGUE.find((k) => k.key === 'execution_plan');
+  const planCtx = { line: { line_no: 1 }, lock: { lockedAt: null }, tree: { stats: { nodes: 5 } }, fromTemplate: true };
+  eq('the Execution plan stage is done by itself', [planKind.state({ ...planCtx, plan: { saved: false, nothingToChoose: true, problems: [], words: 'x', summary: '1 production order, ships as 1 dispatch unit — nothing to choose for this order.' } }).state],
+    ['done']);
+
+  /* ------------------------------------------------------------------------ */
+  section('7. Nothing to choose, on an order (the revision, cut down to one span ×1 with no BOM levels)');
+  await undone(conn, async () => {
+    const revLines = (await SO.getOrder(conn, COMPANY, rev.id)).lines;
+    const span = revLines.find((l) => l.lineType === 'custom');
+    // One line that makes: the stock line goes, the span is ×1, its rows lose their definitions (no BOM levels).
+    await conn.query('UPDATE cf_sales_order_lines SET deleted_at = NOW() WHERE order_id = ? AND id <> ?', [rev.id, span.id]);
+    await conn.query('UPDATE cf_sales_order_lines SET quantity = 1 WHERE id = ?', [span.id]);
+    await conn.query('UPDATE cf_item_details SET source_definition_id = NULL WHERE company_id = ? AND owner_order_line_id = ?', [COMPANY, span.id]);
+    await EP.retirePlanRowsOfOrder(conn, COMPANY, rev.id);
+    const v = await EP.getExecutionPlan(conn, COMPANY, rev.id);
+    eq('GET: nothing to choose, nothing saved, one sentence', [v.nothingToChoose, v.saved, v.summary], [true, null, '1 production order, ships as 1 dispatch unit — nothing to choose for this order.']);
+    eq('…the bars show one option each', [shownLabels(v.options.production), shownLabels(v.options.dispatch)], [['Per line — 1 production order'], ['Same as production orders — 1 dispatch unit']]);
+    const gate = await EP.planGate(conn, COMPANY, rev.id);
+    eq('planGate: required, not saved, nothing to choose', [gate.required, gate.saved, gate.nothingToChoose], [true, false, true]);
+    const pr = await PROC.orderProcess(conn, COMPANY, rev.id);
+    const planSt = lst(pr, span.id, 'execution_plan');
+    ok('the Execution plan stage is done by itself', planSt?.state === 'done' && /^Nothing to choose — 1 production order, ships as 1 dispatch unit$/.test(planSt.detail), JSON.stringify(planSt));
+    ok('…and Freeze design is not held by it', !lst(pr, span.id, 'lock').blockers.some((b) => /execution plan/.test(b.message)) && lst(pr, span.id, 'lock').waitingOn?.stageKey !== 'execution_plan', JSON.stringify(lst(pr, span.id, 'lock')));
+    const lp = await LOCK.lockPlan(conn, COMPANY, span.id);
+    const chk = lp.checks.find((x) => x.key === 'execution_plan');
+    ok('the freeze\'s plan check passes without a save', chk?.ok === true && /^Nothing to choose — 1 production order, ships as 1 dispatch unit\. The default plan is the plan\.$/.test(chk.detail) && !lp.problems.some((p) => /Save the execution plan/.test(p)), JSON.stringify(chk));
+    // A saved plan stays authoritative — and its option is shown though it gives the same.
+    const sv = await EP.saveExecutionPlan(conn, c, rev.id, { production: { level: 'unit' } });
+    ok('saved Per unit: still nothing to choose, the saved option shown', sv.nothingToChoose === true && !!sv.saved && sv.options.production.options.find((o) => o.key === 'unit').hidden === false, JSON.stringify(sv.options.production));
+    const pr2 = await PROC.orderProcess(conn, COMPANY, rev.id);
+    ok('…the stage says the saved plan', /^One production order per unit/.test(lst(pr2, span.id, 'execution_plan').detail), lst(pr2, span.id, 'execution_plan').detail);
+  });
 
   await conn.rollback();
   detachNodeCache(conn);
