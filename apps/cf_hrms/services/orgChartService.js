@@ -68,6 +68,7 @@ import { resolvePositionReporting, scopeSentence } from './reportingResolver.js'
 import { getRoleContent, ROW_IN_FORCE } from './roleContentService.js';
 import { effectiveLinesForPositions } from './contentResolver.js';
 import { embed, dot, ModelUnavailable } from './semantic/embedder.js';
+import { compareUnits } from '../lib/unitOrder.js';
 import {
   DEFINITION_SOURCES, definitionText, loadDefinitions, vectorsFor,
 } from './semantic/searchIndex.js';
@@ -122,7 +123,7 @@ const POSITIONS_SQL = `
  * position can sit in one.
  */
 const DEPARTMENTS_SQL = `
-  SELECT d.id, d.code, d.name, d.parent_department_id, d.department_type, d.is_shared,
+  SELECT d.id, d.code, d.name, d.parent_department_id, d.sort_order, d.department_type, d.is_shared,
          ${DEPARTMENT_LABEL_ID_SQL('d')} AS label_id
     FROM hrms_departments d
    WHERE d.company_id = ? AND d.deleted_at IS NULL`;
@@ -168,7 +169,8 @@ export function shapeDepartments(departmentRows, serveRows, rank) {
 function departmentRanks(rows) {
   const kids = new Map();
   const ids = new Set(rows.map((r) => r.id));
-  const byCode = (a, b) => String(a.code ?? '').localeCompare(String(b.code ?? ''), undefined, { numeric: true }) || a.id - b.id;
+  // Siblings by their stored order, then code, then id (spec §34; lib/unitOrder.js). It was code alone until 2026-10-24.
+  const byCode = compareUnits;
   for (const r of rows) {
     const parentId = r.parent_department_id != null && ids.has(r.parent_department_id) ? r.parent_department_id : 0;
     if (!kids.has(parentId)) kids.set(parentId, []);

@@ -123,7 +123,7 @@ export default {
   async change(db, c, row, state, env) {
     const v = row.values;
     const body = { annualCtc: v.ctc, structureId: row.structureId, effectiveFrom: day(v.from), pfMode: v.pf ? PF_OF[v.pf] : undefined, reason: v.reason ?? `From the Excel file ${String(env.run?.fileName ?? '').slice(0, 200)}` };
-    if (row.mode === 'CORRECT') await updateSalary(db, c, row.current.salary.id, body);
-    else await createSalary(db, c, { ...body, employeeId: row.id, pfMode: body.pfMode ?? row.current.salary?.pfMode ?? 'CEILING' });
+    if (row.mode === 'CORRECT') await updateSalary(db, c, row.current.salary.id, body, null, { warn: 'record', reason: 'Imported from Excel (warnings accepted by the person importing)' });
+    else await createSalary(db, c, { ...body, employeeId: row.id, pfMode: body.pfMode ?? row.current.salary?.pfMode ?? 'CEILING' }, null, { warn: 'record', reason: 'Imported from Excel (warnings accepted by the person importing)' });
   },
 };

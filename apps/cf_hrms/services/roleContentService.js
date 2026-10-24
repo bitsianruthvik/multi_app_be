@@ -40,6 +40,7 @@ import { loadAssignmentIndex } from './leavePolicyRead.js';
 import { issueRoleCode, acceptImportedCode } from './codeService.js';
 import { ROLE_ENTITY } from './codegenProvider.js';
 import { inBatch } from '../lib/batch.js';
+import { orderUnits } from '../lib/unitOrder.js';
 import {
   readTakesEffect, dayBefore, inWindow, isVoid, newLineKey, longDay,
 } from './datedChange.js';
@@ -1776,8 +1777,9 @@ export async function rolesOverview(db, companyId) {
 /** Departments, for the role form's picker. Read-only; the org screens own them. */
 export async function listDepartments(db, companyId) {
   const [rows] = await db.query(
-    'SELECT id, code, name FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY name',
+    'SELECT id, code, name, parent_department_id, sort_order FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL',
     [companyId],
   );
-  return { items: rows.map((r) => ({ id: r.id, code: r.code, name: r.name })) };
+  // Tree order, siblings by their stored order then code (spec §34).
+  return { items: orderUnits(rows).map((r) => ({ id: r.id, code: r.code, name: r.name })) };
 }

@@ -55,6 +55,9 @@ import { attendanceForRun, attendanceState } from '../payrollExit/attendancePay.
 import { policyOf, formulaValues, rateOf } from '../payrollExit/policy.js';
 import { claimsForRun, flexiForRun } from '../payrollExit/claims.js';
 import { settlementsForRun } from '../payrollExit/settlement.js';
+import { statesOf } from '../law/personLaw.js';
+import { currentLaw, withLawContext, usedOf } from '../law/pin.js';
+import { assertRunLockable, topUpsForRun, topUpItem } from '../complianceChecks/wire.js';
 
 export const RUN_STATUSES = ['DRAFT', 'CALCULATED', 'LOCKED', 'RELEASED', 'PAID'];
 const OPEN = ['DRAFT', 'CALCULATED'];
@@ -195,7 +198,13 @@ async function loadWorld(db, companyId, month, extraIds = []) {
   const salaries = new Map(ids.map((id) => [id, []]));
   for (const r of salRows) salaries.get(r.employee_id)?.push(shapeSalary(r));
   const [comps, structs, settings] = await Promise.all([loadComponents(db, companyId), loadStructures(db, companyId), companySettings(db, companyId)]);
-  return { b, emps, ids, salaries, comps, structs, settings };
+  // Spec §36.1: the state follows the person — their main position's location at the month's end (or its
+  // start, for someone who left before the end); null = the company's state. A salary's own state wins.
+  const atEnd = await statesOf(db, companyId, ids, b.to);
+  const missing = ids.filter((i) => atEnd.get(i) == null);
+  const atStart = missing.length ? await statesOf(db, companyId, missing, b.from) : new Map();
+  const personState = new Map(ids.map((i) => [i, atEnd.get(i) ?? atStart.get(i) ?? null]));
+  return { b, emps, ids, salaries, comps, structs, settings, personState };
 }
 
 /** The breakdown of a salary row with the variables of a day; cached per (salary, day). */
@@ -204,7 +213,7 @@ function breakdownCache(world, statFor) {
   return async (salary, on) => {
     const key = `${salary.id}|${on.slice(0, 7)}`;
     if (!cache.has(key)) {
-      const st = await statFor(on, salary.stateCode ?? world.settings.stateCode);
+      const st = await statFor(on, salary.stateCode ?? world.personState?.get(salary.employeeId) ?? world.settings.stateCode);
       const s = world.structs.get(salary.structureId);
       const vars = { PF_CEILING: st.PF?.wageCeiling ?? null, ESI_CEILING: st.ESI?.wageCeiling ?? null };
       cache.set(key, s ? breakdown(s.lines, world.comps.byId, salary.annualCtc, overrideMap(salary), { pfMode: salary.pfMode, vars }) : { ok: false, problems: ['The salary’s structure is not there.'], lines: [] });
@@ -215,8 +224,17 @@ function breakdownCache(world, statFor) {
 
 const W = (code, textValue) => ({ code, text: textValue });
 
-/** POST /payroll/runs/:id/calculate */
+/**
+ * POST /payroll/runs/:id/calculate
+ * Runs in a law context (services/law/pin.js): every law and tax rule version read is noted and stored
+ * on the run (law_versions_json), so services/law reproduceRun can recompute it with exactly those.
+ */
 export async function calculateRun(db, c, id, requestId = null) {
+  if (currentLaw()) return calculateRunInLaw(db, c, id, requestId);
+  return withLawContext(null, () => calculateRunInLaw(db, c, id, requestId));
+}
+
+async function calculateRunInLaw(db, c, id, requestId = null) {
   const run = await runRow(db, c.companyId, id, { forUpdate: true });
   mustBe(run, OPEN, 'calculated');
   await assertEarlierLocked(db, c.companyId, run, 'calculated');
@@ -295,6 +313,9 @@ export async function calculateRun(db, c, id, requestId = null) {
 
   // Income tax (P2): the year's paid months, declarations, profiles and overrides of everybody, read once.
   const taxWorld = await loadTaxWorld(db, c.companyId, month, ids, { runId: id });
+  // Spec §36.3: past a minimum-wage to-do's deadline, the shortfall is paid as a statutory top-up line.
+  const topUps = await topUpsForRun(db, c.companyId, month);
+  const topUpComp = comps.byCode.get('STAT_TOPUP');
 
   const st1 = await statFor(b.from, world.settings.stateCode);
   const missingSettings = ['PF', 'ESI', 'PT', 'LWF'].filter((k) => !st1[k]);
@@ -320,7 +341,7 @@ export async function calculateRun(db, c, id, requestId = null) {
     // A settlement paid in a month after the person left: no salary, no PT or LWF — only the settlement.
     if (!days.segments.length && fnf) {
       const lastSal = sal[sal.length - 1] ?? null;
-      const S0 = await statFor(b.from, lastSal?.stateCode ?? world.settings.stateCode);
+      const S0 = await statFor(b.from, lastSal?.stateCode ?? world.personState.get(e.id) ?? world.settings.stateCode);
       const input0 = {
         month, days, components: comps.byCode, settlementOnly: true, arrears: [], pfMode: 'NONE', esiCovered: false, noEps: true, settings: S0,
         oneTime: [...otherItems.map((i) => ({ code: comps.byId.get(i.component_id)?.code, amount: Number(i.amount), note: i.note })).filter((i) => i.code), ...extraItems],
@@ -349,7 +370,7 @@ export async function calculateRun(db, c, id, requestId = null) {
       continue;
     }
     const lastSeg = days.segments[days.segments.length - 1];
-    const stateCode = lastSeg.salary.stateCode ?? world.settings.stateCode;
+    const stateCode = lastSeg.salary.stateCode ?? world.personState.get(e.id) ?? world.settings.stateCode;
     const S = await statFor(b.from, stateCode);
     for (const g of days.segments) {
       const bdx = await bd(g.salary, b.from);
@@ -426,7 +447,17 @@ export async function calculateRun(db, c, id, requestId = null) {
       arrears, pfMode: lastSeg.salary.pfMode, esiCovered: covered, noEps, settings: S,
     };
     // The month without TDS first: its earnings, PT and PF are what the tax engine counts for this month.
-    const before = computePerson({ ...personInput, tds: 0 });
+    let before = computePerson({ ...personInput, tds: 0 });
+    const topUp = topUps.get(e.id);
+    if (topUp) {
+      const item = topUpItem({ lines: before.lines, days, topUp });
+      if (item && topUpComp?.status === 'ACTIVE') {
+        personInput.oneTime.push(item);
+        before = computePerson({ ...personInput, tds: 0 });
+        warnings.push(W('STAT_TOPUP', `Statutory top-up of ₹${item.amount.toLocaleString('en-IN')} to the minimum wage (compliance to-do #${topUp.todoId}, past its deadline).`));
+        await db.query('UPDATE hrms_compliance_todos SET topup_from = COALESCE(topup_from, ?) WHERE company_id = ? AND id = ?', [month, c.companyId, topUp.todoId]);
+      } else if (item) warnings.push(W('STAT_TOPUP', `A statutory top-up of ₹${item.amount.toLocaleString('en-IN')} is due (to-do #${topUp.todoId}) but the STAT_TOPUP component is missing or inactive.`));
+    }
     const current = monthFromLines(before.lines.map((l) => ({ ...l, comp: comps.byCode.get(l.code) })));
     const tds = await monthlyTds({ companyId: c.companyId, month, employeeId: e.id, world: taxWorld, current }, tdsItems.map((i) => ({ amount: Number(i.amount), note: i.note })));
     const calc = computePerson({ ...personInput, tds: tds.amount, tdsBasis: tds.basis });
@@ -495,10 +526,11 @@ export async function calculateRun(db, c, id, requestId = null) {
   totals.unverifiedSettings = Object.entries(st1).filter(([, v]) => v?.meta?.verification === 'UNVERIFIED').map(([k]) => k);
   totals.statutoryFrom = Object.fromEntries(Object.entries(st1).map(([k, v]) => [k, v?.meta?.effectiveFrom ?? null]));
   totals.strayItems = strayItems.length;
+  const lawVersions = { ...usedOf(currentLaw()), calculatedAt };
   await db.query(
-    `UPDATE hrms_pay_runs SET status = 'CALCULATED', people_count = ?, gross_total = ?, deductions_total = ?, employer_total = ?, net_total = ?, totals_json = ?, calculated_at = ?, calculated_by = ?
+    `UPDATE hrms_pay_runs SET status = 'CALCULATED', people_count = ?, gross_total = ?, deductions_total = ?, employer_total = ?, net_total = ?, totals_json = ?, law_versions_json = ?, calculated_at = ?, calculated_by = ?
       WHERE company_id = ? AND id = ?`,
-    [totals.people, totals.gross, totals.deductions, totals.employer, totals.net, JSON.stringify(totals), calculatedAt, c.userId, c.companyId, id]);
+    [totals.people, totals.gross, totals.deductions, totals.employer, totals.net, JSON.stringify(totals), JSON.stringify(lawVersions), calculatedAt, c.userId, c.companyId, id]);
   await audit(db, c, 'hrms_pay_runs', id, 'UPDATE', { status: run.status }, { status: 'CALCULATED', calculated: { people: totals.people, net: totals.net, warnings: totals.warnings } }, requestId);
   return readRun(db, c, id, { audited: false });
 }
@@ -666,7 +698,9 @@ async function changedSince(db, companyId, r, at = r.calculated_at) {
   const out = [];
   if (await q('SELECT COUNT(*) AS n FROM hrms_pay_salaries WHERE company_id = ? AND updated_at >= ?', [companyId, at])) out.push('a salary');
   if (await q('SELECT COUNT(*) AS n FROM hrms_pay_items WHERE company_id = ? AND run_id = ? AND updated_at >= ?', [companyId, r.id, at])) out.push('a one-time item');
-  if (await q('SELECT COUNT(*) AS n FROM hrms_pay_statutory_settings WHERE company_id = ? AND updated_at >= ?', [companyId, at])) out.push('the statutory settings');
+  // The law (spec §36.1): a PF / ESI / PT / LWF version published (or superseded) since, nationally or in a state of the company.
+  if (await q("SELECT COUNT(*) AS n FROM hrms_law_rules WHERE domain IN ('PF','ESI','PT','LWF') AND updated_at >= ? AND status <> 'DRAFT' AND (jurisdiction = 'IN' OR jurisdiction IN (SELECT state_code FROM hrms_pay_settings WHERE company_id = ? AND deleted_at IS NULL) OR jurisdiction IN (SELECT state_code FROM hrms_location_law WHERE company_id = ? AND deleted_at IS NULL))", [at, companyId, companyId])) out.push('the law (statutory rules)');
+  if (await q('SELECT COUNT(*) AS n FROM hrms_location_law WHERE company_id = ? AND updated_at >= ?', [companyId, at])) out.push('a location’s state');
   if (await q('SELECT COUNT(*) AS n FROM hrms_pay_settings WHERE company_id = ? AND updated_at >= ?', [companyId, at])) out.push('the payroll settings (the state)');
   if (await q('SELECT COUNT(*) AS n FROM hrms_pay_components WHERE company_id = ? AND updated_at >= ?', [companyId, at])) out.push('a component');
   if (await q('SELECT COUNT(*) AS n FROM hrms_pay_structures WHERE company_id = ? AND updated_at >= ?', [companyId, at])) out.push('a structure');
@@ -843,12 +877,14 @@ export async function clearTds(db, c, runId, employeeId, requestId = null) {
 
 /* ══ lock, release, paid, re-open ════════════════════════════════════════ */
 
-export async function lockRun(db, c, id, requestId = null) {
+export async function lockRun(db, c, id, requestId = null, opts = {}) {
   const r = await runRow(db, c.companyId, id, { forUpdate: true });
   mustBe(r, ['CALCULATED'], 'locked');
   await assertEarlierLocked(db, c.companyId, r, 'locked');
   const stale = await changedSince(db, c.companyId, r);
   if (stale.length) throw refuse('STALE', `Something the calculation read has changed since (${stale.join(', ')}). Calculate again, review, then lock.`, { problems: stale });
+  // Spec §36.2: the compliance panel — a HARD breach blocks the lock; a WARN needs an acknowledgement with a reason.
+  await assertRunLockable(db, c, id, { reason: opts.complianceReason ?? null });
   const [neg] = await db.query(
     `SELECT e.employee_code, e.full_name, p.net_pay FROM hrms_pay_run_people p JOIN hrms_employees e ON e.company_id = p.company_id AND e.id = p.employee_id
       WHERE p.company_id = ? AND p.run_id = ? AND p.deleted_at IS NULL AND p.included = 1 AND p.net_pay < 0 ORDER BY e.full_name`, [c.companyId, id]);

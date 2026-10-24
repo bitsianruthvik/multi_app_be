@@ -120,7 +120,7 @@ export const STATUTORY_ROWS = [
 ].map(([kind, stateCode, effectiveFrom, settings, verification, source, sourceUrl, note]) => ({ kind, stateCode, effectiveFrom, settings, verification, source, sourceUrl, note }));
 
 /**
- * Adds what is missing. -> { components, structure, statutory, settings } — what was created.
+ * Adds what is missing. -> { components, structure, statutory (always empty since §37), choices, settings } — what was created.
  * Never changes a row that exists.
  */
 export async function seedPayroll(db, c, requestId = null) {
@@ -157,18 +157,11 @@ export async function seedPayroll(db, c, requestId = null) {
     }
   }
 
-  const [rows] = await db.query('SELECT kind, state_code, effective_from FROM hrms_pay_statutory_settings WHERE company_id = ? AND deleted_at IS NULL', [c.companyId]);
-  const present = new Set(rows.map((r) => `${r.kind}|${r.state_code}|${String(r.effective_from instanceof Date ? r.effective_from.toISOString() : r.effective_from).slice(0, 10)}`));
-  for (const s of STATUTORY_ROWS) {
-    if (present.has(`${s.kind}|${s.stateCode}|${s.effectiveFrom}`)) continue;
-    const [ins] = await db.query(
-      `INSERT INTO hrms_pay_statutory_settings (company_id, kind, state_code, effective_from, settings_json, source, source_url, verification, note, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [c.companyId, s.kind, s.stateCode, s.effectiveFrom, JSON.stringify(s.settings), s.source, s.sourceUrl, s.verification, s.note, c.userId],
-    );
-    await audit(db, c, 'hrms_pay_statutory_settings', ins.insertId, 'CREATE', null, { kind: s.kind, stateCode: s.stateCode, effectiveFrom: s.effectiveFrom, settings: s.settings, verification: s.verification }, requestId);
-    made.statutory.push(`${s.kind} ${s.stateCode} ${s.effectiveFrom}`);
-  }
+  // PF / ESI / PT / LWF are the LAW LAYER's since §37 (product-level, one copy for every company;
+  // migrate-statutory-to-law.mjs moved STATUTORY_ROWS there): nothing per company. `statutory` stays in the
+  // answer, empty, for the screens and tests that read it. The company's CHOICES row is made instead.
+  const { ensureChoices } = await import('../law/company.js'); // lazy: seed.js is also read by scripts that open no pool
+  made.choices = await ensureChoices(db, c, requestId);
 
   const [[set]] = await db.query('SELECT id FROM hrms_pay_settings WHERE company_id = ? AND deleted_at IS NULL', [c.companyId]);
   if (!set) {

@@ -1,8 +1,8 @@
 /**
  * access.js — THE CATALOGUE OF RIGHTS. (TM/CF_HRMS_HIRING_SPEC.md §12.1, §12.2.)
  *
- * One tag = one thing a person may do. Eleven areas, each with up to four rights
- * (view, edit, remove, upload), and seven named rights. Everything else in the
+ * One tag = one thing a person may do. Thirteen areas, each with up to four rights
+ * (view, edit, remove, upload), and eight named rights. Everything else in the
  * app that speaks of rights reads this file: the `PERM` object the routes are
  * guarded with (lib/http.js), the ready-made roles, the migration of the old
  * tags (scripts/setup-access.mjs), the catalogue the screen draws
@@ -38,6 +38,9 @@ export const AREAS = [
   // Spec §28 (2026-10-19): attendance — the day board, the muster, requests, penalties, policies, devices,
   // imports, closing a month. A late area: setup-access grants it to the ready-made roles of an existing company once.
   { key: 'attendance', label: 'Attendance', screens: ['Today', 'Month (muster)', 'Requests', 'Penalties', 'Attendance policies', 'Devices and API keys', 'Imports', 'Close month'], rights: ['view', 'edit', 'remove', 'upload'] },
+  // Spec §36.4 (2026-10-24): law changes published by the product team, what they mean for this company,
+  // acknowledging them, and the deadline calendar (edit: acknowledge, mark a deadline done). A late area.
+  { key: 'compliance', label: 'Compliance', screens: ['Compliance notices', 'Acknowledgements', 'Deadline calendar'], rights: ['view', 'edit'] },
 ];
 
 export const areaTag = (area, right) => `cf_hrms_${area}_${right}`;
@@ -51,6 +54,8 @@ export const NAMED = [
   { key: 'payView', tag: 'cf_hrms_pay_view', label: 'See pay', hint: 'CTC and everything made from it: the hiring terms, the letters and their signed copies.' },
   { key: 'accessManage', tag: 'cf_hrms_access_manage', label: 'Manage logins and access', hint: 'Create logins, change what each access role may do, disable a login, reset a password.' },
   { key: 'selfView', tag: 'cf_hrms_self_view', label: 'See their own place', hint: 'A person’s own position, managers, team and responsibilities — and the team rule of a manager.' },
+  // Spec §36.5: the company's CA — comment on, approve or question the rules and the calculations, sign off a year.
+  { key: 'complianceReview', tag: 'cf_hrms_compliance_review', label: 'Review compliance (CA)', hint: 'Comment on, approve or question the rules in force and the payroll calculations, and sign off a year as the company’s CA.' },
 ];
 
 /** Every tag of the model, areas first. */
@@ -88,12 +93,13 @@ export const TEMPLATES = [
   {
     key: 'HR_MANAGER', label: 'HR manager', platformName: 'HR manager', scope: 'COMPANY', locked: false,
     description: 'Everything in HR — add, change, remove and upload — except logins and access.',
-    tags: ALL_TAGS.filter((t) => t !== named('accessManage')),
+    // Not the CA's sign-off: the reviewer is somebody outside HR (spec §36.5).
+    tags: ALL_TAGS.filter((t) => t !== named('accessManage') && t !== named('complianceReview')),
   },
   {
     key: 'HR_EXECUTIVE', label: 'HR executive', platformName: 'HR executive', scope: 'COMPANY', locked: false,
     description: 'Sees everything; changes employees, hiring, positions, documents, performance and payroll; creates employees. Cannot remove, upload, change the setup or close an employee.',
-    tags: [...views(everyArea), ...edits(['employees', 'hiring', 'positions', 'documents', 'performance', 'payroll', 'attendance']), named('employeeCreate'), named('contactView'), named('payView'), named('selfView')],
+    tags: [...views(everyArea), ...edits(['employees', 'hiring', 'positions', 'documents', 'performance', 'payroll', 'attendance', 'compliance']), named('employeeCreate'), named('contactView'), named('payView'), named('selfView')],
   },
   {
     // `label` is what setup stores (unchanged, so setup-access plans nothing new); `shownLabel` is what
@@ -101,6 +107,14 @@ export const TEMPLATES = [
     key: 'DEPARTMENT_HEAD', label: 'Department head', shownLabel: 'Unit head', platformName: 'Department head', scope: 'DEPARTMENT', locked: false,
     description: 'Sees the organisation and the people of their org unit and everything under it; changes the positions there.',
     tags: [...views(['org', 'roles', 'positions', 'employees', 'time', 'leave', 'performance', 'attendance']), ...edits(['positions', 'performance']), named('contactView'), named('selfView')],
+  },
+  {
+    // Spec §36.5: the company's CA. Reads payroll and tax (with pay, to check the figures) and the compliance
+    // notices; changes nothing there. The one right that writes: comment on, approve or question a rule set,
+    // and sign off a year (cf_hrms_compliance_review).
+    key: 'REVIEWER', label: 'Reviewer (CA)', platformName: 'Reviewer (CA)', scope: 'COMPANY', locked: false,
+    description: 'The company’s CA: sees payroll, tax and the rules in force (read-only), and may comment on, approve or question them and sign off a year.',
+    tags: [...views(['payroll', 'compliance']), named('payView'), named('complianceReview')],
   },
   {
     key: 'EMPLOYEE', label: 'Employee', platformName: 'Employee', scope: 'DEPARTMENT', locked: true,
@@ -116,7 +130,7 @@ export const TEMPLATES = [
  * the tags of these areas its template holds — once per role and area, marked
  * in the audit log, so a right somebody later takes away is not handed back.
  */
-export const LATE_AREAS = ['performance', 'payroll', 'attendance'];
+export const LATE_AREAS = ['performance', 'payroll', 'attendance', 'compliance'];
 export const lateAreaTags = (area) => {
   const a = AREAS.find((x) => x.key === area);
   return a ? a.rights.map((r) => areaTag(a.key, r)) : [];
@@ -226,6 +240,7 @@ export function summaryOf(tags) {
   if (have.has(named('employeeClose'))) extras.push('closes employees');
   if (have.has(named('payView'))) extras.push('sees pay');
   if (have.has(named('accessManage'))) extras.push('manages logins and access');
+  if (have.has(named('complianceReview'))) extras.push('reviews compliance as the CA');
   if (extras.length) parts.push(list(extras));
   return parts.join(' · ');
 }

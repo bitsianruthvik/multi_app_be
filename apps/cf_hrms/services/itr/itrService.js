@@ -283,7 +283,7 @@ async function personOf(db, companyId, employeeId) {
 
 /** The years with rules in hrms_tax_rules that include the return's rules. */
 async function seededYears(db) {
-  const [rows] = await db.query("SELECT DISTINCT tax_year FROM hrms_tax_rules WHERE rule_key = 'return_filing' AND deleted_at IS NULL ORDER BY tax_year DESC");
+  const [rows] = await db.query("SELECT DISTINCT tax_year FROM hrms_tax_rules WHERE rule_key = 'return_filing' AND deleted_at IS NULL AND status = 'PUBLISHED' ORDER BY tax_year DESC");
   return rows.map((r) => r.tax_year);
 }
 

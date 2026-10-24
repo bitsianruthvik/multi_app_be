@@ -110,7 +110,7 @@ async function make(db, c) {
   for (const e of emps) {
     const ctc = ctcFor(e.title, e.id);
     total += ctc;
-    await createSalary(db, c, { employeeId: e.id, annualCtc: ctc, structureId: staff.id, effectiveFrom: SALARY_FROM, reason: REASON }, MARK);
+    await createSalary(db, c, { employeeId: e.id, annualCtc: ctc, structureId: staff.id, effectiveFrom: SALARY_FROM, reason: REASON }, MARK, { warn: 'record', reason: REASON });
   }
   console.log(`  salaries: ${emps.length} people given a DEMO salary from ${SALARY_FROM} (₹${(total / 100000).toFixed(1)} lakh a year in all)`);
 
@@ -152,7 +152,7 @@ async function make(db, c) {
     const calc = await calculateRun(db, c, run.id, MARK);
     const tds = calc.people.reduce((s, x) => s + x.tds, 0);
     if (month === OPEN_MONTH) { console.log(`  run ${month} (#${run.id}): ${calc.run.peopleCount} paid, TDS ₹${tds.toLocaleString('en-IN')} — CALCULATED, not locked`); continue; }
-    await lockRun(db, c, run.id, MARK);
+    await lockRun(db, c, run.id, MARK, { complianceReason: REASON });
     const rel = await releaseRun(db, c, run.id, MARK);
     console.log(`  run ${month} (#${run.id}): ${calc.run.peopleCount} paid, net ₹${calc.run.net.toLocaleString('en-IN')}, TDS ₹${tds.toLocaleString('en-IN')}; locked; ${rel.released} payslips`);
   }

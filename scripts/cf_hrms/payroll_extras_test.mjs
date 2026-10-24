@@ -311,7 +311,7 @@ try {
     { componentId: C.BASIC.id, formula: '50% of CTC' }, { componentId: C.HRA.id, formula: '50% of BASIC' }, { componentId: C.SPECIAL.id, formula: 'balance' }] })).structure;
   const s2 = (await must(U.HR, 'POST', '/payroll/structures', { code: `${TAG}N`, name: `${TAG} With NPS`, lines: [
     { componentId: C.BASIC.id, formula: '50% of CTC' }, { componentId: C.HRA.id, formula: '50% of BASIC' }, { componentId: C.NPS_ER.id, formula: 'round(20% of BASIC)' }, { componentId: C.SPECIAL.id, formula: 'balance' }] })).structure;
-  const salary = (e, ctc, from, structureId = s1.id, pfMode = 'CEILING') => must(U.HR, 'POST', '/payroll/salaries', { employeeId: e, annualCtc: ctc, structureId, effectiveFrom: from, pfMode, reason: 'Test' });
+  const salary = (e, ctc, from, structureId = s1.id, pfMode = 'CEILING') => must(U.HR, 'POST', '/payroll/salaries', { employeeId: e, annualCtc: ctc, structureId, effectiveFrom: from, pfMode, reason: 'Test', complianceReason: 'Test' });
   await salary(E.A, 480000, '2025-04-01');
   await salary(E.B, 204000, '2025-04-01');
   await salary(E.C, 240000, '2025-04-11');
@@ -321,7 +321,7 @@ try {
   const runMonth = async (m) => {
     const run = (await must(U.HR, 'POST', '/payroll/runs', { month: m })).run;
     const calc = await must(U.HR, 'POST', `/payroll/runs/${run.id}/calculate`);
-    await must(U.HR, 'POST', `/payroll/runs/${run.id}/lock`);
+    await must(U.HR, 'POST', `/payroll/runs/${run.id}/lock`, { complianceReason: 'Test' });
     return { run, calc };
   };
   const P = (r) => Object.fromEntries(r.people.map((p) => [p.employee.id, p]));
@@ -337,7 +337,7 @@ try {
   ok(early.status === 200 && !early.json.ready && /LOCKED/.test(early.json.reason), 'a calculated, not locked run: “made from a LOCKED run. Lock it first.”', early.json?.reason);
   const earlyFile = await call(U.HR, 'GET', '/payroll/returns/2025-04/files/ECR');
   ok(earlyFile.status === 409 && earlyFile.json.code === 'NOT_LOCKED', 'its files: refused (NOT_LOCKED)');
-  await must(U.HR, 'POST', `/payroll/runs/${aprRun.id}/lock`);
+  await must(U.HR, 'POST', `/payroll/runs/${aprRun.id}/lock`, { complianceReason: 'Test' });
   const pa = P(aprCalc);
   ok(pa[E.N].tds === 10387, 'NPS: N’s April TDS = 1,24,640 ÷ 12 = 10,387 (the employer’s NPS counted in salary and deducted under 80CCD(2) up to 14% of Basic)', JSON.stringify(pa[E.N].tax ?? pa[E.N].tds));
   // The run's LOP for A: two days (as an approved unpaid leave would give) — the ECR reads the run's LOP days.

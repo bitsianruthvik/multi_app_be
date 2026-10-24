@@ -20,6 +20,7 @@ One tag = one thing a person may do. The Owner (the company’s `admin` role) ho
 | Performance | Plans, A person’s plan, Periods, Actuals, Reviews and check-ins, Actions | `cf_hrms_performance_view` | `cf_hrms_performance_edit` | `cf_hrms_performance_remove` | `cf_hrms_performance_upload` |
 | Payroll | Payroll runs, Salaries, Salary structures, Pay components, Statutory settings | `cf_hrms_payroll_view` | `cf_hrms_payroll_edit` | `cf_hrms_payroll_remove` | `cf_hrms_payroll_upload` |
 | Attendance | Today, Month (muster), Requests, Penalties, Attendance policies, Devices and API keys, Imports, Close month | `cf_hrms_attendance_view` | `cf_hrms_attendance_edit` | `cf_hrms_attendance_remove` | `cf_hrms_attendance_upload` |
+| Compliance | Compliance notices, Acknowledgements, Deadline calendar | `cf_hrms_compliance_view` | `cf_hrms_compliance_edit` | – | – |
 
 | Named right | What it is |
 |---|---|
@@ -30,6 +31,7 @@ One tag = one thing a person may do. The Owner (the company’s `admin` role) ho
 | `cf_hrms_pay_view` | See pay. CTC and everything made from it: the hiring terms, the letters and their signed copies. |
 | `cf_hrms_access_manage` | Manage logins and access. Create logins, change what each access role may do, disable a login, reset a password. |
 | `cf_hrms_self_view` | See their own place. A person’s own position, managers, team and responsibilities — and the team rule of a manager. |
+| `cf_hrms_compliance_review` | Review compliance (CA). Comment on, approve or question the rules in force and the payroll calculations, and sign off a year as the company’s CA. |
 
 How to read the tables below:
 - **a or b** — holding either is enough (a picker two screens share).
@@ -164,10 +166,12 @@ How to read the tables below:
 
 | Route | Right | Also |
 |---|---|---|
-| `GET /organisation/lookups` | `cf_hrms_org_view` or `cf_hrms_roles_view` or `cf_hrms_positions_view` or `cf_hrms_employees_view` or `cf_hrms_hiring_view` or `cf_hrms_documents_view` or `cf_hrms_time_view` or `cf_hrms_leave_view` or `cf_hrms_setup_view` or `cf_hrms_performance_view` or `cf_hrms_payroll_view` or `cf_hrms_attendance_view` |  |
+| `GET /organisation/lookups` | `cf_hrms_org_view` or `cf_hrms_roles_view` or `cf_hrms_positions_view` or `cf_hrms_employees_view` or `cf_hrms_hiring_view` or `cf_hrms_documents_view` or `cf_hrms_time_view` or `cf_hrms_leave_view` or `cf_hrms_setup_view` or `cf_hrms_performance_view` or `cf_hrms_payroll_view` or `cf_hrms_attendance_view` or `cf_hrms_compliance_view` |  |
 | `GET /organisation/departments` | `cf_hrms_org_view` or `cf_hrms_positions_view` | filters: q, label, shared, status, parent |
 | `GET /organisation/departments/staffing` | `cf_hrms_org_view` |  |
 | `POST /organisation/departments` | `cf_hrms_org_edit` | scope: the org unit |
+| `PUT /organisation/departments/order` | `cf_hrms_org_edit` | scope: the org unit |
+| `GET /organisation/departments/:id/move-check` | `cf_hrms_org_edit` |  |
 | `PUT /organisation/departments/:id` | `cf_hrms_org_edit` | scope: the org unit |
 | `DELETE /organisation/departments/:id` | `cf_hrms_org_remove` | scope: the org unit |
 | `GET /organisation/department-labels` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
@@ -690,5 +694,51 @@ How to read the tables below:
 | `GET /payroll/claims/:id/bills/:fileId` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `GET /tax/:year/retirement` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `PUT /tax/:year/retirement/:employeeId` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /law/rules-in-force` | `cf_hrms_payroll_view` or `cf_hrms_compliance_review` | whole-company logins only |
+| `GET /law/tax-rules` | `cf_hrms_payroll_view` or `cf_hrms_compliance_review` | whole-company logins only |
+| `GET /law/rules/:id` | `cf_hrms_payroll_view` or `cf_hrms_compliance_review` | whole-company logins only |
+| `GET /law/choices` | `cf_hrms_payroll_view` or `cf_hrms_compliance_review` | whole-company logins only |
+| `PUT /law/choices` | `cf_hrms_payroll_edit` | whole-company logins only |
+| `GET /law/locations` | `cf_hrms_org_view` or `cf_hrms_payroll_view` |  |
+| `PUT /law/locations/:id` | `cf_hrms_org_edit` | whole-company logins only |
+| `GET /law/roles/:id` | `cf_hrms_roles_view` or `cf_hrms_payroll_view` |  |
+| `PUT /law/roles/:id` | `cf_hrms_roles_edit` | whole-company logins only; the CTC band also needs cf_hrms_pay_view |
+| `GET /law/people/:employeeId/salary-default` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /law/minimum-wage` | `cf_hrms_payroll_view` or `cf_hrms_compliance_review` | whole-company logins only |
+| `GET /payroll/runs/:id/law-versions` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/runs/:id/reproduce` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /compliance/summary` | `cf_hrms_compliance_view` | whole-company logins only |
+| `GET /compliance/bell` | `cf_hrms_compliance_view` | whole-company logins only |
+| `GET /compliance/notifications` | `cf_hrms_compliance_view` | whole-company logins only |
+| `POST /compliance/notifications/:id/acknowledge` | `cf_hrms_compliance_edit` | whole-company logins only |
+| `GET /compliance/calendar` | `cf_hrms_compliance_view` | whole-company logins only |
+| `POST /compliance/calendar/done` | `cf_hrms_compliance_edit` | whole-company logins only |
+| `GET /compliance/review/sets` | `cf_hrms_compliance_view` | whole-company logins only |
+| `GET /compliance/review/sets/:set` | `cf_hrms_compliance_view` | whole-company logins only |
+| `POST /compliance/review/sets/:set/comments` | `cf_hrms_compliance_view` **and** `cf_hrms_compliance_review` | whole-company logins only |
+| `GET /compliance/review/changes` | `cf_hrms_compliance_view` | whole-company logins only |
+| `GET /compliance/review/runs` | `cf_hrms_compliance_view` **and** `cf_hrms_payroll_view` | whole-company logins only |
+| `GET /compliance/review/runs/:runId/people` | `cf_hrms_compliance_view` **and** `cf_hrms_payroll_view` | whole-company logins only |
+| `GET /compliance/review/trace` | `cf_hrms_compliance_view` **and** `cf_hrms_payroll_view` and `cf_hrms_pay_view` | whole-company logins only |
+| `GET /compliance/review/signoffs` | `cf_hrms_compliance_view` | whole-company logins only |
+| `POST /compliance/review/signoffs` | `cf_hrms_compliance_view` **and** `cf_hrms_compliance_review` | whole-company logins only |
+| `GET /compliance/review/pack` | `cf_hrms_compliance_view` | whole-company logins only |
+| `GET /payroll/runs/:id/compliance` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/runs/:id/compliance/acknowledge` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/compliance-todos/summary` | `cf_hrms_payroll_view` | whole-company logins only |
+| `GET /payroll/compliance-todos` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/compliance-todos/check-now` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/compliance-todos/:id` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/compliance-todos/:id/choose` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/compliance-todos/:id/approve` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only; the Owner only, never the one who chose / prepared |
+| `POST /payroll/compliance-todos/:id/dismiss` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/bonus` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/bonus/prepare` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/bonus/:id` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/bonus/:id/approve` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only; the Owner only, never the one who chose / prepared |
+| `POST /payroll/bonus/:id/schedule` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `POST /payroll/bonus/:id/unschedule` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `DELETE /payroll/bonus/:id` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /payroll/bonus/:id/register` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
 
-586 routes.
+634 routes.

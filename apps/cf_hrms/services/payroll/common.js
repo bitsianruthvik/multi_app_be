@@ -5,6 +5,8 @@ import { invalid, HrmsError } from '../../lib/errors.js';
 import { audit as auditRow } from '../peopleService.js';
 import { dateText, today } from '../positionService.js';
 import { money } from './formula.js';
+import { statutoryFromLaw } from '../law/statutory.js';
+import { currentLaw } from '../law/pin.js';
 
 export { money, dateText, today };
 
@@ -118,20 +120,13 @@ export async function companySettings(db, companyId) {
 /**
  * The statutory settings in force on a day, by kind, for a state:
  * { PF, ESI, PT, LWF } (each the settings object, with `meta`), PF and ESI national ('IN').
+ * FROM THE LAW LAYER since §37 (services/law/statutory.js; the old per-company table
+ * hrms_pay_statutory_settings is read by nothing). `companyId` is kept for the callers: the law is the
+ * same for every company. Inside a reproduction, the run's own versions (services/law/pin.js).
  */
 export async function statutoryOn(db, companyId, on, stateCode) {
-  const [rows] = await db.query(
-    `SELECT id, kind, state_code, effective_from, settings_json, source, source_url, verification FROM hrms_pay_statutory_settings
-      WHERE company_id = ? AND deleted_at IS NULL AND effective_from <= ? ORDER BY effective_from DESC, id DESC`,
-    [companyId, on],
-  );
-  const pick = (kind, state) => rows.find((r) => r.kind === kind && r.state_code === state) ?? null;
-  const out = {};
-  for (const [kind, state] of [['PF', 'IN'], ['ESI', 'IN'], ['PT', stateCode], ['LWF', stateCode]]) {
-    const r = pick(kind, state);
-    out[kind] = r ? { ...json(r.settings_json, {}), meta: { id: r.id, effectiveFrom: dateText(r.effective_from), stateCode: r.state_code, verification: r.verification } } : null;
-  }
-  return out;
+  if (currentLaw()?.legacy) return (await import('../law/migrate.js')).legacyStatutoryOn(db, companyId, on, stateCode);
+  return statutoryFromLaw(db, on, stateCode);
 }
 
 /** The person's bank and PAN, from their identifiers (BANK_ACCOUNT, IFSC, PAN), live today. */

@@ -28,6 +28,8 @@ import { buildDepartmentRollup } from '../../apps/cf_hrms/services/departmentRol
 import {
   listDepartments, createDepartment, updateDepartment, deleteDepartment, lookups,
 } from '../../apps/cf_hrms/services/organisationService.js';
+import { initialSortOrders, orderUnits, compareUnits } from '../../apps/cf_hrms/lib/unitOrder.js';
+import { schemaSteps as extrasSchemaSteps, orderPlan as extrasOrderPlan } from '../../apps/cf_hrms/scripts/apply-org-unit-extras-schema.mjs';
 
 const slug = (process.argv.find((a) => a.startsWith('--company=')) || '--company=karni').split('=')[1];
 if (!['localhost', '127.0.0.1'].includes(process.env.DB_HOST)) {
@@ -168,6 +170,39 @@ else {
   const spy = { query: (sql, ...rest) => { seen.push(String(sql)); return pool.query(sql, ...rest); } };
   await buildOrgChart(spy, companyId, {});
   ok(!seen.some((sql) => /hrms_position_work_contexts|hrms_work_assignment_contexts/.test(sql)), 'the chart reads no context-link table');
+}
+
+/* ── 3b. the stored order (spec §34 "Order"; lib/unitOrder.js, apply-org-unit-extras-schema.mjs) ── */
+{
+  const rows = [
+    { id: 1, code: 'D10', parent_department_id: null, sort_order: 0 },
+    { id: 2, code: 'D2', parent_department_id: null, sort_order: 0 },
+    { id: 3, code: 'S1', parent_department_id: 2, sort_order: 2 },
+    { id: 4, code: 'S9', parent_department_id: 2, sort_order: 1 },
+    { id: 5, code: 'S5', parent_department_id: 2, sort_order: 0 },
+    { id: 6, code: 'M1', parent_department_id: 4, sort_order: 1 },
+  ];
+  const init = initialSortOrders(rows);
+  ok(JSON.stringify(init) === JSON.stringify([{ id: 2, sortOrder: 1 }, { id: 1, sortOrder: 2 }, { id: 5, sortOrder: 3 }]),
+    'first order: a group never ordered goes 1..n by code (D2 before D10); a unit at 0 in an ordered group goes after the last; ordered ones stay', JSON.stringify(init));
+  const done = rows.map((r) => ({ ...r, sort_order: init.find((w) => w.id === r.id)?.sortOrder ?? r.sort_order }));
+  ok(initialSortOrders(done).length === 0, 'first order, run twice: nothing more to write');
+  ok(orderUnits(done).map((r) => r.code).join(' ') === 'D2 S9 M1 S1 S5 D10', 'tree order: siblings by sort_order then code, never by name', orderUnits(done).map((r) => r.code).join(' '));
+  const tie = [{ id: 9, code: 'B', sort_order: 1 }, { id: 8, code: 'A', sort_order: 1 }, { id: 7, code: 'A', sort_order: 1 }];
+  ok([...tie].sort(compareUnits).map((r) => r.id).join() === '7,8,9', 'a tie on sort_order: by code, then id');
+  const conn = await pool.getConnection();
+  try {
+    ok((await extrasSchemaSteps(conn)).length === 0, 'the §34 schema is applied (apply-org-unit-extras-schema.mjs plans no column)');
+    const plan = await extrasOrderPlan(conn);
+    ok(plan.length === 0, 'every company’s org units are ordered (the script plans nothing)', plan.map((g) => `${g.slug}:${g.writes.length}`).join(' '));
+  } finally { conn.release(); }
+  const list = await listDepartments(pool, companyId);
+  const bad = list.rows.filter((r, i, a) => {
+    if (r.parentId == null && r.depth === 0) return false;
+    const prev = a.slice(0, i).reverse().find((x) => x.parentId === r.parentId && x.depth === r.depth);
+    return prev && compareUnits(prev, r) > 0;
+  });
+  ok(bad.length === 0, 'the Org units list: siblings in their stored order, then code', bad.map((r) => r.name).slice(0, 3).join(', '));
 }
 
 /* ── 4. department writes, rolled back ───────────────────────────────────── */

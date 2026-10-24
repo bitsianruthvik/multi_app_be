@@ -38,6 +38,7 @@
  */
 import { HrmsError } from '../../lib/errors.js';
 import { audit, bad, refuse, text, money, stamp, json, readAmount, dateText, today, longDate, loadComponents, loadStructures, shapeSalary, SALARY_COLUMNS, statutoryOn, companySettings, identifiersOf, mask } from '../payroll/common.js';
+import { statesOf } from '../law/personLaw.js';
 import { salaryBreakdown, auditSalaryRead } from '../payroll/payrollService.js';
 import { monthBounds, monthDays, lopFromRequests, addDays } from '../payroll/proration.js';
 import { computePerson } from '../payroll/calc.js';
@@ -283,7 +284,7 @@ export async function workOut(db, c, employeeId, inputs = {}) {
     const days = monthDays({ month: exitMonth, joiningDate: joining, exitDate: lastDay, salaries, lopDays: lop });
     for (const seg of days.segments) seg.amounts = Object.fromEntries(((await salaryBreakdown(db, c, seg.salary, { comps, structs, on: b.from })).lines ?? []).map((l) => [l.code, l.monthly]));
     const settings = await companySettings(db, c.companyId);
-    const S = await statutoryOn(db, c.companyId, b.from, salary.stateCode ?? settings.stateCode);
+    const S = await statutoryOn(db, c.companyId, b.from, salary.stateCode ?? (await statesOf(db, c.companyId, [employeeId], lastDay)).get(Number(employeeId)) ?? settings.stateCode);
     const calc = computePerson({ month: exitMonth, days, components: comps.byCode, oneTime: [], arrears: [], pfMode: salary.pfMode, esiCovered: false, settings: S, tds: 0 });
     lastMonth = {
       how: 'ESTIMATE', month: exitMonth, label: b.label, payableDays: days.payableDays, daysInMonth: days.daysInMonth, lopDays: days.lopDays,

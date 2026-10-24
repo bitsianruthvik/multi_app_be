@@ -319,7 +319,7 @@ try {
     { componentId: CO.BASIC.id, formula: '50% of CTC' }, { componentId: CO.HRA.id, formula: '50% of BASIC' }, { componentId: CO.SPECIAL.id, formula: 'balance' }] })).structure;
   const SK = (await must(U.HR, 'POST', '/payroll/structures', { code: `${TAG}K`, name: `${TAG} With NPS`, lines: [
     { componentId: CO.BASIC.id, formula: '50% of CTC' }, { componentId: CO.NPS_ER.id, formula: '40% of BASIC' }, { componentId: CO.SPECIAL.id, formula: 'balance' }] })).structure;
-  const salary = (e, ctc, structureId = S.id, pfMode = 'NONE') => must(U.HR, 'POST', '/payroll/salaries', { employeeId: e, annualCtc: ctc, structureId, effectiveFrom: '2025-04-01', pfMode, reason: 'Test' });
+  const salary = (e, ctc, structureId = S.id, pfMode = 'NONE') => must(U.HR, 'POST', '/payroll/salaries', { employeeId: e, annualCtc: ctc, structureId, effectiveFrom: '2025-04-01', pfMode, reason: 'Test', complianceReason: 'Test' });
   for (const [k, ctc] of [['T', 312000], ['P', 1800000], ['R', 2400000], ['C', 960000], ['H', 960000], ['G1', 960000], ['G2', 960000], ['G3', 2400000], ['G4', 960000]]) await salary(E[k], ctc);
   await salary(E.K, 3600000, SK.id, 'FULL');
   // C on the old regime for 2025-26; R's Form 10E worksheet READY with relief 5,000; P's car.

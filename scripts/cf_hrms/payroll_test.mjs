@@ -404,7 +404,7 @@ try {
   const renamed = await call(U.HR, 'PUT', `/payroll/components/${C.BASIC.id}`, { code: 'BASICPAY' });
   ok(renamed.status === 422 && /Keep the code/.test(JSON.stringify(renamed.json)), 'the code of a component formulas use cannot change');
 
-  const salary = (employeeId, annualCtc, effectiveFrom, extra = {}) => call(U.HR, 'POST', '/payroll/salaries', { employeeId, annualCtc, structureId: staff.id, effectiveFrom, reason: 'Test', ...extra });
+  const salary = (employeeId, annualCtc, effectiveFrom, extra = {}) => call(U.HR, 'POST', '/payroll/salaries', { employeeId, annualCtc, structureId: staff.id, effectiveFrom, reason: 'Test', complianceReason: 'Test', ...extra });
   const sA = await salary(E.a, 600000, '2025-04-01');
   const sB = await salary(E.b, 180000, '2025-07-16');
   const sL = await salary(E.l, 600000, '2025-04-01');

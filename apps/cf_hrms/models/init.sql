@@ -5975,3 +5975,701 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @t = (SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_tax_files' AND COLUMN_NAME = 'purpose');
 SET @sql = IF(@t IS NOT NULL AND @t NOT LIKE '%''CLAIM_BILL''%', "ALTER TABLE hrms_tax_files MODIFY COLUMN purpose ENUM('PROOF','PART_A','PART_B','CLAIM_BILL') NOT NULL", 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ############################################################################
+-- ## 35. ORG UNIT EXTRAS (CF_HRMS_HIRING_SPEC.md §34 — colours, order)        ##
+-- ############################################################################
+-- Added 2026-10-24. Two guarded columns, nothing else:
+--   hrms_department_labels.colour   a palette KEY (blue, teal, green, lime, amber, orange, red, pink,
+--                                   purple, indigo, cyan, slate — departmentLabelService KIND_COLOURS),
+--                                   never a raw hex; NULL = the kind's default colour.
+--   hrms_departments.sort_order     the order among siblings (and at the top level). Lists, pickers and the
+--                                   org chart order siblings by sort_order, then code — never by name.
+-- scripts/apply-org-unit-extras-schema.mjs adds both and fills sort_order from the code order, idempotently.
+
+-- ----- 35a. hrms_department_labels.colour -----------------------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_department_labels' AND COLUMN_NAME = 'colour');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_department_labels ADD COLUMN colour VARCHAR(20) NULL AFTER sort_order', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ----- 35b. hrms_departments.sort_order --------------------------------------------------------
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hrms_departments' AND COLUMN_NAME = 'sort_order');
+SET @sql = IF(@c = 0, 'ALTER TABLE hrms_departments ADD COLUMN sort_order INT NOT NULL DEFAULT 0 AFTER parent_department_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+
+-- ############################################################################
+-- ## 38. COMPLIANCE (CF_HRMS_HIRING_SPEC.md §36.4, §36.5)                     ##
+-- ############################################################################
+-- Added 2026-10-24: the watcher, notices, publishing, notifications, the deadline calendar and the
+-- CA review. The LAW itself (rule versions, DRAFT → PUBLISHED) belongs to the law layer (services/law,
+-- hrms_law_rules — spec §36.1, its own section). This section holds what is AROUND it:
+--
+--   GLOBAL (the product team's; no company_id, only deleted_at):
+--     platform_admins                 who may open /api/platform/* — the product team, outside any company.
+--                                     A user id AND the email it had when granted (both must still match).
+--                                     Written only by scripts/grant-platform-admin.mjs; no route writes it.
+--     hrms_compliance_sources         the official pages the watcher reads (kind html_list / rss / pdf_index;
+--                                     watch_text: the page's visible text is one more item, for a page of
+--                                     rates with no links; also_sites: other sites its links may point to, e.g.
+--                                     EPFO's PDFs on epfindia.gov.in). The first good read is the baseline: no notices.
+--     hrms_compliance_source_items    every link a source has listed (hash of the URL; hash of title + date).
+--     hrms_compliance_check_runs      one row per source per slot: the watcher's claim (restart-safe, two instances).
+--     hrms_compliance_notices         new or changed items for a reviewer: open → linked → published / dismissed.
+--     hrms_compliance_publications    what was published (through the law layer, or the adapter until it exists).
+--
+--   PER COMPANY (company_id + deleted_at):
+--     hrms_compliance_notifications   one per publication (and per due deadline) per company, with its impact;
+--                                     acknowledged once; re-sent while it is not.
+--     hrms_compliance_emails          the outbox: queued, then sent by the hourly pass (rate-limited), only to
+--                                     the company's own Owner / HR logins.
+--     hrms_compliance_deadline_marks  a deadline marked done, and the reminders sent for it.
+--     hrms_compliance_reviews         the CA's state per rule set: PENDING / APPROVED / QUESTIONED.
+--     hrms_compliance_review_comments every comment, approval and question, kept.
+--     hrms_compliance_signoffs        the CA's yearly sign-off (it sets hrms_tax_settings.ca_reviewed for the year).
+-- scripts/apply-compliance-schema.mjs creates them (guarded, dry run by default) and seeds the sources.
+
+CREATE TABLE IF NOT EXISTS platform_admins (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  user_id       INT           NOT NULL,
+  email         VARCHAR(255)  NOT NULL,
+  note          VARCHAR(300)  NULL,
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  user_active   INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, user_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_pa_user (user_active),
+  CONSTRAINT fk_pa_user FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_sources (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  code               VARCHAR(40)   NOT NULL,
+  name               VARCHAR(200)  NOT NULL,
+  url                VARCHAR(500)  NOT NULL,
+  kind               ENUM('html_list','rss','pdf_index') NOT NULL,
+  frequency_hours    INT           NOT NULL DEFAULT 24,
+  domains_json       JSON          NULL,
+  jurisdictions_json JSON          NULL,
+  link_pattern       VARCHAR(300)  NULL,
+  watch_text         TINYINT(1)    NOT NULL DEFAULT 0,
+  also_sites         VARCHAR(300)  NULL,
+  note               VARCHAR(500)  NULL,
+  active             TINYINT(1)    NOT NULL DEFAULT 1,
+  last_checked_at    DATETIME      NULL,
+  last_ok_at         DATETIME      NULL,
+  last_change_at     DATETIME      NULL,
+  last_status        ENUM('NEVER','OK','CHANGED','ERROR','BLOCKED') NOT NULL DEFAULT 'NEVER',
+  last_error         VARCHAR(500)  NULL,
+  fail_count         INT           NOT NULL DEFAULT 0,
+  item_count         INT           NOT NULL DEFAULT 0,
+  next_check_at      DATETIME      NULL,
+  deleted_at         DATETIME      DEFAULT NULL,
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  code_active        VARCHAR(40)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, code, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hcs_code (code_active),
+  KEY idx_hcs_due (active, next_check_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_source_items (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  source_id      INT           NOT NULL,
+  item_hash      CHAR(64)      NOT NULL,
+  content_hash   CHAR(64)      NOT NULL,
+  url            VARCHAR(1000) NOT NULL,
+  title          VARCHAR(500)  NOT NULL,
+  item_date      DATE          NULL,
+  first_seen_at  DATETIME      NOT NULL,
+  last_seen_at   DATETIME      NOT NULL,
+  changed_at     DATETIME      NULL,
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_hcsi_item (source_id, item_hash),
+  CONSTRAINT fk_hcsi_source FOREIGN KEY (source_id) REFERENCES hrms_compliance_sources(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_check_runs (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  source_id      INT           NOT NULL,
+  run_key        VARCHAR(80)   NOT NULL,
+  status         ENUM('RUNNING','DONE','ERROR') NOT NULL DEFAULT 'RUNNING',
+  started_at     DATETIME      NOT NULL,
+  finished_at    DATETIME      NULL,
+  items_seen     INT           NOT NULL DEFAULT 0,
+  found_new      INT           NOT NULL DEFAULT 0,
+  found_changed  INT           NOT NULL DEFAULT 0,
+  http_status    INT           NULL,
+  error          VARCHAR(500)  NULL,
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_hccr_key (run_key),
+  KEY idx_hccr_source (source_id, started_at),
+  CONSTRAINT fk_hccr_source FOREIGN KEY (source_id) REFERENCES hrms_compliance_sources(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_notices (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  source_id        INT           NOT NULL,
+  item_id          INT           NOT NULL,
+  change_kind      ENUM('NEW','CHANGED') NOT NULL DEFAULT 'NEW',
+  title            VARCHAR(500)  NOT NULL,
+  url              VARCHAR(1000) NOT NULL,
+  item_date        DATE          NULL,
+  found_at         DATETIME      NOT NULL,
+  status           ENUM('NEW','OPEN','LINKED','PUBLISHED','DISMISSED') NOT NULL DEFAULT 'NEW',
+  summary          TEXT          NULL,
+  domain           VARCHAR(30)   NULL,
+  jurisdiction     VARCHAR(10)   NULL,
+  rule_key         VARCHAR(64)   NULL,
+  rule_version_id  VARCHAR(40)   NULL,
+  reviewer_user_id INT           NULL,
+  opened_at        DATETIME      NULL,
+  linked_at        DATETIME      NULL,
+  dismissed_reason VARCHAR(500)  NULL,
+  dismissed_at     DATETIME      NULL,
+  publication_id   INT           NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  KEY idx_hcn_status (status, found_at),
+  CONSTRAINT fk_hcn_source FOREIGN KEY (source_id) REFERENCES hrms_compliance_sources(id),
+  CONSTRAINT fk_hcn_item   FOREIGN KEY (item_id)   REFERENCES hrms_compliance_source_items(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_publications (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  notice_id          INT           NULL,
+  domain             VARCHAR(30)   NOT NULL,
+  jurisdiction       VARCHAR(10)   NOT NULL DEFAULT 'IN',
+  rule_key           VARCHAR(64)   NOT NULL,
+  rule_version_id    VARCHAR(40)   NULL,
+  version_label      VARCHAR(40)   NULL,
+  title              VARCHAR(300)  NOT NULL,
+  summary            TEXT          NULL,
+  effective_from     DATE          NOT NULL,
+  value_json         JSON          NULL,
+  source_url         VARCHAR(1000) NULL,
+  via                ENUM('LAW_LAYER','ADAPTER') NOT NULL,
+  published_by       INT           NULL,
+  published_by_name  VARCHAR(150)  NULL,
+  published_at       DATETIME      NOT NULL,
+  companies_notified INT           NOT NULL DEFAULT 0,
+  deleted_at         DATETIME      DEFAULT NULL,
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  KEY idx_hcp_when (published_at),
+  CONSTRAINT fk_hcp_publisher FOREIGN KEY (published_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_notifications (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  kind             ENUM('LAW_CHANGE','DEADLINE') NOT NULL,
+  publication_id   INT           NULL,
+  deadline_key     VARCHAR(60)   NULL,
+  due_date         DATE          NULL,
+  title            VARCHAR(300)  NOT NULL,
+  body             TEXT          NULL,
+  impact_json      JSON          NULL,
+  status           ENUM('OPEN','ACKNOWLEDGED') NOT NULL DEFAULT 'OPEN',
+  acknowledged_by  INT           NULL,
+  acknowledged_at  DATETIME      NULL,
+  ack_note         VARCHAR(500)  NULL,
+  last_sent_at     DATETIME      NULL,
+  send_count       INT           NOT NULL DEFAULT 0,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  pub_active       INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, publication_id, NULL)) VIRTUAL,
+  deadline_active  VARCHAR(60)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, deadline_key, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hcno_tenant (company_id, id),
+  UNIQUE KEY uq_hcno_pub (company_id, pub_active),
+  UNIQUE KEY uq_hcno_deadline (company_id, deadline_active),
+  KEY idx_hcno_status (company_id, status),
+  CONSTRAINT fk_hcno_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hcno_pub     FOREIGN KEY (publication_id) REFERENCES hrms_compliance_publications(id),
+  CONSTRAINT fk_hcno_ack     FOREIGN KEY (acknowledged_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_emails (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  notification_id  INT           NULL,
+  to_user_id       INT           NOT NULL,
+  to_email         VARCHAR(255)  NOT NULL,
+  subject          VARCHAR(300)  NOT NULL,
+  body_html        MEDIUMTEXT    NOT NULL,
+  reason           ENUM('NEW','RESEND','REMINDER') NOT NULL DEFAULT 'NEW',
+  status           ENUM('QUEUED','SENT','FAILED','SKIPPED') NOT NULL DEFAULT 'QUEUED',
+  attempts         INT           NOT NULL DEFAULT 0,
+  error            VARCHAR(500)  NULL,
+  queued_at        DATETIME      NOT NULL,
+  sent_at          DATETIME      NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  KEY idx_hcem_status (status, queued_at),
+  KEY idx_hcem_company (company_id, status),
+  CONSTRAINT fk_hcem_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hcem_note    FOREIGN KEY (company_id, notification_id) REFERENCES hrms_compliance_notifications(company_id, id),
+  CONSTRAINT fk_hcem_user    FOREIGN KEY (to_user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_deadline_marks (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  deadline_key     VARCHAR(60)   NOT NULL,
+  due_date         DATE          NOT NULL,
+  done_at          DATETIME      NULL,
+  done_by          INT           NULL,
+  done_note        VARCHAR(500)  NULL,
+  reminded_3_at    DATETIME      NULL,
+  reminded_1_at    DATETIME      NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  key_active       VARCHAR(60)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, deadline_key, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hcdm_key (company_id, key_active),
+  CONSTRAINT fk_hcdm_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hcdm_done    FOREIGN KEY (done_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_reviews (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  rule_set         VARCHAR(60)   NOT NULL,
+  status           ENUM('PENDING','APPROVED','QUESTIONED') NOT NULL DEFAULT 'PENDING',
+  fingerprint      CHAR(64)      NULL,
+  decided_by       INT           NULL,
+  decided_at       DATETIME      NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  set_active       VARCHAR(60)   GENERATED ALWAYS AS (IF(deleted_at IS NULL, rule_set, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hcrv_set (company_id, set_active),
+  CONSTRAINT fk_hcrv_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hcrv_by      FOREIGN KEY (decided_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_review_comments (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  rule_set         VARCHAR(60)   NOT NULL,
+  rule_key         VARCHAR(64)   NULL,
+  action           ENUM('COMMENT','APPROVE','QUESTION') NOT NULL,
+  body             VARCHAR(2000) NULL,
+  user_id          INT           NOT NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  KEY idx_hcrc_set (company_id, rule_set, created_at),
+  CONSTRAINT fk_hcrc_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hcrc_user    FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_signoffs (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  tax_year         VARCHAR(7)    NOT NULL,
+  signed_by        INT           NOT NULL,
+  signed_at        DATETIME      NOT NULL,
+  note             VARCHAR(1000) NULL,
+  snapshot_json    JSON          NULL,
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  year_active      VARCHAR(7)    GENERATED ALWAYS AS (IF(deleted_at IS NULL, tax_year, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hcso_year (company_id, year_active),
+  CONSTRAINT fk_hcso_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hcso_by      FOREIGN KEY (signed_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+-- ############################################################################
+-- ## 37. LAW LAYER (CF_HRMS_HIRING_SPEC.md §36.1 — C1)                         ##
+-- ############################################################################
+-- Added 2026-10-24. THE LAW is product-level data (one copy for every company), versioned and
+-- published by the product team; a company makes only CHOICES within it.
+--
+--   GLOBAL (no company_id; deleted_at):
+--     hrms_law_rules              every rule version: domain (PF, ESI, PT, LWF, MIN_WAGE, BONUS, GRATUITY,
+--                                 OVERTIME, WAGES, LEAVE_MIN …) × jurisdiction (IN or a state code) × rule_key ×
+--                                 effective_from × version. DRAFT → PUBLISHED → SUPERSEDED. A PUBLISHED row
+--                                 is NEVER edited (services/law refuses it): a change is a new version, and
+--                                 publishing it supersedes the earlier one of the same rule and date. Several
+--                                 effective dates of one rule are all PUBLISHED: each is in force from its
+--                                 date until the next (or its effective_to).
+--     hrms_tax_rules (§27)        gains the same version / status / publish fields (37b). Existing rows
+--                                 are PUBLISHED version 1.
+--
+--   PER COMPANY (company_id + deleted_at):
+--     hrms_law_company_choices    one row: the company's choices within the law (PF on the ceiling or on
+--                                 the full wage for new salaries, its PF / ESI / PT / LWF registration
+--                                 numbers, its bonus rate). Not law.
+--     hrms_law_company_notes      the company's own note / "checked by our CA" against a law version.
+--     hrms_location_law           a location's state and minimum-wage zone (a person's state = their
+--                                 main position's location).
+--     hrms_role_law               a role's skill category and scheduled employment (minimum wages).
+--     hrms_pay_role_structures    a role's default salary structure, with an optional CTC band.
+--     hrms_pay_runs.law_versions_json (37c)  the law and tax rule version ids a calculation used.
+--
+-- apps/cf_hrms/scripts/apply-law-schema.mjs applies exactly this (guarded, dry run by default);
+-- migrate-statutory-to-law.mjs moves hrms_pay_statutory_settings into hrms_law_rules (the old table
+-- stays, read by nothing, for the record); seed-law-rules.mjs adds the new law data.
+
+CREATE TABLE IF NOT EXISTS hrms_law_rules (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  domain          VARCHAR(20)   NOT NULL,                 -- PF ESI PT LWF MIN_WAGE BONUS GRATUITY OVERTIME WAGES LEAVE_MIN
+  jurisdiction    VARCHAR(10)   NOT NULL DEFAULT 'IN',    -- IN, or a state code (TG …)
+  rule_key        VARCHAR(64)   NOT NULL,                 -- 'settings' (PF/ESI/PT/LWF), an employment key (MIN_WAGE) …
+  title           VARCHAR(200)  NULL,
+  value_json      JSON          NOT NULL,
+  effective_from  DATE          NOT NULL,
+  effective_to    DATE          NULL,                     -- NULL = until the next effective_from
+  version         INT           NOT NULL DEFAULT 1,       -- per (domain, jurisdiction, rule_key, effective_from)
+  status          ENUM('DRAFT','PUBLISHED','SUPERSEDED') NOT NULL DEFAULT 'DRAFT',
+  source_url      VARCHAR(500)  NULL,
+  source_note     VARCHAR(2000) NULL,
+  note            VARCHAR(1000) NULL,
+  verified        TINYINT(1)    NOT NULL DEFAULT 0,
+  reviewed_by     VARCHAR(120)  NULL,                     -- who published it (platform admin / script)
+  published_at    DATETIME      NULL,
+  review_by       DATE          NULL,                     -- look at it again by
+  supersedes_id   INT           NULL,
+  created_by      VARCHAR(120)  NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  published_key   TINYINT       GENERATED ALWAYS AS (IF(status = 'PUBLISHED' AND deleted_at IS NULL, 1, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hlr_version   (domain, jurisdiction, rule_key, effective_from, version),
+  UNIQUE KEY uq_hlr_published (domain, jurisdiction, rule_key, effective_from, published_key),
+  KEY idx_hlr_lookup (domain, jurisdiction, status, effective_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_law_company_choices (
+  id                    INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id            INT           NOT NULL,
+  pf_wage_basis         ENUM('CEILING','FULL') NOT NULL DEFAULT 'CEILING',  -- the default for a new salary
+  pf_establishment_code VARCHAR(40)   NULL,
+  esi_employer_code     VARCHAR(40)   NULL,
+  pt_registration_no    VARCHAR(40)   NULL,                 -- PT registration (employer)
+  pt_enrolment_no       VARCHAR(40)   NULL,                 -- PT enrolment (the company itself)
+  lwf_registration_no   VARCHAR(40)   NULL,
+  bonus_rate            DECIMAL(5,2)  NULL,                 -- the company's bonus %, within the law's minimum and maximum
+  note                  VARCHAR(1000) NULL,
+
+  deleted_at            DATETIME      DEFAULT NULL,
+  created_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by            INT           NULL,
+
+  company_active        INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, company_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hlcc_company (company_active),
+  CONSTRAINT fk_hlcc_company FOREIGN KEY (company_id) REFERENCES companies(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_law_company_notes (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  rule_id         INT           NOT NULL,                 -- hrms_law_rules.id
+  verification    ENUM('VERIFIED','UNVERIFIED') NULL,     -- the company's own "checked" mark
+  note            VARCHAR(500)  NULL,
+  created_by      INT           NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  rule_active     INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, rule_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hlcn_rule (company_id, rule_active),
+  CONSTRAINT fk_hlcn_company FOREIGN KEY (company_id) REFERENCES companies(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_location_law (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  location_id     INT           NOT NULL,
+  state_code      VARCHAR(10)   NULL,                     -- TG …; NULL = the company's state
+  min_wage_zone   VARCHAR(20)   NULL,                     -- the zone of the state's minimum-wage notification (I, II, III …)
+  note            VARCHAR(500)  NULL,
+  created_by      INT           NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  location_active INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, location_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hlol_location (company_id, location_active),
+  CONSTRAINT fk_hlol_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hlol_location FOREIGN KEY (company_id, location_id) REFERENCES hrms_locations(company_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_role_law (
+  id                   INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id           INT           NOT NULL,
+  role_id              INT           NOT NULL,
+  skill_category       ENUM('UNSKILLED','SEMI_SKILLED','SKILLED','HIGHLY_SKILLED') NULL,
+  scheduled_employment VARCHAR(64)   NULL,                -- a MIN_WAGE rule_key of the state (e.g. ALL_EMPLOYMENTS)
+  note                 VARCHAR(500)  NULL,
+  created_by           INT           NULL,
+
+  deleted_at           DATETIME      DEFAULT NULL,
+  created_at           TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at           TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  role_active          INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, role_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hrlw_role (company_id, role_active),
+  CONSTRAINT fk_hrlw_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hrlw_role    FOREIGN KEY (company_id, role_id) REFERENCES hrms_roles(company_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_pay_role_structures (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  role_id         INT           NOT NULL,
+  structure_id    INT           NOT NULL,
+  ctc_min         DECIMAL(14,2) NULL,                     -- the role's CTC band (a year), optional
+  ctc_max         DECIMAL(14,2) NULL,
+  note            VARCHAR(500)  NULL,
+  created_by      INT           NULL,
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  role_active     INT           GENERATED ALWAYS AS (IF(deleted_at IS NULL, role_id, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hprs_role (company_id, role_active),
+  CONSTRAINT fk_hprs_company   FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hprs_role      FOREIGN KEY (company_id, role_id) REFERENCES hrms_roles(company_id, id),
+  CONSTRAINT fk_hprs_structure FOREIGN KEY (company_id, structure_id) REFERENCES hrms_pay_structures(company_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 37b. hrms_tax_rules: versions, published the same way ------------------------------------
+-- (apply-law-schema.mjs runs each step only when it is missing.)
+-- "ALTER TABLE hrms_tax_rules ADD COLUMN version INT NOT NULL DEFAULT 1 AFTER value_json"
+-- "ALTER TABLE hrms_tax_rules ADD COLUMN status ENUM('DRAFT','PUBLISHED','SUPERSEDED') NOT NULL DEFAULT 'PUBLISHED' AFTER version"
+-- "ALTER TABLE hrms_tax_rules ADD COLUMN reviewed_by VARCHAR(120) NULL AFTER verified"
+-- "ALTER TABLE hrms_tax_rules ADD COLUMN published_at DATETIME NULL AFTER reviewed_by"
+-- "ALTER TABLE hrms_tax_rules ADD COLUMN review_by DATE NULL AFTER published_at"
+-- "ALTER TABLE hrms_tax_rules ADD COLUMN supersedes_id INT NULL AFTER review_by"
+-- "ALTER TABLE hrms_tax_rules ADD COLUMN published_key TINYINT GENERATED ALWAYS AS (IF(status = 'PUBLISHED' AND deleted_at IS NULL, 1, NULL)) VIRTUAL"
+-- "ALTER TABLE hrms_tax_rules ADD UNIQUE KEY uq_htr_version (tax_year, regime, rule_key, version)"
+-- "ALTER TABLE hrms_tax_rules ADD UNIQUE KEY uq_htr_published (tax_year, regime, rule_key, published_key)"
+-- "ALTER TABLE hrms_tax_rules DROP INDEX uq_htr_rule"
+-- "UPDATE hrms_tax_rules SET published_at = created_at, reviewed_by = 'seed-tax-rules (version 1)' WHERE published_at IS NULL AND status = 'PUBLISHED'"
+
+-- ----- 37c. hrms_pay_runs.law_versions_json ----------------------------------------------------
+-- "ALTER TABLE hrms_pay_runs ADD COLUMN law_versions_json JSON NULL AFTER totals_json"
+
+
+
+-- ############################################################################
+-- ## 39. COMPLIANCE CHECKS (CF_HRMS_HIRING_SPEC.md §36.2, §36.3 — C2; bonus)  ##
+-- ############################################################################
+-- Added 2026-10-24. The checks themselves are code (services/complianceChecks/checks.js) against the
+-- law in force (§37). What is stored is what a person decided about a check, the per-company to-dos
+-- with their chosen fix, and the yearly statutory bonus.
+--
+--   hrms_compliance_acks       a WARN accepted with a reason and the approver: on a salary save, a
+--                              structure save, before a run is locked, on a leave/attendance policy.
+--                              context + entity_id say where; check_key + rule_id say which check
+--                              against which law version (a later version asks again).
+--   hrms_compliance_todos      per company: what no longer complies (one row per check x law version),
+--                              people and structures affected (affected_json), deadline = the law's
+--                              effective date. OPEN -> CHOSEN (HR picked a fix) -> APPLIED (the Owner
+--                              approved; applied as dated salary rows / a new structure) - or RESOLVED
+--                              (no longer found) / DISMISSED (a WARN, with a reason). One open row per
+--                              todo_key (open_key). A HARD minimum-wage to-do past its deadline pays a
+--                              statutory top-up line (component STAT_TOPUP) in each run until applied.
+--   hrms_bonus_runs            the statutory bonus of an accounting year (Code on Wages ss.26-41):
+--                              DRAFT (prepared by HR) -> APPROVED (the Owner, not the preparer) ->
+--                              SCHEDULED (BONUS one-time items in a month's open run).
+--   hrms_bonus_lines           one per person: eligible or why not, days worked, the wages and the
+--                              calculation wage month by month (months_json), the bonus.
+--   hrms_bonus_set_on_off      set-on / set-off of the allocable surplus, by year, carried up to 4 years.
+--
+-- apps/cf_hrms/scripts/apply-compliance-checks-schema.mjs applies exactly this (guarded, dry run by
+-- default) and adds the STAT_TOPUP component to every company that has payroll components.
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_acks (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  context         ENUM('SALARY','STRUCTURE','RUN','LEAVE_POLICY','ATTENDANCE_POLICY','TODO') NOT NULL,
+  entity_id       INT           NOT NULL,                 -- the salary / structure / run / policy / to-do id
+  employee_id     INT           NULL,                     -- the person, where the check is a person's
+  check_key       VARCHAR(40)   NOT NULL,                 -- MIN_WAGE, WAGES_50, PF_LEFT_OUT, OT_HOURS ...
+  rule_id         INT           NULL,                     -- hrms_law_rules.id the check ran against
+  message         VARCHAR(600)  NULL,                     -- what the warning said
+  reason          VARCHAR(500)  NOT NULL,                 -- why it was accepted
+  approved_by     INT           NULL,                     -- users.id of who accepted it
+
+  deleted_at      DATETIME      DEFAULT NULL,
+  created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  KEY idx_hcak_entity (company_id, context, entity_id),
+  KEY idx_hcak_person (company_id, employee_id, check_key),
+  CONSTRAINT fk_hcak_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hcak_by      FOREIGN KEY (approved_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_compliance_todos (
+  id                INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT           NOT NULL,
+  todo_key          VARCHAR(120)  NOT NULL,               -- check_key:rule_id (one open to-do per break of a law version)
+  check_key         VARCHAR(40)   NOT NULL,
+  severity          ENUM('HARD','WARN','INFO') NOT NULL DEFAULT 'WARN',
+  rule_id           INT           NULL,                   -- hrms_law_rules.id
+  rule_version      INT           NULL,
+  title             VARCHAR(300)  NOT NULL,
+  message           VARCHAR(2000) NULL,
+  effective_from    DATE          NULL,                   -- the law's effective date
+  deadline          DATE          NULL,                   -- = effective_from
+  status            ENUM('OPEN','CHOSEN','APPLIED','RESOLVED','DISMISSED') NOT NULL DEFAULT 'OPEN',
+  people_count      INT           NOT NULL DEFAULT 0,
+  structures_count  INT           NOT NULL DEFAULT 0,
+  affected_json     JSON          NULL,                   -- { people: [...], structures: [...], policies: [...] }
+  chosen_option     VARCHAR(40)   NULL,                   -- RESPLIT, RAISE_CTC, ADD_STATUTORY ...
+  chosen_json       JSON          NULL,                   -- the preview HR chose (before / after)
+  chosen_note       VARCHAR(500)  NULL,
+  chosen_by         INT           NULL,
+  chosen_at         DATETIME      NULL,
+  approved_by       INT           NULL,
+  approved_at       DATETIME      NULL,
+  applied_at        DATETIME      NULL,
+  applied_json      JSON          NULL,                   -- what was written: structures, salary rows, components
+  letters           TINYINT(1)    NOT NULL DEFAULT 0,     -- revision letters asked for
+  dismissed_reason  VARCHAR(500)  NULL,
+  resolved_at       DATETIME      NULL,
+  first_seen_at     DATETIME      NULL,
+  last_checked_at   DATETIME      NULL,
+  last_trigger      VARCHAR(20)   NULL,                   -- PUBLISH, NIGHTLY, CHECK_NOW, APPLY
+  reminder_count    INT           NOT NULL DEFAULT 0,
+  last_reminded_at  DATETIME      NULL,
+  topup_from        CHAR(7)       NULL,                   -- the first run month a statutory top-up was paid
+  created_by        INT           NULL,
+
+  deleted_at        DATETIME      DEFAULT NULL,
+  created_at        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  open_key          VARCHAR(120)  GENERATED ALWAYS AS (IF(deleted_at IS NULL AND status IN ('OPEN','CHOSEN'), todo_key, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hctd_tenant (company_id, id),
+  UNIQUE KEY uq_hctd_open (company_id, open_key),
+  KEY idx_hctd_status (company_id, status, deadline),
+  CONSTRAINT fk_hctd_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hctd_chooser  FOREIGN KEY (chosen_by) REFERENCES users(id),
+  CONSTRAINT fk_hctd_approver FOREIGN KEY (approved_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_bonus_runs (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT           NOT NULL,
+  bonus_year         VARCHAR(7)    NOT NULL,              -- the accounting year, '2026-27' (1 April - 31 March)
+  year_from          DATE          NOT NULL,
+  year_to            DATE          NOT NULL,
+  rate_pct           DECIMAL(5,2)  NOT NULL,              -- the company's choice, 8.33 ... 20
+  status             ENUM('DRAFT','APPROVED','SCHEDULED') NOT NULL DEFAULT 'DRAFT',
+  allocable_surplus  DECIMAL(16,2) NULL,                  -- optional: for set-on / set-off
+  deadline           DATE          NULL,                  -- paid by (Code on Wages s.39: 8 months after the year)
+  totals_json        JSON          NULL,
+  law_json           JSON          NULL,                  -- the law versions used (ids) and their values
+  note               VARCHAR(500)  NULL,
+  prepared_by        INT           NULL,
+  prepared_at        DATETIME      NULL,
+  approved_by        INT           NULL,
+  approved_at        DATETIME      NULL,
+  pay_run_id         INT           NULL,                  -- the month's run that pays it
+  pay_month          CHAR(7)       NULL,
+  scheduled_by       INT           NULL,
+  scheduled_at       DATETIME      NULL,
+
+  deleted_at         DATETIME      DEFAULT NULL,
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT           NULL,
+
+  year_active        VARCHAR(7)    GENERATED ALWAYS AS (IF(deleted_at IS NULL, bonus_year, NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_hbr_tenant (company_id, id),
+  UNIQUE KEY uq_hbr_year (company_id, year_active),
+  CONSTRAINT fk_hbr_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hbr_preparer FOREIGN KEY (prepared_by) REFERENCES users(id),
+  CONSTRAINT fk_hbr_approver FOREIGN KEY (approved_by) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_bonus_lines (
+  id                INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id        INT           NOT NULL,
+  bonus_run_id      INT           NOT NULL,
+  employee_id       INT           NOT NULL,
+  eligible          TINYINT(1)    NOT NULL DEFAULT 0,
+  reason            VARCHAR(300)  NULL,                   -- why not eligible, or what was left out
+  days_worked       DECIMAL(6,1)  NOT NULL DEFAULT 0,
+  months_json       JSON          NULL,                   -- [{ month, payableDays, daysInMonth, wage, fullWage, counted, ceiling, calcWage }]
+  wages_total       DECIMAL(14,2) NOT NULL DEFAULT 0,
+  calc_wage_total   DECIMAL(14,2) NOT NULL DEFAULT 0,
+  ceiling           DECIMAL(12,2) NULL,                   -- the monthly calculation ceiling (higher of Rs 7,000 and the minimum wage)
+  amount            DECIMAL(12,2) NOT NULL DEFAULT 0,
+  item_id           INT           NULL,                   -- hrms_pay_items.id once scheduled
+
+  deleted_at        DATETIME      DEFAULT NULL,
+  created_at        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by        INT           NULL,
+
+  KEY idx_hbl_run (company_id, bonus_run_id),
+  CONSTRAINT fk_hbl_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hbl_run      FOREIGN KEY (company_id, bonus_run_id) REFERENCES hrms_bonus_runs(company_id, id),
+  CONSTRAINT fk_hbl_employee FOREIGN KEY (company_id, employee_id) REFERENCES hrms_employees(company_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_bonus_set_on_off (
+  id                 INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id         INT           NOT NULL,
+  bonus_year         VARCHAR(7)    NOT NULL,              -- the year it arose in
+  kind               ENUM('SET_ON','SET_OFF') NOT NULL,
+  amount             DECIMAL(16,2) NOT NULL,
+  carry_until_year   VARCHAR(7)    NULL,                  -- the 4th accounting year after (Code on Wages s.36)
+  bonus_run_id       INT           NULL,
+  note               VARCHAR(500)  NULL,
+
+  deleted_at         DATETIME      DEFAULT NULL,
+  created_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at         TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by         INT           NULL,
+
+  KEY idx_hbso_year (company_id, bonus_year),
+  CONSTRAINT fk_hbso_company FOREIGN KEY (company_id) REFERENCES companies(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

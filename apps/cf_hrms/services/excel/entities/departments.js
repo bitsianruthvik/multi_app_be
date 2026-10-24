@@ -7,6 +7,7 @@
 import { PERM, words, coded, textOf, STATUS, yes, flag, changedKeys, inScope, loops } from './_shared.js';
 import * as ORG from '../../organisationService.js';
 import { labelState } from './_labels.js';
+import { orderUnits } from '../../../lib/unitOrder.js';
 
 const codesOf = (text) => String(text ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -26,11 +27,13 @@ export default {
   list: { name: 'departments', read: async (db, c) => (await ORG.listDepartments(db, c.companyId)).rows },
 
   async load(db, c, env) {
-    const [[rows], [serves], groups] = await Promise.all([
-      db.query('SELECT id, code, name, department_type, parent_department_id, is_shared, status, updated_at FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY name, id', [c.companyId]),
+    const [[unordered], [serves], groups] = await Promise.all([
+      db.query('SELECT id, code, name, department_type, parent_department_id, sort_order, is_shared, status, updated_at FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [c.companyId]),
       db.query('SELECT department_id, serves_department_id FROM hrms_department_serves WHERE company_id = ? AND deleted_at IS NULL', [c.companyId]),
       labelState(db, c.companyId),
     ]);
+    // The sheet lists the units in tree order, siblings by their stored order then code (spec §34).
+    const rows = orderUnits(unordered);
     const labels = groups.model.labels;
     const departments = coded('Org units', rows);
     const codeOf = new Map(departments.entries.map((e) => [e.id, e.key]));

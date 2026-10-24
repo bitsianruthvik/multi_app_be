@@ -35,6 +35,7 @@ import { today as todayText, dateText, LIVE_ON } from '../positionService.js';
 import { loadAssignmentIndex, resolveEffective, rulesOfPolicies, applicability, noticeForQuantity } from '../leavePolicyRead.js';
 import { resolveReporting, resolvePositionReporting } from '../reportingResolver.js';
 import { EMPLOYEE_IN_DEPARTMENTS_SQL } from '../accessScope.js';
+import { unitIdsAndBelow } from '../../lib/listFilters.js';
 import {
   makeCalendar, countDays, isDate, addDays, daysBetween, spanText, dayText, daysWords, daysOffPhrase, MAX_RANGE_DAYS,
 } from './days.js';
@@ -780,7 +781,8 @@ export async function listRequests(db, c, query = {}, scopeDeptIds = null, viewe
   if (isDate(String(query.from ?? ''))) { where.push('r.to_date >= ?'); params.push(String(query.from)); }
   if (isDate(String(query.to ?? ''))) { where.push('r.from_date <= ?'); params.push(String(query.to)); }
   if (!blank(query.q)) { where.push('(e.full_name LIKE ? OR e.employee_code LIKE ?)'); const like = `%${String(query.q).trim().slice(0, 100)}%`; params.push(like, like); }
-  if (query.departmentId) { where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, [Number(query.departmentId) || 0]); }
+  // One or more org units, each with everything under it (spec §34.2); a unit not of this company is refused.
+  if (query.departmentId) { where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, await unitIdsAndBelow(db, c.companyId, query.departmentId)); }
   if (scopeDeptIds) {
     if (!scopeDeptIds.length) return { items: [], total: 0 };
     where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, scopeDeptIds);
@@ -1034,7 +1036,8 @@ export async function balancesGrid(db, c, query = {}, scopeDeptIds = null) {
   const where = ["e.company_id = ?", 'e.deleted_at IS NULL', "e.employment_status <> 'EXITED'"];
   const params = [c.companyId];
   if (!blank(query.q)) { where.push('(e.full_name LIKE ? OR e.employee_code LIKE ?)'); const like = `%${String(query.q).trim().slice(0, 100)}%`; params.push(like, like); }
-  if (query.departmentId) { where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, [Number(query.departmentId) || 0]); }
+  // One or more org units, each with everything under it (spec §34.2); a unit not of this company is refused.
+  if (query.departmentId) { where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, await unitIdsAndBelow(db, c.companyId, query.departmentId)); }
   if (scopeDeptIds) {
     if (!scopeDeptIds.length) return { year: null, leaveTypes: [], rows: [] };
     where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, scopeDeptIds);

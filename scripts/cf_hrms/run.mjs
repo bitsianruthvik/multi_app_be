@@ -49,7 +49,7 @@ const AREAS = {
   },
   departments: {
     suites: ['departments_model_test', 'label_test'],
-    paths: [`${H}/services/departmentRollupService.js`, `${H}/routes/organisation.js`],
+    paths: [`${H}/services/departmentRollupService.js`, `${H}/routes/organisation.js`, `${H}/lib/unitOrder.js`, `${H}/scripts/apply-org-unit-extras-schema.mjs`],
   },
   chart: {
     suites: ['one_chair_test', 'departments_model_test', 'team_scope_test', 'semantic_search_test'],
@@ -125,6 +125,18 @@ const AREAS = {
     suites: ['excel_test'],
     paths: [`${H}/services/excel/**`, `${H}/routes/excel.js`],
   },
+  // The law layer (spec §36.1, C1): PF / ESI / PT / LWF, minimum wages and the rest as global versioned rules; payroll reads
+  // them by the person's state and stores the versions it used. A change to the law layer runs every payroll suite (the
+  // proof that the move kept every amount) and law_test; a change to payroll or tax runs law_test too.
+  law: {
+    suites: ['law_test', 'payroll_test', 'payroll_tax_test', 'payroll_extras_test', 'payroll_exit_test', 'tax_test', 'company_setup_test'],
+    paths: [`${H}/services/law/**`, `${H}/routes/law.js`, `${H}/scripts/apply-law-schema.mjs`, `${H}/scripts/migrate-statutory-to-law.mjs`,
+      `${H}/scripts/seed-law-rules.mjs`, `${H}/scripts/seed-tax-rules.mjs`, 'scripts/cf_hrms/law_test.mjs'],
+  },
+  lawReaders: {
+    suites: ['law_test'],
+    paths: [`${H}/services/payroll/**`, `${H}/services/tax/**`, `${H}/services/payrollTax/runTax.js`, `${H}/services/payrollExit/settlement.js`],
+  },
   tax: {
     suites: ['tax_test'],
     paths: [`${H}/services/tax/**`, `${H}/scripts/apply-tax-schema.mjs`, `${H}/scripts/seed-tax-rules.mjs`, 'scripts/cf_hrms/tax_test.mjs'],
@@ -168,6 +180,24 @@ const AREAS = {
     suites: ['company_setup_test'],
     paths: [`${H}/scripts/setup-company.mjs`, `${H}/services/accessSetup.js`, `${H}/services/accessGrants.js`, `${H}/services/payroll/seed.js`,
       `${H}/scripts/setup-performance.mjs`, `${H}/services/labelGroupService.js`, `${H}/models/seed.sql`, 'scripts/cf_hrms/company_setup_test.mjs'],
+  },
+  // Compliance (spec §36.4, §36.5): the platform console and admins, the watcher, notices and publishing, notifications
+  // and emails, the deadline calendar, the CA reviewer. It reads the law layer (rules in force, draft / publish, run
+  // snapshots), the tax rules and P2's CA tick, so a change to any of those runs it; the reviewer role runs access_test.
+  compliance: {
+    suites: ['compliance_test', 'access_test'],
+    paths: [`${H}/services/compliance/**`, `${H}/routes/compliance.js`, `${H}/routes/platform.js`, `${H}/scripts/apply-compliance-schema.mjs`,
+      `${H}/scripts/grant-platform-admin.mjs`, `${H}/services/law/**`, `${H}/services/payrollTax/settings.js`, `${H}/services/payrollTax/common.js`,
+      'core/middleware/appContext.js', 'scripts/cf_hrms/compliance_test.mjs'],
+  },
+  // Compliance checks (spec §36.2, §36.3, C2): checks on structure / salary / policy save and before a run's lock,
+  // to-dos with a fix (after a publish, nightly, check now), the statutory top-up, the bonus run. They run inside the
+  // salary save, the run's calculate and lock and the policy saves, so those suites run too.
+  complianceChecks: {
+    suites: ['compliance_checks_test', 'payroll_test', 'payroll_exit_test', 'leave_policy_test', 'attendance_test'],
+    paths: [`${H}/services/complianceChecks/**`, `${H}/routes/complianceChecks.js`, `${H}/scripts/apply-compliance-checks-schema.mjs`,
+      `${H}/services/law/**`, `${H}/services/payroll/**`, `${H}/services/leavePolicyService.js`, `${H}/services/attendance/policy.js`,
+      'scripts/cf_hrms/compliance_checks_test.mjs'],
   },
 };
 

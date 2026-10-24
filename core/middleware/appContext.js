@@ -60,7 +60,8 @@ export const appContext = async (req, res, next) => {
     if (
       parts.length > 1 &&
       parts[0].toLowerCase() === "api" &&
-      ["public", "query"].includes(parts[1].toLowerCase())
+      // `platform`: the product team's console (apps/cf_hrms/routes/platform.js) belongs to no company.
+      ["public", "query", "platform"].includes(parts[1].toLowerCase())
     ) {
       req.company = null;
       req.appCtx = null;

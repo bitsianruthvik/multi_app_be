@@ -26,6 +26,8 @@
  */
 import { pool } from './db.js';
 import { ctx } from './http.js';
+import { fail } from '../../../core/middleware/requirePerm.js';
+import { invalid } from './errors.js';
 import { labelIndex, labelMatcher } from '../services/labelGroupService.js';
 
 const blank = (v) => v === undefined || v === null || String(v).trim() === '';
@@ -49,7 +51,13 @@ const flag = (pick) => (row, value) => { const want = yesNo(value); return want 
  * its parents'. A label's name is still taken (§13.6 had `label=Section`).
  */
 const byLabel = (pick) => (row, value, aux) => aux.labelTest(value)(pick(row));
-/** "This department and everything below it." `tree.below(id)` is that set of ids. */
+/**
+ * "This org unit and everything below it", for ONE OR MORE units (spec §34.2):
+ * `department=12` or `department=12,40` — a row passes when its unit is at or
+ * under ANY of them. `tree.below(id)` is that set of ids. Every id must be a
+ * live org unit of this company (`assertUnitIds`, run by filterRows): a bad
+ * or foreign id is refused (422), never quietly dropped.
+ */
 const inDepartment = (pick) => (row, value, tree) => {
   const ids = idSet(value);
   if (!ids.size) return true;
@@ -239,10 +247,12 @@ export const LIST_SPECS = {
 /** The department tree of a company, as "this one and everything below it". One read. */
 export async function departmentTree(db, companyId) {
   const [rows] = await db.query('SELECT id, parent_department_id FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+  const live = new Set(rows.map((r) => r.id));
   const childrenOf = new Map();
   for (const r of rows) if (r.parent_department_id != null) childrenOf.set(r.parent_department_id, [...(childrenOf.get(r.parent_department_id) ?? []), r.id]);
   const memo = new Map();
   return {
+    has: (id) => live.has(Number(id)),
     below(id) {
       const key = Number(id);
       if (memo.has(key)) return memo.get(key);
@@ -254,7 +264,46 @@ export async function departmentTree(db, companyId) {
     },
   };
 }
-const NO_TREE = { below: (id) => new Set([Number(id)]) };
+const NO_TREE = { has: () => true, below: (id) => new Set([Number(id)]) };
+
+/**
+ * The org unit ids of a `department` address value — "12" or "12,40" — each a
+ * live unit of this company, or 422 INVALID naming what is wrong. `tree` from
+ * departmentTree (read here when not given). -> number[] (blank -> []).
+ */
+export async function assertUnitIds(db, companyId, value, tree = null) {
+  const tokens = csv(value);
+  if (!tokens.length) return [];
+  const bad = tokens.filter((t) => !/^\d+$/.test(t) || Number(t) <= 0);
+  if (bad.length) {
+    throw invalid('INVALID', 'The org unit filter holds something that is not an org unit.', {
+      problems: [`"${bad[0].slice(0, 30)}" is not an org unit. The org unit filter takes org unit ids, separated by commas.`],
+    });
+  }
+  const ids = [...new Set(tokens.map(Number))];
+  const t = tree ?? await departmentTree(db, companyId);
+  const unknown = ids.filter((id) => !t.has(id));
+  if (unknown.length) {
+    throw invalid('INVALID', `${unknown.length === 1 ? 'An org unit' : 'Some org units'} in the filter ${unknown.length === 1 ? 'is' : 'are'} not in this company.`, {
+      problems: [`${unknown.length === 1 ? 'One org unit' : `${unknown.length} org units`} in the filter ${unknown.length === 1 ? 'does' : 'do'} not exist in this company (removed, or never here). Choose the org units again.`],
+    });
+  }
+  return ids;
+}
+
+/**
+ * For services that filter in SQL (leave requests and balances, attendance):
+ * `departmentId=12,40` -> every unit id at or under 12 or 40, checked as above.
+ * -> number[] ([] when the value is blank).
+ */
+export async function unitIdsAndBelow(db, companyId, value) {
+  if (blank(value)) return [];
+  const tree = await departmentTree(db, companyId);
+  const ids = await assertUnitIds(db, companyId, value, tree);
+  const out = new Set();
+  for (const id of ids) for (const x of tree.below(id)) out.add(x);
+  return [...out];
+}
 
 /** Which of a spec's filters the address actually uses. */
 export const activeFilters = (spec, query = {}) => Object.keys(spec.filters).filter((name) => !blank(query[name]));
@@ -264,6 +313,8 @@ export async function filterRows(db, companyId, rows, query, spec) {
   const active = activeFilters(spec, query);
   if (!active.length) return rows;
   const tree = (spec.needsTree ?? []).some((n) => active.includes(n)) ? await departmentTree(db, companyId) : NO_TREE;
+  // One or more org units, each "and below": refused when one is not a unit of this company (spec §34.2).
+  if (active.includes('department') && spec.filters.department) await assertUnitIds(db, companyId, query.department, tree);
   const index = (spec.needsLabels ?? []).some((n) => active.includes(n)) ? await labelIndex(db, companyId) : null;
   const tests = new Map();
   const aux = {
@@ -296,11 +347,12 @@ export const listed = (name) => {
     const send = res.json.bind(res);
     res.json = (body) => {
       if (res.statusCode >= 400) return send(body);
-      applyListFilters(pool, ctx(req).companyId, body, req.query, spec).then(send, () => send(body));
+      // A filter refused in words (a bad org unit id: 422) answers as a handler's refusal does; anything else sends the rows unfiltered.
+      applyListFilters(pool, ctx(req).companyId, body, req.query, spec).then(send, (err) => (err?.status && err.status < 500 ? fail(res, err) : send(body)));
       return res;
     };
     next();
   }, { hrmsStep: Object.keys(spec.filters).length ? `filters: ${Object.keys(spec.filters).join(', ')}` : 'adds total and count' });
 };
 
-export default { LIST_SPECS, listed, filterRows, applyListFilters, departmentTree, activeFilters };
+export default { LIST_SPECS, listed, filterRows, applyListFilters, departmentTree, activeFilters, assertUnitIds, unitIdsAndBelow };

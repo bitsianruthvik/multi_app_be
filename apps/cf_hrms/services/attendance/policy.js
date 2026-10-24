@@ -19,6 +19,7 @@
  * An ACTION: { type: LEAVE | LOP | AMOUNT | WARNING, days (LEAVE, LOP: 0.5 | 1),
  *              leaveTypeIds (LEAVE, in order of preference), elseLop (LEAVE), amount (AMOUNT) }
  */
+import { attendancePolicyGate } from '../complianceChecks/wire.js';
 import { HrmsError, invalid, notFound, conflict } from '../../lib/errors.js';
 import { audit } from '../peopleService.js';
 import { hoursWords, minutesWords } from './time.js';
@@ -297,7 +298,9 @@ export async function createPolicy(conn, c, body = {}, requestId = null) {
     [c.companyId, head.code, head.name, head.description, head.status ?? 'ACTIVE', JSON.stringify(rules), c.userId],
   );
   await audit(conn, c, 'hrms_attendance_policies', ins.insertId, 'CREATE', null, { ...head, rules }, requestId);
-  return readPolicy(conn, c, ins.insertId);
+  // Spec §36.2: overtime below the legal rate refuses an ACTIVE policy.
+  const compliance = await attendancePolicyGate(conn, c, ins.insertId);
+  return { ...(await readPolicy(conn, c, ins.insertId)), compliance };
 }
 
 export async function updatePolicy(conn, c, id, body = {}, requestId = null) {
@@ -314,7 +317,8 @@ export async function updatePolicy(conn, c, id, body = {}, requestId = null) {
   await conn.query('UPDATE hrms_attendance_policies SET name = ?, code = ?, description = ?, status = ?, rules_json = ? WHERE company_id = ? AND id = ?',
     [next.name, next.code, next.description, next.status, JSON.stringify(next.rules), c.companyId, id]);
   await audit(conn, c, 'hrms_attendance_policies', id, 'UPDATE', { name: row.name, status: row.status, rules: json(row.rules_json) }, next, requestId);
-  return readPolicy(conn, c, id);
+  const compliance = await attendancePolicyGate(conn, c, id);
+  return { ...(await readPolicy(conn, c, id)), compliance };
 }
 
 export async function removePolicy(conn, c, id, requestId = null) {

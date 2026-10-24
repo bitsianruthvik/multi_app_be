@@ -178,6 +178,6 @@ export async function readYear(db, c, year) {
 
 /** The tax years a company can work in: those with rules, the current one first. */
 export async function taxYears(db) {
-  const [rows] = await db.query("SELECT DISTINCT tax_year FROM hrms_tax_rules WHERE deleted_at IS NULL AND rule_key = 'slabs' ORDER BY tax_year DESC");
+  const [rows] = await db.query("SELECT DISTINCT tax_year FROM hrms_tax_rules WHERE deleted_at IS NULL AND status = 'PUBLISHED' AND rule_key = 'slabs' ORDER BY tax_year DESC");
   return rows.map((r) => r.tax_year);
 }

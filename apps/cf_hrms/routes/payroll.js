@@ -115,7 +115,7 @@ router.get('/payroll/runs/:id', ...viewPay, handle((req) => tx(req, (db, c) => R
 router.delete('/payroll/runs/:id', ...remove, handle((req) => tx(req, (db, c) => RUN.deleteRun(db, c, id(req), reqId(req)))));
 router.get('/payroll/runs/:id/people/:personId', ...viewPay, handle((req) => tx(req, (db, c) => RUN.readRunPerson(db, c, id(req), intParam(req.params.personId, 'personId'), reqId(req)))));
 router.post('/payroll/runs/:id/calculate', ...editPay, handle((req) => tx(req, (db, c) => RUN.calculateRun(db, c, id(req), reqId(req)))));
-router.post('/payroll/runs/:id/lock', ...editPay, handle((req) => tx(req, (db, c) => RUN.lockRun(db, c, id(req), reqId(req)))));
+router.post('/payroll/runs/:id/lock', ...editPay, handle((req) => tx(req, (db, c) => RUN.lockRun(db, c, id(req), reqId(req), { complianceReason: req.body?.complianceReason ?? null }))));
 router.post('/payroll/runs/:id/release', ...editPay, handle((req) => tx(req, (db, c) => RUN.releaseRun(db, c, id(req), reqId(req)))));
 router.post('/payroll/runs/:id/paid', ...editPay, handle((req) => tx(req, (db, c) => RUN.markPaid(db, c, id(req), req.body ?? {}, reqId(req)))));
 // The Owner only: the guard lets payroll edit in, the service refuses anybody but the Owner (c.owner).

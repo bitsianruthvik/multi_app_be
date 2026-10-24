@@ -126,7 +126,7 @@ const baseline = await rowCounts();
 const baselineCounter = await counterOf(pool, 'hrms_employee');
 const baselineRefCounter = await counterOf(pool, 'hrms_hiring');
 const baselineChart = (await buildOrgChart(pool, COMPANY, {})).counts;
-const baselineHirings = Number((await pool.query('SELECT COUNT(*) AS n FROM hrms_hirings WHERE company_id = ?', [COMPANY]))[0][0].n);
+const baselineHirings = Number((await pool.query('SELECT COUNT(*) AS n FROM hrms_hirings WHERE company_id = ? AND deleted_at IS NULL', [COMPANY]))[0][0].n);
 
 console.log(`hiring_test — ${company.name} (${COMPANY}), run tag ${TAG}, as of ${on}; the other company is ${other.name} (${OTHER})`);
 
@@ -1046,7 +1046,8 @@ if (vacantRows.length < 2 || !someone) {
     ok(!mine(lists.open) && Boolean(mine(lists.done)) && Boolean(mine(lists.all)) && lists.all.hirings.length === baselineHirings + 1 && lists.byPos.hirings[0].id === H
       && lists.byPos.hirings.every((x) => x.positionId === target.id) && lists.all.hirings[0].id === H
       && mine(lists.done).employee.employeeCode === done.employee.employeeCode && !('candidate' in mine(lists.done)),
-    'GET /hirings: it is under done, not open; a list row is the summary, without the candidate’s details');
+    'GET /hirings: it is under done, not open; a list row is the summary, without the candidate’s details',
+    JSON.stringify({ open: Boolean(mine(lists.open)), done: Boolean(mine(lists.done)), all: lists.all.hirings.length, baseline: baselineHirings, first: lists.all.hirings[0]?.id, H, byPos: lists.byPos.hirings.map((x) => x.id) }));
     ok(refused(await caught(() => HIRE.listHirings(db, COMPANY, { status: 'nonsense' })), 422, 'INVALID'), 'an unknown ?status= is refused');
 
     // ── every refusal after DONE ──
@@ -1504,7 +1505,7 @@ section('[end] The tenant is as it was found');
     `positions / filled / vacant unchanged (${chart.positions} / ${chart.filled} / ${chart.vacant}), open hirings unchanged (${chart.hiring})`);
   if (IS_KARNI) {
     ok(chart.positions === 220 && chart.filled === 71 && chart.vacant === 149, 'Karni: 220 positions, 71 filled, 149 vacant');
-    const [[n]] = await pool.query('SELECT (SELECT COUNT(*) FROM hrms_employees WHERE company_id = ? AND deleted_at IS NULL) AS employees, (SELECT COUNT(*) FROM hrms_hirings WHERE company_id = ?) AS hirings', [COMPANY, COMPANY]);
+    const [[n]] = await pool.query('SELECT (SELECT COUNT(*) FROM hrms_employees WHERE company_id = ? AND deleted_at IS NULL) AS employees, (SELECT COUNT(*) FROM hrms_hirings WHERE company_id = ? AND deleted_at IS NULL) AS hirings', [COMPANY, COMPANY]);
     ok(Number(n.employees) === 71 && Number(n.hirings) === baselineHirings, `Karni: 71 employees, and no hiring left by this run (${baselineHirings} were there when it began)`, JSON.stringify(n));
     if (baselineHirings) console.log(`        note: ${baselineHirings} hiring row(s) existed in this company BEFORE the run began — not made by this file.`);
     await rolledBack(async (db) => {

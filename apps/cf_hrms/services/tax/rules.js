@@ -10,6 +10,7 @@
  * number of its own.
  */
 import { TAX_RULE_ROWS } from './ruleData.js';
+import { taxRowsFor } from '../law/store.js';
 
 export const REGIMES = ['OLD', 'NEW'];
 export const AGE_BANDS = ['BELOW_60', 'AGE_60_TO_80', 'AGE_80_PLUS'];
@@ -48,13 +49,13 @@ export function rulesFromRows(rows, year, regime) {
 
 export const rulesFromSeed = (year, regime) => rulesFromRows(TAX_RULE_ROWS, year, regime);
 
-/** Reads one year and regime from hrms_tax_rules. `db` is a mysql2 pool or connection. */
+/**
+ * Reads one year and regime from hrms_tax_rules: the PUBLISHED version of each rule (spec §36.1 —
+ * tax rules are versioned and published like the law layer's), or, while a payroll run is being
+ * reproduced, exactly the versions that run used (services/law/pin.js). `db` is a mysql2 pool or connection.
+ */
 export async function loadTaxRules(db, year, regime) {
-  const [rows] = await db.query(
-    `SELECT tax_year, regime, rule_key, value_json, source_note, source_url, verified
-       FROM hrms_tax_rules WHERE tax_year = ? AND regime = ? AND deleted_at IS NULL`,
-    [year, String(regime).toUpperCase()],
-  );
+  const rows = await taxRowsFor(db, year, regime);
   return rulesFromRows(rows, year, regime);
 }
 

@@ -4,7 +4,7 @@
  *   1. the slug and email checks: what the platform routes and the login screen accept;
  *   2. the refusals: no source login, --password on production, an email of another company;
  *   3. a throwaway company: every step "created", the password hash copied (compared in SQL,
- *      never printed), the Owner holds every right incl. access_manage, the five ready-made
+ *      never printed), the Owner holds every right incl. access_manage, the six ready-made
  *      roles, reporting types, shifts, the Kind list, performance and payroll defaults;
  *   4. a second run: every step "exists", nothing added;
  *   5. isolation: the new company's grants point only at its own app; the source company's
@@ -81,7 +81,7 @@ try {
   for (const k of ['company', 'cf_hrms app', 'admin role', 'login', 'app access', 'reporting types', 'shifts', 'kind labels', 'performance settings', 'payroll']) {
     check(`run 1: ${k} created`, s1[k] === 'created', s1[k]);
   }
-  for (const label of ['Owner', 'HR manager', 'HR executive', 'Department head', 'Employee']) check(`run 1: access role ${label} created`, s1[`access role ${label}`] === 'created');
+  for (const label of ['Owner', 'HR manager', 'HR executive', 'Department head', 'Reviewer (CA)', 'Employee']) check(`run 1: access role ${label} created`, s1[`access role ${label}`] === 'created');
   const cid = r1.company.id;
   check('hash copied from the source login', (await n('SELECT COUNT(*) n FROM users a JOIN users b ON b.id = ? WHERE a.id = ? AND a.password = b.password', [source.id, r1.user.id])) === 1);
   check('login row: this company, role admin', (await n("SELECT COUNT(*) n FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ? AND u.company_id = ? AND r.name = 'admin'", [r1.user.id, cid])) === 1);
@@ -89,16 +89,18 @@ try {
   check(`Owner holds all ${ALL_TAGS.length} rights`, r1.checks.ownerTags === ALL_TAGS.length, String(r1.checks.ownerTags));
   check('Owner holds cf_hrms_access_manage', r1.checks.hasAccessManage);
   check('Owner access row', r1.checks.ownerRow?.template_key === 'OWNER' && r1.checks.ownerRow?.scope === 'COMPANY');
-  check('five platform roles', (await n('SELECT COUNT(*) n FROM roles WHERE company_id = ? AND deleted_at IS NULL', [cid])) === 5);
+  check('six platform roles (Reviewer (CA) since spec §36.5)', (await n('SELECT COUNT(*) n FROM roles WHERE company_id = ? AND deleted_at IS NULL', [cid])) === 6);
   check('six reporting types', (await n('SELECT COUNT(*) n FROM hrms_reporting_relationship_types WHERE company_id = ?', [cid])) === 6);
   check('three shifts, 21 days', (await n('SELECT COUNT(*) n FROM hrms_shifts WHERE company_id = ?', [cid])) === 3
     && (await n('SELECT COUNT(*) n FROM hrms_shift_days WHERE company_id = ?', [cid])) === 21);
   check('Kind group with labels', (await n('SELECT COUNT(*) n FROM hrms_label_groups WHERE company_id = ? AND is_kind = 1', [cid])) === 1
     && (await n('SELECT COUNT(*) n FROM hrms_department_labels WHERE company_id = ?', [cid])) >= 3);
   check('performance settings', (await n('SELECT COUNT(*) n FROM hrms_performance_settings WHERE company_id = ?', [cid])) === 1);
-  check('payroll: components, structure, statutory, settings TG', r1.checks.components > 0
+  // Statutory rates are the law layer's since spec §36.1 (global, hrms_law_rules): a company gets its CHOICES row, not rate rows.
+  check('payroll: components, structure, law choices, settings TG', r1.checks.components > 0
     && (await n("SELECT COUNT(*) n FROM hrms_pay_structures WHERE company_id = ? AND code = 'STAFF_STD'", [cid])) === 1
-    && (await n('SELECT COUNT(*) n FROM hrms_pay_statutory_settings WHERE company_id = ?', [cid])) > 0
+    && (await n('SELECT COUNT(*) n FROM hrms_law_company_choices WHERE company_id = ? AND deleted_at IS NULL', [cid])) === 1
+    && (await n('SELECT COUNT(*) n FROM hrms_pay_statutory_settings WHERE company_id = ?', [cid])) === 0
     && (await n("SELECT COUNT(*) n FROM hrms_pay_settings WHERE company_id = ? AND state_code = 'TG'", [cid])) === 1);
   check('empty: no org units, employees or positions', r1.checks.departments === 0 && r1.checks.employees === 0
     && (await n('SELECT COUNT(*) n FROM hrms_positions WHERE company_id = ?', [cid])) === 0);

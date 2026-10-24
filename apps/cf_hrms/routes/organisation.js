@@ -6,7 +6,13 @@
  *   GET    /organisation/departments                pre-ordered tree, depth + child counts; + type, isShared, serves[], and `types` in use
  *   POST   /organisation/departments                { name, parentId?, labelId? | type? (the label's name), isShared?,
  *                                                     serves?: [departmentId], status? } — rows carry type (label name) + labelId
- *   PUT    /organisation/departments/:id            same fields; parentId moves the branch; serves replaces the list
+ *   PUT    /organisation/departments/:id            same fields; parentId moves the branch (after its new siblings, or at
+ *                                                     sortOrder); serves replaces the list. POST takes sortOrder too
+ *                                                     (a "+" between siblings: that place, the later ones move down)
+ *   PUT    /organisation/departments/order          { parentId: id | null, ids: [id] } — every sibling under one parent once,
+ *                                                     in the order wanted -> { parentId, rows: [{ id, sortOrder }] }
+ *   GET    /organisation/departments/:id/move-check ?parentId=  (blank = top) -> { unit, from, to, unitsUnder, positionsUnder,
+ *                                                     allowed, problem, sentence } — the words of the move confirm; writes nothing
  *   DELETE /organisation/departments/:id
  *   GET    /organisation/departments/staffing  ?on=  every department's roles and positions (seats, filled, vacant,
  *                                                    who is in each seat) in ONE answer, cut from the org chart's own nodes
@@ -70,7 +76,7 @@ import { PERM, ANY_VIEW, guard, handle, ctx, intParam, dateParam } from '../lib/
 import { departmentWrite, companyWide } from '../lib/gates.js';
 import {
   lookups,
-  listDepartments, createDepartment, updateDepartment, deleteDepartment,
+  listDepartments, createDepartment, updateDepartment, deleteDepartment, reorderDepartments, moveCheck,
   listLocations, createLocation, updateLocation, deleteLocation,
   listWorkContexts, createWorkContext, updateWorkContext, deleteWorkContext,
   listContractors, createContractor, updateContractor, deleteContractor,
@@ -102,6 +108,9 @@ router.get('/organisation/departments', guard([PERM.org.view, PERM.positions.vie
 // company, so the cf_hrms_self_view employee logins get a 403.
 router.get('/organisation/departments/staffing', guard(PERM.org.view), handle((req) => departmentStaffing(pool, ctx(req).companyId, { on: dateParam(req.query.on) })));
 router.post('/organisation/departments', guard(PERM.org.edit), departmentWrite({ creating: true }), handle((req) => tx(req, (db, c) => createDepartment(db, c, req.body))));
+// The order of the units under one parent (spec §34): checked like a new unit under that parent (the scope covers the parent).
+router.put('/organisation/departments/order', guard(PERM.org.edit), departmentWrite({ creating: true }), handle((req) => tx(req, (db, c) => reorderDepartments(db, c, req.body ?? {}))));
+router.get('/organisation/departments/:id/move-check', guard(PERM.org.edit), handle((req) => moveCheck(pool, ctx(req).companyId, intParam(req.params.id), req.query.parentId ?? null)));
 router.put('/organisation/departments/:id', guard(PERM.org.edit), departmentWrite(), handle((req) => tx(req, (db, c) => updateDepartment(db, c, intParam(req.params.id), req.body))));
 router.delete('/organisation/departments/:id', guard(PERM.org.remove), departmentWrite(), handle((req) => tx(req, (db, c) => deleteDepartment(db, c, intParam(req.params.id)))));
 
@@ -112,9 +121,11 @@ router.delete('/organisation/departments/:id', guard(PERM.org.remove), departmen
 // detail.departmentCount unless ?moveTo=<labelId> says where its departments go.
 //   GET    /organisation/department-labels            { labels: [{ id, name, sortOrder, departmentCount, defaultShiftId }],
 //                                                      shifts: [{ id, code, name }] } (the choices of "New positions start on")
-//   POST   /organisation/department-labels            { name, defaultShiftId? }              -> the label (also under `label`)
+//   POST   /organisation/department-labels            { name, defaultShiftId?, colour? }     -> the label (also under `label`)
 //   PUT    /organisation/department-labels/order      { ids: number[] }      -> { labels, shifts }
-//   PUT    /organisation/department-labels/:id        { name?, sortOrder?, defaultShiftId? }       -> the label (also under `label`)
+//   PUT    /organisation/department-labels/:id        { name?, sortOrder?, defaultShiftId?, colour? } -> the label (also under `label`)
+//          colour: a palette key (blue teal green lime amber orange red pink purple indigo cyan slate), null = the default;
+//          every label read carries `colour` (the key it shows) and `colourChosen` (stored, or null)
 //          defaultShiftId = "New positions start on" (spec §17.2): a shift id, or null for none
 //   DELETE /organisation/department-labels/:id        ?moveTo=<labelId>      -> { ok, id, departmentsMoved }
 router.get('/organisation/department-labels', guard([PERM.org.view, PERM.positions.view]), handle((req) => listLabels(pool, ctx(req).companyId)));

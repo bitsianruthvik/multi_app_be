@@ -27,6 +27,7 @@
  *     policy, and no read has to ask.
  *   - Everything is audited, in the caller's transaction.
  */
+import { leavePolicyGate } from './complianceChecks/wire.js';
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { audit } from './peopleService.js';
 import {
@@ -576,7 +577,9 @@ export async function createPolicy(conn, c, body = {}, requestId = null) {
   await writeRuleSet(conn, c, ins.insertId, rules);
   await audit(conn, c, 'hrms_leave_policies', ins.insertId, 'CREATE', null,
     { name: f.name, code: f.code ?? null, status: f.status ?? 'DRAFT', effectiveFrom: f.effective_from ?? null, fromTemplate: template?.key ?? null, copyOf, leaveTypes: rules.length }, requestId);
-  return getPolicy(conn, c.companyId, ins.insertId);
+  // Spec §36.2: an ACTIVE policy below the legal annual-leave minimum is refused (the transaction rolls back).
+  const compliance = await leavePolicyGate(conn, c, ins.insertId);
+  return { ...(await getPolicy(conn, c.companyId, ins.insertId)), compliance };
 }
 
 /**
@@ -603,7 +606,8 @@ export async function updatePolicy(conn, c, id, body = {}, requestId = null) {
   if (rules) await writeRuleSet(conn, c, id, rules);
   await audit(conn, c, 'hrms_leave_policies', id, 'UPDATE', { name: before.name, status: before.status, effectiveFrom: dateOnly(before.effective_from) },
     { ...f, ...(rules ? { leaveTypes: rules.length } : {}) }, requestId);
-  return getPolicy(conn, c.companyId, id);
+  const compliance = await leavePolicyGate(conn, c, id);
+  return { ...(await getPolicy(conn, c.companyId, id)), compliance };
 }
 
 /** DELETE /leave/policies/:id — 409 IN_USE listing where it is assigned. */

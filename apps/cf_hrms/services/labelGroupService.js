@@ -65,7 +65,7 @@ export async function readModel(db, companyId) {
       `SELECT id, name, sort_order, is_kind FROM hrms_label_groups
         WHERE company_id = ? AND deleted_at IS NULL ORDER BY is_kind DESC, sort_order, id`, [companyId]),
     db.query(
-      `SELECT l.id, l.group_id, l.name, l.sort_order, IF(s.id IS NULL, NULL, l.default_shift_id) AS default_shift_id,
+      `SELECT l.id, l.group_id, l.name, l.sort_order, l.colour, IF(s.id IS NULL, NULL, l.default_shift_id) AS default_shift_id,
               (SELECT COUNT(*) FROM hrms_departments d
                 WHERE d.company_id = l.company_id AND d.deleted_at IS NULL AND LOWER(d.department_type) = LOWER(l.name)) AS department_count
          FROM hrms_department_labels l
@@ -79,7 +79,7 @@ export async function readModel(db, companyId) {
 /** The labels in ONE query, without the counts — for readers that only need the list (the Excel files). */
 export async function readLists(db, companyId) {
   const [rows] = await db.query(
-    `SELECT g.id AS gid, g.name AS gname, g.sort_order AS gsort, g.is_kind, l.id, l.name, l.sort_order,
+    `SELECT g.id AS gid, g.name AS gname, g.sort_order AS gsort, g.is_kind, l.id, l.name, l.sort_order, l.colour,
             IF(s.id IS NULL, NULL, l.default_shift_id) AS default_shift_id
        FROM hrms_label_groups g
        LEFT JOIN hrms_department_labels l ON l.company_id = g.company_id AND l.group_id = g.id AND l.deleted_at IS NULL
@@ -89,7 +89,7 @@ export async function readLists(db, companyId) {
   if (!rows.some((r) => r.id != null)) return ensureKind(db, companyId);
   const kind = { id: rows[0].gid, name: rows[0].gname, sort_order: rows[0].gsort, is_kind: 1 };
   const labels = rows.filter((r) => r.id != null)
-    .map((r) => ({ id: r.id, group_id: r.gid, name: r.name, sort_order: r.sort_order, default_shift_id: r.default_shift_id ?? null }));
+    .map((r) => ({ id: r.id, group_id: r.gid, name: r.name, sort_order: r.sort_order, colour: r.colour ?? null, default_shift_id: r.default_shift_id ?? null }));
   return modelOf([kind], labels);
 }
 

@@ -67,10 +67,10 @@ import { ROW_IN_FORCE } from './roleContentService.js';
  * ══════════════════════════════════════════════════════════════════════════ */
 
 const UNITS_SQL = `
-  SELECT id, code, name, parent_department_id, department_type, is_shared, status
+  SELECT id, code, name, parent_department_id, sort_order, department_type, is_shared, status
     FROM hrms_departments
    WHERE company_id = ? AND deleted_at IS NULL
-   ORDER BY name, code, id`;
+   ORDER BY sort_order, code, id`;
 
 /**
  * The same positions the chart draws: CLOSED seats are out, DRAFT and FROZEN

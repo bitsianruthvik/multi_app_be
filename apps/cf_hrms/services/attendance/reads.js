@@ -11,6 +11,7 @@
  */
 import ExcelJS from 'exceljs';
 import { EMPLOYEE_IN_DEPARTMENTS_SQL } from '../accessScope.js';
+import { unitIdsAndBelow } from '../../lib/listFilters.js';
 import { addDays, weekdayOf, WEEKDAY_NAMES } from '../leave/days.js';
 import { loadPersons, loadWorlds, approverChain } from '../leave/requestService.js';
 import { attendanceMonth } from './month.js';
@@ -28,13 +29,16 @@ export const LEGEND = [
 
 const monthOrNow = (m, tz) => (MONTH_RE.test(String(m ?? '')) ? String(m) : nowIn(tz).slice(0, 7));
 
-/** The employees a list may show: everyone (null), a department scope, or some ids. */
+/**
+ * The employees a list may show: everyone (null), a department scope, or some ids.
+ * `departmentId`: one or more org units ("12" or "12,40"), each with everything under it (spec §34.2).
+ */
 export async function peopleIn(db, companyId, { scopeDeptIds = null, employeeIds = null, departmentId = null, q = null, on }) {
   const where = ["e.company_id = ?", 'e.deleted_at IS NULL', "e.employment_status <> 'EXITED'"];
   const params = [companyId];
   if (employeeIds) { if (!employeeIds.length) return []; where.push('e.id IN (?)'); params.push(employeeIds); }
   if (scopeDeptIds) { if (!scopeDeptIds.length) return []; where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, scopeDeptIds); }
-  if (departmentId) { where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, [Number(departmentId)]); }
+  if (departmentId) { where.push(EMPLOYEE_IN_DEPARTMENTS_SQL('e')); params.push(on, on, await unitIdsAndBelow(db, companyId, departmentId)); }
   if (q) { where.push('(e.full_name LIKE ? OR e.employee_code LIKE ?)'); const like = `%${String(q).slice(0, 100)}%`; params.push(like, like); }
   const [rows] = await db.query(`SELECT e.id FROM hrms_employees e WHERE ${where.join(' AND ')} ORDER BY e.full_name, e.id LIMIT 3000`, params);
   return rows.map((r) => r.id);

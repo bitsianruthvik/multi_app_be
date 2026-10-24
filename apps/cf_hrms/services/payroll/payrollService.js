@@ -10,6 +10,8 @@
  * SALARY AMOUNTS: the routes ask for cf_hrms_pay_view; every read of another person's salary
  * here writes a READ row in the audit log (`auditSalaryRead`).
  */
+import * as LAW from '../law/index.js';
+import * as LAWCO from '../law/company.js';
 import { notFound, invalid } from '../../lib/errors.js';
 import {
   audit, money, num, flag, text, isDate, json, stamp, refuse, bad, readAmount, longDate, dayBefore, dateText, today,
@@ -20,6 +22,7 @@ import { breakdown } from './structure.js';
 import { checkLines, VARIABLES, parse, FormulaError, MAX_FORMULA_LENGTH } from './formula.js';
 import { KINDS, inCtc } from './structure.js';
 import { seedPayroll } from './seed.js';
+import * as CHK from '../complianceChecks/wire.js';
 
 const CODE_RE = /^[A-Z][A-Z0-9_]{0,29}$/;
 const RESERVED = new Set([...VARIABLES, 'BALANCE', 'MIN', 'MAX', 'ROUND', 'OF']);
@@ -218,8 +221,11 @@ export async function previewStructure(db, c, body = {}) {
   const ctc = readAmount(body.annualCtc ?? 600000, 'Sample CTC', p);
   const vars = await varsOn(db, c.companyId, isDate(body.on) ? body.on : today());
   if (problems.length || p.length) return { ok: false, problems: [...problems, ...p], warnings: [], lines: [], vars };
-  const b = breakdown(lines, comps.byId, ctc, body.overrides ?? {}, { pfMode: PF_MODES.includes(body.pfMode) ? body.pfMode : 'CEILING', vars });
-  return { ...b, vars };
+  const pfMode = PF_MODES.includes(body.pfMode) ? body.pfMode : 'CEILING';
+  const b = breakdown(lines, comps.byId, ctc, body.overrides ?? {}, { pfMode, vars });
+  // Spec §36.2: the live compliance check for the sample CTC and the role's skill (body.place: { roleId?, state?, zone?, skill? }).
+  const compliance = b.ok ? await CHK.structurePreviewChecks(db, c, { lines: b.lines, components: comps, place: body.place ?? {}, on: isDate(body.on) ? body.on : today(), pfMode }) : null;
+  return { ...b, vars, compliance };
 }
 
 async function writeLines(db, c, structureId, lines) {
@@ -251,6 +257,7 @@ export async function createStructure(db, c, body = {}, requestId = null) {
     .catch((e) => { if (e.errno === 1062) throw refuse('DUPLICATE', `A structure with the code ${code} already exists.`); throw e; });
   await writeLines(db, c, ins.insertId, lines);
   const out = await getStructure(db, c, ins.insertId);
+  await structureAcks(db, c, ins.insertId, lines, comps, body);
   await audit(db, c, 'hrms_pay_structures', ins.insertId, 'CREATE', null, { code, name, lines: lines.map((l) => [l.comp.code, l.formula]) }, requestId);
   return out;
 }
@@ -276,12 +283,23 @@ export async function updateStructure(db, c, id, body = {}, requestId = null) {
   const cols = Object.keys(sets);
   if (cols.length) await db.query(`UPDATE hrms_pay_structures SET ${cols.map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`, [...cols.map((k) => sets[k]), c.companyId, id]);
   if (lines) await writeLines(db, c, id, lines);
+  if (lines && body.complianceReason) await structureAcks(db, c, id, lines, await loadComponents(db, c.companyId), body);
   if (!cols.length && lines) await db.query('UPDATE hrms_pay_structures SET updated_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
   const after = await getStructure(db, c, id);
   await audit(db, c, 'hrms_pay_structures', id, 'UPDATE',
     { name: before.name, status: before.status, lines: before.lines.map((l) => [l.code, l.formula]) },
     { name: after.structure.name, status: after.structure.status, lines: after.structure.lines.map((l) => [l.code, l.formula]) }, requestId);
   return after;
+}
+
+/** A structure saved with body.complianceReason: its structure-level WARNs (50% rule, usual shares) at the sample CTC are accepted. */
+async function structureAcks(db, c, structureId, lines, comps, body) {
+  if (!body.complianceReason) return;
+  const ctc = Number(body.sampleCtc) > 0 ? Number(body.sampleCtc) : 600000;
+  const b = breakdown(lines, comps.byId, ctc, {}, { vars: await varsOn(db, c.companyId, today()) });
+  if (!b.ok) return;
+  const chk = await CHK.structurePreviewChecks(db, c, { lines: b.lines, components: comps, place: body.place ?? {} });
+  await CHK.structureSaveAcks(db, c, structureId, chk.results, body.complianceReason);
 }
 
 export async function deleteStructure(db, c, id, requestId = null) {
@@ -446,7 +464,7 @@ async function checkSalary(db, c, employee, s, { comps, structs }) {
  * dated in the past (a raise announced in June from April): the next run pays the arrears.
  * -> { salary, arrearsFrom?: month }
  */
-export async function createSalary(db, c, body = {}, requestId = null) {
+export async function createSalary(db, c, body = {}, requestId = null, opts = {}) {
   const employeeId = Number(body.employeeId);
   if (!Number.isInteger(employeeId) || employeeId <= 0) throw bad('Choose the person.', ['Choose the person.']);
   const employee = await employeeRow(db, c.companyId, employeeId);
@@ -458,9 +476,11 @@ export async function createSalary(db, c, body = {}, requestId = null) {
     problems.push(`Effective from: the salary from ${longDate(last.effectiveFrom)} is the latest. A revision starts after it — or correct that one.`);
   }
   const [comps, structs] = await Promise.all([loadComponents(db, c.companyId), loadStructures(db, c.companyId)]);
-  const s = { pfMode: 'CEILING', overrides: [], ...out };
+  const s = { pfMode: (await LAWCO.getChoices(db, c.companyId)).pfWageBasis, overrides: [], ...out };
   if (!problems.length) problems.push(...await checkSalary(db, c, employee, s, { comps, structs }));
   if (problems.length) throw bad('The salary cannot be saved yet.', problems);
+  // Spec §36.2: HARD refuses (422 COMPLIANCE_HARD); a WARN needs body.complianceReason (409 COMPLIANCE_WARN), kept with the approver.
+  const gate = await CHK.salaryGate(db, c, { employeeId, salary: s, breakdown: await salaryBreakdown(db, c, { ...s, overrides: s.overrides ?? [] }, { comps, structs, on: s.effectiveFrom }), components: comps, body, warn: opts.warn ?? 'require', reason: opts.reason ?? null });
   if (last) {
     await db.query('UPDATE hrms_pay_salaries SET effective_to = ? WHERE company_id = ? AND id = ?', [dayBefore(s.effectiveFrom), c.companyId, last.id]);
     await audit(db, c, 'hrms_pay_salaries', last.id, 'UPDATE', { effectiveTo: last.effectiveTo }, { effectiveTo: dayBefore(s.effectiveFrom), endedBy: 'revision' }, requestId);
@@ -472,14 +492,15 @@ export async function createSalary(db, c, body = {}, requestId = null) {
   );
   const [[row]] = await db.query(`SELECT ${SALARY_COLUMNS} FROM hrms_pay_salaries WHERE id = ?`, [ins.insertId]);
   const salary = shapeSalary(row);
+  await CHK.recordAcks(db, c, 'SALARY', salary.id, gate.toAck, gate.reason, { employeeId });
   await audit(db, c, 'hrms_pay_salaries', salary.id, 'CREATE', null, { employeeId, annualCtc: salary.annualCtc, structureId: salary.structureId, effectiveFrom: salary.effectiveFrom, pfMode: salary.pfMode, overrides: salary.overrides, reason: salary.reason }, requestId);
   const locked = await lockedMonthsOf(db, c.companyId, employeeId);
   const back = locked.filter((l) => l.month >= salary.effectiveFrom.slice(0, 7)).map((l) => l.month).sort();
-  return { salary, arrearsFor: back, note: back.length ? `Dated back over ${back.length} paid month${back.length === 1 ? '' : 's'} (${back.join(', ')}): the next run pays the arrears.` : null };
+  return { salary, compliance: gate.results, arrearsFor: back, note: back.length ? `Dated back over ${back.length} paid month${back.length === 1 ? '' : 's'} (${back.join(', ')}): the next run pays the arrears.` : null };
 }
 
 /** PUT /payroll/salaries/:id — corrects a row no locked run has paid on. Otherwise: add a revision. */
-export async function updateSalary(db, c, id, body = {}, requestId = null) {
+export async function updateSalary(db, c, id, body = {}, requestId = null, opts = {}) {
   const [[row]] = await db.query(`SELECT ${SALARY_COLUMNS} FROM hrms_pay_salaries WHERE company_id = ? AND id = ? AND deleted_at IS NULL`, [c.companyId, id]);
   if (!row) throw notFound('That salary');
   const before = shapeSalary(row);
@@ -499,6 +520,7 @@ export async function updateSalary(db, c, id, body = {}, requestId = null) {
   const [comps, structs] = await Promise.all([loadComponents(db, c.companyId), loadStructures(db, c.companyId)]);
   if (!problems.length) problems.push(...await checkSalary(db, c, employee, s, { comps, structs }));
   if (problems.length) throw bad('The salary cannot be saved yet.', problems);
+  const gate = await CHK.salaryGate(db, c, { employeeId: before.employeeId, salary: s, breakdown: await salaryBreakdown(db, c, { ...s, overrides: s.overrides ?? [] }, { comps, structs, on: s.effectiveFrom }), components: comps, body, warn: opts.warn ?? 'require', reason: opts.reason ?? null });
   await db.query('UPDATE hrms_pay_salaries SET effective_from = ?, annual_ctc = ?, structure_id = ?, overrides_json = ?, pf_mode = ?, state_code = ?, reason = ? WHERE company_id = ? AND id = ?',
     [s.effectiveFrom, s.annualCtc, s.structureId, s.overrides?.length ? JSON.stringify(s.overrides) : null, s.pfMode, s.stateCode ?? null, s.reason ?? null, c.companyId, id]);
   if (prev && out.effectiveFrom && out.effectiveFrom !== before.effectiveFrom) {
@@ -506,8 +528,9 @@ export async function updateSalary(db, c, id, body = {}, requestId = null) {
   }
   const [[again]] = await db.query(`SELECT ${SALARY_COLUMNS} FROM hrms_pay_salaries WHERE id = ?`, [id]);
   const after = shapeSalary(again);
+  await CHK.recordAcks(db, c, 'SALARY', id, gate.toAck, gate.reason, { employeeId: before.employeeId });
   await audit(db, c, 'hrms_pay_salaries', id, 'UPDATE', before, after, requestId);
-  return { salary: after };
+  return { salary: after, compliance: gate.results };
 }
 
 /** DELETE /payroll/salaries/:id — only the latest row, unpaid; the row before it runs on again. */
@@ -528,121 +551,61 @@ export async function deleteSalary(db, c, id, requestId = null) {
 
 /* ══ statutory settings ══════════════════════════════════════════════════ */
 
+/* ══ statutory: THE LAW LAYER (spec §36.1) ══════════════════════════════
+ * PF, ESI, PT and LWF are product-level law since §37 (hrms_law_rules, services/law): read-only for a
+ * company. The company keeps its CHOICES (PF basis for new salaries, registration numbers, bonus rate —
+ * GET/PUT /law/choices) and may record its own note and "checked" mark against a version. */
 const KINDS_S = ['PF', 'ESI', 'PT', 'LWF'];
-const shapeStatutory = (r) => ({
-  id: r.id, kind: r.kind, stateCode: r.state_code, effectiveFrom: dateText(r.effective_from), settings: json(r.settings_json, {}),
-  source: r.source ?? null, sourceUrl: r.source_url ?? null, verification: r.verification, note: r.note ?? null, updatedAt: stamp(r.updated_at),
+const shapeStatutory = (r, note = null) => ({
+  id: r.id, kind: r.domain, stateCode: r.jurisdiction, effectiveFrom: r.effectiveFrom, effectiveTo: r.effectiveTo ?? null, settings: r.value,
+  source: r.sourceNote ?? null, sourceUrl: r.sourceUrl ?? null, verification: r.verified ? 'VERIFIED' : 'UNVERIFIED', note: r.note ?? null,
+  version: r.version, status: r.status, publishedAt: r.publishedAt ?? null, reviewedBy: r.reviewedBy ?? null, title: r.title ?? null,
+  companyNote: note ? { verification: note.verification, note: note.note } : null,
 });
+const LAW_WORDS = 'The law is kept by the product team for every company, versioned and published with its source.';
 
 export async function listStatutory(db, c) {
-  const [rows] = await db.query('SELECT * FROM hrms_pay_statutory_settings WHERE company_id = ? AND deleted_at IS NULL ORDER BY kind, state_code, effective_from DESC', [c.companyId]);
   const settings = await companySettings(db, c.companyId);
+  const states = await LAW.companyStates(db, c.companyId);
+  const rows = (await LAW.listRules(db, { includeTax: false })).filter((r) => KINDS_S.includes(r.domain) && r.ruleKey === 'settings' && r.status !== 'DRAFT' && ['IN', ...states].includes(r.jurisdiction));
+  const notes = await LAWCO.notesOf(db, c.companyId);
   const inForce = await statutoryOn(db, c.companyId, today(), settings.stateCode);
+  const published = rows.filter((r) => r.status === 'PUBLISHED');
   return {
-    settings: rows.map(shapeStatutory), company: settings,
+    settings: published.map((r) => shapeStatutory(r, notes.get(r.id))),
+    superseded: rows.filter((r) => r.status === 'SUPERSEDED').map((r) => shapeStatutory(r, notes.get(r.id))),
+    company: settings, choices: await LAWCO.getChoices(db, c.companyId), readOnly: true, readOnlyWhy: LAW_WORDS,
     inForce: Object.fromEntries(Object.entries(inForce).map(([k, v]) => [k, v?.meta?.id ?? null])),
-    states: [{ code: 'IN', name: 'All India (PF, ESI)' }, { code: 'TG', name: 'Telangana' }, { code: 'AP', name: 'Andhra Pradesh' }, { code: 'KA', name: 'Karnataka' }, { code: 'MH', name: 'Maharashtra' }, { code: 'TN', name: 'Tamil Nadu' }],
-    unverified: rows.filter((r) => r.verification === 'UNVERIFIED').length,
+    states: [{ code: 'IN', name: 'All India (PF, ESI)' }, ...LAWCO.STATES],
+    unverified: published.filter((r) => !r.verified).length,
   };
 }
 
-function readStatutory(body, { creating, current = null }) {
-  const problems = [];
-  const kind = String(body.kind ?? current?.kind ?? '').toUpperCase();
-  if (!KINDS_S.includes(kind)) problems.push('Kind: PF, ESI, PT or LWF.');
-  const stateCode = String(body.stateCode ?? current?.stateCode ?? (kind === 'PF' || kind === 'ESI' ? 'IN' : '')).trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(stateCode)) problems.push('State: a two-letter code (TG for Telangana, IN for the whole country).');
-  if ((kind === 'PF' || kind === 'ESI') && stateCode !== 'IN') problems.push('PF and ESI are the same everywhere: their state is IN.');
-  const effectiveFrom = String(body.effectiveFrom ?? current?.effectiveFrom ?? '').slice(0, 10);
-  if (!isDate(effectiveFrom)) problems.push('From: a date as YYYY-MM-DD.');
-  const settings = body.settings ?? current?.settings;
-  problems.push(...settingsProblems(kind, settings));
-  const verification = String(body.verification ?? current?.verification ?? 'UNVERIFIED').toUpperCase();
-  if (!['VERIFIED', 'UNVERIFIED'].includes(verification)) problems.push('Checked: verified or unverified.');
-  const out = { kind, stateCode, effectiveFrom, settings, verification, source: text(body.source ?? current?.source, 4000), sourceUrl: text(body.sourceUrl ?? current?.sourceUrl, 500), note: text(body.note ?? current?.note, 500) };
-  if (creating && !out.source) problems.push('Source: say where these values come from (the act, the notification, the page).');
-  return { out, problems };
+export async function createStatutory() {
+  throw refuse('LAW_IS_PRODUCT', `${LAW_WORDS} A new rate or slab is published there, from its date; it then applies to every company. Your own choices are under Payroll › Statutory settings › Your choices.`);
 }
 
-const isNum = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
-export function settingsProblems(kind, s) {
-  const p = [];
-  if (!s || typeof s !== 'object' || Array.isArray(s)) return ['Settings: send the values as an object.'];
-  const need = (keys) => { for (const k of keys) if (!isNum(Number(s[k])) || s[k] === '' || s[k] == null) p.push(`${k}: a number, zero or more.`); };
-  if (kind === 'PF') need(['employeeRate', 'employerRate', 'epsRate', 'wageCeiling', 'edliRate', 'adminRate']);
-  if (kind === 'ESI') {
-    need(['employeeRate', 'employerRate', 'wageCeiling']);
-    if (s.periods && (!Array.isArray(s.periods) || s.periods.some((x) => !/^\d{2}-\d{2}$/.test(x?.from ?? '') || !/^\d{2}-\d{2}$/.test(x?.to ?? '')))) p.push('periods: a list of { from: "MM-DD", to: "MM-DD" }.');
-  }
-  if (kind === 'PT') {
-    if (!Array.isArray(s.slabs) || !s.slabs.length) p.push('slabs: a list of { upTo, amount } — the last with upTo empty.');
-    else {
-      s.slabs.forEach((x, i) => {
-        if (!isNum(Number(x?.amount))) p.push(`Slab ${i + 1}: the amount is a number.`);
-        if (x?.upTo != null && x.upTo !== '' && !isNum(Number(x.upTo))) p.push(`Slab ${i + 1}: "up to" is a number, or empty for the top slab.`);
-      });
-      if (s.slabs.filter((x) => x?.upTo == null || x.upTo === '').length !== 1) p.push('slabs: exactly one slab has no upper limit (the top one).');
-    }
-  }
-  if (kind === 'LWF') {
-    need(['employee', 'employer']);
-    if (!Array.isArray(s.months) || s.months.some((m) => !Number.isInteger(Number(m)) || m < 1 || m > 12)) p.push('months: the months it is deducted in, 1–12.');
-  }
-  for (const k of ['rounding']) if (s[k] && !['NEAREST', 'UP', 'DOWN'].includes(s[k])) p.push('rounding: NEAREST, UP or DOWN.');
-  return p;
-}
-
-/** A statutory row used by a locked run (a month on or after its day, before the next row) is not changed: add a new row. */
-async function statutoryInUse(db, c, row) {
-  const [[next]] = await db.query('SELECT MIN(effective_from) AS d FROM hrms_pay_statutory_settings WHERE company_id = ? AND deleted_at IS NULL AND kind = ? AND state_code = ? AND effective_from > ?',
-    [c.companyId, row.kind, row.stateCode, row.effectiveFrom]);
-  const [[used]] = await db.query(
-    `SELECT GROUP_CONCAT(period_month ORDER BY period_month) AS months FROM hrms_pay_runs WHERE company_id = ? AND deleted_at IS NULL AND status IN ('LOCKED','RELEASED','PAID')
-        AND CONCAT(period_month, '-01') >= ? ${next?.d ? 'AND CONCAT(period_month, \'-01\') < ?' : ''}`,
-    [c.companyId, row.effectiveFrom, ...(next?.d ? [dateText(next.d)] : [])]);
-  return used?.months ? String(used.months) : null;
-}
-
-export async function createStatutory(db, c, body = {}, requestId = null) {
-  const { out, problems } = readStatutory(body, { creating: true });
-  if (problems.length) throw bad('These settings cannot be saved yet.', problems);
-  const [ins] = await db.query(
-    `INSERT INTO hrms_pay_statutory_settings (company_id, kind, state_code, effective_from, settings_json, source, source_url, verification, note, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, out.kind, out.stateCode, out.effectiveFrom, JSON.stringify(out.settings), out.source, out.sourceUrl, out.verification, out.note, c.userId],
-  ).catch((e) => { if (e.errno === 1062) throw refuse('DUPLICATE', `There are ${out.kind} settings for ${out.stateCode} from ${longDate(out.effectiveFrom)} already. Change that row.`); throw e; });
-  await audit(db, c, 'hrms_pay_statutory_settings', ins.insertId, 'CREATE', null, out, requestId);
-  const [[r]] = await db.query('SELECT * FROM hrms_pay_statutory_settings WHERE id = ?', [ins.insertId]);
-  return { setting: shapeStatutory(r) };
-}
-
+/**
+ * PUT /payroll/statutory/:id — a published law version is never edited. Only the company's OWN note and
+ * "checked" mark against it can be recorded (hrms_law_company_notes); the law row stays as published.
+ */
 export async function updateStatutory(db, c, id, body = {}, requestId = null) {
-  const [[r]] = await db.query('SELECT * FROM hrms_pay_statutory_settings WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, id]);
-  if (!r) throw notFound('Those statutory settings');
-  const before = shapeStatutory(r);
-  const { out, problems } = readStatutory(body, { creating: false, current: before });
-  const valuesChange = JSON.stringify(out.settings) !== JSON.stringify(before.settings) || out.effectiveFrom !== before.effectiveFrom || out.kind !== before.kind || out.stateCode !== before.stateCode;
+  const r = await LAW.getVersion(db, id);
+  if (!r || r.kind !== 'LAW' || !KINDS_S.includes(r.domain) || r.status === 'DRAFT') throw notFound('Those statutory settings');
+  const valuesChange = (body.settings !== undefined && JSON.stringify(body.settings) !== JSON.stringify(r.value))
+    || (body.effectiveFrom !== undefined && String(body.effectiveFrom).slice(0, 10) !== r.effectiveFrom)
+    || (body.kind !== undefined && String(body.kind).toUpperCase() !== r.domain)
+    || (body.stateCode !== undefined && String(body.stateCode).toUpperCase() !== r.jurisdiction)
+    || body.source !== undefined || body.sourceUrl !== undefined;
   if (valuesChange) {
-    const used = await statutoryInUse(db, c, before);
-    if (used) problems.push(`Locked payroll runs used these values (${used}). They stay as they were: add a new row from the day the change applies. (The source and “checked” can still be changed.)`);
+    throw bad('Published law is not changed here.', [`Published law is never edited: to change it, the product team must add a new row (a new version of the rule) from the day the change applies. ${LAW_WORDS} You can still record your own note and “checked” mark.`]);
   }
-  if (problems.length) throw bad('These settings cannot be saved yet.', problems);
-  await db.query('UPDATE hrms_pay_statutory_settings SET kind = ?, state_code = ?, effective_from = ?, settings_json = ?, source = ?, source_url = ?, verification = ?, note = ? WHERE company_id = ? AND id = ?',
-    [out.kind, out.stateCode, out.effectiveFrom, JSON.stringify(out.settings), out.source, out.sourceUrl, out.verification, out.note, c.companyId, id])
-    .catch((e) => { if (e.errno === 1062) throw refuse('DUPLICATE', 'There is another row of that kind and state from that day.'); throw e; });
-  await audit(db, c, 'hrms_pay_statutory_settings', id, 'UPDATE', before, out, requestId);
-  const [[again]] = await db.query('SELECT * FROM hrms_pay_statutory_settings WHERE id = ?', [id]);
-  return { setting: shapeStatutory(again) };
+  await LAWCO.setNote(db, c, r.id, { verification: body.verification, note: body.note }, requestId);
+  return { setting: shapeStatutory(r, (await LAWCO.notesOf(db, c.companyId)).get(r.id)) };
 }
 
-export async function deleteStatutory(db, c, id, requestId = null) {
-  const [[r]] = await db.query('SELECT * FROM hrms_pay_statutory_settings WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, id]);
-  if (!r) throw notFound('Those statutory settings');
-  const s = shapeStatutory(r);
-  const used = await statutoryInUse(db, c, s);
-  if (used) throw refuse('IN_USE', `Locked payroll runs used these values (${used}). They stay.`);
-  await db.query('UPDATE hrms_pay_statutory_settings SET deleted_at = NOW() WHERE company_id = ? AND id = ?', [c.companyId, id]);
-  await audit(db, c, 'hrms_pay_statutory_settings', id, 'DELETE', s, null, requestId);
-  return { ok: true };
+export async function deleteStatutory() {
+  throw refuse('LAW_IS_PRODUCT', `${LAW_WORDS} A published version stays, for the months that used it.`);
 }
 
 /** PUT /payroll/settings { stateCode?, debitAccountNo?, debitIfsc?, narration? } */

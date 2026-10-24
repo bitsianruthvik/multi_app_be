@@ -10,6 +10,7 @@ import { newPositionShift } from './newPositionShift.js';
 import { issuePositionCode, acceptImportedCode } from './codeService.js';
 import { POSITION_ENTITY, cardCodeOf } from './codegenProvider.js';
 import { inBatch } from '../lib/batch.js';
+import { orderUnits } from '../lib/unitOrder.js';
 import { randomUUID } from 'crypto';
 /**
  * positionService.js — positions, their work contexts, the FORMAL reporting
@@ -1799,7 +1800,9 @@ export async function positionOptions(db, companyId) {
   const q = (sql) => db.query(sql, [companyId]).then(([rows]) => rows);
   const [roles, departments, locations, shifts, contexts, types, positions, kras, responsibilities, kpis] = await Promise.all([
     q("SELECT id, role_code AS code, title AS name, status FROM hrms_roles WHERE company_id = ? AND deleted_at IS NULL ORDER BY title"),
-    q('SELECT id, code, name FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY name'),
+    // Tree order, siblings by their stored order then code (spec §34).
+    q('SELECT id, code, name, parent_department_id, sort_order FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL')
+      .then((rows) => orderUnits(rows).map((r) => ({ id: r.id, code: r.code, name: r.name }))),
     q('SELECT id, code, name FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL ORDER BY name'),
     q('SELECT id, code, name FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY code'),
     q('SELECT id, code, name, context_type AS contextType FROM hrms_work_contexts WHERE company_id = ? AND deleted_at IS NULL ORDER BY name'),

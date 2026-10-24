@@ -31,6 +31,7 @@ import { yearSettings, proofsStatusFor } from './settings.js';
 import { profilesOf, citiesOf, placeOfPosting, metroOf } from './profiles.js';
 import { lineRows, claimsOf } from './declarations.js';
 import { loadComponents, loadStructures, shapeSalary, SALARY_COLUMNS, overrideMap, statutoryOn, companySettings } from '../payroll/common.js';
+import { statesOf } from '../law/personLaw.js';
 import { breakdown } from '../payroll/structure.js';
 import { pfFor, ptFor } from '../payroll/statutory.js';
 import { monthBounds } from '../payroll/proration.js';
@@ -95,6 +96,8 @@ export async function loadTaxWorld(db, companyId, month, employeeIds, { runId = 
     profiles, pans, cities, posting, comps, structs, paySettings, lines, paid, lockedMonths, salaries,
     overrides: new Map(ovr.map((o) => [o.employee_id, { amount: money(o.amount), reason: o.reason }])),
     statFor, bdCache: new Map(),
+    // Spec §36.1: the state follows the person (their main position's location); null = the company's.
+    personState: await statesOf(db, companyId, ids, monthEnd),
   };
 }
 
@@ -150,7 +153,7 @@ export async function salaryMonth(world, employeeId, month) {
   if (!sal) return null;
   const s = world.structs.get(sal.structureId);
   if (!s) return null;
-  const state = sal.stateCode ?? world.paySettings.stateCode;
+  const state = sal.stateCode ?? world.personState?.get(employeeId) ?? world.paySettings.stateCode;
   const st = await world.statFor(b.from, state);
   const key = `${sal.id}|${month}`;
   if (!world.bdCache.has(key)) {

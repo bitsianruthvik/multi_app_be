@@ -38,6 +38,7 @@ import { DEPARTMENT_LABEL_ID_SQL, readModel, linkDepartmentLabel, retireDepartme
 import { issueDepartmentCode, issueLocationCode, acceptImportedCode } from './codeService.js';
 import { DEPARTMENT_ENTITY, LOCATION_ENTITY } from './codegenProvider.js';
 import { inBatch } from '../lib/batch.js';
+import { compareUnits, orderUnits } from '../lib/unitOrder.js';
 
 import {
   WEEKDAY_NAMES, hhmm, spanMinutes, shapeDay, defaultWeek, weekOf, summaryOf, weeklyHoursOf, mirrorOf, weekdayName,
@@ -366,8 +367,8 @@ export async function lookups(db, companyId) {
     [companyId],
   );
   const [departments] = await db.query(
-    `SELECT id, code, name, department_type, is_shared, parent_department_id, status FROM hrms_departments
-      WHERE company_id = ? AND deleted_at IS NULL ORDER BY name`,
+    `SELECT id, code, name, department_type, is_shared, parent_department_id, sort_order, status FROM hrms_departments
+      WHERE company_id = ? AND deleted_at IS NULL`,
     [companyId],
   );
   const [shifts] = await db.query(
@@ -377,9 +378,11 @@ export async function lookups(db, companyId) {
   );
   return {
     locations: locations.map((r) => ({ id: r.id, code: r.code, name: r.name, locationType: r.location_type, status: r.status })),
-    departments: departments.map((r) => ({
+    // Tree order: a unit, then what is under it; siblings by their stored order, then code (spec §34).
+    departments: orderUnits(departments).map((r) => ({
       id: r.id, code: r.code, name: r.name, status: r.status,
       parentId: r.parent_department_id ?? null, type: r.department_type ?? null, isShared: Boolean(r.is_shared),
+      sortOrder: Number(r.sort_order ?? 0),
     })),
     shifts: shifts.map((r) => ({ id: r.id, code: r.code, name: r.name, status: r.status })),
     locationTypes: LOCATION_TYPES,
@@ -400,6 +403,8 @@ const mapDepartment = (r, serves = []) => ({
   code: r.code,
   name: r.name,
   parentId: r.parent_department_id,
+  // The order among its siblings (spec §34): lists order by it, then code.
+  sortOrder: Number(r.sort_order ?? 0),
   type: r.department_type ?? null,
   isShared: Boolean(r.is_shared),
   serves,
@@ -431,13 +436,14 @@ export async function listDepartments(db, companyId) {
   // The labels first: ensureLabels makes the company's list when it has none.
   const types = (await ensureLabels(db, companyId)).map((l) => l.name);
   const [rows] = await db.query(
-    `SELECT d.id, d.code, d.name, d.parent_department_id, d.department_type, d.is_shared, d.status, d.created_at,
+    `SELECT d.id, d.code, d.name, d.parent_department_id, d.sort_order, d.department_type, d.is_shared, d.status, d.created_at,
             ${DEPARTMENT_LABEL_ID_SQL('d')} AS label_id
-       FROM hrms_departments d WHERE d.company_id = ? AND d.deleted_at IS NULL
-      ORDER BY d.name`,
+       FROM hrms_departments d WHERE d.company_id = ? AND d.deleted_at IS NULL`,
     [companyId],
   );
   const serves = await servesByDepartment(db, companyId);
+  // Siblings (and the top level) by their stored order, then code — never by name (spec §34).
+  rows.sort(compareUnits);
   // `types`: the company's labels' names, in its order.
   return { rows: toPreOrder(rows, 'parent_department_id', (r) => mapDepartment(r, serves.get(r.id) ?? [])), types };
 }
@@ -549,11 +555,154 @@ async function departmentLabelOf(db, c, input, { creating, options }) {
   });
 }
 
+/* ── order among siblings (spec §34) ───────────────────────────────────── */
+
+/** `sortOrder` from a body: undefined (not asked), or a whole number from 1. */
+function sortOrderInput(input, problems) {
+  if (input.sortOrder === undefined || input.sortOrder === null || input.sortOrder === '') return undefined;
+  const n = Number(input.sortOrder);
+  if (!Number.isInteger(n) || n < 1 || n > 100000) { problems.push('The place among its siblings must be a whole number from 1.'); return undefined; }
+  return n;
+}
+
+/**
+ * The sort_order a unit takes under `parentId` (null = the top level), the
+ * unit itself (`selfId`) left out of its siblings:
+ *   no place asked -> after the last sibling;
+ *   place n        -> n, and every sibling at n or after moves one down.
+ */
+async function placeAmongSiblings(db, companyId, parentId, selfId, wanted) {
+  const [[last]] = await db.query(
+    `SELECT COALESCE(MAX(sort_order), 0) AS n FROM hrms_departments
+      WHERE company_id = ? AND deleted_at IS NULL AND parent_department_id <=> ? AND id <> ?`,
+    [companyId, parentId, selfId ?? 0],
+  );
+  if (wanted === undefined) return Number(last.n) + 1;
+  await db.query(
+    `UPDATE hrms_departments SET sort_order = sort_order + 1
+      WHERE company_id = ? AND deleted_at IS NULL AND parent_department_id <=> ? AND id <> ? AND sort_order >= ?`,
+    [companyId, parentId, selfId ?? 0, wanted],
+  );
+  return wanted;
+}
+
+/**
+ * PUT /organisation/departments/order { parentId: number | null, ids: number[] }
+ * The siblings under one parent (null = the top level), every one once, in
+ * the order wanted. Company-scoped: a parent or an id of another company is
+ * "not one of them" (422), and nothing is written. Each unit whose place
+ * changes is audited (UPDATE, before / after sortOrder).
+ *   -> { parentId, rows: [{ id, sortOrder }] }
+ */
+export async function reorderDepartments(db, c, body = {}) {
+  const problems = [];
+  const parentId = idOrNull(body.parentId, 'Parent org unit', problems);
+  const ids = Array.isArray(body.ids) ? body.ids.map(Number) : null;
+  if (!ids || !ids.length || ids.some((v) => !Number.isInteger(v) || v <= 0)) problems.push('Send the ids of the org units, in the order wanted.');
+  assertNoProblems(problems);
+  if (parentId != null) {
+    const [[parent]] = await db.query('SELECT id FROM hrms_departments WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, parentId]);
+    if (!parent) {
+      throw invalid('BAD_REFERENCE', 'The org unit they sit under does not exist.', { problems: ['The org unit they sit under does not exist in this company.'] });
+    }
+  }
+  const [siblings] = await db.query(
+    `SELECT id, name, sort_order FROM hrms_departments
+      WHERE company_id = ? AND deleted_at IS NULL AND parent_department_id <=> ? FOR UPDATE`,
+    [c.companyId, parentId],
+  );
+  const have = new Map(siblings.map((r) => [r.id, r]));
+  const where = parentId == null ? 'at the top level' : 'under that org unit';
+  if (new Set(ids).size !== ids.length || ids.length !== siblings.length || ids.some((v) => !have.has(v))) {
+    const strangers = ids.filter((v) => !have.has(v)).length;
+    throw invalid('INVALID', `Send every org unit ${where} once, in the order wanted.`, {
+      problems: [strangers
+        ? `${strangers === 1 ? 'One of the org units sent does' : `${strangers} of the org units sent do`} not sit ${where}. Only units with the same parent can be put in order together.`
+        : `There ${siblings.length === 1 ? 'is 1 org unit' : `are ${siblings.length} org units`} ${where}. Send the id of each one exactly once, in the order wanted.`],
+    });
+  }
+  const changed = ids.map((id, i) => ({ id, before: Number(have.get(id).sort_order), after: i + 1 })).filter((x) => x.before !== x.after);
+  if (changed.length) {
+    await db.query(
+      `UPDATE hrms_departments SET sort_order = CASE id ${changed.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
+      [...changed.flatMap((x) => [x.id, x.after]), c.companyId, changed.map((x) => x.id)],
+    );
+    for (const x of changed) {
+      // eslint-disable-next-line no-await-in-loop -- one audit row per unit that moved, in the same transaction
+      await audit(db, c, 'hrms_departments', x.id, 'UPDATE', { sortOrder: x.before }, { sortOrder: x.after, reordered: true, parentId });
+    }
+  }
+  return { parentId, rows: ids.map((id, i) => ({ id, sortOrder: i + 1 })) };
+}
+
+/** "6 positions and 2 units under it move with it" — what a move takes along. */
+function carriesSentence(positions, units) {
+  const p = positions === 1 ? '1 position' : `${positions} positions`;
+  const u = units === 1 ? '1 unit' : `${units} units`;
+  if (positions && units) return `${p} and ${u} under it move with it`;
+  if (positions) return `${p} under it ${positions === 1 ? 'moves' : 'move'} with it`;
+  if (units) return `the ${u} under it ${units === 1 ? 'moves' : 'move'} with it`;
+  return 'nothing else is under it';
+}
+
+/**
+ * GET /organisation/departments/:id/move-check?parentId=  (blank = the top level)
+ * What moving a unit under another would do, in the words of the confirm (spec §34.3):
+ *   { unit, from, to, unitsUnder, positionsUnder, allowed, problem, sentence }
+ * `sentence`: "Move Lamination (Section) from Production to Operations — 6 positions and
+ * 2 units under it move with it". `allowed` false with `problem` when the move is refused
+ * (inside itself, onto itself, a parent that is not in this company). Nothing is written;
+ * the move itself is PUT /organisation/departments/:id { parentId, sortOrder? }.
+ */
+export async function moveCheck(db, companyId, id, parentIdRaw) {
+  const problems = [];
+  const parentId = idOrNull(parentIdRaw === '' ? null : parentIdRaw, 'Parent org unit', problems);
+  assertNoProblems(problems);
+  const [units] = await db.query(
+    'SELECT id, name, department_type, parent_department_id FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL',
+    [companyId],
+  );
+  const byId = new Map(units.map((u) => [u.id, u]));
+  const unit = byId.get(id);
+  if (!unit) throw notFound('Org unit');
+  const kids = new Map();
+  for (const u of units) if (u.parent_department_id != null) kids.set(u.parent_department_id, [...(kids.get(u.parent_department_id) ?? []), u.id]);
+  const below = new Set();
+  const walk = [id];
+  while (walk.length) { const x = walk.pop(); if (below.has(x)) continue; below.add(x); walk.push(...(kids.get(x) ?? [])); }
+  const [[pos]] = await db.query(
+    "SELECT COUNT(*) AS n FROM hrms_positions WHERE company_id = ? AND deleted_at IS NULL AND status <> 'CLOSED' AND department_id IN (?)",
+    [companyId, [...below]],
+  );
+  const short = (u) => (u ? { id: u.id, name: u.name, type: u.department_type ?? null } : null);
+  const from = unit.parent_department_id != null ? byId.get(unit.parent_department_id) ?? null : null;
+  const to = parentId != null ? byId.get(parentId) ?? null : null;
+  let problem = null;
+  if (parentId != null && !to) problem = 'That org unit does not exist in this company.';
+  else if (parentId === id) problem = 'An org unit cannot sit under itself.';
+  else if (parentId != null && below.has(parentId)) problem = `"${to.name}" is under ${unit.name}, so ${unit.name} cannot also sit under it.`;
+  else if ((unit.parent_department_id ?? null) === parentId) problem = `It already sits ${to ? `under ${to.name}` : 'at the top level'}.`;
+  const positionsUnder = Number(pos.n);
+  const unitsUnder = below.size - 1;
+  const named = unit.department_type ? `${unit.name} (${unit.department_type})` : unit.name;
+  return {
+    unit: short(unit),
+    from: short(from),
+    to: short(to),
+    unitsUnder,
+    positionsUnder,
+    allowed: !problem,
+    problem,
+    sentence: `Move ${named} from ${from ? from.name : 'the top level'} to ${to ? to.name : 'the top level'} — ${carriesSentence(positionsUnder, unitsUnder)}`,
+  };
+}
+
 export async function createDepartment(db, c, input = {}, options = {}) {
   const problems = [];
   const fields = departmentFields(input, problems);
   const parentId = idOrNull(input.parentId, 'Parent org unit', problems);
   const serves = servesInput(input, problems);
+  const sortOrder = sortOrderInput(input, problems);
   assertNoProblems(problems);
   // The label must be one of the company's list; a department created with none takes the first.
   const label = await departmentLabelOf(db, c, input, { creating: true, options });
@@ -561,6 +710,8 @@ export async function createDepartment(db, c, input = {}, options = {}) {
   await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, null, parentId, 'Org unit');
   fields.code = (await acceptImportedCode(db, c.companyId, DEPARTMENT_ENTITY, options.importedCode))
     ?? await issueDepartmentCode(db, c.companyId, { name: fields.name, type: fields.department_type, parentId, userId: c.userId });
+  // After the last sibling, or at the place asked for (a "+" between two siblings).
+  fields.sort_order = await placeAmongSiblings(db, c.companyId, parentId, null, sortOrder);
   const id = await insertRow(db, 'hrms_departments', c.companyId, c.userId, {
     ...fields,
     parent_department_id: parentId,
@@ -591,7 +742,12 @@ export async function updateDepartment(db, c, id, input = {}, options = {}) {
     fields.parent_department_id = parentId;
   }
   const serves = servesInput(input, problems);
+  const sortOrder = sortOrderInput(input, problems);
   assertNoProblems(problems);
+  // Moved to another parent: after its new siblings (or at the place asked for). Same parent and a place: that place.
+  const parentAfter = fields.parent_department_id !== undefined ? fields.parent_department_id : (before.parent_department_id ?? null);
+  const moved = fields.parent_department_id !== undefined && (fields.parent_department_id ?? null) !== (before.parent_department_id ?? null);
+  if (moved || sortOrder !== undefined) fields.sort_order = await placeAmongSiblings(db, c.companyId, parentAfter, id, sortOrder);
   const sharedAfter = fields.is_shared !== undefined ? fields.is_shared === 1 : Boolean(before.is_shared);
   await updateRow(db, 'hrms_departments', c.companyId, id, fields);
   // Un-sharing a department retires what it served: a serves row on a department

@@ -59,6 +59,7 @@ import { HOLDS_SEAT_SQL } from './seatCount.js';
 import { assertNoOpenHiring } from './hiringRead.js';
 import { EMPLOYEE_IN_DEPARTMENTS_SQL, scopeToday } from './accessScope.js';
 import { inBatch } from '../lib/batch.js';
+import { orderUnits } from '../lib/unitOrder.js';
 
 export const ASSIGNMENT_STATUSES = ['PLANNED', 'ACTIVE', 'SUSPENDED', 'ENDED'];
 /** Statuses that put a person on the job today. ENDED and PLANNED do not. */
@@ -938,7 +939,9 @@ export async function assignmentOptions(db, companyId, query = {}) {
               p.location_id AS locationId, p.default_shift_id AS defaultShiftId, p.status
          FROM hrms_positions p LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
         WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status <> 'CLOSED' ORDER BY name`),
-    q('SELECT id, code, name FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY name'),
+    // Tree order, siblings by their stored order then code (spec §34).
+    q('SELECT id, code, name, parent_department_id, sort_order FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL')
+      .then((rows) => orderUnits(rows).map((r) => ({ id: r.id, code: r.code, name: r.name }))),
     q('SELECT id, code, name FROM hrms_locations WHERE company_id = ? AND deleted_at IS NULL ORDER BY name'),
     q('SELECT id, code, name FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL ORDER BY code'),
     q('SELECT id, code, name, context_type AS contextType FROM hrms_work_contexts WHERE company_id = ? AND deleted_at IS NULL ORDER BY name'),

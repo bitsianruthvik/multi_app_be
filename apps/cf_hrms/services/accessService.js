@@ -567,7 +567,9 @@ export async function resetPassword(conn, c, userId, requestId = null) {
 
 /**
  * GET /access/me — what the person asking may do, read now:
- * { role: { id, label, scope }, tags, scope: { all, departmentNames } }.
+ * { role: { id, label, scope }, tags, scope: { all, departmentNames, rootDepartmentIds, departmentIds } }.
+ * rootDepartmentIds: the units the login holds (departmentNames, same order); departmentIds: those and
+ * everything under them (spec §34.5: the org chart maps the scope by id — names can repeat).
  */
 export async function me(conn, c, access) {
   const app = await requireApp(conn, c.companyId);
@@ -576,7 +578,12 @@ export async function me(conn, c, access) {
   return {
     role: { id: access.roleId, label: access.label, scope: access.scope },
     tags,
-    scope: { all: Boolean(scope.all), departmentNames: scope.all ? [] : scope.departmentNames },
+    scope: {
+      all: Boolean(scope.all),
+      departmentNames: scope.all ? [] : scope.departmentNames,
+      rootDepartmentIds: scope.all ? [] : [...(scope.rootIds ?? [])],
+      departmentIds: scope.all ? [] : [...(scope.departmentIds ?? [])].sort((a, b) => a - b),
+    },
   };
 }
 

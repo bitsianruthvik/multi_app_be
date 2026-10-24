@@ -232,7 +232,7 @@ try {
   const C = Object.fromEntries((await must(U.HR, 'GET', '/payroll/components')).components.map((k) => [k.code, k]));
   const st = (await must(U.HR, 'POST', '/payroll/structures', { code: `${TAG}S`, name: `${TAG} Basic half`, lines: [
     { componentId: C.BASIC.id, formula: '50% of CTC' }, { componentId: C.HRA.id, formula: '50% of BASIC' }, { componentId: C.SPECIAL.id, formula: 'balance' }] })).structure;
-  const salary = (e, ctc, from) => must(U.HR, 'POST', '/payroll/salaries', { employeeId: e, annualCtc: ctc, structureId: st.id, effectiveFrom: from, pfMode: 'NONE', reason: 'Test' });
+  const salary = (e, ctc, from) => must(U.HR, 'POST', '/payroll/salaries', { employeeId: e, annualCtc: ctc, structureId: st.id, effectiveFrom: from, pfMode: 'NONE', reason: 'Test', complianceReason: 'Test' });
   for (const [k, ctc, from] of [['N', 1800000, '2025-04-01'], ['B', 1500000, '2025-04-01'], ['P', 1800000, '2025-07-01'], ['O', 1200000, '2025-04-01'], ['X', 1800000, '2025-04-01'], ['M', 1800000, '2025-04-01'], ['S', 600000, '2025-04-01'], ['T', 600000, '2025-04-01']]) await salary(E[k], ctc, from);
 
   /* ══ 1. regime and the cut-off ═══════════════════════════════════════ */

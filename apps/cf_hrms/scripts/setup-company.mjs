@@ -64,7 +64,7 @@ const require = createRequire(import.meta.url);
  */
 export const SLUG_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
 /** First segments the backend or the frontend already routes, or appContext skips (core/middleware/appContext.js, index.js, App.tsx). */
-export const RESERVED_SLUGS = new Set(['api', 'public', 'query', 'integrations', 'admin', 'iclock', 'uploads', 'debug', 'health', 'select-company', 'login', 'auth', 'apps', 'schema']);
+export const RESERVED_SLUGS = new Set(['api', 'public', 'query', 'integrations', 'admin', 'iclock', 'uploads', 'debug', 'health', 'select-company', 'login', 'auth', 'apps', 'schema', 'platform']);
 
 /** The backend login (core/auth/authController.js loginUser). */
 export const BACKEND_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;

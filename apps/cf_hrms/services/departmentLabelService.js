@@ -18,10 +18,51 @@ import { ensureKind, readModel, readName, DEFAULT_LABELS } from './labelGroupSer
 
 export { DEFAULT_LABELS };
 
-const shape = (r) => ({
+/**
+ * COLOUR PER KIND (spec §34.1). A palette KEY, never a raw hex: the screens map
+ * each key to a fill, a text and an edge colour checked for contrast in the
+ * light and the dark theme (multi_app_fe …/cf_hrms/components/kindColours.css).
+ * A kind with no colour chosen shows its default: Department blue, Section
+ * teal, Machine amber; any other kind the first palette key no other kind of
+ * the company shows yet (in the kinds' order).
+ */
+export const KIND_COLOURS = Object.freeze(['blue', 'teal', 'green', 'lime', 'amber', 'orange', 'red', 'pink', 'purple', 'indigo', 'cyan', 'slate']);
+export const DEFAULT_KIND_COLOURS = Object.freeze({ department: 'blue', section: 'teal', machine: 'amber' });
+
+/** labelId -> the colour each kind shows, for a list in the kinds' order. */
+export function shownColours(labels) {
+  const out = new Map();
+  const used = new Set();
+  for (const l of labels) if (KIND_COLOURS.includes(l.colour)) { out.set(l.id, l.colour); used.add(l.colour); }
+  for (const l of labels) {
+    if (out.has(l.id)) continue;
+    const wanted = DEFAULT_KIND_COLOURS[String(l.name ?? '').trim().toLowerCase()];
+    const key = wanted && !used.has(wanted) ? wanted : (KIND_COLOURS.find((k) => !used.has(k)) ?? KIND_COLOURS[used.size % KIND_COLOURS.length]);
+    out.set(l.id, key);
+    used.add(key);
+  }
+  return out;
+}
+
+/** A colour from a body: a palette key, or null / '' for the default. Anything else is refused. */
+function readColour(value) {
+  if (value === null || value === '') return null;
+  const key = String(value ?? '').trim().toLowerCase();
+  if (!KIND_COLOURS.includes(key)) {
+    throw invalid('INVALID', 'Choose one of the colours offered.', {
+      problems: [`"${String(value).slice(0, 30)}" is not one of the colours. Choose one of ${KIND_COLOURS.join(', ')}, or the default.`],
+    });
+  }
+  return key;
+}
+
+const shape = (r, colours = null) => ({
   id: r.id, name: r.name, sortOrder: Number(r.sort_order), departmentCount: Number(r.department_count ?? 0),
   // 'New positions start on' (spec §17.2): the shift a new position in a department carrying this label gets.
   defaultShiftId: r.default_shift_id ?? null,
+  // §34.1: `colour` the palette key the kind SHOWS (chosen or default); `colourChosen` the stored one, null = default.
+  colour: colours?.get(r.id) ?? (KIND_COLOURS.includes(r.colour) ? r.colour : null),
+  colourChosen: KIND_COLOURS.includes(r.colour) ? r.colour : null,
 });
 
 /**
@@ -55,7 +96,8 @@ export async function listLabels(db, companyId) {
     ensureKind(db, companyId),
     db.query("SELECT id, code, name FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL AND status = 'ACTIVE' ORDER BY id", [companyId]),
   ]);
-  return { labels: model.labels.map(shape), shifts: shifts.map((x) => ({ id: x.id, code: x.code ?? null, name: x.name })) };
+  const colours = shownColours(model.labels);
+  return { labels: model.labels.map((l) => shape(l, colours)), shifts: shifts.map((x) => ({ id: x.id, code: x.code ?? null, name: x.name })) };
 }
 
 /**
@@ -129,21 +171,28 @@ async function audit(db, c, id, action, before, after) {
   );
 }
 
-const one = async (db, companyId, id) => shape((await readModel(db, companyId)).labelById.get(id));
+const one = async (db, companyId, id) => {
+  const model = await readModel(db, companyId);
+  return shape(model.labelById.get(id), shownColours(model.labels));
+};
 
-/** POST /organisation/department-labels { name, defaultShiftId? } */
+/** POST /organisation/department-labels { name, defaultShiftId?, colour? } — no colour: the first one no other kind shows. */
 export async function createLabel(db, c, body = {}) {
   const model = await ensureKind(db, c.companyId, c.userId);
   const groupId = model.kind.id;
   const name = readName(body.name);
   await assertNameFree(db, c.companyId, groupId, name);
   const defaultShiftId = await readDefaultShift(db, c.companyId, body.defaultShiftId);
+  // No colour asked for: the one it would show as the last kind of the list, stored, so it keeps it when others move.
+  const colour = body.colour !== undefined && body.colour !== null && body.colour !== ''
+    ? readColour(body.colour)
+    : shownColours([...model.labels, { id: 0, name, colour: null }]).get(0);
   const [[last]] = await db.query('SELECT COALESCE(MAX(sort_order), 0) AS n FROM hrms_department_labels WHERE company_id = ? AND group_id = ? AND deleted_at IS NULL', [c.companyId, groupId]);
   const [res] = await db.query(
-    'INSERT INTO hrms_department_labels (company_id, group_id, name, sort_order, default_shift_id, created_by) VALUES (?, ?, ?, ?, ?, ?)',
-    [c.companyId, groupId, name, Number(last.n) + 1, defaultShiftId, c.userId ?? null],
+    'INSERT INTO hrms_department_labels (company_id, group_id, name, sort_order, colour, default_shift_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [c.companyId, groupId, name, Number(last.n) + 1, colour, defaultShiftId, c.userId ?? null],
   );
-  await audit(db, c, res.insertId, 'CREATE', null, { name, defaultShiftId });
+  await audit(db, c, res.insertId, 'CREATE', null, { name, colour, defaultShiftId });
   const label = await one(db, c.companyId, res.insertId);
   return { ...label, label };
 }
@@ -183,7 +232,14 @@ export async function updateLabel(db, c, id, body = {}) {
       after.defaultShiftId = shiftId;
     }
   }
-  if (Object.keys(after).length) await audit(db, c, id, 'UPDATE', { name: before.name, sortOrder: before.sort_order, defaultShiftId: before.default_shift_id ?? null }, { ...after, departmentsRenamed: renamed });
+  if (body.colour !== undefined) {
+    const colour = readColour(body.colour);
+    if (colour !== (before.colour ?? null)) {
+      await db.query('UPDATE hrms_department_labels SET colour = ? WHERE company_id = ? AND id = ?', [colour, c.companyId, id]);
+      after.colour = colour;
+    }
+  }
+  if (Object.keys(after).length) await audit(db, c, id, 'UPDATE', { name: before.name, sortOrder: before.sort_order, colour: before.colour ?? null, defaultShiftId: before.default_shift_id ?? null }, { ...after, departmentsRenamed: renamed });
   const label = await one(db, c.companyId, id);
   return { ...label, label, departmentsRenamed: renamed };
 }
@@ -249,4 +305,4 @@ export async function deleteLabel(db, c, id, { moveTo = null } = {}) {
   return { ok: true, id, departmentsMoved: moved };
 }
 
-export default { DEFAULT_LABELS, ensureLabels, listLabels, resolveLabel, resolveKindLabel, createLabel, updateLabel, reorderLabels, deleteLabel };
+export default { DEFAULT_LABELS, KIND_COLOURS, DEFAULT_KIND_COLOURS, shownColours, ensureLabels, listLabels, resolveLabel, resolveKindLabel, createLabel, updateLabel, reorderLabels, deleteLabel };

@@ -7,10 +7,12 @@
  *   node seed-tax-rules.mjs --apply --target=prod (after the rules are reviewed)
  *   node seed-tax-rules.mjs --year=2026-27        one year only
  *
- * Idempotent by (tax_year, regime, rule_key): a missing row is inserted, a row whose value,
- * source or verified flag differs is updated (and said, old → new), an equal row is left
- * alone; a second run changes nothing. Rows in the table that the seed does not know are
- * listed, never deleted. One transaction. Needs apply-tax-schema.mjs first.
+ * Idempotent by (tax_year, regime, rule_key): a missing rule is inserted as PUBLISHED version 1;
+ * a rule whose PUBLISHED value, source or verified flag differs gets a NEW version (published, the
+ * old one SUPERSEDED — a published version is never edited; spec §36.1, models/init.sql §37b), and
+ * it is said, old → new; an equal one is left alone; a second run changes nothing. Drafts and
+ * superseded versions are not compared. Rows in the table that the seed does not know are listed,
+ * never deleted. One transaction. Needs apply-tax-schema.mjs and apply-law-schema.mjs first.
  */
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -30,7 +32,7 @@ export function stable(v) {
 
 /** What the seed would do: { insert[], update[], same, unknown[] }. Reads only. */
 export async function seedPlan(conn, rows = TAX_RULE_ROWS) {
-  const [have] = await conn.query('SELECT id, tax_year, regime, rule_key, value_json, source_note, source_url, verified, deleted_at FROM hrms_tax_rules');
+  const [have] = await conn.query("SELECT id, tax_year, regime, rule_key, value_json, source_note, source_url, verified, deleted_at, version FROM hrms_tax_rules WHERE status = 'PUBLISHED' AND deleted_at IS NULL");
   const byKey = new Map(have.map((r) => [`${r.tax_year}|${r.regime}|${r.rule_key}`, r]));
   const plan = { insert: [], update: [], same: 0, unknown: [] };
   const seen = new Set();
@@ -45,7 +47,6 @@ export async function seedPlan(conn, rows = TAX_RULE_ROWS) {
     if ((cur.source_note ?? '') !== r.source_note) changes.push('source_note');
     if ((cur.source_url ?? '') !== r.source_url) changes.push('source_url');
     if (Number(cur.verified) !== Number(r.verified)) changes.push(`verified ${cur.verified} → ${r.verified}`);
-    if (cur.deleted_at) changes.push('restored (was deleted)');
     if (changes.length) plan.update.push({ ...r, id: cur.id, changes }); else plan.same += 1;
   }
   for (const [k, r] of byKey) if (!seen.has(k) && (!YEAR || r.tax_year === YEAR)) plan.unknown.push(k);
@@ -55,12 +56,16 @@ export async function seedPlan(conn, rows = TAX_RULE_ROWS) {
 /** Applies a plan inside the caller's transaction. */
 export async function applyPlan(conn, plan) {
   for (const r of plan.insert) {
-    await conn.query('INSERT INTO hrms_tax_rules (tax_year, regime, rule_key, value_json, source_note, source_url, verified) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    await conn.query("INSERT INTO hrms_tax_rules (tax_year, regime, rule_key, value_json, source_note, source_url, verified, version, status, reviewed_by, published_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'PUBLISHED', 'script: seed-tax-rules', NOW())",
       [r.tax_year, r.regime, r.rule_key, JSON.stringify(r.value), r.source_note, r.source_url, r.verified]);
   }
   for (const r of plan.update) {
-    await conn.query('UPDATE hrms_tax_rules SET value_json = ?, source_note = ?, source_url = ?, verified = ?, deleted_at = NULL WHERE id = ?',
-      [JSON.stringify(r.value), r.source_note, r.source_url, r.verified, r.id]);
+    // A new version, published; the old one SUPERSEDED (never edited).
+    const [[m]] = await conn.query('SELECT COALESCE(MAX(version), 0) AS v FROM hrms_tax_rules WHERE tax_year = ? AND regime = ? AND rule_key = ?', [r.tax_year, r.regime, r.rule_key]);
+    await conn.query("UPDATE hrms_tax_rules SET status = 'SUPERSEDED' WHERE id = ? AND status = 'PUBLISHED'", [r.id]);
+    await conn.query(`INSERT INTO hrms_tax_rules (tax_year, regime, rule_key, value_json, version, status, source_note, source_url, verified, reviewed_by, published_at, supersedes_id)
+       VALUES (?, ?, ?, ?, ?, 'PUBLISHED', ?, ?, ?, 'script: seed-tax-rules', NOW(), ?)`,
+    [r.tax_year, r.regime, r.rule_key, JSON.stringify(r.value), Number(m.v) + 1, r.source_note, r.source_url, r.verified, r.id]);
   }
 }
 

@@ -28,6 +28,9 @@ import attendanceRoutes from './attendance.js';
 import selfAttendanceRoutes from './selfAttendance.js';
 import payrollExtrasRoutes from './payrollExtras.js';
 import payrollExitRoutes from './payrollExit.js';
+import lawRoutes from './law.js';
+import complianceRoutes from './compliance.js';
+import complianceChecksRoutes from './complianceChecks.js';
 
 const router = Router();
 
@@ -158,5 +161,12 @@ router.use(taxRoutes);
 router.use(payrollExtrasRoutes);
 // Payroll P3b (spec §25.5): full and final, claims, attendance in the run, the payroll policy (routes/payrollExit.js).
 router.use(payrollExitRoutes);
+// The law layer, read-only for a company, plus its choices and the law facts of locations and roles (spec §36.1).
+router.use(lawRoutes);
+// Compliance (spec §36.4, §36.5): law changes and their acknowledgement, the deadline calendar, the CA's review
+// (routes/compliance.js). The product team's console is NOT here: app.js mounts it at /api/platform.
+router.use(complianceRoutes);
+// Compliance checks, to-dos with a proposed fix, the bonus run (spec §36.2, §36.3 — C2).
+router.use(complianceChecksRoutes);
 
 export default router;

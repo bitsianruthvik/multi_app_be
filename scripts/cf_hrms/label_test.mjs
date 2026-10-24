@@ -202,6 +202,9 @@ try {
     return { status: res.status, json };
   };
   const get = async (url, who = O) => { const r = await call(who, 'GET', url); if (r.status !== 200) throw new Error(`GET ${url}: ${r.status} ${JSON.stringify(r.json)}`); return r.json; };
+  // A company of this run alone (no units, no kinds), for the checks that need an empty or a one-kind list.
+  let scratchSeq = 0;
+  const scratchCompany = async () => { scratchSeq += 1; return ins('INSERT INTO companies (name, slug) VALUES (?, ?)', [`${TAG} scratch ${scratchSeq}`, `${TAG.toLowerCase()}-scratch-${scratchSeq}`]); };
   const typeOf = async (deptId) => (await one('SELECT department_type FROM hrms_departments WHERE id = ?', [deptId])).department_type;
   const linkOf = async (deptId) => (await one(
     'SELECT l.name FROM hrms_department_label_links k JOIN hrms_department_labels l ON l.id = k.label_id WHERE k.company_id = ? AND k.department_id = ? AND k.deleted_at IS NULL', [COMPANY, deptId]))?.name ?? null;
@@ -267,13 +270,15 @@ try {
   const goneUnused = await call(O, 'DELETE', `/organisation/department-labels/${unused.id}`);
   ok(goneUnused.status === 200 && goneUnused.json.departmentsMoved === 0, 'a label no department carries is removed without a move');
   {
-    // The last label: every other one retired inside this run's transaction.
-    await db.query('SAVEPOINT zz_last');
-    const keep = label('Department').id;
-    await db.query('UPDATE hrms_department_labels SET deleted_at = NOW() WHERE company_id = ? AND id <> ? AND deleted_at IS NULL', [COMPANY, keep]);
-    const last = await call(O, 'DELETE', `/organisation/department-labels/${keep}`);
-    ok(last.status === 409 && last.json.code === 'LAST_LABEL', 'the last label cannot be removed (409 LAST_LABEL)', `${last.status} ${last.json?.code}`);
-    await db.query('ROLLBACK TO SAVEPOINT zz_last');
+    // The last label — on a SCRATCH company made by this run (2026-10-24): a test never retires,
+    // renames or deletes a real company's kinds, not even inside its transaction (a deadlock that
+    // rolls the transaction back early would leave the rest of the run autocommitting).
+    const scratch = await scratchCompany();
+    const sc = { companyId: scratch, userId: null };
+    const kinds = (await LABELS.listLabels(db, scratch)).labels;
+    for (const k of kinds.slice(1)) await LABELS.deleteLabel(db, sc, k.id);
+    const last = await caught(() => LABELS.deleteLabel(db, sc, kinds[0].id));
+    ok(last?.status === 409 && last.code === 'LAST_LABEL', 'the last label cannot be removed (409 LAST_LABEL) — on a scratch company of this run', why(last));
   }
   ok(Number((await one("SELECT COUNT(*) AS n FROM hrms_audit_log WHERE company_id = ? AND entity_type = 'hrms_department_labels' AND entity_id = ?", [COMPANY, BAY.id])).n) >= 3,
     'label writes are in the audit log');
@@ -500,19 +505,17 @@ try {
   {
     const refusedAs = (e, status, code) => Boolean(e) && e.status === status && e.code === code;
     const names = (list) => list.labels.map((l) => l.name);
-    // A company with no department: its list is made on first read.
-    const fresh = await one(
-      `SELECT co.id, co.name FROM companies co WHERE co.id <> ? AND co.deleted_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM hrms_departments d WHERE d.company_id = co.id) ORDER BY co.id LIMIT 1`, [COMPANY]);
-    if (!fresh) skip('a first read', 'no other company without departments');
-    else {
-      await db.query('DELETE FROM hrms_department_labels WHERE company_id = ?', [fresh.id]);
+    // A company with no department: its list is made on first read. A scratch company of this run —
+    // never another tenant's list (2026-10-24).
+    const fresh = { id: await scratchCompany() };
+    {
       const first = await LABELS.listLabels(db, fresh.id);
       ok(JSON.stringify(names(first)) === JSON.stringify(['Department', 'Section', 'Machine']) && first.labels.every((l, i) => l.sortOrder === i + 1 && l.departmentCount === 0 && l.id > 0 && l.defaultShiftId === null)
-        && JSON.stringify(Object.keys(first.labels[0])) === JSON.stringify(['id', 'name', 'sortOrder', 'departmentCount', 'defaultShiftId']),
-      'a company with no list gets Department, Section, Machine on its first read: { id, name, sortOrder, departmentCount, defaultShiftId }', JSON.stringify(first.labels));
+        && JSON.stringify(Object.keys(first.labels[0])) === JSON.stringify(['id', 'name', 'sortOrder', 'departmentCount', 'defaultShiftId', 'colour', 'colourChosen']),
+      'a company with no list gets Department, Section, Machine on its first read: { id, name, sortOrder, departmentCount, defaultShiftId, colour, colourChosen } (spec §34.1)', JSON.stringify(first.labels));
       ok(JSON.stringify((await LABELS.listLabels(db, fresh.id)).labels.map((l) => l.id)) === JSON.stringify(first.labels.map((l) => l.id)), 'a second read writes nothing more');
-      await db.query('DELETE FROM hrms_department_labels WHERE company_id = ?', [fresh.id]);
+      // Its list made again from what its units already carry: this run's own scratch company and labels only.
+      await db.query('DELETE FROM hrms_department_labels WHERE company_id = ? AND id IN (?)', [fresh.id, first.labels.map((l) => l.id)]);
       await db.query("INSERT INTO hrms_departments (company_id, code, name, department_type) VALUES (?, ?, ?, 'Bay'), (?, ?, ?, 'section')", [fresh.id, `${TAG}X1`, `${TAG} X1`, fresh.id, `${TAG}X2`, `${TAG} X2`]);
       const withOwn = await LABELS.listLabels(db, fresh.id);
       ok(JSON.stringify(names(withOwn)) === JSON.stringify(['Department', 'Section', 'Machine', 'Bay']) && withOwn.labels[3].departmentCount === 1 && withOwn.labels[1].departmentCount === 1,
@@ -570,13 +573,9 @@ try {
     const kept = MIG.planLabels([{ id: 1, department_type: 'Machine / area', is_shared: 0, deleted_at: null }, { id: 2, department_type: 'Bay', is_shared: 0, deleted_at: null }],
       [{ id: 9, name: 'Department', sort_order: 1 }, { id: 10, name: 'machine', sort_order: 2 }]);
     ok(JSON.stringify(kept.add) === JSON.stringify(['Bay']), 'a company that already has a list gains only a label its departments use and the list lacks');
-    const fresh = await one(
-      `SELECT co.id FROM companies co WHERE co.id <> ? AND co.deleted_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM hrms_departments d WHERE d.company_id = co.id AND d.name NOT LIKE ?) ORDER BY co.id LIMIT 1`, [COMPANY, `${TAG}%`]);
-    if (!fresh) skip('the migration applied', 'no other company without departments');
-    else {
-      await db.query('DELETE FROM hrms_department_labels WHERE company_id = ?', [fresh.id]);
-      await db.query('DELETE FROM hrms_departments WHERE company_id = ? AND name LIKE ?', [fresh.id, `${TAG}%`]);
+    // A scratch company of this run (2026-10-24): never another tenant's list.
+    const fresh = { id: await scratchCompany() };
+    {
       const rows = [['Process', 0], ['Shared crew', 0], ['shared crew', 1], ['Machine / area', 0], [null, 0], ['', 0], ['Section', 0], ['Bay', 0]];
       const ids = [];
       for (const [i, [type, shared]] of rows.entries()) ids.push(await ins('INSERT INTO hrms_departments (company_id, code, name, department_type, is_shared) VALUES (?, ?, ?, ?, ?)', [fresh.id, `${TAG}M${i}`, `${TAG} M${i}`, type, shared]));
@@ -815,6 +814,177 @@ try {
         'another company: cannot assign or clear our label’s policy (404), ask for our department (404), give its label our shift (422), nor see ours', `${t1.status} ${t2.status} ${t4.status}`);
       ok((await eff(pB)).policy.id === P.plant.id, 'and our answer is unchanged');
     }
+  }
+
+  /* ══ 16-18. spec §34: colour per kind, several org units, order and moves ══ */
+  section('[16] Colour per kind (spec §34.1): saved, validated, a default per kind');
+  {
+    const list = (await get('/organisation/department-labels')).labels;
+    const byName = (n) => list.find((l) => l.name === n);
+    ok(list.every((l) => LABELS.KIND_COLOURS.includes(l.colour) && 'colourChosen' in l), 'every kind shows a palette key (colour) and says what was chosen (colourChosen)', JSON.stringify(list.map((l) => [l.name, l.colour, l.colourChosen])));
+    const defaults = [['Department', 'blue'], ['Section', 'teal'], ['Machine', 'amber']].filter(([n]) => byName(n) && byName(n).colourChosen == null);
+    ok(defaults.every(([n, k]) => byName(n).colour === k), 'no colour chosen: Department blue, Section teal, Machine amber', defaults.map(([n]) => `${n}=${byName(n).colour}`).join(' '));
+    ok(new Set(list.map((l) => l.colour)).size === Math.min(list.length, LABELS.KIND_COLOURS.length), 'no two kinds show the same colour while the palette lasts');
+    // A kind of this run's own: a test never changes a real kind, not even inside its transaction.
+    const machine = (await call(O, 'POST', '/organisation/department-labels', { name: `${TAG} Tint` })).json;
+    const set = await call(O, 'PUT', `/organisation/department-labels/${machine.id}`, { colour: 'Purple' });
+    const reread = (await get('/organisation/department-labels')).labels.find((l) => l.id === machine.id);
+    ok(set.status === 200 && set.json.colour === 'purple' && set.json.colourChosen === 'purple' && reread.colour === 'purple'
+      && (await one('SELECT colour FROM hrms_department_labels WHERE id = ?', [machine.id])).colour === 'purple', 'PUT colour: stored as the palette key (any case), read back', JSON.stringify(set.json));
+    const bad = [await call(O, 'PUT', `/organisation/department-labels/${machine.id}`, { colour: 'fuchsia' }),
+      await call(O, 'PUT', `/organisation/department-labels/${machine.id}`, { colour: '#ff0000' }),
+      await call(O, 'POST', '/organisation/department-labels', { name: `${TAG} Tinted`, colour: 'gold' })];
+    ok(bad.every((r) => r.status === 422 && /not one of the colours/.test(JSON.stringify(r.json.problems))) && (await one('SELECT colour FROM hrms_department_labels WHERE id = ?', [machine.id])).colour === 'purple'
+      && !(await one('SELECT id FROM hrms_department_labels WHERE company_id = ? AND name = ? AND deleted_at IS NULL', [COMPANY, `${TAG} Tinted`])),
+    'an unknown key or a raw hex: 422 in words, nothing written', bad.map((r) => r.status).join(' '));
+    const cleared = await call(O, 'PUT', `/organisation/department-labels/${machine.id}`, { colour: null });
+    ok(cleared.status === 200 && cleared.json.colourChosen === null && LABELS.KIND_COLOURS.includes(cleared.json.colour), 'colour null: back to the default', JSON.stringify(cleared.json));
+    const fresh = (await call(O, 'POST', '/organisation/department-labels', { name: `${TAG} Cell` })).json;
+    const shownBefore = new Set(list.map((l) => l.colour));
+    ok(LABELS.KIND_COLOURS.includes(fresh.colourChosen) && (list.length >= LABELS.KIND_COLOURS.length || !shownBefore.has(fresh.colour)), 'a new kind is given (and keeps) a colour no other kind shows', JSON.stringify(fresh));
+    const picked = (await call(O, 'POST', '/organisation/department-labels', { name: `${TAG} Strip`, colour: 'cyan' })).json;
+    ok(picked.colour === 'cyan' && picked.colourChosen === 'cyan', 'a new kind with a colour chosen keeps it', JSON.stringify(picked));
+    ok(Number((await one("SELECT COUNT(*) AS n FROM hrms_audit_log WHERE company_id = ? AND entity_type = 'hrms_department_labels' AND entity_id = ? AND JSON_EXTRACT(after_json, '$.colour') IS NOT NULL", [COMPANY, machine.id])).n) >= 1, 'a colour change is audited');
+    if (!THEM) skip('colour tenant check', 'no second company with an admin login');
+    else {
+      const t = await call(THEM, 'PUT', `/organisation/department-labels/${machine.id}`, { colour: 'red' }, { as: other.slug });
+      ok([404, 422].includes(t.status) && (await one('SELECT colour FROM hrms_department_labels WHERE id = ?', [machine.id])).colour == null, 'another company cannot colour our kind', String(t.status));
+    }
+  }
+
+  // A small tree of our own: TOP (Department) › S1, S2, S3 (Sections); M1 (Machine) under S1.
+  const unit = async (name, extra = {}) => { const r = await call(O, 'POST', '/organisation/departments', { name: `${TAG} ${name}`, ...extra }); if (r.status !== 200) throw new Error(`make ${name}: ${r.status} ${JSON.stringify(r.json)}`); return r.json; };
+  const TOP = await unit('Top', { type: 'Department' });
+  const S1 = await unit('S1', { parentId: TOP.id, type: 'Section' });
+  const S2 = await unit('S2', { parentId: TOP.id, type: 'Section' });
+  const S3 = await unit('S3', { parentId: TOP.id, type: 'Section' });
+  const M1 = await unit('M1', { parentId: S1.id, type: 'Machine' });
+  const ourRole = await ins("INSERT INTO hrms_roles (company_id, role_code, title, role_purpose, status) VALUES (?, ?, ?, 'Runs it.', 'ACTIVE')", [COMPANY, `${TAG}R2`, `${TAG} Minder`]);
+  const ourShift = (await get('/organisation/department-labels')).shifts[0];
+  const place = async (code, departmentId) => ins("INSERT INTO hrms_positions (company_id, position_code, role_id, position_title, department_id, default_shift_id, status) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE')", [COMPANY, `${TAG}-U${code}`, ourRole, `${TAG} U${code}`, departmentId, ourShift.id]);
+  const PU = { s1: await place('S1', S1.id), m1a: await place('M1A', M1.id), m1b: await place('M1B', M1.id), s2: await place('S2', S2.id), s3: await place('S3', S3.id) };
+  const person = async (code, p, d) => {
+    const e = await ins("INSERT INTO hrms_employees (company_id, employee_code, full_name, date_of_joining, employment_type, employment_status) VALUES (?, ?, ?, '2026-01-01', 'EMPLOYEE', 'ACTIVE')", [COMPANY, `${TAG}U${code}`, `${TAG} Unit person ${code}`]);
+    await ins("INSERT INTO hrms_work_assignments (company_id, employee_id, role_id, position_id, department_id, is_primary, status, effective_from) VALUES (?, ?, ?, ?, ?, 1, 'ACTIVE', '2026-01-01')", [COMPANY, e, ourRole, p, d]);
+    return e;
+  };
+  const EU = { m1: await person('M1', PU.m1a, M1.id), s2: await person('S2', PU.s2, S2.id), s3: await person('S3', PU.s3, S3.id) };
+  const theirUnit = other ? await one('SELECT id FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [other.id]) : null;
+
+  section('[17] One or more org units (spec §34.2): department=a,b, each "and below"');
+  {
+    const posIds = async (dq) => { const r = await call(O, 'GET', `/positions?q=${TAG}-U&department=${dq}`); return { status: r.status, ids: (r.json?.items ?? []).map((p) => p.id), json: r.json }; };
+    const two = await posIds(`${S1.id},${S3.id}`);
+    ok(two.status === 200 && same(two.ids, [PU.s1, PU.m1a, PU.m1b, PU.s3]), 'positions ?department=S1,S3: S1, the machine under it, and S3 — not S2', JSON.stringify(two.ids));
+    ok(same((await posIds(String(S1.id))).ids, [PU.s1, PU.m1a, PU.m1b]), 'an old single value still works, "and below"');
+    ok(same((await posIds(`${S1.id}, ${M1.id}`)).ids, [PU.s1, PU.m1a, PU.m1b]), 'a unit and one under it: no row twice; spaces are fine');
+    const emp = (await get(`/people/employees?q=${TAG}%20Unit&department=${S1.id},${S2.id}`)).items.map((e) => e.id);
+    ok(same(emp, [EU.m1, EU.s2]), 'employees ?department=S1,S2: the person on the machine under S1, and S2’s', JSON.stringify(emp));
+    const deps = (await get(`/organisation/departments?q=${TAG}&parent=${S1.id},${TOP.id}`)).rows.map((r) => r.id);
+    ok(same(deps, [S1.id, S2.id, S3.id, M1.id]), 'org units ?parent=S1,TOP: everything under either', JSON.stringify(deps));
+    const refused = [
+      ['abc', await posIds('abc')], ['0', await posIds('0')], ['a gone id', await posIds(`${S1.id},99999999`)],
+      ...(theirUnit ? [['another company’s unit', await posIds(`${S1.id},${theirUnit.id}`)]] : []),
+    ];
+    ok(refused.every(([, r]) => r.status === 422 && r.json?.code === 'INVALID'), 'refused (422): not a number, 0, a unit that does not exist, another company’s unit', refused.map(([w, r]) => `${w}:${r.status}`).join(' '));
+    if (!theirUnit) skip('another company’s unit in the filter', 'no other company has an org unit');
+    const others = [
+      ['employees', `/people/employees?department=${S1.id},${S3.id}`, `/people/employees?department=${S1.id},x`],
+      ['hirings', `/hirings?status=all&department=${S1.id},${S3.id}`, `/hirings?status=all&department=x`],
+      ['performance plans', `/performance/plans?department=${S1.id},${S3.id}`, `/performance/plans?department=99999999`],
+      ['leave requests', `/leave/requests?departmentId=${S1.id},${S3.id}`, `/leave/requests?departmentId=${S1.id},x`],
+      ['leave balances', `/leave/balances?departmentId=${S1.id},${S3.id}`, `/leave/balances?departmentId=99999999`],
+      ['attendance month', `/attendance/month?departmentId=${S1.id},${S3.id}`, `/attendance/month?departmentId=x`],
+      ['attendance today', `/attendance/today?departmentId=${S1.id},${S3.id}`, `/attendance/today?departmentId=99999999`],
+    ];
+    const res = [];
+    for (const [name, good, badUrl] of others) {
+      const g = await call(O, 'GET', good);
+      const b = await call(O, 'GET', badUrl);
+      res.push([name, g.status, b.status]);
+    }
+    const absent = res.filter(([, g]) => g === 404);
+    ok(res.every(([, g, b]) => g === 404 || (g === 200 && b === 422)), 'every list that takes it: two units 200, a bad or foreign one 422', res.map((r) => r.join(':')).join(' '));
+    if (absent.length) skip('lists not mounted', absent.map((r) => r[0]).join(', '));
+    const leaveTwo = await call(O, 'GET', `/leave/balances?departmentId=${S1.id},${S3.id}`);
+    if (leaveTwo.status === 200) {
+      const who = (leaveTwo.json.rows ?? []).map((r) => r.person?.id ?? r.person?.employeeId).filter(Boolean);
+      ok(who.includes(EU.m1) && who.includes(EU.s3) && !who.includes(EU.s2), 'leave balances ?departmentId=S1,S3: "and below" (the machine’s person), not S2', JSON.stringify(who.filter((id) => Object.values(EU).includes(id))));
+    }
+    const month = await call(O, 'GET', `/attendance/month?departmentId=${S1.id},${S3.id}`);
+    if (month.status === 200) {
+      const ids = JSON.stringify(month.json);
+      ok(ids.includes(`${TAG} Unit person M1`) && ids.includes(`${TAG} Unit person S3`) && !ids.includes(`${TAG} Unit person S2`), 'attendance month ?departmentId=S1,S3: "and below", not S2');
+    }
+  }
+
+  section('[18] Order, moves and the top level (spec §34 "Order", "No silent top level", §34.3)');
+  {
+    const sortOf = async (id) => Number((await one('SELECT sort_order FROM hrms_departments WHERE id = ?', [id])).sort_order);
+    const kidsInList = async (parentId) => (await get(`/organisation/departments?q=${TAG}`)).rows.filter((r) => r.parentId === parentId).map((r) => r.id);
+    ok(JSON.stringify([await sortOf(S1.id), await sortOf(S2.id), await sortOf(S3.id)]) === '[1,2,3]' && JSON.stringify(await kidsInList(TOP.id)) === JSON.stringify([S1.id, S2.id, S3.id]),
+      'a new unit goes after its last sibling (1, 2, 3); the list shows siblings in that order');
+    const topBefore = Number((await one('SELECT COALESCE(MAX(sort_order), 0) AS n FROM hrms_departments WHERE company_id = ? AND parent_department_id IS NULL AND deleted_at IS NULL AND id <> ?', [COMPANY, TOP.id])).n);
+    ok(TOP.parentId == null && await sortOf(TOP.id) === topBefore + 1, 'no parent given: the server still makes a TOP-LEVEL unit (the first of a company must be), after the last top unit', `${await sortOf(TOP.id)} vs ${topBefore}`);
+
+    const order = await call(O, 'PUT', '/organisation/departments/order', { parentId: TOP.id, ids: [S3.id, S1.id, S2.id] });
+    ok(order.status === 200 && JSON.stringify(order.json.rows) === JSON.stringify([{ id: S3.id, sortOrder: 1 }, { id: S1.id, sortOrder: 2 }, { id: S2.id, sortOrder: 3 }])
+      && JSON.stringify(await kidsInList(TOP.id)) === JSON.stringify([S3.id, S1.id, S2.id]), 'PUT /organisation/departments/order: the siblings take the order sent, and the list follows', JSON.stringify(order.json));
+    const look = (await get('/organisation/lookups')).departments.map((d) => d.id).filter((id) => [S1.id, S2.id, S3.id, M1.id].includes(id));
+    ok(JSON.stringify(look) === JSON.stringify([S3.id, S1.id, M1.id, S2.id]), 'the pickers (lookups) follow: tree order, siblings by the stored order', JSON.stringify(look));
+    const chartIds = (await get('/orgchart')).departments.map((d) => d.id).filter((id) => [S1.id, S2.id, S3.id].includes(id));
+    ok(JSON.stringify(chartIds) === JSON.stringify([S3.id, S1.id, S2.id]), 'the org chart’s departments rank in the same order', JSON.stringify(chartIds));
+    ok(Number((await one("SELECT COUNT(*) AS n FROM hrms_audit_log WHERE company_id = ? AND entity_type = 'hrms_departments' AND entity_id IN (?) AND JSON_EXTRACT(after_json, '$.reordered') = true", [COMPANY, [S1.id, S2.id, S3.id]])).n) === 3, 'each unit whose place changed is audited');
+    const snapshot = async () => JSON.stringify([await sortOf(S1.id), await sortOf(S2.id), await sortOf(S3.id), await sortOf(M1.id)]);
+    const still = await snapshot();
+    const bads = [
+      ['one missing', await call(O, 'PUT', '/organisation/departments/order', { parentId: TOP.id, ids: [S3.id, S1.id] })],
+      ['twice', await call(O, 'PUT', '/organisation/departments/order', { parentId: TOP.id, ids: [S3.id, S1.id, S1.id] })],
+      ['not a sibling', await call(O, 'PUT', '/organisation/departments/order', { parentId: TOP.id, ids: [S3.id, S1.id, S2.id, M1.id] })],
+      ['wrong parent', await call(O, 'PUT', '/organisation/departments/order', { parentId: S1.id, ids: [S3.id, S1.id, S2.id] })],
+      ['no ids', await call(O, 'PUT', '/organisation/departments/order', { parentId: TOP.id, ids: [] })],
+      ['a gone parent', await call(O, 'PUT', '/organisation/departments/order', { parentId: 99999999, ids: [S1.id] })],
+      ...(theirUnit ? [['their parent', await call(O, 'PUT', '/organisation/departments/order', { parentId: theirUnit.id, ids: [S1.id] })]] : []),
+    ];
+    ok(bads.every(([, r]) => r.status === 422) && await snapshot() === still, 'refused (422), nothing written: an id missing or twice, a unit of another parent, the wrong parent, no ids, a parent not in this company', bads.map(([w, r]) => `${w}:${r.status}`).join(' '));
+    if (THEM) {
+      const t = await call(THEM, 'PUT', '/organisation/departments/order', { parentId: TOP.id, ids: [S1.id, S2.id, S3.id] }, { as: other.slug });
+      const t2 = await call(THEM, 'GET', `/organisation/departments/${S1.id}/move-check?parentId=`, undefined, { as: other.slug });
+      ok([404, 422].includes(t.status) && t2.status === 404 && await snapshot() === still, 'another company cannot order our units, nor ask what moving one would do', `${t.status} ${t2.status}`);
+    } else skip('order tenant check', 'no second company with an admin login');
+    if (!U.EMPLOYEE) skip('order rights', 'no Employee access role');
+    else ok((await call(U.EMPLOYEE, 'PUT', '/organisation/departments/order', { parentId: TOP.id, ids: [S1.id, S2.id, S3.id] })).status === 403, 'an Employee login: 403');
+
+    const first = await unit('S0', { parentId: TOP.id, type: 'Section', sortOrder: 1 });
+    ok(JSON.stringify(await kidsInList(TOP.id)) === JSON.stringify([first.id, S3.id, S1.id, S2.id]) && first.sortOrder === 1, 'a "+" between siblings: POST with sortOrder 1 puts it first, the rest move down');
+    const renamed = await call(O, 'PUT', `/organisation/departments/${S1.id}`, { name: `${TAG} S1 renamed` });
+    ok(renamed.status === 200 && JSON.stringify(await kidsInList(TOP.id)) === JSON.stringify([first.id, S3.id, S1.id, S2.id]), 'an edit that does not move it keeps its place (sort order kept)');
+
+    const check = await call(O, 'GET', `/organisation/departments/${S1.id}/move-check?parentId=${S3.id}`);
+    ok(check.status === 200 && check.json.allowed === true && check.json.unitsUnder === 1 && check.json.positionsUnder === 3
+      && check.json.sentence === `Move ${TAG} S1 renamed (Section) from ${TAG} Top to ${TAG} S3 — 3 positions and 1 unit under it move with it`,
+    'move-check: the confirm’s sentence, with the positions and units that go along', JSON.stringify(check.json));
+    const toTop = await call(O, 'GET', `/organisation/departments/${M1.id}/move-check?parentId=`);
+    ok(toTop.json.allowed === true && /from .* S1 renamed to the top level — 2 positions under it move with it$/.test(toTop.json.sentence), 'move-check to the top level says so', toTop.json.sentence);
+    const inside = await call(O, 'GET', `/organisation/departments/${S1.id}/move-check?parentId=${M1.id}`);
+    ok(inside.status === 200 && inside.json.allowed === false && /under/.test(inside.json.problem), 'move-check under its own machine: not allowed, in words', inside.json.problem);
+
+    const before = { parent: TOP.id, sort: await sortOf(S1.id) };
+    const moved = await call(O, 'PUT', `/organisation/departments/${S1.id}`, { parentId: S2.id });
+    ok(moved.status === 200 && moved.json.parentId === S2.id && moved.json.sortOrder === 1 && Number((await one('SELECT parent_department_id AS p FROM hrms_departments WHERE id = ?', [M1.id])).p) === S1.id,
+      're-parent (PUT parentId): it goes after its new siblings, and what is under it moves with it', JSON.stringify(moved.json));
+    const cycle = await call(O, 'PUT', `/organisation/departments/${S1.id}`, { parentId: M1.id });
+    const self = await call(O, 'PUT', `/organisation/departments/${S1.id}`, { parentId: S1.id });
+    const foreign = theirUnit ? await call(O, 'PUT', `/organisation/departments/${S1.id}`, { parentId: theirUnit.id }) : { status: 422 };
+    ok(cycle.status === 422 && cycle.json.code === 'CYCLE' && self.status === 422 && foreign.status === 422
+      && Number((await one('SELECT parent_department_id AS p FROM hrms_departments WHERE id = ?', [S1.id])).p) === S2.id,
+    'refused: under its own machine (CYCLE), under itself, under another company’s unit — it stays where it was', `${cycle.status} ${self.status} ${foreign.status}`);
+    const undo = await call(O, 'PUT', `/organisation/departments/${S1.id}`, { parentId: before.parent, sortOrder: before.sort });
+    ok(undo.status === 200 && JSON.stringify(await kidsInList(TOP.id)) === JSON.stringify([first.id, S3.id, S1.id, S2.id]), 'Undo (PUT parentId + sortOrder back): the old place among the old siblings');
+    const audits = Number((await one("SELECT COUNT(*) AS n FROM hrms_audit_log WHERE company_id = ? AND entity_type = 'hrms_departments' AND entity_id = ? AND action = 'UPDATE' AND JSON_EXTRACT(after_json, '$.parent_department_id') IS NOT NULL", [COMPANY, S1.id])).n);
+    ok(audits >= 2, 'the move and its undo are audited', String(audits));
+    const badPlace = await call(O, 'POST', '/organisation/departments', { name: `${TAG} bad place`, parentId: TOP.id, sortOrder: 'first' });
+    ok(badPlace.status === 422, 'a place that is not a whole number: 422');
   }
 
   karniAfter = { before: karniBefore };

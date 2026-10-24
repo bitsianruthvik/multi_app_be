@@ -5,6 +5,11 @@ import indexRoutes from './routes/index.js';
 import codegenModule from '../cf_erp/modules/codegen/index.js';
 import { PERM } from './lib/http.js';
 import { startNightly } from './services/attendance/scheduler.js';
+import platformRoutes from './routes/platform.js';
+import { startCompliance } from './services/compliance/scheduler.js';
+import { listenForPublishes } from './services/compliance/notices.js';
+import { listenForLaw, startChecks } from './services/complianceChecks/todos.js';
+import { registerProposals } from './services/complianceChecks/index.js';
 // Side effect: registers employee codes and letter references with the code generator.
 import {
   EMPLOYEE_ENTITY, HIRING_ENTITY, DEPARTMENT_ENTITY, ROLE_ENTITY, POSITION_ENTITY, LOCATION_ENTITY,
@@ -76,6 +81,21 @@ export default {
     // Attendance (spec §28.2): the nightly run for yesterday — in the real server only, never in a
     // test script that mounts these routes (services/attendance/scheduler.js says why it is restart-safe).
     if (/[\\/]index\.js$/.test(process.argv[1] ?? '')) startNightly();
+    // Compliance (spec §36.4): the product team's console, outside any company — /api/platform/* (appContext lets
+    // it through without a company; every route checks platform_admins, routes/platform.js). A law version
+    // published anywhere is announced to every company; the hourly pass (watcher, reminders, re-sends, outbox)
+    // runs in the real server only, like the attendance nightly run.
+    server.use('/api/platform', platformRoutes);
+    listenForPublishes().catch(() => { /* the law layer is not there yet: the console announces its own publishes */ });
+    if (/[\\/]index\.js$/.test(process.argv[1] ?? '')) startCompliance();
+    // Compliance checks (spec §36.3, C2): a published law version makes or updates each company's to-dos;
+    // C4's notifications carry C2's fix proposals; the nightly pass re-checks and reminds. Real server only: a
+    // test script subscribes itself (its publishes run inside one rolled-back transaction).
+    if (/[\\/]index\.js$/.test(process.argv[1] ?? '')) {
+      listenForLaw();
+      registerProposals().catch(() => { /* C4's impact hook is not there: notifications go without proposals */ });
+      startChecks();
+    }
   },
 
   // Nothing executes these — apps/_loader.js ignores the field and push-to-prod
