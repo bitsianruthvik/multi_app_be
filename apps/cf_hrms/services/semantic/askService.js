@@ -58,7 +58,7 @@ const KIND_ALIAS = {
   RESPONSIBILITY: 'RESPONSIBILITY', RESPONSIBILITIES: 'RESPONSIBILITY',
   KPI: 'KPI', KPIS: 'KPI',
   ROLE: 'ROLE', ROLES: 'ROLE',
-  DEPARTMENT: 'DEPARTMENT', DEPARTMENTS: 'DEPARTMENT',
+  DEPARTMENT: 'DEPARTMENT', DEPARTMENTS: 'DEPARTMENT', ORG_UNIT: 'DEPARTMENT', ORG_UNITS: 'DEPARTMENT',
 };
 
 export function readAskKinds(value) {
@@ -66,7 +66,7 @@ export function readAskKinds(value) {
   const parts = (Array.isArray(value) ? value : String(value).split(','))
     .map((s) => String(s).trim().toUpperCase()).filter(Boolean);
   const unknown = parts.filter((p) => !KIND_ALIAS[p]);
-  if (unknown.length) throw invalid('INVALID', `Unknown kind: ${unknown.join(', ')}. Use KRA, RESPONSIBILITY, KPI, ROLE or DEPARTMENT.`);
+  if (unknown.length) throw invalid('INVALID', `Unknown kind: ${unknown.join(', ')}. Use KRA, RESPONSIBILITY, KPI, ROLE or DEPARTMENT (an org unit).`);
   const kinds = ASK_KINDS.filter((k) => parts.some((p) => KIND_ALIAS[p] === k));
   if (!kinds.length) throw invalid('INVALID', 'Choose at least one kind.');
   return kinds;
@@ -90,8 +90,8 @@ export const QUESTION_LEADS = [
   'whose job is to', 'whose job is', 'whose kra is', 'whose kpi is',
   'who has', 'who have', 'who all', 'who is', "who's", 'who are', 'who does', 'who do', 'who will', 'who should', 'who can', 'who',
   'which positions are responsible for', 'which position is responsible for', 'which role is responsible for',
-  'which department is responsible for', 'which positions', 'which position does', 'which position', 'which roles', 'which role',
-  'which person', 'which people', 'which department', 'which team', 'what position', 'what role',
+  'which department is responsible for', 'which org unit is responsible for', 'which positions', 'which position does', 'which position', 'which roles', 'which role',
+  'which person', 'which people', 'which department', 'which org unit', 'which section', 'which machine', 'which team', 'what position', 'what role',
   'is there anyone who', 'is there someone who', 'is anyone', 'does anyone', 'anyone who', 'someone who',
   'the person who', 'the one who', 'person who', 'people who',
 ];
@@ -310,7 +310,7 @@ export async function askWhoOwns(db, companyId, opts = {}) {
     if (!Number.isInteger(n) || n <= 0) throw invalid('INVALID', `${what} must be an id.`);
     return n;
   };
-  const departmentId = asId(opts.department, 'department');
+  const departmentId = asId(opts.department, 'org unit');
   const locationId = asId(opts.location, 'location');
   const labelValue = opts.label == null ? '' : String(opts.label).trim();
   const explicitKinds = readAskKinds(opts.kinds);

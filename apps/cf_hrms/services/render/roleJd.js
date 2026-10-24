@@ -287,7 +287,7 @@ function positionContextDocx(pc) {
   out.push(factTable([
     ['Position code', pc.position.positionCode],
     ['Position title', pc.position.displayTitle ?? pc.position.positionTitle],
-    ['Department', pc.position.departmentName],
+    ['Org unit', pc.position.departmentName],
     ['Location', pc.position.locationName],
     // One position is one chair on one shift: it is filled or it is vacant.
     ['Shift', pc.position.shiftCode ? `${pc.position.shiftCode}${pc.position.shiftName ? ` — ${pc.position.shiftName}` : ''}` : null],
@@ -364,7 +364,7 @@ export async function renderRoleJdDocx(snapshot) {
       ['Role code', role.roleCode],
       ['Role title', role.title],
       ['Status', titleCase(role.status)],
-      ['Default department', role.defaultDepartmentName ?? role.departmentName ?? null],
+      ['Default org unit', role.defaultDepartmentName ?? role.departmentName ?? null],
       ['Content resolved through', layerChain(content.layers)],
     ]),
   ];
@@ -619,7 +619,7 @@ function writePositionContextPdf(kit, pc) {
   kit.facts([
     ['Position code', pc.position.positionCode],
     ['Position title', pc.position.displayTitle ?? pc.position.positionTitle],
-    ['Department', pc.position.departmentName],
+    ['Org unit', pc.position.departmentName],
     ['Location', pc.position.locationName],
     // One position is one chair on one shift: it is filled or it is vacant.
     ['Shift', pc.position.shiftCode ? `${pc.position.shiftCode}${pc.position.shiftName ? ` — ${pc.position.shiftName}` : ''}` : null],
@@ -666,7 +666,7 @@ export async function renderRoleJdPdf(snapshot) {
     ['Role code', role.roleCode],
     ['Role title', role.title],
     ['Status', titleCase(role.status)],
-    ['Default department', role.defaultDepartmentName ?? role.departmentName ?? null],
+    ['Default org unit', role.defaultDepartmentName ?? role.departmentName ?? null],
     ['Content resolved through', layerChain(content.layers)],
   ]);
 

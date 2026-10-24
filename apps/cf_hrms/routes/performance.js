@@ -92,7 +92,7 @@ router.put('/performance/role-frequencies', guard(PERM.setup.edit), handle((req)
 
 /* ── periods ──────────────────────────────────────────────────────────── */
 
-router.get('/performance/periods', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.get('/performance/periods', guard(PERM.performance.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   listPeriods(pool, ctx(req).companyId, { year: req.query.year, frequency: req.query.frequency }, await peopleFilter(req))
 )));
 router.post('/performance/periods/:id/close', guard(PERM.performance.edit), companyWide('A period is closed for the whole company, by somebody whose access covers it.'),
@@ -100,17 +100,17 @@ router.post('/performance/periods/:id/close', guard(PERM.performance.edit), comp
 
 /* ── making plans ─────────────────────────────────────────────────────── */
 
-router.post('/performance/plans/preview', guard(PERM.performance.edit, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.post('/performance/plans/preview', guard(PERM.performance.edit, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   previewPlans(pool, ctx(req).companyId, req.body ?? {}, await peopleFilter(req))
 )));
-router.post('/performance/plans/create', guard(PERM.performance.edit, { note: 'narrowed to the login’s department' }), handle(async (req) => {
+router.post('/performance/plans/create', guard(PERM.performance.edit, { note: 'narrowed to the login’s org unit' }), handle(async (req) => {
   const scope = await peopleFilter(req);
   return tx(req, (db, c) => createPlans(db, c, req.body ?? {}, scope));
 }));
 
 /* ── the list, and bulk actions ───────────────────────────────────────── */
 
-router.get('/performance/plans', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), listed('plans'), handle(async (req) => {
+router.get('/performance/plans', guard(PERM.performance.view, { note: 'narrowed to the login’s org unit' }), listed('plans'), handle(async (req) => {
   const { items } = await listPlans(pool, ctx(req).companyId, { periodId: req.query.periodId ? intParam(req.query.periodId, 'periodId') : null }, await peopleFilter(req));
   const wantsCancelled = String(req.query.status ?? '').toUpperCase().split(',').includes('CANCELLED');
   return { items: wantsCancelled ? items : items.filter((p) => p.status !== 'CANCELLED') };
@@ -138,7 +138,7 @@ router.post('/performance/plans/:id/kpis/:kpiId/target', guard(PERM.performance.
 
 /* ── actuals (spec §19) ───────────────────────────────────────────────── */
 
-router.get('/performance/actuals', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), handle(async (req) => {
+router.get('/performance/actuals', guard(PERM.performance.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => {
   const c = ctx(req);
   const grid = await actualsGrid(pool, c.companyId, req.query ?? {}, { scopeDeptIds: await peopleFilter(req), canEnter: can(req, PERM.performance.edit) });
   return narrowGrid(pool, c.companyId, grid, req.query ?? {});
@@ -154,7 +154,7 @@ const inBodyPlan = Object.assign(step(async (req) => {
 router.put('/performance/actuals', guard(PERM.performance.edit), inBodyPlan, handle((req) => tx(req, (db, c) => enterOne(db, c, req.body ?? {}))));
 router.get('/performance/plans/:id/kpis/:kpiId/actuals', guard(PERM.performance.view), inPlan,
   handle((req) => actualHistory(pool, ctx(req).companyId, id(req), intParam(req.params.kpiId, 'kpiId'))));
-router.get('/performance/bands', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.get('/performance/bands', guard(PERM.performance.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   chartBands(pool, ctx(req).companyId, { periodId: req.query.periodId ? intParam(req.query.periodId, 'periodId') : null }, await peopleFilter(req))
 )));
 
@@ -171,7 +171,7 @@ const inAction = Object.assign(step(async (req) => {
 }), { hrmsStep: 'scope: the person whose plan the action is on' });
 const reviewCanFor = (req) => ({ owner: ctx(req).owner, edit: can(req, PERM.performance.edit), cancel: can(req, PERM.performance.remove) });
 
-router.get('/performance/reviews', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), listed('reviews'), handle(async (req) => (
+router.get('/performance/reviews', guard(PERM.performance.view, { note: 'narrowed to the login’s org unit' }), listed('reviews'), handle(async (req) => (
   listReviews(pool, ctx(req), { scopeDeptIds: await peopleFilter(req) })
 )));
 router.get('/performance/reviews/:id', guard(PERM.performance.view), inReview, handle((req) => readReview(pool, ctx(req).companyId, id(req), 'MANAGE', reviewCanFor(req))));
@@ -181,7 +181,7 @@ router.post('/performance/reviews/:id/cancel', guard(PERM.performance.remove), i
 router.post('/performance/plans/:id/check-ins', guard(PERM.performance.edit), inPlan, handle((req) => tx(req, (db, c) => openCheckIn(db, c, id(req), req.body ?? {}))));
 router.get('/performance/plans/:id/reviews', guard(PERM.performance.view), inPlan, handle((req) => planReviews(pool, ctx(req), id(req), 'MANAGE', reviewCanFor(req))));
 
-router.get('/performance/actions', guard(PERM.performance.view, { note: 'narrowed to the login’s department' }), listed('actions'), handle(async (req) => {
+router.get('/performance/actions', guard(PERM.performance.view, { note: 'narrowed to the login’s org unit' }), listed('actions'), handle(async (req) => {
   const out = await listActions(pool, ctx(req), { scopeDeptIds: await peopleFilter(req) }, { edit: can(req, PERM.performance.edit) });
   // Open ones unless the address asks for a status (status=all: every one).
   return String(req.query.status ?? '').trim() ? out : { ...out, items: out.items.filter((a) => a.status === 'OPEN') };

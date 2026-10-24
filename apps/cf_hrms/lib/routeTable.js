@@ -114,8 +114,8 @@ export function renderAccessDoc(rows) {
   out.push('How to read the tables below:');
   out.push('- **a or b** — holding either is enough (a picker two screens share).');
   out.push('- **and** — both are needed.');
-  out.push('- **scope: the position / the person / the department** — for a login whose access role is “only their department and below”, the thing named must be inside it (403 `OUT_OF_SCOPE`). A whole-company login is not affected.');
-  out.push('- **whole-company logins only** — the thing belongs to no department, so a department-scoped login cannot change it.');
+  out.push('- **scope: the position / the person / the org unit** — for a login whose access role is “their org unit and everything under it”, the thing named must be inside it (403 `OUT_OF_SCOPE`). A whole-company login is not affected.');
+  out.push('- **whole-company logins only** — the thing belongs to no org unit, so an org-unit-scoped login cannot change it.');
   out.push('- `cf_hrms_contact_view` and `cf_hrms_pay_view` also change what a route RETURNS: without them contact details and pay are removed from the answer on the server.');
   out.push('- **filters: …** — the search and filters that list takes in its address (`?q=&status=`); it answers `total` and `count` beside its rows.');
   out.push('- `upload` rights guard the Excel uploads (the Excel section).');

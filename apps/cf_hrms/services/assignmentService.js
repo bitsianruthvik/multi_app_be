@@ -352,7 +352,7 @@ async function readAssignmentBody(db, companyId, body, { partial = false, curren
   }
 
   for (const [key, col, table, label] of [
-    ['departmentId', 'department_id', 'hrms_departments', 'department'],
+    ['departmentId', 'department_id', 'hrms_departments', 'org unit'],
     ['locationId', 'location_id', 'hrms_locations', 'location'],
     ['defaultShiftId', 'default_shift_id', 'hrms_shifts', 'shift'],
   ]) {

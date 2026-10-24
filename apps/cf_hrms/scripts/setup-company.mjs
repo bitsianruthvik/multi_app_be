@@ -50,6 +50,7 @@ import { setupPerformance } from './setup-performance.mjs';
 import { seedPayroll } from '../services/payroll/seed.js';
 import { ensureKind } from '../services/labelGroupService.js';
 import { ALL_TAGS } from '../lib/access.js';
+import { weekOf, summaryOf } from '../services/shiftRead.js';
 
 const require = createRequire(import.meta.url);
 
@@ -225,7 +226,15 @@ export async function setupCompany(conn, { slug, name, email, userName, password
       WHERE s.company_id = ? AND s.deleted_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM hrms_shift_days x WHERE x.company_id = s.company_id AND x.shift_id = s.id AND x.weekday = d.weekday)`,
     [companyId]);
-  step('shifts', sh.affectedRows || sd.affectedRows ? 'created' : 'exists', `${sh.affectedRows} of 3 shifts added, ${sd.affectedRows} shift days added`);
+  // Each shift's summary line (hrms_shifts.week_summary), as every screen and apply-shift-calendar-schema write it.
+  const [shiftRows] = await conn.query('SELECT id, start_time, end_time, week_summary FROM hrms_shifts WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+  const [dayRows] = await conn.query('SELECT shift_id, weekday, is_working, start_time, end_time, break_minutes FROM hrms_shift_days WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+  let summaries = 0;
+  for (const r of shiftRows) {
+    const line = summaryOf(weekOf(dayRows.filter((d) => d.shift_id === r.id), r));
+    if (r.week_summary !== line) { await conn.query('UPDATE hrms_shifts SET week_summary = ? WHERE id = ?', [line, r.id]); summaries += 1; }
+  }
+  step('shifts', sh.affectedRows || sd.affectedRows || summaries ? 'created' : 'exists', `${sh.affectedRows} of 3 shifts added, ${sd.affectedRows} shift days added, ${summaries} summary lines written`);
 
   // 9. the Kind label list.
   const [[k0]] = await conn.query('SELECT COUNT(*) AS n FROM hrms_label_groups WHERE company_id = ? AND deleted_at IS NULL AND is_kind = 1', [companyId]);

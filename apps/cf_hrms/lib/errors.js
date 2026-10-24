@@ -31,7 +31,7 @@ export function assertNoProblems(problems, message = 'Some fields need attention
 // message, which is a signal that the index deserves a sentence.
 const UNIQUE_MESSAGES = {
   uq_hloc_code: 'A location with that code already exists.',
-  uq_hdep_code: 'A department with that code already exists.',
+  uq_hdep_code: 'An org unit with that code already exists.',
   uq_hwct_code: 'A work context with that code already exists.',
   uq_hwct_name: 'A work context with that name already exists — machines are named once.',
   uq_hcon_code: 'A contractor with that code already exists.',
@@ -56,7 +56,7 @@ const UNIQUE_MESSAGES = {
   uq_hdlb_group_name: 'A label with that name already exists.',
   uq_hlgr_name: 'A label group with that name already exists.',
   uq_hlgr_kind: 'The company already has its Kind group.',
-  uq_hdll_one: 'A department has one label in each group.',
+  uq_hdll_one: 'An org unit has one kind.',
   uq_hacr_role: 'That role already has its access settings.',
   uq_hrol_code: 'A role with that code already exists.',
   uq_hrol_title: 'A role with that title already exists.',

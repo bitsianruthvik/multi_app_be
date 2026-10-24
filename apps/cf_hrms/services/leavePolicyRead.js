@@ -365,7 +365,7 @@ export async function loadAssignmentIndex(db, companyId, { labels = true } = {})
  * @returns the spec's `Effective`:
  *   { policy: Ref | null, from: 'ROLE' | 'LABEL' | 'LOCATION' | 'COMPANY' | null, line }
  *   and, only when from is LABEL: label: { id, name }
- *   line: "Office staff — from the role" · "Shop floor — from the label Machine" ·
+ *   line: "Office staff — from the role" · "Shop floor — from the kind Machine" ·
  *         "Shop floor — from Unit 2" (a location) · "Office staff — the company default" · "No leave policy"
  */
 export function resolveEffective(index, { roleId = null, locationId = null, departmentId = null } = {}) {
@@ -374,7 +374,7 @@ export function resolveEffective(index, { roleId = null, locationId = null, depa
   const labelId = departmentId != null ? index.labelOfDepartment?.get(Number(departmentId)) : null;
   const byLabel = labelId != null ? index.byLabel.get(labelId) : null;
   if (byLabel) {
-    return { policy: byLabel.policy, from: 'LABEL', label: { ...byLabel.label }, line: `${byLabel.policy.name} — from the label ${byLabel.label.name}` };
+    return { policy: byLabel.policy, from: 'LABEL', label: { ...byLabel.label }, line: `${byLabel.policy.name} — from the kind ${byLabel.label.name}` };
   }
   const location = locationId != null ? index.byLocation.get(Number(locationId)) : null;
   if (location) return { policy: location, from: 'LOCATION', line: `${location.name} — from ${index.locationName.get(Number(locationId)) ?? 'the location'}` };

@@ -8,7 +8,7 @@ One tag = one thing a person may do. The Owner (the company’s `admin` role) ho
 
 | Area | Screens | view | edit | remove | upload |
 |---|---|---|---|---|---|
-| Organisation | Departments, Department labels, Locations | `cf_hrms_org_view` | `cf_hrms_org_edit` | `cf_hrms_org_remove` | `cf_hrms_org_upload` |
+| Organisation | Org units, Kinds of org unit, Locations | `cf_hrms_org_view` | `cf_hrms_org_edit` | `cf_hrms_org_remove` | `cf_hrms_org_upload` |
 | Roles | Roles, Job content of a role, Libraries | `cf_hrms_roles_view` | `cf_hrms_roles_edit` | `cf_hrms_roles_remove` | `cf_hrms_roles_upload` |
 | Positions | Positions, Org chart, Job content of a position, Shift of a position, Reporting lines, Moving a person | `cf_hrms_positions_view` | `cf_hrms_positions_edit` | `cf_hrms_positions_remove` | `cf_hrms_positions_upload` |
 | Employees | Employees, Their documents and identifiers, Positions held | `cf_hrms_employees_view` | `cf_hrms_employees_edit` | – | `cf_hrms_employees_upload` |
@@ -34,8 +34,8 @@ One tag = one thing a person may do. The Owner (the company’s `admin` role) ho
 How to read the tables below:
 - **a or b** — holding either is enough (a picker two screens share).
 - **and** — both are needed.
-- **scope: the position / the person / the department** — for a login whose access role is “only their department and below”, the thing named must be inside it (403 `OUT_OF_SCOPE`). A whole-company login is not affected.
-- **whole-company logins only** — the thing belongs to no department, so a department-scoped login cannot change it.
+- **scope: the position / the person / the org unit** — for a login whose access role is “their org unit and everything under it”, the thing named must be inside it (403 `OUT_OF_SCOPE`). A whole-company login is not affected.
+- **whole-company logins only** — the thing belongs to no org unit, so an org-unit-scoped login cannot change it.
 - `cf_hrms_contact_view` and `cf_hrms_pay_view` also change what a route RETURNS: without them contact details and pay are removed from the answer on the server.
 - **filters: …** — the search and filters that list takes in its address (`?q=&status=`); it answers `total` and `count` beside its rows.
 - `upload` rights guard the Excel uploads (the Excel section).
@@ -167,9 +167,9 @@ How to read the tables below:
 | `GET /organisation/lookups` | `cf_hrms_org_view` or `cf_hrms_roles_view` or `cf_hrms_positions_view` or `cf_hrms_employees_view` or `cf_hrms_hiring_view` or `cf_hrms_documents_view` or `cf_hrms_time_view` or `cf_hrms_leave_view` or `cf_hrms_setup_view` or `cf_hrms_performance_view` or `cf_hrms_payroll_view` or `cf_hrms_attendance_view` |  |
 | `GET /organisation/departments` | `cf_hrms_org_view` or `cf_hrms_positions_view` | filters: q, label, shared, status, parent |
 | `GET /organisation/departments/staffing` | `cf_hrms_org_view` |  |
-| `POST /organisation/departments` | `cf_hrms_org_edit` | scope: the department |
-| `PUT /organisation/departments/:id` | `cf_hrms_org_edit` | scope: the department |
-| `DELETE /organisation/departments/:id` | `cf_hrms_org_remove` | scope: the department |
+| `POST /organisation/departments` | `cf_hrms_org_edit` | scope: the org unit |
+| `PUT /organisation/departments/:id` | `cf_hrms_org_edit` | scope: the org unit |
+| `DELETE /organisation/departments/:id` | `cf_hrms_org_remove` | scope: the org unit |
 | `GET /organisation/department-labels` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
 | `POST /organisation/department-labels` | `cf_hrms_org_edit` | whole-company logins only |
 | `PUT /organisation/department-labels/order` | `cf_hrms_org_edit` | whole-company logins only |
@@ -249,9 +249,9 @@ How to read the tables below:
 | `GET /positions/options` | `cf_hrms_positions_view` or `cf_hrms_hiring_view` or `cf_hrms_employees_view` |  |
 | `GET /positions/new-shift` | `cf_hrms_positions_view` |  |
 | `GET /positions` | `cf_hrms_positions_view` | filters: q, department, label, role, shift, location, state |
-| `POST /positions` | `cf_hrms_positions_edit` | scope: the department it is created in |
+| `POST /positions` | `cf_hrms_positions_edit` | scope: the org unit it is created in |
 | `GET /positions/:id` | `cf_hrms_positions_view` |  |
-| `PUT /positions/:id` | `cf_hrms_positions_edit` | scope: the position; scope: a department it is moved to |
+| `PUT /positions/:id` | `cf_hrms_positions_edit` | scope: the position; scope: an org unit it is moved to |
 | `POST /positions/:id/status` | `cf_hrms_positions_edit` | scope: the position; status CLOSED also needs cf_hrms_positions_remove |
 | `POST /positions/:id/add-sibling` | `cf_hrms_positions_edit` | scope: the position |
 | `GET /positions/:id/delete-impact` | `cf_hrms_positions_view` |  |
@@ -409,14 +409,14 @@ How to read the tables below:
 | `GET /leave/assignments` | `cf_hrms_leave_view` |  |
 | `PUT /leave/assignments` | `cf_hrms_leave_edit` | whole-company logins only; clearing one (policyId: null) also needs cf_hrms_leave_remove |
 | `GET /leave/policy-for` | `cf_hrms_leave_view` |  |
-| `GET /leave/requests` | `cf_hrms_leave_view` | narrowed to the login’s department |
+| `GET /leave/requests` | `cf_hrms_leave_view` | narrowed to the login’s org unit |
 | `POST /leave/requests/preview` | `cf_hrms_leave_edit` | scope: the person |
 | `POST /leave/requests` | `cf_hrms_leave_edit` | scope: the person |
 | `GET /leave/requests/:id` | `cf_hrms_leave_view` | scope: the person |
 | `POST /leave/requests/:id/approve` | `cf_hrms_leave_edit` | scope: the person |
 | `POST /leave/requests/:id/reject` | `cf_hrms_leave_edit` | scope: the person |
 | `POST /leave/requests/:id/cancel` | `cf_hrms_leave_edit` | scope: the person |
-| `GET /leave/balances` | `cf_hrms_leave_view` | narrowed to the login’s department |
+| `GET /leave/balances` | `cf_hrms_leave_view` | narrowed to the login’s org unit |
 | `PUT /leave/balances` | `cf_hrms_leave_edit` | scope: the person; clearing one (opening: null) also needs cf_hrms_leave_remove |
 
 ## Code formats
@@ -499,19 +499,19 @@ How to read the tables below:
 | `GET /imports/status` | `cf_hrms_employee_bulk_add` |  |
 | `GET /overview/nav-counts` | any login with access to the app |  |
 | `GET /overview/home` | any login with access to the app |  |
-| `GET /commands/actions` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
-| `GET /commands/options` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
-| `POST /commands/read` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
-| `POST /commands/check` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
-| `POST /commands/apply` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's department scope — checked per step |
+| `GET /commands/actions` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's org unit scope — checked per step |
+| `GET /commands/options` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's org unit scope — checked per step |
+| `POST /commands/read` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's org unit scope — checked per step |
+| `POST /commands/check` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's org unit scope — checked per step |
+| `POST /commands/apply` | `cf_hrms_org_edit` or `cf_hrms_roles_edit` or `cf_hrms_positions_edit` | each step also needs its own action's right (org edit / roles edit / positions edit) and the login's org unit scope — checked per step |
 | `GET /performance/settings` | `cf_hrms_performance_view` or `cf_hrms_setup_view` |  |
 | `PUT /performance/settings` | `cf_hrms_setup_edit` |  |
 | `PUT /performance/role-frequencies` | `cf_hrms_setup_edit` |  |
-| `GET /performance/periods` | `cf_hrms_performance_view` | narrowed to the login’s department |
+| `GET /performance/periods` | `cf_hrms_performance_view` | narrowed to the login’s org unit |
 | `POST /performance/periods/:id/close` | `cf_hrms_performance_edit` | whole-company logins only |
-| `POST /performance/plans/preview` | `cf_hrms_performance_edit` | narrowed to the login’s department |
-| `POST /performance/plans/create` | `cf_hrms_performance_edit` | narrowed to the login’s department |
-| `GET /performance/plans` | `cf_hrms_performance_view` | filters: q, status, department, label, frequency, weightsOk, band; narrowed to the login’s department |
+| `POST /performance/plans/preview` | `cf_hrms_performance_edit` | narrowed to the login’s org unit |
+| `POST /performance/plans/create` | `cf_hrms_performance_edit` | narrowed to the login’s org unit |
+| `GET /performance/plans` | `cf_hrms_performance_view` | filters: q, status, department, label, frequency, weightsOk, band; narrowed to the login’s org unit |
 | `POST /performance/plans/activate` | `cf_hrms_performance_edit` | scope: each plan’s person |
 | `POST /performance/plans/cancel` | `cf_hrms_performance_remove` | scope: each plan’s person |
 | `GET /performance/plans/:id` | `cf_hrms_performance_view` | scope: the person the plan is for |
@@ -522,18 +522,18 @@ How to read the tables below:
 | `PUT /performance/plans/:id/kpis/:kpiId` | `cf_hrms_performance_edit` | scope: the person the plan is for |
 | `DELETE /performance/plans/:id/kpis/:kpiId` | `cf_hrms_performance_edit` | scope: the person the plan is for |
 | `POST /performance/plans/:id/kpis/:kpiId/target` | `cf_hrms_performance_edit` | scope: the person the plan is for |
-| `GET /performance/actuals` | `cf_hrms_performance_view` | narrowed to the login’s department |
+| `GET /performance/actuals` | `cf_hrms_performance_view` | narrowed to the login’s org unit |
 | `PUT /performance/actuals` | `cf_hrms_performance_edit` | scope: the person the plan is for |
 | `GET /performance/plans/:id/kpis/:kpiId/actuals` | `cf_hrms_performance_view` | scope: the person the plan is for |
-| `GET /performance/bands` | `cf_hrms_performance_view` | narrowed to the login’s department |
-| `GET /performance/reviews` | `cf_hrms_performance_view` | filters: q, period, kind, status, state, department, label, manager; narrowed to the login’s department |
+| `GET /performance/bands` | `cf_hrms_performance_view` | narrowed to the login’s org unit |
+| `GET /performance/reviews` | `cf_hrms_performance_view` | filters: q, period, kind, status, state, department, label, manager; narrowed to the login’s org unit |
 | `GET /performance/reviews/:id` | `cf_hrms_performance_view` | scope: the person the review is about |
 | `PUT /performance/reviews/:id` | `cf_hrms_performance_edit` | scope: the person the review is about |
 | `POST /performance/reviews/:id/close` | `cf_hrms_performance_edit` | scope: the person the review is about |
 | `POST /performance/reviews/:id/cancel` | `cf_hrms_performance_remove` | scope: the person the review is about |
 | `POST /performance/plans/:id/check-ins` | `cf_hrms_performance_edit` | scope: the person the plan is for |
 | `GET /performance/plans/:id/reviews` | `cf_hrms_performance_view` | scope: the person the plan is for |
-| `GET /performance/actions` | `cf_hrms_performance_view` | filters: q, status, overdue, owner, period, department, label, manager; narrowed to the login’s department |
+| `GET /performance/actions` | `cf_hrms_performance_view` | filters: q, status, overdue, owner, period, department, label, manager; narrowed to the login’s org unit |
 | `POST /performance/plans/:id/actions` | `cf_hrms_performance_edit` | scope: the person the plan is for |
 | `PUT /performance/actions/:id` | `cf_hrms_performance_edit` | scope: the person whose plan the action is on |
 | `POST /performance/actions/:id/done` | `cf_hrms_performance_edit` | scope: the person whose plan the action is on |
@@ -581,19 +581,19 @@ How to read the tables below:
 | `GET /payroll/runs/:id/bank-file` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `GET /payroll/runs/:id/payslips` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `GET /payroll/payslips/:id/file` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
-| `GET /attendance/today` | `cf_hrms_attendance_view` | narrowed to the login’s department |
-| `GET /attendance/month` | `cf_hrms_attendance_view` | narrowed to the login’s department |
-| `GET /attendance/month/workbook` | `cf_hrms_attendance_view` | narrowed to the login’s department |
-| `GET /attendance/summary` | `cf_hrms_attendance_view` | narrowed to the login’s department |
+| `GET /attendance/today` | `cf_hrms_attendance_view` | narrowed to the login’s org unit |
+| `GET /attendance/month` | `cf_hrms_attendance_view` | narrowed to the login’s org unit |
+| `GET /attendance/month/workbook` | `cf_hrms_attendance_view` | narrowed to the login’s org unit |
+| `GET /attendance/summary` | `cf_hrms_attendance_view` | narrowed to the login’s org unit |
 | `GET /attendance/people/:id` | `cf_hrms_attendance_view` | scope: the person |
 | `PUT /attendance/days` | `cf_hrms_attendance_edit` | scope: the person; never the login’s own day |
-| `POST /attendance/process` | `cf_hrms_attendance_edit` | a department-scoped login processes its own people only |
-| `GET /attendance/requests` | `cf_hrms_attendance_view` | narrowed to the login’s department |
+| `POST /attendance/process` | `cf_hrms_attendance_edit` | an org-unit-scoped login processes its own people only |
+| `GET /attendance/requests` | `cf_hrms_attendance_view` | narrowed to the login’s org unit |
 | `POST /attendance/requests` | `cf_hrms_attendance_edit` | scope: the person |
 | `GET /attendance/requests/:id` | `cf_hrms_attendance_view` | scope: the person |
 | `POST /attendance/requests/:id/approve` | `cf_hrms_attendance_edit` | scope: the person |
 | `POST /attendance/requests/:id/reject` | `cf_hrms_attendance_edit` | scope: the person |
-| `GET /attendance/penalties` | `cf_hrms_attendance_view` | narrowed to the login’s department |
+| `GET /attendance/penalties` | `cf_hrms_attendance_view` | narrowed to the login’s org unit |
 | `POST /attendance/penalties/:id/waive` | `cf_hrms_attendance_edit` | scope: the person |
 | `GET /attendance/policies` | `cf_hrms_attendance_view` |  |
 | `POST /attendance/policies/sentences` | `cf_hrms_attendance_view` |  |

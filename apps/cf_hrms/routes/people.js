@@ -83,7 +83,7 @@ router.get('/people/employees', guard(PERM.employees.view), showsPeople, listed(
   listEmployees(pool, ctx(req).companyId, req.query, { departmentIds: await peopleFilter(req), searchContact: canSeePii(req) })
 )));
 
-router.post('/people/employees', guard(PERM.employeeCreate, { also: [PERM.employees.edit] }), companyWide('A person joins your department through a hiring on one of its positions.'), showsPeople, handle((req) => (
+router.post('/people/employees', guard(PERM.employeeCreate, { also: [PERM.employees.edit] }), companyWide('A person joins your org unit through a hiring on one of its positions.'), showsPeople, handle((req) => (
   tx(req, (db, c) => createEmployee(db, c, req.body ?? {}, reqId(req)))
 )));
 

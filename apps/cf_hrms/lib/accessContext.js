@@ -19,6 +19,7 @@
  * would be at most CACHE_MS behind. Tags are never cached here.
  */
 import { pool } from './db.js';
+import { shownRoleLabel } from './access.js';
 
 const CACHE_MS = 5000;
 const cache = new Map(); // `${userId}:${appId}` -> { at, value }
@@ -55,7 +56,7 @@ export async function accessOf(req) {
     roleId: row.role_id,
     roleName: row.role_name,
     owner,
-    label: row.label ?? (owner ? 'Owner' : row.role_name),
+    label: shownRoleLabel(row.label, row.template_key) ?? (owner ? 'Owner' : row.role_name),
     // A role nobody has described keeps what it always had: the whole company.
     scope: owner ? 'COMPANY' : (row.scope === 'DEPARTMENT' ? 'DEPARTMENT' : 'COMPANY'),
     templateKey: row.template_key ?? null,

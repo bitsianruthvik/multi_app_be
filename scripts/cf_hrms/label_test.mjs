@@ -221,6 +221,10 @@ try {
   const added = await call(O, 'POST', '/organisation/department-labels', { name: `  ${TAG}   Bay ` });
   const BAY = added.json;
   ok(added.status === 200 && BAY.name === `${TAG} Bay` && BAY.departmentCount === 0 && BAY.label?.id === BAY.id && !('groupId' in BAY), 'POST a label: trimmed, no departments yet', JSON.stringify(added.json));
+  {
+    const bayRow = await one('SELECT company_id FROM hrms_department_labels WHERE id = ?', [BAY.id]);
+    ok(Number(bayRow?.company_id) === Number(COMPANY), 'spec §33 "+ add a kind" (POST /organisation/department-labels): the new kind is stored under this company’s company_id', JSON.stringify(bayRow));
+  }
   const dup = await call(O, 'POST', '/organisation/department-labels', { name: `${TAG} BAY` });
   const blank = await call(O, 'POST', '/organisation/department-labels', { name: '  ' });
   const long = await call(O, 'POST', '/organisation/department-labels', { name: 'x'.repeat(41) });
@@ -312,7 +316,7 @@ try {
     ok(set.status === 200 && set.json.defaultShiftId === (notGeneral ?? general).id && bad.status === 422, 'a label takes a default shift; a shift that is not the company\'s: 422', `${set.status} ${bad.status}`);
     const sugg = await get(`/positions/new-shift?departmentId=${A.id}`);
     ok(sugg.suggestion.from === 'LABEL' && sugg.suggestion.shift.id === (notGeneral ?? general).id && sugg.suggestion.label?.name === 'Machine' && !('groupName' in sugg.suggestion.label)
-      && /from the label Machine/.test(sugg.suggestion.line), 'GET /positions/new-shift: a department labelled Machine starts on its shift', JSON.stringify(sugg.suggestion));
+      && /from the kind Machine/.test(sugg.suggestion.line), 'GET /positions/new-shift: a department labelled Machine starts on its shift', JSON.stringify(sugg.suggestion));
     const made = await call(O, 'POST', '/positions', { roleId: role, departmentId: A.id, status: 'ACTIVE' });
     const madeId = made.json?.id ?? made.json?.position?.id ?? null;
     const madeShift = madeId ? (await one('SELECT default_shift_id FROM hrms_positions WHERE id = ?', [madeId]))?.default_shift_id : null;
@@ -351,7 +355,7 @@ try {
   }
 
   /* ══ 5. Excel ════════════════════════════════════════════════════════════ */
-  section('[5] Excel: the column "Label"; an old "Kind" file still reads');
+  section('[5] Excel: the column "Kind" (spec §33); old "Label" files still read');
   {
     const download = async (entity, query = '') => { const r = await call(O, 'GET', `/excel/${entity}/workbook${query}`); if (r.status !== 200) throw new Error(`download ${entity}: ${r.status} ${JSON.stringify(r.json)}`); return r.json; };
     const preview = (entity, contentBase64) => call(O, 'POST', `/excel/${entity}/preview`, { fileName: `${entity}.xlsx`, contentBase64 });
@@ -360,41 +364,45 @@ try {
     const file = await download('departments', `?q=${TAG}`);
     const book = await open(file.contentBase64);
     const heads = [...book.head.keys()].filter((h) => !h.startsWith('_'));
-    ok(heads.includes('Label') && !heads.includes('Kind') && heads.join('|') === 'Code|Name|Label|Under|Shared|Serves|Status',
-      'the departments file: Code · Name · Label · Under · Shared · Serves · Status — no per-group columns', heads.join(', '));
-    ok(book.get(book.find('Name', `${TAG} A`), 'Label') === 'Machine', 'a department\'s cell holds its label');
+    ok(heads.includes('Kind') && !heads.includes('Label') && heads.join('|') === 'Code|Kind|Name|Under|Shared|Serves|Status',
+      'the org units file: Code · Kind · Name · Under · Shared · Serves · Status — no per-group columns', heads.join(', '));
+    ok(book.get(book.find('Name', `${TAG} A`), 'Kind') === 'Machine', 'an org unit\'s cell holds its kind');
     const unchanged = await preview('departments', file.contentBase64);
     ok(unchanged.status === 200 && unchanged.json.summary.change === 0 && unchanged.json.summary.problems === 0, 'download -> upload unchanged = every row SAME', JSON.stringify(unchanged.json?.summary));
-    const oldFile = await edited(file.contentBase64, (b) => { b.ws.getRow(1).getCell(b.head.get('Label')).value = 'Kind ★'; });
+    const oldFile = await edited(file.contentBase64, (b) => { b.ws.getRow(1).getCell(b.head.get('Kind')).value = 'Label ★'; });
     const old = await preview('departments', oldFile);
-    ok(old.status === 200 && old.json.summary.change === 0 && old.json.summary.problems === 0, 'a file with the header "Kind" (downloaded while labels had groups) reads the same', JSON.stringify(old.json?.summary ?? old.json));
-    const changedFile = await edited(file.contentBase64, (b) => b.set(b.find('Name', `${TAG} A`), 'Label', 'Section'));
+    ok(old.status === 200 && old.json.summary.change === 0 && old.json.summary.problems === 0, 'a file with the header "Label" (downloaded before spec §33) reads the same', JSON.stringify(old.json?.summary ?? old.json));
+    const changedFile = await edited(file.contentBase64, (b) => b.set(b.find('Name', `${TAG} A`), 'Kind', 'Section'));
     const changed = await preview('departments', changedFile);
     const row = changed.json.rows.find((r) => r.action === 'CHANGE');
-    ok(changed.json.summary.change === 1 && row?.changes.length === 1 && row.changes[0].column === 'Label' && row.changes[0].from === 'Machine' && row.changes[0].to === 'Section',
-      'a label changed in the file = one CHANGE, from -> to', JSON.stringify(row));
+    ok(changed.json.summary.change === 1 && row?.changes.length === 1 && row.changes[0].column === 'Kind' && row.changes[0].from === 'Machine' && row.changes[0].to === 'Section',
+      'a kind changed in the file = one CHANGE, from -> to', JSON.stringify(row));
     const applied = await applyX('departments', changedFile, { add: 0, change: 1 });
-    ok(applied.status === 200 && await typeOf(A.id) === 'Section' && await linkOf(A.id) === 'Section', 'applied: the department now carries Section (department_type and link)');
+    ok(applied.status === 200 && await typeOf(A.id) === 'Section' && await linkOf(A.id) === 'Section', 'applied: the org unit now carries Section (department_type and link)');
     await db.query('UPDATE hrms_departments SET updated_at = NOW() - INTERVAL 1 MINUTE WHERE company_id = ? AND name LIKE ?', [COMPANY, `${TAG}%`]);
     const fresh = (await download('departments', `?q=${TAG}`)).contentBase64;
-    const oldChanged = await edited(fresh, (b) => { b.ws.getRow(1).getCell(b.head.get('Label')).value = 'Kind ★'; b.head.set('Kind', b.head.get('Label')); b.set(b.find('Name', `${TAG} A`), 'Kind', 'Machine'); });
+    const oldChanged = await edited(fresh, (b) => { b.ws.getRow(1).getCell(b.head.get('Kind')).value = 'Label ★'; b.head.set('Label', b.head.get('Kind')); b.set(b.find('Name', `${TAG} A`), 'Label', 'Machine'); });
     const oldApplied = await applyX('departments', oldChanged, { add: 0, change: 1 });
-    ok(oldApplied.status === 200 && await typeOf(A.id) === 'Machine', 'a change in an old "Kind" file is applied too', JSON.stringify(oldApplied.json));
-    const wrong = await preview('departments', await edited(fresh, (b) => b.set(b.find('Name', `${TAG} B`), 'Label', `${TAG} no such`)));
-    ok(wrong.json.rows.some((r) => r.action === 'PROBLEM' && String(r.label ?? '').includes('B') && /no such/.test(JSON.stringify(r.problems))), 'a label that is not in the list = a problem on that row', JSON.stringify(wrong.json.rows.filter((r) => r.action === 'PROBLEM')));
+    ok(oldApplied.status === 200 && await typeOf(A.id) === 'Machine', 'a change in an old "Label" file is applied too', JSON.stringify(oldApplied.json));
+    const wrong = await preview('departments', await edited(fresh, (b) => b.set(b.find('Name', `${TAG} B`), 'Kind', `${TAG} no such`)));
+    ok(wrong.json.rows.some((r) => r.action === 'PROBLEM' && String(r.label ?? '').includes('B') && /no such/.test(JSON.stringify(r.problems))), 'a kind that is not in the list = a problem on that row', JSON.stringify(wrong.json.rows.filter((r) => r.action === 'PROBLEM')));
     const pFile = await download('positions', `?q=${TAG}&label=${label('Section').id}`);
     const pBook = await open(pFile.contentBase64);
     const pHeads = [...pBook.head.keys()].filter((h) => !h.startsWith('_'));
     const pList = await get(`/positions?q=${TAG}&label=${label('Section').id}`);
-    ok(pHeads.filter((h) => h === 'Label').length === 1 && !pHeads.includes('Kind') && pHeads[pHeads.length - 1] === 'Label'
-      && pBook.get(pBook.find('Code', `${TAG}-CH`), 'Label') === 'Section' && pFile.rows === pList.count && pList.count >= 2,
-    'positions file: ONE info column "Label" with the department\'s label; the label filter decides the rows', `${pHeads.join(', ')} · ${pFile.rows} rows`);
+    ok(pHeads.filter((h) => h === 'Org unit kind').length === 1 && !pHeads.includes('Label') && !pHeads.includes('Kind') && pHeads[pHeads.length - 1] === 'Org unit kind'
+      && pBook.get(pBook.find('Code', `${TAG}-CH`), 'Org unit kind') === 'Section' && pFile.rows === pList.count && pList.count >= 2,
+    'positions file: ONE info column "Org unit kind" with the org unit\'s kind; the kind filter decides the rows', `${pHeads.join(', ')} · ${pFile.rows} rows`);
     const pSame = await preview('positions', pFile.contentBase64);
     ok(pSame.json.summary.change === 0 && pSame.json.summary.problems === 0, 'the info column is ignored on upload (unchanged file = SAME)');
+    const pOld = await edited(pFile.contentBase64, (b) => { b.ws.getRow(1).getCell(b.head.get('Org unit')).value = 'Department ★'; b.ws.getRow(1).getCell(b.head.get('Org unit kind')).value = 'Label'; });
+    const pOldSame = await preview('positions', pOld);
+    ok(pOldSame.status === 200 && pOldSame.json.summary.change === 0 && pOldSame.json.summary.problems === 0 && !(pOldSame.json.fileProblems ?? []).length,
+      'a positions file with the old headers "Department" and "Label" reads the same', JSON.stringify(pOldSame.json?.summary ?? pOldSame.json));
     const eFile = await download('employees', `?q=${TAG}`);
     const eBook = await open(eFile.contentBase64);
-    ok([...eBook.head.keys()].filter((h) => h === 'Label').length === 1 && !eBook.head.has('Kind') && eBook.get(eBook.find('Name', `${TAG} Person CH`), 'Label') === 'Section',
-      'employees file: ONE info column "Label"', [...eBook.head.keys()].join(', '));
+    ok([...eBook.head.keys()].filter((h) => h === 'Org unit kind').length === 1 && !eBook.head.has('Label') && eBook.get(eBook.find('Name', `${TAG} Person CH`), 'Org unit kind') === 'Section',
+      'employees file: ONE info column "Org unit kind"', [...eBook.head.keys()].join(', '));
   }
 
   /* ══ 6. code formats ═════════════════════════════════════════════════════ */
@@ -403,8 +411,8 @@ try {
     const entities = await get('/codegen/entities');
     const dept = (Array.isArray(entities) ? entities : entities.entities).find((e) => e.entityType === 'hrms_department');
     const labelConds = dept.conditionTokens.filter((t) => t.key.startsWith('label'));
-    ok(labelConds.length === 1 && labelConds[0].key === 'label' && labelConds[0].label === 'Label' && !('groupId' in labelConds[0]),
-      'GET /codegen/entities: departments are tested on ONE condition, `label` ("Label"); no per-group conditions', dept.conditionTokens.map((t) => t.key).join(', '));
+    ok(labelConds.length === 1 && labelConds[0].key === 'label' && labelConds[0].label === 'Kind' && !('groupId' in labelConds[0]),
+      'GET /codegen/entities: org units are tested on ONE condition, `label` ("Kind"); no per-group conditions', dept.conditionTokens.map((t) => t.key).join(', '));
     await createScheme(db, COMPANY, c.userId, {
       code: `${TAG}_MC`, name: `${TAG} Machines`, entityType: 'hrms_department', targetField: 'code', seqScope: 'prefix', priority: 10, status: 'active',
       conditions: [{ tokenKey: 'label', operator: 'eq', value: String(label('Machine').id) }],
@@ -463,6 +471,28 @@ try {
       ok(theirs.status === 200 && !theirs.json.labels.some((l) => l.id === label('Machine').id) && t2.status === 404 && t3.status === 404 && theirFilter.json.count === 0,
         'another company: does not see these labels, cannot rename or remove them, and filtering by them finds nothing of theirs',
         `${theirs.status} ${t2.status} ${t3.status} ${theirFilter.json?.count}`);
+      // spec §33 isolation: our kind id and our org unit as "Sits under" are of no use to another company; nothing is written.
+      const deptCount = async (cid) => Number((await one('SELECT COUNT(*) AS n FROM hrms_departments WHERE company_id = ?', [cid])).n);
+      const theirBefore = await deptCount(other.id);
+      const theirOne = await one('SELECT id, department_type FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [other.id]);
+      const useOurKind = await call(THEM, 'POST', '/organisation/departments', { name: `${TAG} stranger kind`, labelId: label('Machine').id }, { as: other.slug });
+      const useOurParent = await call(THEM, 'POST', '/organisation/departments', { name: `${TAG} stranger parent`, parentId: A.id }, { as: other.slug });
+      const putOurKind = theirOne ? await call(THEM, 'PUT', `/organisation/departments/${theirOne.id}`, { labelId: label('Machine').id }, { as: other.slug }) : null;
+      const putOurParent = theirOne ? await call(THEM, 'PUT', `/organisation/departments/${theirOne.id}`, { parentId: A.id }, { as: other.slug }) : null;
+      const theirAfter = theirOne ? await one('SELECT department_type, parent_department_id FROM hrms_departments WHERE id = ?', [theirOne.id]) : null;
+      const refusedAll = [useOurKind, useOurParent, putOurKind, putOurParent].filter(Boolean).every((r) => [404, 422].includes(r.status));
+      ok(refusedAll && await deptCount(other.id) === theirBefore
+        && (!theirOne || (theirAfter.department_type === theirOne.department_type && theirAfter.parent_department_id !== A.id)),
+        'another company: creating or changing an org unit with OUR kind id or under OUR org unit is refused, and nothing of theirs is written',
+        [useOurKind, useOurParent, putOurKind, putOurParent].map((r) => r?.status ?? '-').join(' '));
+      // "Sits under" reads GET /organisation/departments: each company sees only its own rows.
+      const ourIds = new Set((await q('SELECT id FROM hrms_departments WHERE company_id = ?', [COMPANY])).map((r) => Number(r.id)));
+      const theirIds = new Set((await q('SELECT id FROM hrms_departments WHERE company_id = ?', [other.id])).map((r) => Number(r.id)));
+      const theirList = await call(THEM, 'GET', '/organisation/departments', undefined, { as: other.slug });
+      const ourList = await get('/organisation/departments');
+      ok(theirList.status === 200 && theirList.json.rows.every((r) => theirIds.has(Number(r.id))) && ourList.rows.length > 0 && ourList.rows.every((r) => ourIds.has(Number(r.id))),
+        'GET /organisation/departments (the "Sits under" picker): each company is answered with its own rows only',
+        `${theirList.status} ours ${ourList.rows.length} theirs ${theirList.json?.rows?.length}`);
     }
   }
   /* ══ 9. the list's edges, on the service (from cleanup_a_test, 2026-10-16) ═ */
@@ -628,7 +658,7 @@ try {
       'PUT /leave/assignments { scope: LABEL, labelId } -> the label row carries its policy (no group, no conflicts)', JSON.stringify(row));
     const viaLabel = await eff(pC);
     ok(viaLabel.from === 'LABEL' && viaLabel.policy.id === P.unit.id && viaLabel.label?.id === U2.id && viaLabel.label.name === U2_NAME && !('groupName' in viaLabel.label) && !('conflict' in viaLabel)
-      && viaLabel.line === `${P.unit.name} — from the label ${U2_NAME}`, 'a label’s policy beats the location’s: "<policy> — from the label <name>"', JSON.stringify(viaLabel));
+      && viaLabel.line === `${P.unit.name} — from the kind ${U2_NAME}`, 'a label’s policy beats the location’s: "<policy> — from the kind <name>"', JSON.stringify(viaLabel));
     ok((await put({ scope: 'LABEL', labelId: PLANT.id, policyId: P.plant.id })).status === 200 && (await eff(pA)).from === 'LABEL' && (await eff(pA)).policy.id === P.plant.id,
       'another label gets its own policy: its department’s positions take it');
     ok((await eff(pChild)).from === 'LOCATION', 'a department under one that carries the label does not get it (its own label only)');
@@ -699,7 +729,7 @@ try {
     const suggest = async (qs) => (await must(O, 'GET', `/positions/new-shift?${qs}`)).suggestion;
     const s1 = await suggest(`departmentId=${D1.id}`);
     const s3 = await suggest(`departmentId=${D3.id}`);
-    ok(s1.shift.id === NIGHT.id && s1.label.name === PLANT_NAME && s1.line === `Starts on ${NIGHT.name}${/shift$/i.test(NIGHT.name) ? '' : ' shift'} (from the label ${PLANT_NAME})`
+    ok(s1.shift.id === NIGHT.id && s1.label.name === PLANT_NAME && s1.line === `Starts on ${NIGHT.name}${/shift$/i.test(NIGHT.name) ? '' : ' shift'} (from the kind ${PLANT_NAME})`
       && s3.from === 'GENERAL' && s3.shift.id === G.id, 'the suggestion says the shift and why, in words; a child department is not given its parent’s', `${s1.line} / ${s3.line}`);
     ok((await call(O, 'GET', '/positions/new-shift?departmentId=99999999')).status === 404, 'a department that is not this company’s: 404');
     ok(chooseNewShift({ label: { id: 1, name: 'X', defaultShiftId: 424242 }, shifts: allShifts }).from === 'GENERAL', 'a default pointing at a shift that is gone is passed over');
@@ -717,12 +747,12 @@ try {
     // the Excel positions upload
     const blankBook = await open((await must(O, 'GET', '/excel/positions/workbook?blank=1')).contentBase64);
     const roleText = `${TAG}RB — ${TAG} Role B`;
-    blankBook.set(2, 'Role', roleText); blankBook.set(2, 'Department', `${D1.code} — ${D1.name}`); blankBook.set(2, 'Status', 'ACTIVE');
-    blankBook.set(3, 'Role', roleText); blankBook.set(3, 'Department', `${D1.code} — ${D1.name}`); blankBook.set(3, 'Shift', `${G.code} — ${G.name}`); blankBook.set(3, 'Status', 'ACTIVE');
+    blankBook.set(2, 'Role', roleText); blankBook.set(2, 'Org unit', `${D1.code} — ${D1.name}`); blankBook.set(2, 'Status', 'ACTIVE');
+    blankBook.set(3, 'Role', roleText); blankBook.set(3, 'Org unit', `${D1.code} — ${D1.name}`); blankBook.set(3, 'Shift', `${G.code} — ${G.name}`); blankBook.set(3, 'Status', 'ACTIVE');
     const file = await blankBook.save();
     const pre = await must(O, 'POST', '/excel/positions/preview', { fileName: 'p.xlsx', contentBase64: file });
     const shiftChange = (r) => r?.changes.find((x) => x.column === 'Shift')?.to ?? '';
-    ok(pre.summary.add === 2 && pre.summary.problems === 0 && shiftChange(pre.rows[0]) === `${NIGHT.code} — ${NIGHT.name} (from the label ${PLANT_NAME})` && shiftChange(pre.rows[1]) === `${G.code} — ${G.name}`,
+    ok(pre.summary.add === 2 && pre.summary.problems === 0 && shiftChange(pre.rows[0]) === `${NIGHT.code} — ${NIGHT.name} (from the kind ${PLANT_NAME})` && shiftChange(pre.rows[1]) === `${G.code} — ${G.name}`,
       'Excel preview: a new row with no shift says what it will start on and why; a named shift stays', JSON.stringify(pre.rows.map((r) => [r.action, shiftChange(r), r.problems])));
     const applied = await must(O, 'POST', '/excel/positions/apply', { fileName: 'p.xlsx', contentBase64: file, expect: { add: 2, change: 0 } });
     const rows = await q('SELECT position_code, default_shift_id FROM hrms_positions WHERE company_id = ? AND position_code IN (?) ORDER BY id', [COMPANY, applied.issuedCodes.map((x) => x.code)]);
@@ -741,7 +771,7 @@ try {
     });
     const checked = await checkPlan(pool, OWNER, [stepPos('s1', field('department', D2.id, D2.name)), stepPos('s2', field('department', D2.id, D2.name), G)]);
     const [cp1, cp2] = checked.preview.positions;
-    ok(checked.clean && cp1.shiftName === DAY.name && cp1.shiftFrom === 'LABEL' && cp1.shiftLine.includes(`from the label ${U2_NAME}`) && cp2.shiftFrom === 'NAMED' && cp2.shiftName === G.name,
+    ok(checked.clean && cp1.shiftName === DAY.name && cp1.shiftFrom === 'LABEL' && cp1.shiftLine.includes(`from the kind ${U2_NAME}`) && cp2.shiftFrom === 'NAMED' && cp2.shiftName === G.name,
       'command bar check: the preview says the shift it will use and why — the label’s, or the one asked for', JSON.stringify([cp1.shiftLine, cp2.shiftLine, checked.steps.map((s) => s.problems)]));
     const withDept = [
       { id: 'd1', action: 'add_department', confidence: 1, sourceText: 'test', fields: { name: { value: `${TAG} New bay`, fromText: 'x', confidence: 1 }, label: { value: U2_NAME, fromText: U2_NAME, confidence: 1 } } },

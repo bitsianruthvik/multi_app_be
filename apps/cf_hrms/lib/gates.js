@@ -33,18 +33,18 @@ export const inPosition = (kind = 'position', pick = byId) => named('scope: the 
 /** The employee in the address — or the employee a sub-row (`kind`) belongs to. */
 export const inEmployee = (kind = 'employee', pick = byId) => named('scope: the person', (req) => assertEmployeeInScope(req, pick(req), kind));
 /** A new position: the department in the body must be inside. */
-export const newPositionBody = named('scope: the department it is created in', (req) => assertPositionBody(req, req.body ?? {}, { creating: true }));
+export const newPositionBody = named('scope: the org unit it is created in', (req) => assertPositionBody(req, req.body ?? {}, { creating: true }));
 /** A position being changed: a department in the body must be inside. */
-export const positionBody = named('scope: a department it is moved to', (req) => assertPositionBody(req, req.body ?? {}));
+export const positionBody = named('scope: an org unit it is moved to', (req) => assertPositionBody(req, req.body ?? {}));
 /** A department being added (`creating`) or changed. */
-export const departmentWrite = ({ creating = false } = {}) => named('scope: the department', (req) => assertDepartmentWrite(req, creating ? null : req.params.id, req.body ?? {}));
+export const departmentWrite = ({ creating = false } = {}) => named('scope: the org unit', (req) => assertDepartmentWrite(req, creating ? null : req.params.id, req.body ?? {}));
 /** Something that belongs to no department: not for a login scoped to one. */
 export const companyWide = (sentence) => named('whole-company logins only', (req) => assertCompanyWide(req, sentence));
 /** A work assignment named in a body: the person and the position must both be inside. */
 export const assignmentBody = named('scope: the person and the position in the body', async (req) => {
   if (req.body?.employeeId != null) await assertEmployeeInScope(req, req.body.employeeId);
   if (req.body?.positionId != null) await assertPositionInScope(req, req.body.positionId);
-  else if (!(await scopeOf(req)).all && req.method === 'POST') await assertCompanyWide(req, 'Choose a position inside your own department.');
+  else if (!(await scopeOf(req)).all && req.method === 'POST') await assertCompanyWide(req, 'Choose a position inside your own org unit.');
 });
 
 /* ── shows / takes ───────────────────────────────────────────────────────── */

@@ -75,7 +75,7 @@ export async function todayBoard(db, c, { date = null, departmentId = null, scop
     if (state === 'OFF') counts.off += 1;
     if (state === 'NOT_PUNCHED') counts.notPunched += 1;
     if (r?.missing_punch) counts.missing += 1;
-    const dept = person?.departmentName ?? 'No department';
+    const dept = person?.departmentName ?? 'No org unit';
     const g = groups.get(dept) ?? { department: dept, counts: { people: 0, present: 0, late: 0, absent: 0, leave: 0, off: 0, notPunched: 0 }, people: [] };
     g.counts.people += 1;
     g.counts[{ PRESENT: 'present', LATE: 'late', HALF: 'present', ABSENT: 'absent', LEAVE: 'leave', OFF: 'off', NOT_PUNCHED: 'notPunched' }[state]] += 1;
@@ -135,7 +135,7 @@ export async function musterWorkbook(db, c, query = {}, scopeDeptIds = null) {
   ws.addRow([`Muster roll — ${g.label}${g.final ? ' (closed)' : ''}`]);
   ws.getRow(1).font = { bold: true, size: 13 };
   ws.addRow(['Legend: ' + g.legend.map((l) => `${l.letter} ${l.words}`).join(' · ')]);
-  const head = ['Code', 'Name', 'Department', ...g.dates.map((d) => `${d.day} ${d.weekday}`), 'Present', 'Absent (LOP)', 'Leave paid', 'Leave unpaid', 'Weekly offs', 'Holidays', 'Late marks', 'OT hours', 'Penalty LOP', 'LOP days', 'Payable days'];
+  const head = ['Code', 'Name', 'Org unit', ...g.dates.map((d) => `${d.day} ${d.weekday}`), 'Present', 'Absent (LOP)', 'Leave paid', 'Leave unpaid', 'Weekly offs', 'Holidays', 'Late marks', 'OT hours', 'Penalty LOP', 'LOP days', 'Payable days'];
   ws.addRow(head);
   ws.getRow(3).font = { bold: true };
   for (const r of g.rows) {

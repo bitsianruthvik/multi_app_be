@@ -111,7 +111,7 @@ async function assertCopyScope(req) {
   if ((await scopeOf(req)).all) return;
   const targets = Array.isArray(req.body?.targets) ? req.body.targets : [];
   if (String(req.body?.mode ?? '').toUpperCase() !== 'SEAT' || targets.some((t) => t?.type !== 'position')) {
-    await assertCompanyWide(req, 'Roles belong to the whole company. Your access covers the positions of your own department only.');
+    await assertCompanyWide(req, 'Roles belong to the whole company. Your access covers the positions of your org unit and everything under it.');
   }
   for (const t of targets) await assertPositionInScope(req, t?.id);
 }
@@ -135,9 +135,9 @@ router.post('/role-content-copy', guard([PERM.roles.edit, PERM.positions.edit], 
 router.get('/role-masters/:kind', guard([PERM.roles.view, PERM.positions.view]), listed('libraries'), handle((req) => listMaster(pool, ctx(req).companyId, req.params.kind)));
 router.get('/role-masters/:kind/:id', guard([PERM.roles.view, PERM.positions.view]), handle((req) => getMaster(pool, ctx(req).companyId, req.params.kind, intParam(req.params.id))));
 router.get('/role-masters/:kind/:id/usage', guard([PERM.roles.view, PERM.positions.view]), handle((req) => masterUsage(pool, ctx(req).companyId, req.params.kind, intParam(req.params.id))));
-router.post('/role-masters/:kind', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createMasterItem(db, c, req.params.kind, req.body))));
-router.put('/role-masters/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateMasterItem(db, c, req.params.kind, intParam(req.params.id), req.body))));
-router.delete('/role-masters/:kind/:id', guard(PERM.roles.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteMasterItem(db, c, req.params.kind, intParam(req.params.id)))));
+router.post('/role-masters/:kind', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createMasterItem(db, c, req.params.kind, req.body))));
+router.put('/role-masters/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateMasterItem(db, c, req.params.kind, intParam(req.params.id), req.body))));
+router.delete('/role-masters/:kind/:id', guard(PERM.roles.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteMasterItem(db, c, req.params.kind, intParam(req.params.id)))));
 
 // ----- roles ---------------------------------------------------------------
 // `/roles/overview` and `/roles/departments` sit above `/roles/:id` on purpose:
@@ -145,14 +145,14 @@ router.delete('/role-masters/:kind/:id', guard(PERM.roles.remove), companyWide('
 router.get('/roles/overview', guard(PERM.roles.view), handle((req) => rolesOverview(pool, ctx(req).companyId)));
 router.get('/roles/departments', guard(PERM.roles.view), handle((req) => listDepartments(pool, ctx(req).companyId)));
 router.get('/roles', guard(PERM.roles.view), listed('roles'), handle((req) => listRoles(pool, ctx(req).companyId)));
-router.post('/roles', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createRole(db, c, req.body))));
+router.post('/roles', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createRole(db, c, req.body))));
 router.get('/roles/:id', guard(PERM.roles.view), handle((req) => getRole(pool, ctx(req).companyId, intParam(req.params.id))));
-router.put('/roles/:id', guard(PERM.roles.edit, { note: 'status RETIRED also needs cf_hrms_roles_remove' }), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => {
+router.put('/roles/:id', guard(PERM.roles.edit, { note: 'status RETIRED also needs cf_hrms_roles_remove' }), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => {
   // Retiring a role is removing it, by another door.
   if (String(req.body?.status ?? '').toUpperCase() === 'RETIRED') assertPerm(req, PERM.roles.remove);
   return tx(req, (db, c) => updateRole(db, c, intParam(req.params.id), req.body));
 }));
-router.delete('/roles/:id', guard(PERM.roles.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteRole(db, c, intParam(req.params.id)))));
+router.delete('/roles/:id', guard(PERM.roles.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteRole(db, c, intParam(req.params.id)))));
 
 /**
  * The role layer of the content, grouped. Overlays are NOT applied here — that
@@ -178,20 +178,20 @@ router.get('/roles/:id/content', guard(PERM.roles.view), handle((req) => getRole
 router.get('/roles/:id/job-content', guard(PERM.roles.view), handle((req) => roleJobContent(
   pool, ctx(req).companyId, intParam(req.params.id), { on: dateParam(req.query.on) },
 )));
-router.post('/roles/:id/kras', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createRoleKra(db, c, intParam(req.params.id), req.body ?? {}))));
-router.put('/roles/:id/content-group', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => moveRoleLines(db, c, intParam(req.params.id), req.body ?? {}))));
-router.put('/role-kras/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => renameRoleKra(db, c, intParam(req.params.id), req.body ?? {}))));
-router.delete('/role-kras/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteRoleKra(db, c, intParam(req.params.id), { takesEffect: req.query.takesEffect, reason: req.query.reason }))));
+router.post('/roles/:id/kras', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createRoleKra(db, c, intParam(req.params.id), req.body ?? {}))));
+router.put('/roles/:id/content-group', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => moveRoleLines(db, c, intParam(req.params.id), req.body ?? {}))));
+router.put('/role-kras/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => renameRoleKra(db, c, intParam(req.params.id), req.body ?? {}))));
+router.delete('/role-kras/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteRoleKra(db, c, intParam(req.params.id), { takesEffect: req.query.takesEffect, reason: req.query.reason }))));
 // Spec §16: the dated list of changes to the role's job content.
 router.get('/roles/:id/job-content/history', guard(PERM.roles.view), handle((req) => roleJobHistory(pool, ctx(req).companyId, intParam(req.params.id))));
 // Spec §16.1: a role line's wording, changed from a day — a new version of the same line, never an edit of the shared library text.
-router.post('/role-content/:kind/:id/reword', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => rewordRoleLine(db, c, req.params.kind === 'kpis' ? 'KPI' : req.params.kind === 'responsibilities' ? 'RESPONSIBILITY' : req.params.kind, intParam(req.params.id), req.body ?? {}))));
+router.post('/role-content/:kind/:id/reword', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => rewordRoleLine(db, c, req.params.kind === 'kpis' ? 'KPI' : req.params.kind === 'responsibilities' ? 'RESPONSIBILITY' : req.params.kind, intParam(req.params.id), req.body ?? {}))));
 
 // ----- role content --------------------------------------------------------
-router.post('/roles/:id/content/:kind', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => addContent(db, c, intParam(req.params.id), req.params.kind, req.body))));
-router.put('/roles/:id/content/:kind/order', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => reorderContent(db, c, intParam(req.params.id), req.params.kind, req.body?.ids))));
-router.put('/role-content/:kind/:id/group', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => regroupContent(db, c, req.params.kind, intParam(req.params.id), req.body?.roleKraAssignmentId ?? null, { takesEffect: req.body?.takesEffect, reason: req.body?.reason }))));
-router.put('/role-content/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateContent(db, c, req.params.kind, intParam(req.params.id), req.body))));
-router.delete('/role-content/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => removeContent(db, c, req.params.kind, intParam(req.params.id), { endOn: req.query.endOn, takesEffect: req.query.takesEffect, reason: req.query.reason }))));
+router.post('/roles/:id/content/:kind', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => addContent(db, c, intParam(req.params.id), req.params.kind, req.body))));
+router.put('/roles/:id/content/:kind/order', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => reorderContent(db, c, intParam(req.params.id), req.params.kind, req.body?.ids))));
+router.put('/role-content/:kind/:id/group', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => regroupContent(db, c, req.params.kind, intParam(req.params.id), req.body?.roleKraAssignmentId ?? null, { takesEffect: req.body?.takesEffect, reason: req.body?.reason }))));
+router.put('/role-content/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateContent(db, c, req.params.kind, intParam(req.params.id), req.body))));
+router.delete('/role-content/:kind/:id', guard(PERM.roles.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => removeContent(db, c, req.params.kind, intParam(req.params.id), { endOn: req.query.endOn, takesEffect: req.query.takesEffect, reason: req.query.reason }))));
 
 export default router;

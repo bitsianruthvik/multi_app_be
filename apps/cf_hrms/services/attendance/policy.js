@@ -241,7 +241,7 @@ export function resolveAttendance(index, { roleId = null, locationId = null, dep
   if (role) return { policy: role, from: 'ROLE', line: `${role.name} — from the role` };
   const labelId = departmentId != null ? index.labelOfDepartment.get(Number(departmentId)) : null;
   const label = labelId != null ? index.byLabel.get(labelId) : null;
-  if (label) return { policy: label, from: 'LABEL', line: `${label.name} — from the label ${index.names.get(`B${labelId}`) ?? ''}`.trim() };
+  if (label) return { policy: label, from: 'LABEL', line: `${label.name} — from the kind ${index.names.get(`B${labelId}`) ?? ''}`.trim() };
   const loc = locationId != null ? index.byLocation.get(Number(locationId)) : null;
   if (loc) return { policy: loc, from: 'LOCATION', line: `${loc.name} — from ${index.names.get(`L${locationId}`) ?? 'the location'}` };
   if (index.company) return { policy: index.company, from: 'COMPANY', line: `${index.company.name} — the company default` };

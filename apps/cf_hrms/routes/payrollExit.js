@@ -64,7 +64,7 @@ import * as RF from '../services/payrollExit/retirementFacts.js';
 import { settlementPdf, settlementFileName } from '../services/payrollExit/settlementPdf.js';
 
 const router = Router();
-const whole = companyWide('Payroll belongs to the whole company. Your access covers your own department only.');
+const whole = companyWide('Payroll belongs to the whole company. Your access covers your org unit and everything under it.');
 const view = [...guard(PERM.payroll.view), whole];
 const viewPay = [...guard(PERM.payroll.view, { also: [PERM.payView] }), whole];
 const edit = [...guard(PERM.payroll.edit), whole];

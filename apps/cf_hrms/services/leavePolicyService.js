@@ -773,7 +773,7 @@ export async function policyFor(db, companyId, query = {}) {
     locationId = p.location_id;
     departmentId = p.department_id;
   } else if (roleId === null && locationId === null && departmentId === null) {
-    throw invalid('INVALID', 'Say which position — or which role, department and location — to answer for.');
+    throw invalid('INVALID', 'Say which position — or which role, org unit and location — to answer for.');
   }
   return { effective: resolveEffective(await loadAssignmentIndex(db, companyId), { roleId, locationId, departmentId }) };
 }

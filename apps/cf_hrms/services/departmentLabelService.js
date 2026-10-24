@@ -74,7 +74,7 @@ export async function resolveKindLabel(db, companyId, given, { fallbackToFirst =
   const choices = labels.map((l) => l.name).join(', ');
   if (!text) {
     if (fallbackToFirst) return labels[0];
-    throw invalid('INVALID', 'Choose a label for the department.', { problems: [`Choose a label: ${choices}.`] });
+    throw invalid('INVALID', 'Choose what kind of org unit it is.', { problems: [`Choose a kind: ${choices}.`] });
   }
   const hit = labels.find((l) => l.name.toLowerCase() === text.toLowerCase());
   if (!hit && addIfMissing) {
@@ -87,8 +87,8 @@ export async function resolveKindLabel(db, companyId, given, { fallbackToFirst =
   }
   if (!hit) {
     const shown = text.slice(0, 60);
-    throw invalid('INVALID', `"${shown}" is not one of this company's department labels.`, {
-      problems: [`"${shown}" is not one of this company's labels. Choose one of ${choices}, or add it to the list first.`],
+    throw invalid('INVALID', `"${shown}" is not one of this company's kinds of org unit.`, {
+      problems: [`"${shown}" is not one of this company's kinds. Choose one of ${choices}, or add it to the list first.`],
     });
   }
   return hit;
@@ -216,7 +216,7 @@ export async function deleteLabel(db, c, id, { moveTo = null } = {}) {
   const before = await requireLabel(db, c.companyId, id, model);
   const labels = model.labels;
   if (labels.length <= 1) {
-    throw conflict('LAST_LABEL', 'This is the only label left. Every department needs one, so add another before removing this one.');
+    throw conflict('LAST_LABEL', 'This is the only kind left. Every org unit needs one, so add another before removing this one.');
   }
   const departmentCount = Number(labels.find((l) => l.id === id)?.department_count ?? 0);
   let moved = 0;
@@ -224,15 +224,15 @@ export async function deleteLabel(db, c, id, { moveTo = null } = {}) {
   if (departmentCount > 0) {
     const many = departmentCount !== 1;
     if (moveTo == null || moveTo === '') {
-      throw conflict('IN_USE', `${departmentCount} ${many ? 'departments use' : 'department uses'} the label "${before.name}". Choose the label ${many ? 'they move' : 'it moves'} to.`, {
-        problems: [`${departmentCount} ${many ? 'departments are' : 'department is'} labelled "${before.name}". Choose another label for ${many ? 'them' : 'it'}, then remove this one.`],
+      throw conflict('IN_USE', `${departmentCount} ${many ? 'org units are' : 'org unit is'} of the kind "${before.name}". Choose the kind ${many ? 'they move' : 'it moves'} to.`, {
+        problems: [`${departmentCount} ${many ? 'org units are' : 'org unit is'} of the kind "${before.name}". Choose another kind for ${many ? 'them' : 'it'}, then remove this one.`],
         detail: { departmentCount },
       });
     }
     target = labels.find((l) => l.id === Number(moveTo));
     if (!target || target.id === id) {
-      throw invalid('INVALID', 'Choose another label of the list to move the departments to.', {
-        problems: ['The label to move the departments to must be another label of the list.'], detail: { departmentCount },
+      throw invalid('INVALID', 'Choose another kind of the list to move the org units to.', {
+        problems: ['The kind to move the org units to must be another kind of the list.'], detail: { departmentCount },
       });
     }
     const [res] = await db.query(

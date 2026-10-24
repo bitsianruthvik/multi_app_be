@@ -457,8 +457,8 @@ try {
   {
     const me = {};
     for (const t of TEMPLATES) me[t.key] = (await call(U[t.key], 'GET', '/access/me')).json;
-    ok(TEMPLATES.every((t) => same(me[t.key].tags, t.tags) && me[t.key].role.label === t.label && me[t.key].role.id === roleIdOf[t.key]),
-      'GET /access/me: every role is told exactly its rights, and its role by its label (the Owner’s is "Owner", though the platform role is admin)');
+    ok(TEMPLATES.every((t) => same(me[t.key].tags, t.tags) && me[t.key].role.label === (t.shownLabel ?? t.label) && me[t.key].role.id === roleIdOf[t.key]),
+      'GET /access/me: every role is told exactly its rights, and its role by its label (the Owner’s is "Owner", though the platform role is admin; DEPARTMENT_HEAD shows as "Unit head")');
     ok(me.OWNER.scope.all === true && me.HR_MANAGER.scope.all === true && me.DEPARTMENT_HEAD.scope.all === false && JSON.stringify(me.DEPARTMENT_HEAD.scope.departmentNames) === JSON.stringify([`${TAG} ROOT`])
       && me.DEPARTMENT_HEAD.role.scope === 'DEPARTMENT' && JSON.stringify(Object.keys(me.OWNER)) === JSON.stringify(['role', 'tags', 'scope']),
     '…and its scope: the whole company, or the department it is limited to — { role: { id, label, scope }, tags, scope: { all, departmentNames } }', JSON.stringify(me.DEPARTMENT_HEAD.scope));
@@ -602,7 +602,7 @@ try {
       'the employees list holds the people of their department and below — and nobody else in the company', `${list.json?.items?.length} rows`);
     const inside1 = await call(head, 'GET', `/people/employees/${E.sub}`);
     const outside1 = await call(head, 'GET', `/people/employees/${E.out}`);
-    ok(inside1.status === 200 && inside1.json.employee.phone === '9100000003' && outside1.status === 403 && outside1.json.code === 'OUT_OF_SCOPE' && /outside your department/.test(outside1.json.message),
+    ok(inside1.status === 200 && inside1.json.employee.phone === '9100000003' && outside1.status === 403 && outside1.json.code === 'OUT_OF_SCOPE' && /outside your org unit/.test(outside1.json.message),
       'one of theirs opens, with contact details (the role holds contact view); one outside is 403 OUT_OF_SCOPE, in words', `${inside1.status} ${outside1.status} ${outside1.json?.message}`);
     const refusedReads = [];
     for (const url of [`/people/employees/${E.out}/positions`, `/people/employees/${E.out}/assignments`, `/people/employees/${E.out}/identifiers`, `/people/employees/${E.out}/documents`, `/people/employees/${E.out}/events`, `/people/employees/${E.out}/exits`, `/people/employees/${E.free}`]) {
@@ -800,6 +800,11 @@ try {
       && five[0].label === 'Owner' && five[0].platformName === 'admin' && five[0].locked === true && five[4].locked === true && five[1].locked === false && five[3].scope === 'DEPARTMENT'
       && five[2].summary === 'Sees everything · changes positions, employees, hiring, documents, performance, payroll and attendance · cannot remove · creates employees and sees pay' && five.every((r) => typeof r.loginCount === 'number'),
     'GET /access/roles: the five ready-made roles first, each { roleId, label, platformName, description, scope, templateKey, locked, tags, loginCount, summary }', JSON.stringify(five.map((r) => r.templateKey)));
+    const [[dhRow]] = await db.query('SELECT label FROM hrms_access_roles WHERE company_id = ? AND role_id = ? AND deleted_at IS NULL', [COMPANY, five[3].roleId]);
+    const cat = await call(U.OWNER, 'GET', '/access/catalog');
+    ok(five[3].label === 'Unit head' && five[3].platformName === 'Department head' && dhRow?.label === 'Department head'
+      && cat.status === 200 && cat.json.templates?.find((t) => t.key === 'DEPARTMENT_HEAD')?.label === 'Unit head',
+      'spec §33: the ready-made DEPARTMENT_HEAD shows as "Unit head" (list and catalog); its platform role and stored label stay "Department head"', JSON.stringify({ label: five[3].label, platformName: five[3].platformName, stored: dhRow?.label, cat: cat.status }));
 
     const made = await call(U.OWNER, 'POST', '/access/roles', { label: `  ${TAG}  Payroll clerk `, description: 'Reads people and pay.', scope: 'COMPANY', copyFrom: 'HR_EXECUTIVE' });
     madeRoleId = made.json?.role?.roleId;
@@ -880,7 +885,7 @@ try {
     const me = list.json.logins.find((l) => l.userId === U.OWNER.id);
     const dh = list.json.logins.find((l) => l.userId === U.DEPARTMENT_HEAD.id);
     ok(list.status === 200 && JSON.stringify(Object.keys(dh)) === JSON.stringify(['userId', 'name', 'email', 'role', 'state', 'employee', 'isYou']) && me.isYou === true && dh.isYou === false && me.role.label === 'Owner'
-      && dh.role.id === roleIdOf.DEPARTMENT_HEAD && dh.role.label === 'Department head' && dh.state === 'ACTIVE'
+      && dh.role.id === roleIdOf.DEPARTMENT_HEAD && dh.role.label === 'Unit head' && dh.state === 'ACTIVE'
       && JSON.stringify(dh.employee) === JSON.stringify({ id: E.head, employeeCode: `${TAG}HEAD`, fullName: `${TAG} Person HEAD`, positionCode: `${TAG}-HEAD`, departmentName: `${TAG} ROOT` }),
     'GET /access/logins -> { logins: [{ userId, name, email, role: { id, label }, state, employee: { id, employeeCode, fullName, positionCode, departmentName } | null, isYou }], withoutLogin }', JSON.stringify(dh));
     const without = list.json.withoutLogin.find((w) => w.employeeId === E.out);

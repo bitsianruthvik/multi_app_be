@@ -30,7 +30,7 @@ import { signToken } from '../../core/utils/jwt.js';
 import { appContext } from '../../core/middleware/appContext.js';
 import hrmsApp from '../../apps/cf_hrms/app.js';
 import { PERM } from '../../apps/cf_hrms/lib/http.js';
-import { loadRecords } from '../../apps/cf_hrms/services/commands/records.js';
+import { loadRecords, labelOf } from '../../apps/cf_hrms/services/commands/records.js';
 import { readCommand } from '../../apps/cf_hrms/services/commands/reader.js';
 import { checkPlan, applyPlan } from '../../apps/cf_hrms/services/commands/plan.js';
 import { unload, modelStatus } from '../../apps/cf_hrms/services/semantic/embedder.js';
@@ -124,6 +124,12 @@ const CASES = [
   ['add department "Customer Service" under Sales & Marketing', [['add_department', { name: 'Customer Service', label: 'Department', under: 'Sales & Marketing' }]]],
   ['we need a Safety department under Operations', [['add_department', { name: 'Safety', under: 'Operations' }]]],
   ['add a section named Dispatch Desk under Logistcs', [['add_department', { name: 'Dispatch Desk', label: 'Section', under: 'Logistics' }]]],
+  // spec §33: "org unit" is the general word; "section" / "machine" say the kind. Tagged: each must be fully right.
+  ['add an org unit called Stores Annex under Operations', [['add_department', { name: 'Stores Annex', label: 'Department', under: 'Operations' }]], 'org33'],
+  ['create a new org unit Ink Kitchen as a section under Printing', [['add_department', { name: 'Ink Kitchen', label: 'Section', under: 'Printing' }]], 'org33'],
+  ['add org unit "Pouch Line 4" as a machine under Printing', [['add_department', { name: 'Pouch Line 4', label: 'Machine', under: 'Printing' }]], 'org33'],
+  ['add a machine Nord 2 under Printing', [['add_department', { name: 'Nord 2', label: 'Machine', under: 'Printing' }]], 'org33'],
+  ['new section Coating Lab in the Quality org unit', [['add_department', { name: 'Coating Lab', label: 'Section', under: 'Quality' }]], 'org33'],
   ['add a role called Shift Supervisor', [['add_role', { title: 'Shift Supervisor' }]]],
   ['create a new role Safety Officer with purpose keep the plant safe', [['add_role', { title: 'Safety Officer', purpose: 'Keep the plant safe' }]]],
   ['add role "Export Coordinator"', [['add_role', { title: 'Export Coordinator' }]]],
@@ -249,10 +255,12 @@ section('[1] The reader on everyday requests');
 const tally = { right: 0, oneFix: 0, wrong: 0 };
 const fresh = { right: 0, oneFix: 0, wrong: 0 };
 const missesAll = [];
+const org33 = [];   // spec §33: these must read fully right, whatever the overall rate
 const times = [];
 await unload();
 for (const [text, expect, tag] of CASES) {
   const { r, wrong, misses } = await scoreCase(text, expect);
+  if (tag === 'org33' && wrong !== 0) org33.push(`${text}: ${misses.join('; ')}`);
   if (tag === 'fresh') fresh[wrong === 0 ? 'right' : wrong === 1 ? 'oneFix' : 'wrong'] += 1;
   times.push(r.stats.ms);
   if (wrong === 0) tally.right += 1;
@@ -290,6 +298,11 @@ console.log(`\n  READER HIT RATE on ${total} requests: fully right ${tally.right
 console.log(`  of which the ${fresh.right + fresh.oneFix + fresh.wrong} FRESH requests: fully right ${fresh.right}, one correction ${fresh.oneFix}, wrong ${fresh.wrong}.`);
 for (const m of missesAll) console.log(`    ${m}`);
 ok(total >= 40, `at least 40 requests (${total})`);
+ok(org33.length === 0, 'spec §33: "org unit", "section" and "machine" read as an org unit of that kind — every one fully right', org33.join(' | '));
+{
+  const withKind = recs.departments.find((d) => d.label);
+  ok(withKind && labelOf('department', withKind, recs) === `${withKind.name} (${withKind.label})`, 'spec §33: an org unit in a drop-down shows its kind, "Name (Kind)" — Department too', withKind ? labelOf('department', withKind, recs) : 'none');
+}
 ok(tally.right / total >= FULLY_RIGHT_FLOOR, `fully right at least ${FULLY_RIGHT_FLOOR * 100}%`, `${tally.right}/${total}`);
 {
   const r = await readCommand('please sort out the canteen menu for next week', recs);
@@ -319,14 +332,14 @@ section('[2] Check: rights, scope and the trial run');
   ok(sRecs.employees.length < recs.employees.length, `a department-scoped login is offered only its own people (${sRecs.employees.length} of ${recs.employees.length})`);
   const outside = (await readCommand('add a position Helper in Accounts', sRecs)).plan.steps;
   const c3 = await checkPlan(pool, scoped, outside, { tryRun: false });
-  ok(c3.steps[0].problems.some((p) => /outside your department/.test(p)), 'scoped: a position in another department is a problem');
+  ok(c3.steps[0].problems.some((p) => /outside your org unit/.test(p)), 'scoped: a position in another department is a problem');
   const inside = (await readCommand('add a position Helper in Slitting', sRecs)).plan.steps;
   const c4 = await checkPlan(pool, scoped, inside, { tryRun: false });
   ok(c4.clean, 'scoped: inside its own departments is fine', JSON.stringify(c4.steps[0].problems));
   const c5 = await checkPlan(pool, scoped, (await readCommand(`add a role ${TAG} X`, sRecs)).plan.steps, { tryRun: false });
   ok(c5.steps[0].problems.some((p) => /whole company/.test(p)), 'scoped: a role is company-wide, so it is a problem');
   const c6 = await checkPlan(pool, scoped, (await readCommand(`add a section ${TAG} S under Accounts`, sRecs)).plan.steps, { tryRun: false });
-  ok(c6.steps[0].problems.some((p) => /outside your department/.test(p)), 'scoped: a section under another department is a problem');
+  ok(c6.steps[0].problems.some((p) => /outside your org unit/.test(p)), 'scoped: a section under another department is a problem');
 
   // The trial run finds what only the service knows: the same KRA twice on a new role.
   const dup = (await readCommand(`add a role ${TAG} Twin; add a KRA Output to ${TAG} Twin; add a KRA Output to ${TAG} Twin`, recs)).plan.steps;

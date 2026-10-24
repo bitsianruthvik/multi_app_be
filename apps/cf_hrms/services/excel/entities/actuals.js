@@ -93,7 +93,7 @@ export default {
   columns: () => [
     { key: 'person', header: 'Person', kind: 'info', width: 28, meaning: 'Employee code and name.' },
     { key: 'position', header: 'Position', kind: 'info', width: 26, meaning: 'The position the plan was made for.' },
-    { key: 'department', header: 'Department', kind: 'info', width: 22, meaning: 'Its department.' },
+    { key: 'department', header: 'Org unit', aliases: ['Department'], kind: 'info', width: 22, meaning: 'Its org unit.' },
     { key: 'kra', header: 'KRA', kind: 'info', width: 24, meaning: 'The KRA heading the KPI is under (blank: under no KRA).' },
     { key: 'kpi', header: 'KPI', kind: 'info', width: 36, meaning: 'What is measured.' },
     { key: 'unit', header: 'Unit', kind: 'info', width: 10, meaning: 'The unit of the value.' },

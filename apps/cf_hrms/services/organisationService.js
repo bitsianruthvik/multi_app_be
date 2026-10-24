@@ -183,11 +183,14 @@ async function assertNameFree(db, table, companyId, name, excludeId, label, why)
  * edited before this service existed), an unguarded walk never returns and the
  * request hangs instead of failing.
  */
+/** "A location" / "An org unit". */
+const aOf = (label) => `${/^[aeiou]/i.test(label) ? "An" : "A"} ${label.toLowerCase()}`;
+
 async function assertNoCycle(db, table, parentCol, companyId, id, parentId, label) {
   if (!parentId) return;
   if (id && parentId === id) {
-    throw invalid('CYCLE', `A ${label.toLowerCase()} cannot be its own parent.`, {
-      problems: [`A ${label.toLowerCase()} cannot be its own parent.`],
+    throw invalid('CYCLE', `${aOf(label)} cannot be its own parent.`, {
+      problems: [`${aOf(label)} cannot be its own parent.`],
     });
   }
   let cursor = parentId;
@@ -229,7 +232,7 @@ async function assertNoLiveChildren(db, table, parentCol, companyId, id, label) 
   const rest = kids.length - named.length;
   const list = named.join(', ') + (rest > 0 ? ` and ${rest} more` : '');
   throw conflict('HAS_CHILDREN', `${label} still has ${kids.length} ${kids.length === 1 ? 'child' : 'children'}: ${list}.`, {
-    problems: [`Move or delete ${list} first — deleting this row would leave ${kids.length === 1 ? 'it' : 'them'} pointing at a ${label.toLowerCase()} nobody can see.`],
+    problems: [`Move or delete ${list} first — deleting this row would leave ${kids.length === 1 ? 'it' : 'them'} pointing at ${aOf(label).toLowerCase()} nobody can see.`],
   });
 }
 
@@ -448,14 +451,14 @@ export async function listDepartments(db, companyId) {
 async function writeServes(db, c, departmentId, isShared, wanted) {
   const ids = [...new Set((wanted ?? []).map((v) => Number(v)))];
   if (ids.some((v) => !Number.isInteger(v) || v <= 0)) {
-    throw invalid('VALIDATION', 'Serves: every entry must be a department.', { problems: ['Serves: every entry must be a department id.'] });
+    throw invalid('VALIDATION', 'Serves: every entry must be an org unit.', { problems: ['Serves: every entry must be an org unit id.'] });
   }
   if (ids.includes(departmentId)) {
-    throw invalid('VALIDATION', 'A department cannot serve itself.', { problems: ['A department cannot serve itself. List the OTHER departments this one works for.'] });
+    throw invalid('VALIDATION', 'An org unit cannot serve itself.', { problems: ['An org unit cannot serve itself. List the OTHER org units this one works for.'] });
   }
   if (ids.length && !isShared) {
-    throw invalid('VALIDATION', 'Only a shared department serves other departments.', {
-      problems: ['Only a shared department serves other departments. Mark this one as shared first, or clear the list.'],
+    throw invalid('VALIDATION', 'Only a shared org unit serves other org units.', {
+      problems: ['Only a shared org unit serves other org units. Mark this one as shared first, or clear the list.'],
     });
   }
   if (ids.length) {
@@ -466,8 +469,8 @@ async function writeServes(db, c, departmentId, isShared, wanted) {
     const have = new Set(found.map((r) => r.id));
     const missing = ids.filter((v) => !have.has(v));
     if (missing.length) {
-      throw invalid('BAD_REFERENCE', 'A department this one is said to serve does not exist.', {
-        problems: [`${missing.length === 1 ? 'A department' : `${missing.length} departments`} in the serves list ${missing.length === 1 ? 'does' : 'do'} not exist in this company.`],
+      throw invalid('BAD_REFERENCE', 'An org unit this one is said to serve does not exist.', {
+        problems: [`${missing.length === 1 ? 'An org unit' : `${missing.length} org units`} in the serves list ${missing.length === 1 ? 'does' : 'do'} not exist in this company.`],
       });
     }
   }
@@ -511,7 +514,7 @@ function departmentFields(input, problems, { partial = false } = {}) {
 
 function servesInput(input, problems) {
   if (input.serves === undefined) return undefined;
-  if (!Array.isArray(input.serves)) { problems.push('Serves must be a list of departments.'); return undefined; }
+  if (!Array.isArray(input.serves)) { problems.push('Serves must be a list of org units.'); return undefined; }
   return input.serves;
 }
 
@@ -549,13 +552,13 @@ async function departmentLabelOf(db, c, input, { creating, options }) {
 export async function createDepartment(db, c, input = {}, options = {}) {
   const problems = [];
   const fields = departmentFields(input, problems);
-  const parentId = idOrNull(input.parentId, 'Parent department', problems);
+  const parentId = idOrNull(input.parentId, 'Parent org unit', problems);
   const serves = servesInput(input, problems);
   assertNoProblems(problems);
   // The label must be one of the company's list; a department created with none takes the first.
   const label = await departmentLabelOf(db, c, input, { creating: true, options });
   fields.department_type = label.name;
-  await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, null, parentId, 'Department');
+  await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, null, parentId, 'Org unit');
   fields.code = (await acceptImportedCode(db, c.companyId, DEPARTMENT_ENTITY, options.importedCode))
     ?? await issueDepartmentCode(db, c.companyId, { name: fields.name, type: fields.department_type, parentId, userId: c.userId });
   const id = await insertRow(db, 'hrms_departments', c.companyId, c.userId, {
@@ -572,7 +575,7 @@ export async function createDepartment(db, c, input = {}, options = {}) {
 }
 
 export async function updateDepartment(db, c, id, input = {}, options = {}) {
-  const before = await requireRow(db, 'hrms_departments', c.companyId, id, 'Department');
+  const before = await requireRow(db, 'hrms_departments', c.companyId, id, 'Org unit');
   const problems = [];
   const fields = departmentFields(input, problems, { partial: true });
   assertNoProblems(problems);
@@ -582,9 +585,9 @@ export async function updateDepartment(db, c, id, input = {}, options = {}) {
     await linkDepartmentLabel(db, c, id, { groupId: label.group_id, labelId: label.id });
   }
   if (input.parentId !== undefined) {
-    const parentId = idOrNull(input.parentId, 'Parent department', problems);
+    const parentId = idOrNull(input.parentId, 'Parent org unit', problems);
     assertNoProblems(problems);
-    await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, id, parentId, 'Department');
+    await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, id, parentId, 'Org unit');
     fields.parent_department_id = parentId;
   }
   const serves = servesInput(input, problems);
@@ -603,11 +606,11 @@ export async function updateDepartment(db, c, id, input = {}, options = {}) {
 }
 
 export async function deleteDepartment(db, c, id) {
-  const before = await requireRow(db, 'hrms_departments', c.companyId, id, 'Department');
-  await assertNoLiveChildren(db, 'hrms_departments', 'parent_department_id', c.companyId, id, 'Department');
+  const before = await requireRow(db, 'hrms_departments', c.companyId, id, 'Org unit');
+  await assertNoLiveChildren(db, 'hrms_departments', 'parent_department_id', c.companyId, id, 'Org unit');
   await assertNotReferenced(db, c.companyId, id, [
     { table: 'hrms_work_contexts', column: 'department_id', label: 'work context' },
-    { table: 'hrms_department_serves', column: 'serves_department_id', label: 'shared department that serves it', plural: 'shared departments that serve it' },
+    { table: 'hrms_department_serves', column: 'serves_department_id', label: 'shared org unit that serves it', plural: 'shared org units that serve it' },
     { table: 'hrms_roles', column: 'default_department_id', label: 'role' },
     { table: 'hrms_positions', column: 'department_id', label: 'position' },
     { table: 'hrms_work_assignments', column: 'department_id', label: 'work assignment' },
@@ -625,7 +628,7 @@ async function getDepartment(db, companyId, id) {
     `SELECT d.*, ${DEPARTMENT_LABEL_ID_SQL('d')} AS label_id FROM hrms_departments d WHERE d.company_id = ? AND d.id = ? AND d.deleted_at IS NULL`,
     [companyId, id],
   );
-  if (!row) throw notFound('Department');
+  if (!row) throw notFound('Org unit');
   const serves = await servesByDepartment(db, companyId, id);
   return mapDepartment(row, serves.get(id) ?? []);
 }
@@ -790,7 +793,7 @@ export async function createWorkContext(db, c, input = {}) {
   const fields = contextFields(input, problems);
   const parentId = idOrNull(input.parentId, 'Parent context', problems);
   const locationId = idOrNull(input.locationId, 'Location', problems);
-  const departmentId = idOrNull(input.departmentId, 'Department', problems);
+  const departmentId = idOrNull(input.departmentId, 'Org unit', problems);
   assertNoProblems(problems);
   await assertCodeFree(db, 'hrms_work_contexts', c.companyId, fields.code, null, 'Work context');
   // uq_hwct_name exists so the org-chart import collapses the same machine
@@ -830,7 +833,7 @@ export async function updateWorkContext(db, c, id, input = {}) {
     assertNoProblems(problems);
   }
   if (input.departmentId !== undefined) {
-    fields.department_id = idOrNull(input.departmentId, 'Department', problems);
+    fields.department_id = idOrNull(input.departmentId, 'Org unit', problems);
     assertNoProblems(problems);
   }
   await updateRow(db, 'hrms_work_contexts', c.companyId, id, fields);
@@ -921,7 +924,7 @@ export async function createContractor(db, c, input = {}) {
   assertNoProblems(problems);
   await assertCodeFree(db, 'hrms_contractors', c.companyId, fields.code, null, 'Contractor');
   await assertNameFree(db, 'hrms_contractors', c.companyId, fields.name, null, 'Contractor',
-    'One row per employer — the same agency supplying two departments is still one contractor.');
+    'One row per employer — the same agency supplying two org units is still one contractor.');
   const id = await insertRow(db, 'hrms_contractors', c.companyId, c.userId, { ...fields, status: fields.status ?? 'ACTIVE' });
   await audit(db, c, 'hrms_contractors', id, 'CREATE', null, fields);
   return getContractor(db, c.companyId, id);
@@ -935,7 +938,7 @@ export async function updateContractor(db, c, id, input = {}) {
   if (fields.code !== undefined) await assertCodeFree(db, 'hrms_contractors', c.companyId, fields.code, id, 'Contractor');
   if (fields.name !== undefined) {
     await assertNameFree(db, 'hrms_contractors', c.companyId, fields.name, id, 'Contractor',
-      'One row per employer — the same agency supplying two departments is still one contractor.');
+      'One row per employer — the same agency supplying two org units is still one contractor.');
   }
   await updateRow(db, 'hrms_contractors', c.companyId, id, fields);
   await audit(db, c, 'hrms_contractors', id, 'UPDATE', mapContractor(before), fields);

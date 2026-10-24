@@ -26,7 +26,7 @@ const INFO_KEY = 'departmentLabel';
 
 /** The info column "Label" (positions, employees). Ignored on upload. */
 export function labelInfoColumn(model) {
-  return { key: INFO_KEY, header: 'Label', kind: 'info', width: 16, meaning: 'The label of its department.', example: model.labels[0]?.name ?? '' };
+  return { key: INFO_KEY, header: 'Org unit kind', aliases: ['Label'], kind: 'info', width: 16, meaning: 'The kind of its org unit (Department, Section, Machine …).', example: model.labels[0]?.name ?? '' };
 }
 
 /** The info column's cell for a department. */

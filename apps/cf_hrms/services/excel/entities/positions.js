@@ -1,5 +1,5 @@
 /**
- * Positions in Excel. Code (issued) · Role★ · Department★ · Shift · Location · Reports to · Status · Person (info).
+ * Positions in Excel. Code (issued) · Role★ · Org unit★ (header "Department" before §33) · Shift · Location · Reports to · Status · Person (info).
  * A NEW row with the Shift left blank starts on its department's label default, else General
  * (spec §17.2, services/newPositionShift.js — worked out in memory, no query per row); an existing
  * row cannot be left without a shift.
@@ -59,7 +59,7 @@ export default {
       labelState(db, c.companyId),
     ]);
     const lists = {
-      roles: coded('Roles', roles), departments: coded('Departments', departments), shifts: coded('Shifts', shifts), locations: coded('Locations', locations),
+      roles: coded('Roles', roles), departments: coded('Org units', departments), shifts: coded('Shifts', shifts), locations: coded('Locations', locations),
       positions: coded('Positions', rows.map((p) => ({ id: p.id, code: p.position_code, name: p.role_title ?? '' }))), status: words('Status', STATUSES),
     };
     const manager = new Map();
@@ -82,8 +82,8 @@ export default {
   columns: (state) => [
     { key: 'code', header: 'Code', kind: 'issued', width: 14, meaning: 'The position’s code.', example: 'P021-2' },
     { key: 'role', header: 'Role', kind: 'list', list: 'roles', required: true, width: 36, meaning: 'The job this position is for.', example: 'R014 — Shift In-charge' },
-    { key: 'department', header: 'Department', kind: 'list', list: 'departments', required: true, width: 34, meaning: 'Where the position sits.', example: 'D004 — Production' },
-    { key: 'shift', header: 'Shift', kind: 'list', list: 'shifts', width: 18, meaning: 'The one shift this position works. Blank on a new row: the shift its department’s label starts new positions on, else the General shift.', example: 'D — Day' },
+    { key: 'department', header: 'Org unit', aliases: ['Department'], kind: 'list', list: 'departments', required: true, width: 34, meaning: 'The org unit the position sits in.', example: 'D004 — Production' },
+    { key: 'shift', header: 'Shift', kind: 'list', list: 'shifts', width: 18, meaning: 'The one shift this position works. Blank on a new row: the shift its org unit’s kind starts new positions on, else the General shift.', example: 'D — Day' },
     { key: 'location', header: 'Location', kind: 'list', list: 'locations', width: 22, meaning: 'Where it is based, if the company has more than one place.', example: 'L01 — Unit 2' },
     { key: 'reportsTo', header: 'Reports to', kind: 'list', list: 'positions', width: 34, meaning: 'The position this one reports to. Blank = the top of the chart.', example: 'P004 — Plant Head' },
     { key: 'status', header: 'Status', kind: 'list', list: 'status', width: 12, meaning: 'DRAFT, ACTIVE or FROZEN (kept, not to be filled).', example: 'ACTIVE' },
@@ -104,7 +104,7 @@ export default {
       if (!choice.shift) row.problems.push('Shift: this company has no shift yet. Add one under Shifts first.');
       else {
         row.entries.shift = { id: choice.shift.id };
-        const why = choice.from === 'LABEL' ? `from the label ${choice.label.name}` : 'the company’s general shift';
+        const why = choice.from === 'LABEL' ? `from the kind ${choice.label.name}` : 'the company’s general shift';
         row.values.shift = `${textOf(state.lists.shifts, choice.shift.id) ?? choice.shift.name} (${why})`;
       }
     }
@@ -114,7 +114,7 @@ export default {
     if (row.managerId != null && state.primaryTypeId == null) row.problems.push('Reports to: this company has no “primary manager” reporting type. Add it under Reporting types first.');
     const departmentId = row.entries.department?.id ?? null;
     if (!env.scope.all && departmentId != null && !inScope(env, departmentId)) {
-      row.problems.push('Department: choose a department inside your own. Your access covers your own department and the ones below it.');
+      row.problems.push('Org unit: choose an org unit inside your own. Your access covers your org unit and everything under it.');
     }
   },
 

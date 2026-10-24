@@ -41,7 +41,7 @@ const refOf = (s) => ({ id: s.id, code: s.code ?? null, name: s.name });
  * @param likeShiftId  add-sibling only: the shift of the position it is added beside
  * @returns { shift: { id, code, name } | null, from: 'LABEL' | 'LIKE' | 'GENERAL' | null,
  *            label: { id, name } | null,
- *            line: "Starts on Day shift (from the label Machine)" }
+ *            line: "Starts on Day shift (from the kind Machine)" }
  */
 export function chooseNewShift({ label = null, shifts = [], likeShiftId = null } = {}) {
   const byId = new Map(shifts.map((s) => [Number(s.id), s]));
@@ -49,7 +49,7 @@ export function chooseNewShift({ label = null, shifts = [], likeShiftId = null }
   if (LIVE(own)) {
     return {
       shift: refOf(own), from: 'LABEL', label: { id: label.id, name: label.name },
-      line: `Starts on ${shiftWords(own.name)} (from the label ${label.name})`,
+      line: `Starts on ${shiftWords(own.name)} (from the kind ${label.name})`,
     };
   }
   const like = likeShiftId != null ? byId.get(Number(likeShiftId)) : null;

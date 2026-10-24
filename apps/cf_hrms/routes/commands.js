@@ -28,7 +28,7 @@ import { loadRecords, labelOf } from '../services/commands/records.js';
 
 const router = Router();
 const ANY_ACTION = [PERM.org.edit, PERM.roles.edit, PERM.positions.edit];
-const NOTE = 'each step also needs its own action\'s right (org edit / roles edit / positions edit) and the login\'s department scope — checked per step';
+const NOTE = 'each step also needs its own action\'s right (org edit / roles edit / positions edit) and the login\'s org unit scope — checked per step';
 const actor = (req) => actorOf(req, { can, scopeOf, ctx });
 
 router.get('/commands/actions', guard(ANY_ACTION, { note: NOTE }), handle(() => ({ actions: catalogue() })));

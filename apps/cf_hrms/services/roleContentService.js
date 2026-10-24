@@ -558,7 +558,7 @@ function roleFields(input, problems, { creating }) {
   if (creating || input.rolePurpose !== undefined) out.role_purpose = str(input.rolePurpose, 4000, problems, 'Purpose');
   if (creating || input.roleSummary !== undefined) out.role_summary = str(input.roleSummary, 4000, problems, 'Summary');
   if (creating || input.defaultDepartmentId !== undefined) {
-    out.default_department_id = input.defaultDepartmentId ? intValue(input.defaultDepartmentId, problems, 'Department') : null;
+    out.default_department_id = input.defaultDepartmentId ? intValue(input.defaultDepartmentId, problems, 'Org unit') : null;
   }
   if (creating || input.status !== undefined) out.status = enumValue(input.status ?? 'DRAFT', ROLE_STATUSES, problems, 'Status', { required: true });
   if (creating || input.effectiveFrom !== undefined) out.effective_from = dateValue(input.effectiveFrom, problems, 'Effective from');
@@ -593,7 +593,7 @@ export async function assertTitleFree(db, companyId, title, exceptId = null) {
 async function assertDepartment(db, companyId, departmentId) {
   if (!departmentId) return;
   const [[dept]] = await db.query('SELECT id FROM hrms_departments WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, departmentId]);
-  if (!dept) throw invalid('BAD_REFERENCE', 'That department does not exist in this company.');
+  if (!dept) throw invalid('BAD_REFERENCE', 'That org unit does not exist in this company.');
 }
 
 /**

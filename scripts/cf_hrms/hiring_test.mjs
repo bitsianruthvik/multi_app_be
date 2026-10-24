@@ -1417,7 +1417,7 @@ section('[8] Permissions and the two Code formats screens, over HTTP');
       const by = Object.fromEntries((entities.json ?? []).map((e) => [e.entityType, e]));
       const keys = (e) => e.tokens.map((t) => t.key).join(' ');
       const tests = (e) => e.conditionTokens.map((t) => `${t.key}:${t.operators.join('/')}:${t.valueKind}`).join(' ');
-      ok(JSON.stringify(entities.json.map((e) => e.label)) === JSON.stringify(['Departments', 'Roles', 'Positions', 'Locations', 'Employees', 'Letters (reference numbers)'])
+      ok(JSON.stringify(entities.json.map((e) => e.label)) === JSON.stringify(['Org units', 'Roles', 'Positions', 'Locations', 'Employees', 'Letters (reference numbers)'])
         && keys(by.hrms_department) === 'label label.initial name.initials name parent.code' && tests(by.hrms_department) === 'label:eq/in:departmentLabel'
         && keys(by.hrms_role) === 'title.initials title department.code' && tests(by.hrms_role) === ''
         && keys(by.hrms_position) === 'role.code department.code shift.code location.code card.code' && tests(by.hrms_position) === 'department:under/eq/in:department role:eq/in:role'

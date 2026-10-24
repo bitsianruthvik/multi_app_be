@@ -101,14 +101,14 @@ export async function scopeOf(req, db = pool) {
   return scope;
 }
 
-const outOfScope = (what) => new HrmsError(403, 'OUT_OF_SCOPE', `${what} is outside your department. Your access covers your own department and the ones below it.`);
+const outOfScope = (what) => new HrmsError(403, 'OUT_OF_SCOPE', `${what} is outside your org unit. Your access covers your org unit and everything under it.`);
 const inside = (scope, departmentId) => departmentId != null && scope.departmentIds.has(Number(departmentId));
 const companyOf = (req) => Number(req.user?.companyId ?? req.user?.company_id);
 const asId = (v) => { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : null; };
 
 /* ── departments ─────────────────────────────────────────────────────────── */
 
-export async function assertDepartmentInScope(req, departmentId, what = 'That department') {
+export async function assertDepartmentInScope(req, departmentId, what = 'That org unit') {
   const scope = await scopeOf(req);
   if (scope.all) return;
   if (!inside(scope, departmentId)) throw outOfScope(what);
@@ -122,14 +122,14 @@ export async function assertDepartmentWrite(req, departmentId, body = {}) {
   const scope = await scopeOf(req);
   if (scope.all) return;
   if (departmentId != null) {
-    if (!inside(scope, departmentId)) throw outOfScope('That department');
+    if (!inside(scope, departmentId)) throw outOfScope('That org unit');
     if (scope.rootIds.includes(Number(departmentId))) {
-      throw new HrmsError(403, 'OUT_OF_SCOPE', 'This is your own department. Changing it, moving it or removing it needs somebody whose access covers the whole company.');
+      throw new HrmsError(403, 'OUT_OF_SCOPE', 'This is your own org unit. Changing it, moving it or removing it needs somebody whose access covers the whole company.');
     }
   }
   const parentGiven = Object.prototype.hasOwnProperty.call(body ?? {}, 'parentId');
   if (departmentId == null || parentGiven) {
-    if (!inside(scope, asId(body?.parentId))) throw outOfScope('The department this would sit under');
+    if (!inside(scope, asId(body?.parentId))) throw outOfScope('The org unit this would sit under');
   }
 }
 
@@ -175,7 +175,7 @@ export async function assertPositionBody(req, body = {}, { creating = false } = 
   const given = Object.prototype.hasOwnProperty.call(body ?? {}, 'departmentId');
   if (!creating && !given) return;
   if (!inside(scope, asId(body?.departmentId))) {
-    throw new HrmsError(403, 'OUT_OF_SCOPE', 'Choose a department inside your own. Your access covers your own department and the ones below it.');
+    throw new HrmsError(403, 'OUT_OF_SCOPE', 'Choose an org unit inside your own. Your access covers your org unit and everything under it.');
   }
 }
 

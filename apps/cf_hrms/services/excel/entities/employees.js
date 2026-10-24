@@ -143,10 +143,10 @@ export default {
       else if (entry.row.status === 'CLOSED') row.problems.push(`Position: ${entry.key} is closed. Reopen it on the Positions screen, or choose another.`);
       else if (state.hiring.has(entry.id)) row.problems.push(`Position: a hiring is open for ${entry.key}. Finish or close the hiring, or choose another position.`);
       else if (state.held.has(entry.id)) row.problems.push(`Position: ${entry.key} is not vacant — somebody is in it, or is due to join it. A position is for one person.`);
-      else if (!inScope(env, entry.row.department_id)) row.problems.push(`Position: ${entry.key} is outside your department. Your access covers your own department and the ones below it.`);
+      else if (!inScope(env, entry.row.department_id)) row.problems.push(`Position: ${entry.key} is outside your org unit. Your access covers your org unit and everything under it.`);
       else { row.position = entry; row.values.position = entry.text; }
     } else if (!env.scope.all) {
-      row.problems.push('Position: a new person is added to a position inside your department. Choose a vacant one.');
+      row.problems.push('Position: a new person is added to a position inside your org unit. Choose a vacant one.');
     }
   },
 

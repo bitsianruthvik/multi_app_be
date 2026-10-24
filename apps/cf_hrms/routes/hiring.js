@@ -70,12 +70,12 @@ const reqId = (req) => req.id ?? req.headers['x-request-id'] ?? null;
 // ── settings, templates, placeholders ───────────────────────────────────────
 
 router.get('/hiring/settings', guard([PERM.hiring.view, PERM.setup.view]), handle((req) => getSettings(pool, ctx(req).companyId)));
-router.put('/hiring/settings', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => (
+router.put('/hiring/settings', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => (
   tx(req, (db, c) => updateSettings(db, c, req.body ?? {}, reqId(req)))
 )));
 
 router.get('/hiring/templates', guard([PERM.hiring.view, PERM.setup.view]), handle((req) => listTemplates(pool, ctx(req).companyId)));
-router.put('/hiring/templates/:kind', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => (
+router.put('/hiring/templates/:kind', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => (
   tx(req, (db, c) => putTemplate(db, c, req.params.kind, req.body ?? {}, reqId(req)))
 )));
 router.get('/hiring/templates/:kind/file', guard([PERM.hiring.view, PERM.setup.view], { also: [PERM.payView] }), handle((req) => readTemplateFile(pool, ctx(req).companyId, req.params.kind)));

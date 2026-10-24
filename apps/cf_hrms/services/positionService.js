@@ -460,8 +460,8 @@ export async function suggestNewShift(db, companyId, query = {}) {
     if (departmentId === null) departmentId = like.department_id;
   }
   const problems = [];
-  if (departmentId !== null) await exists(db, companyId, 'hrms_departments', departmentId, 'department', problems);
-  if (problems.length) throw notFound('That department');
+  if (departmentId !== null) await exists(db, companyId, 'hrms_departments', departmentId, 'org unit', problems);
+  if (problems.length) throw notFound('That org unit');
   return { suggestion: await newPositionShift(db, companyId, { departmentId, likeShiftId }) };
 }
 
@@ -481,7 +481,7 @@ async function readPositionBody(db, companyId, body, { partial = false, current 
   if (!partial || has('positionTitle')) out.position_title = readText(body.positionTitle, 'Position title', 200, problems);
 
   for (const [key, col, table, label] of [
-    ['departmentId', 'department_id', 'hrms_departments', 'department'],
+    ['departmentId', 'department_id', 'hrms_departments', 'org unit'],
     ['locationId', 'location_id', 'hrms_locations', 'location'],
     ['defaultShiftId', 'default_shift_id', 'hrms_shifts', 'shift'],
   ]) {

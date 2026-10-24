@@ -94,12 +94,12 @@ const listOf = (cond) => (cond.operator === 'in' ? cond.value.split(',').map((s)
 
 const EMPLOYEE_TOKENS = [
   {
-    key: 'department.code', label: 'Department code', available: true,
-    phrase: 'the department code', example: 'QC', help: 'The code of the department the person joins. Empty when the employee is created without a position.',
+    key: 'department.code', label: 'Org unit code', available: true,
+    phrase: 'the org unit code', example: 'QC', help: 'The code of the org unit the person joins. Empty when the employee is created without a position.',
   },
   {
-    key: 'department.name', label: 'Department name', available: true,
-    phrase: 'the department name', example: 'Quality', help: 'The name of the department the person joins. Long for a code — give it a length limit.',
+    key: 'department.name', label: 'Org unit name', available: true,
+    phrase: 'the org unit name', example: 'Quality', help: 'The name of the org unit the person joins. Long for a code — give it a length limit.',
   },
   {
     key: 'location.code', label: 'Location code', available: true,
@@ -141,9 +141,9 @@ const EMPLOYEE_TOKENS = [
 
 const EMPLOYEE_CONDITIONS = [
   {
-    key: 'department', label: 'Department', operators: ['under', 'eq', 'in'], valueKind: 'department',
-    phrase: 'the department',
-    help: '“Is under” holds for the department you choose and every department below it, and scores more the deeper that department is: a top department 1, one below it 2. “Is” names exact departments and scores more than any “is under”.',
+    key: 'department', label: 'Org unit', operators: ['under', 'eq', 'in'], valueKind: 'department',
+    phrase: 'the org unit',
+    help: '“Is under” holds for the org unit you choose and every org unit below it, and scores more the deeper that org unit is: a top org unit 1, one below it 2. “Is” names exact org units and scores more than any “is under”.',
   },
   {
     key: 'location', label: 'Location', operators: ['eq', 'in'], valueKind: 'location',
@@ -222,7 +222,7 @@ const employeeProvider = {
     }
     if (!values.length || values.some((v) => !/^\d+$/.test(v))) return 'Choose from the list.';
     if (cond.token_key === 'department') {
-      return (await idsExist(db, companyId, 'hrms_departments', values.map(Number))) ? null : 'That department does not exist.';
+      return (await idsExist(db, companyId, 'hrms_departments', values.map(Number))) ? null : 'That org unit does not exist.';
     }
     if (cond.token_key === 'location') {
       return (await idsExist(db, companyId, 'hrms_locations', values.map(Number))) ? null : 'That location does not exist.';
@@ -278,8 +278,8 @@ const HIRING_TOKENS = [
     phrase: 'the month', example: '08', help: 'The month of the letter date, as two digits.',
   },
   {
-    key: 'department.code', label: 'Department code', available: true,
-    phrase: 'the department code', example: 'QC', help: 'The code of the department of the position being filled.',
+    key: 'department.code', label: 'Org unit code', available: true,
+    phrase: 'the org unit code', example: 'QC', help: 'The code of the org unit of the position being filled.',
   },
   {
     key: 'location.code', label: 'Location code', available: true,

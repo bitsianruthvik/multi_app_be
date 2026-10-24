@@ -22,7 +22,7 @@ export const words = (s) => norm(s).split(' ').filter(Boolean);
 const FILLER = new Set([
   'the', 'a', 'an', 'our', 'my', 'this', 'that', 'new', 'existing', 'current', 'of', 'and',
   'role', 'roles', 'position', 'positions', 'post', 'seat', 'chair', 'vacancy', 'opening',
-  'department', 'dept', 'section', 'unit', 'team', 'machine',
+  'department', 'dept', 'section', 'unit', 'units', 'org', 'team', 'machine',
   'shift', 'person', 'employee', 'staff', 'mr', 'mrs', 'ms', 'miss', 'shri', 'smt', 'called', 'named',
 ]);
 export const keyWords = (s, keep = new Set()) => words(s).filter((w) => keep.has(w) || !FILLER.has(w));

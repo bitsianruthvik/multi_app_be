@@ -118,60 +118,60 @@ router.delete('/organisation/departments/:id', guard(PERM.org.remove), departmen
 //          defaultShiftId = "New positions start on" (spec §17.2): a shift id, or null for none
 //   DELETE /organisation/department-labels/:id        ?moveTo=<labelId>      -> { ok, id, departmentsMoved }
 router.get('/organisation/department-labels', guard([PERM.org.view, PERM.positions.view]), handle((req) => listLabels(pool, ctx(req).companyId)));
-router.post('/organisation/department-labels', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createLabel(db, c, req.body ?? {}))));
+router.post('/organisation/department-labels', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createLabel(db, c, req.body ?? {}))));
 // Before /:id, or "order" would be read as an id.
-router.put('/organisation/department-labels/order', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => reorderLabels(db, c, req.body ?? {}))));
-router.put('/organisation/department-labels/:id', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateLabel(db, c, intParam(req.params.id), req.body ?? {}))));
-router.delete('/organisation/department-labels/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteLabel(db, c, intParam(req.params.id), { moveTo: req.query.moveTo ?? null }))));
+router.put('/organisation/department-labels/order', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => reorderLabels(db, c, req.body ?? {}))));
+router.put('/organisation/department-labels/:id', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateLabel(db, c, intParam(req.params.id), req.body ?? {}))));
+router.delete('/organisation/department-labels/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteLabel(db, c, intParam(req.params.id), { moveTo: req.query.moveTo ?? null }))));
 
 // ----- locations ------------------------------------------------------------
 router.get('/organisation/locations', guard([PERM.org.view, PERM.positions.view]), listed('locations'), handle((req) => listLocations(pool, ctx(req).companyId)));
-router.post('/organisation/locations', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createLocation(db, c, req.body))));
-router.put('/organisation/locations/:id', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateLocation(db, c, intParam(req.params.id), req.body))));
-router.delete('/organisation/locations/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteLocation(db, c, intParam(req.params.id)))));
+router.post('/organisation/locations', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createLocation(db, c, req.body))));
+router.put('/organisation/locations/:id', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateLocation(db, c, intParam(req.params.id), req.body))));
+router.delete('/organisation/locations/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteLocation(db, c, intParam(req.params.id)))));
 
 // ----- work contexts --------------------------------------------------------
 // A work context is NEVER a manager (plan §2 rule 3). Nothing here can make one:
 // both reporting tables key on positions and employees, and no route in this
 // file writes to either.
 router.get('/organisation/work-contexts', guard([PERM.org.view, PERM.positions.view]), handle((req) => listWorkContexts(pool, ctx(req).companyId)));
-router.post('/organisation/work-contexts', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createWorkContext(db, c, req.body))));
-router.put('/organisation/work-contexts/:id', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateWorkContext(db, c, intParam(req.params.id), req.body))));
-router.delete('/organisation/work-contexts/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteWorkContext(db, c, intParam(req.params.id)))));
+router.post('/organisation/work-contexts', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createWorkContext(db, c, req.body))));
+router.put('/organisation/work-contexts/:id', guard(PERM.org.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateWorkContext(db, c, intParam(req.params.id), req.body))));
+router.delete('/organisation/work-contexts/:id', guard(PERM.org.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteWorkContext(db, c, intParam(req.params.id)))));
 
 // ----- contractors (people permissions, see the header) ---------------------
 router.get('/organisation/contractors', guard(PERM.employees.view), handle((req) => listContractors(pool, ctx(req).companyId)));
-router.post('/organisation/contractors', guard(PERM.employees.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createContractor(db, c, req.body))));
-router.put('/organisation/contractors/:id', guard(PERM.employees.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateContractor(db, c, intParam(req.params.id), req.body))));
-router.delete('/organisation/contractors/:id', guard(PERM.employees.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteContractor(db, c, intParam(req.params.id)))));
+router.post('/organisation/contractors', guard(PERM.employees.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createContractor(db, c, req.body))));
+router.put('/organisation/contractors/:id', guard(PERM.employees.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateContractor(db, c, intParam(req.params.id), req.body))));
+router.delete('/organisation/contractors/:id', guard(PERM.employees.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteContractor(db, c, intParam(req.params.id)))));
 
 // ----- shifts ---------------------------------------------------------------
 router.get('/organisation/shifts', guard([PERM.time.view, PERM.positions.view]), listed('shifts'), handle((req) => listShifts(pool, ctx(req).companyId)));
 router.get('/organisation/shifts/:id', guard([PERM.time.view, PERM.positions.view]), handle((req) => getShiftDetail(pool, ctx(req).companyId, intParam(req.params.id))));
-router.post('/organisation/shifts', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createShift(db, c, req.body))));
-router.put('/organisation/shifts/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateShift(db, c, intParam(req.params.id), req.body))));
-router.delete('/organisation/shifts/:id', guard(PERM.time.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteShift(db, c, intParam(req.params.id)))));
+router.post('/organisation/shifts', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createShift(db, c, req.body))));
+router.put('/organisation/shifts/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateShift(db, c, intParam(req.params.id), req.body))));
+router.delete('/organisation/shifts/:id', guard(PERM.time.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteShift(db, c, intParam(req.params.id)))));
 
 // ----- holiday calendars ----------------------------------------------------
 // A named list of dated holidays; a shift selects one (spec §6.2).
 router.get('/organisation/holiday-calendars', guard(PERM.time.view), listed('holidayCalendars'), handle((req) => listHolidayCalendars(pool, ctx(req).companyId)));
-router.post('/organisation/holiday-calendars', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createHolidayCalendar(db, c, req.body ?? {}))));
+router.post('/organisation/holiday-calendars', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createHolidayCalendar(db, c, req.body ?? {}))));
 router.get('/organisation/holiday-calendars/:id', guard(PERM.time.view), handle((req) => getHolidayCalendar(pool, ctx(req).companyId, intParam(req.params.id), { year: req.query.year })));
-router.put('/organisation/holiday-calendars/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateHolidayCalendar(db, c, intParam(req.params.id), req.body ?? {}))));
-router.delete('/organisation/holiday-calendars/:id', guard(PERM.time.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteHolidayCalendar(db, c, intParam(req.params.id)))));
-router.post('/organisation/holiday-calendars/:id/holidays', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createCalendarHoliday(db, c, intParam(req.params.id), req.body ?? {}))));
-router.post('/organisation/holiday-calendars/:id/copy-year', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => copyHolidayYear(db, c, intParam(req.params.id), req.body ?? {}))));
+router.put('/organisation/holiday-calendars/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateHolidayCalendar(db, c, intParam(req.params.id), req.body ?? {}))));
+router.delete('/organisation/holiday-calendars/:id', guard(PERM.time.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteHolidayCalendar(db, c, intParam(req.params.id)))));
+router.post('/organisation/holiday-calendars/:id/holidays', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createCalendarHoliday(db, c, intParam(req.params.id), req.body ?? {}))));
+router.post('/organisation/holiday-calendars/:id/copy-year', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => copyHolidayYear(db, c, intParam(req.params.id), req.body ?? {}))));
 
 // ----- holidays -------------------------------------------------------------
 router.get('/organisation/holidays', guard(PERM.time.view), listed('holidays'), handle((req) => listHolidays(pool, ctx(req).companyId, { year: req.query.year })));
-router.post('/organisation/holidays', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createHoliday(db, c, req.body))));
-router.put('/organisation/holidays/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateHoliday(db, c, intParam(req.params.id), req.body))));
-router.delete('/organisation/holidays/:id', guard(PERM.time.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteHoliday(db, c, intParam(req.params.id)))));
+router.post('/organisation/holidays', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createHoliday(db, c, req.body))));
+router.put('/organisation/holidays/:id', guard(PERM.time.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateHoliday(db, c, intParam(req.params.id), req.body))));
+router.delete('/organisation/holidays/:id', guard(PERM.time.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteHoliday(db, c, intParam(req.params.id)))));
 
 // ----- reporting relationship types -----------------------------------------
 router.get('/organisation/reporting-types', guard([PERM.setup.view, PERM.positions.view]), listed('reportingTypes'), handle((req) => listReportingTypes(pool, ctx(req).companyId)));
-router.post('/organisation/reporting-types', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createReportingType(db, c, req.body))));
-router.put('/organisation/reporting-types/:id', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateReportingType(db, c, intParam(req.params.id), req.body))));
-router.delete('/organisation/reporting-types/:id', guard(PERM.setup.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteReportingType(db, c, intParam(req.params.id)))));
+router.post('/organisation/reporting-types', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createReportingType(db, c, req.body))));
+router.put('/organisation/reporting-types/:id', guard(PERM.setup.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateReportingType(db, c, intParam(req.params.id), req.body))));
+router.delete('/organisation/reporting-types/:id', guard(PERM.setup.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteReportingType(db, c, intParam(req.params.id)))));
 
 export default router;

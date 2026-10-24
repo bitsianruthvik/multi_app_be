@@ -53,7 +53,7 @@ export const DEFAULT_RULES = {
     ],
   },
   [DEPARTMENT_ENTITY]: {
-    code: 'HRMS_DEPARTMENT', name: 'Department codes', description: madeOnFirstUse('a department code'),
+    code: 'HRMS_DEPARTMENT', name: 'Org unit codes', description: madeOnFirstUse('an org unit code'),
     segments: literalAndNumber('D', '000'),
   },
   [ROLE_ENTITY]: {
@@ -77,7 +77,7 @@ export const DEFAULT_RULES = {
 export const CODE_HOME = {
   [EMPLOYEE_ENTITY]: { what: 'employee code', table: 'hrms_employees', column: 'employee_code', max: 50 },
   [HIRING_ENTITY]: { what: 'letter reference', table: 'hrms_hirings', column: 'ref_no', max: 100 },
-  [DEPARTMENT_ENTITY]: { what: 'department code', table: 'hrms_departments', column: 'code', max: 50 },
+  [DEPARTMENT_ENTITY]: { what: 'org unit code', table: 'hrms_departments', column: 'code', max: 50 },
   [ROLE_ENTITY]: { what: 'role code', table: 'hrms_roles', column: 'role_code', max: 50 },
   [POSITION_ENTITY]: { what: 'position code', table: 'hrms_positions', column: 'position_code', max: 50 },
   [LOCATION_ENTITY]: { what: 'location code', table: 'hrms_locations', column: 'code', max: 50 },
@@ -129,7 +129,7 @@ async function issue(connection, companyId, entityType, context) {
       throw invalid('NO_CODE_FORMAT', `No code format applies to this ${what}. Check the rules under Code formats.`);
     }
     if (out.text.length > max) {
-      throw invalid('CODE_TOO_LONG', `The code format gives ${out.text}, which is longer than the ${max} characters a ${what} can hold. Shorten the format under Code formats.`);
+      throw invalid('CODE_TOO_LONG', `The code format gives ${out.text}, which is longer than the ${max} characters ${/^[aeiou]/i.test(what) ? 'an' : 'a'} ${what} can hold. Shorten the format under Code formats.`);
     }
     if (!(await isTaken(connection, companyId, entityType, out.text))) return out.text;
     // No running number, or one that did not move the text: trying again gives the same code.

@@ -114,7 +114,7 @@ export async function renderProfileDocx(snapshot) {
     children.push(factTable([
       ['Role', [a.roleCode, a.roleTitle].filter(Boolean).join(' · ')],
       ['Position', a.positionCode ? [a.positionCode, a.positionTitle].filter(Boolean).join(' · ') : 'No position — the work is real without a sanctioned seat'],
-      ['Department', a.departmentName],
+      ['Org unit', a.departmentName],
       ['Location', a.locationName],
       ['Shift', a.shiftCode ? `${a.shiftCode}${a.shiftName ? ` — ${a.shiftName}` : ''}` : null],
       ['Allocation', a.allocationText],
@@ -212,7 +212,7 @@ export async function renderProfilePdf(snapshot) {
     kit.facts([
       ['Role', [a.roleCode, a.roleTitle].filter(Boolean).join(' · ')],
       ['Position', a.positionCode ? [a.positionCode, a.positionTitle].filter(Boolean).join(' · ') : 'No position — the work is real without a sanctioned seat'],
-      ['Department', a.departmentName],
+      ['Org unit', a.departmentName],
       ['Location', a.locationName],
       ['Shift', a.shiftCode ? `${a.shiftCode}${a.shiftName ? ` — ${a.shiftName}` : ''}` : null],
       ['Allocation', a.allocationText],

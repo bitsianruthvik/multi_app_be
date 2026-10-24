@@ -57,12 +57,12 @@ async function envOf(req) {
 router.get('/excel/entities', guard(PERM.signedIn), handle(async (req) => listEntities(await envOf(req))));
 
 for (const def of ENTITIES) {
-  const whole = def.wholeCompany ? [companyWide(`${def.label} belong to the whole company. Your access covers your own department only — you can download this file, not upload it.`)] : [];
+  const whole = def.wholeCompany ? [companyWide(`${def.label} belong to the whole company. Your access covers your org unit and everything under it — you can download this file, not upload it.`)] : [];
   const upload = guard(def.uploadRight, {
     also: [def.viewRight, ...(def.alsoRights ?? [])],
     ...(def.entity === 'employees' ? { note: 'a file with NEW rows also needs cf_hrms_employee_bulk_add; contact columns only with cf_hrms_contact_view' } : {}),
   });
-  const wholeDownload = def.downloadWholeCompany ? [companyWide(`${def.label} belong to the whole company. Your access covers your own department only.`)] : [];
+  const wholeDownload = def.downloadWholeCompany ? [companyWide(`${def.label} belong to the whole company. Your access covers your org unit and everything under it.`)] : [];
   router.get(`/excel/${def.entity}/workbook`, guard(def.viewRight, def.alsoRights ? { also: def.alsoRights } : {}), ...wholeDownload, handle(async (req) => downloadWorkbook(pool, ctx(req), def, await envOf(req))));
   router.post(`/excel/${def.entity}/preview`, upload, ...whole, handle(async (req) => previewUpload(pool, ctx(req), def, req.body ?? {}, await envOf(req))));
   router.post(`/excel/${def.entity}/apply`, upload, ...whole, handle(async (req) => {

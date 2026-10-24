@@ -28,8 +28,11 @@ export const textOf = (step, name) => {
   return v == null ? '' : String(v).trim();
 };
 
+/** "a role" / "an org unit". */
+const aWord = (w) => `${/^[aeiou]/i.test(w) ? 'an' : 'a'} ${w}`;
+
 const KIND_WORD = {
-  department: 'department', role: 'role', position: 'position', employee: 'person', shift: 'shift', label: 'label',
+  department: 'org unit', role: 'role', position: 'position', employee: 'person', shift: 'shift', label: 'kind',
 };
 
 /**
@@ -46,7 +49,7 @@ export function resolve(ctx, step, name, kind, problems, { required = true, word
       return null;
     }
     if (made.kind !== kind) {
-      problems.push(`Choose ${what} — the step it pointed at makes a ${KIND_WORD[made.kind] ?? made.kind}, not a ${KIND_WORD[kind] ?? kind}.`);
+      problems.push(`Choose ${what} — the step it pointed at makes ${aWord(KIND_WORD[made.kind] ?? made.kind)}, not ${aWord(KIND_WORD[kind] ?? kind)}.`);
       return null;
     }
     return { ...made, step: f.ref.id };
@@ -87,14 +90,14 @@ export function needRight(ctx, tag, words, problems) {
   if (!ctx.actor.can(tag)) problems.push(`You do not have the right to ${words}.`);
 }
 
-export const COMPANY_WIDE = 'Roles belong to the whole company. Your access covers your own department only.';
+export const COMPANY_WIDE = 'Roles belong to the whole company. Your access covers your org unit and everything under it.';
 
 /** A scoped login may not do this at all. */
 export function companyWideOnly(ctx, problems, sentence = COMPANY_WIDE) {
   if (!(ctx.actor.scope ?? { all: true }).all) problems.push(sentence);
 }
 
-export const OUTSIDE = (what) => `${what} is outside your department. Your access covers your own department and the ones below it.`;
+export const OUTSIDE = (what) => `${what} is outside your org unit. Your access covers your org unit and everything under it.`;
 
 /** The names of a department's parents, top first — for the picture. */
 export function pathOf(recs, departmentId) {

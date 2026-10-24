@@ -196,7 +196,7 @@ async function analyse(db, c, def, body, env) {
         row.id = id;
         row.current = current;
         row.label = current.label;
-        if (current.inScope === false) row.problems.push('This record is outside your department. Your access covers your own department and the ones below it.');
+        if (current.inScope === false) row.problems.push('This record is outside your org unit. Your access covers your org unit and everything under it.');
         const seen = cellOf(r.getCell(2));
         const was = seen.kind === 'date' ? seen.value.toISOString() : String(seen.value ?? '');
         if (!was) row.problems.push('The hidden columns of this row were changed. Download a fresh file.');

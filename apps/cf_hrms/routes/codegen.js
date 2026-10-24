@@ -21,7 +21,7 @@ import { companyWide } from '../lib/gates.js';
 const router = Router();
 const on = (req, res, next) => next();
 
-const whole = companyWide('Code formats belong to the whole company. Your access covers your own department only.');
+const whole = companyWide('Code formats belong to the whole company. Your access covers your org unit and everything under it.');
 
 router.get('/codegen/entities', guard(PERM.setup.view), on);
 router.get('/codegen/schemes', guard(PERM.setup.view), on);

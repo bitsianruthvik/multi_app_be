@@ -263,7 +263,7 @@ export async function createPlans(db, c, body = {}, scopeDeptIds = null) {
     chosen = [...willGet, ...joiners].filter((p) => want.has(p.employeeId));
     const known = new Set([...willGet, ...joiners, ...skipped].map((p) => p.employeeId));
     const unknown = [...want].filter((id) => !known.has(id));
-    if (unknown.length) throw invalid('INVALID', 'Some of the people chosen are not in this company, or not in your department.', { detail: unknown });
+    if (unknown.length) throw invalid('INVALID', 'Some of the people chosen are not in this company, or not in your org unit.', { detail: unknown });
   }
   const periodId = await ensurePeriod(db, c, period);
   if (!chosen.length) {

@@ -1,7 +1,7 @@
 /**
- * Departments in Excel. Code (issued) · Name★ · Label★ · Under · Shared · Serves · Status.
- * Label: the department's ONE label, a drop-down of the company's labels. A file downloaded while labels had
- * groups (header "Kind") still reads — the column's `aliases`.
+ * Org units (departments) in Excel. Code (issued) · Kind★ · Name★ · Under · Shared · Serves · Status (spec §33).
+ * Kind: the unit's ONE label, a drop-down of the company's kinds. Older files (header "Label", and the "Kind" of
+ * the label-group days) still read — the column's `aliases`.
  * Writes go through organisationService (the label rules, the cycle rule, the serves rule, the code).
  */
 import { PERM, words, coded, textOf, STATUS, yes, flag, changedKeys, inScope, loops } from './_shared.js';
@@ -12,17 +12,17 @@ const codesOf = (text) => String(text ?? '').split(',').map((s) => s.trim()).fil
 
 export default {
   entity: 'departments',
-  label: 'Departments',
+  label: 'Org units',
   area: 'org',
   viewRight: PERM.org.view,
   uploadRight: PERM.org.upload,
   wholeCompany: false,
   intro: [
-    'One row is one department. Everything is a department — a section and a machine too; the Label says which.',
-    'Under: the department this one sits in. Leave it blank for a department at the top.',
-    'Serves: only for a shared department — the codes of the departments it works for, separated by commas.',
+    'One row is one org unit: a department, a section, a machine … The Kind says which.',
+    'Under: the org unit this one sits in. Leave it blank for an org unit at the top.',
+    'Serves: only for a shared org unit — the codes of the org units it works for, separated by commas.',
   ],
-  rules: ['A new department can only be put under a department that already exists. To add a department and one below it, upload the first, download again, then add the second.'],
+  rules: ['A new org unit can only be put under an org unit that already exists. To add an org unit and one below it, upload the first, download again, then add the second.'],
   list: { name: 'departments', read: async (db, c) => (await ORG.listDepartments(db, c.companyId)).rows },
 
   async load(db, c, env) {
@@ -32,7 +32,7 @@ export default {
       labelState(db, c.companyId),
     ]);
     const labels = groups.model.labels;
-    const departments = coded('Departments', rows);
+    const departments = coded('Org units', rows);
     const codeOf = new Map(departments.entries.map((e) => [e.id, e.key]));
     const servedBy = new Map();
     for (const s of serves) if (codeOf.has(s.serves_department_id)) servedBy.set(s.department_id, [...(servedBy.get(s.department_id) ?? []), codeOf.get(s.serves_department_id)]);
@@ -45,18 +45,18 @@ export default {
       },
     }]));
     return {
-      lists: { labels: words('Labels', labels.map((l) => l.name)), departments, status: words('Status', STATUS) },
+      lists: { labels: words('Kinds', labels.map((l) => l.name)), departments, status: words('Status', STATUS) },
       current,
     };
   },
 
   columns: () => [
-    { key: 'code', header: 'Code', kind: 'issued', width: 14, meaning: 'The department’s code.', example: 'D012' },
-    { key: 'name', header: 'Name', kind: 'text', required: true, max: 200, width: 34, meaning: 'What the department is called.', example: 'Quality Control' },
-    { key: 'label', header: 'Label', aliases: ['Kind'], kind: 'list', list: 'labels', required: true, width: 18, meaning: 'The department’s label: what kind of department it is.', example: 'Section' },
-    { key: 'under', header: 'Under', kind: 'list', list: 'departments', width: 36, meaning: 'The department it sits in. Blank = at the top.', example: 'D004 — Production' },
-    { key: 'shared', header: 'Shared', kind: 'yesno', meaning: 'Yes when it works for several departments.', example: 'No' },
-    { key: 'serves', header: 'Serves', kind: 'text', max: 500, width: 26, meaning: 'For a shared department: the codes of the departments it works for, separated by commas.', example: 'D004, D007' },
+    { key: 'code', header: 'Code', kind: 'issued', width: 14, meaning: 'The org unit’s code.', example: 'D012' },
+    { key: 'label', header: 'Kind', aliases: ['Label'], kind: 'list', list: 'labels', required: true, width: 18, meaning: 'What kind of org unit it is: Department, Section, Machine, or another of the company’s kinds.', example: 'Section' },
+    { key: 'name', header: 'Name', kind: 'text', required: true, max: 200, width: 34, meaning: 'What the org unit is called.', example: 'Quality Control' },
+    { key: 'under', header: 'Under', kind: 'list', list: 'departments', width: 36, meaning: 'The org unit it sits in. Blank = at the top.', example: 'D004 — Production' },
+    { key: 'shared', header: 'Shared', kind: 'yesno', meaning: 'Yes when it works for several org units.', example: 'No' },
+    { key: 'serves', header: 'Serves', kind: 'text', max: 500, width: 26, meaning: 'For a shared org unit: the codes of the org units it works for, separated by commas.', example: 'D004, D007' },
     { key: 'status', header: 'Status', kind: 'list', list: 'status', width: 14, meaning: 'ACTIVE, or INACTIVE to keep it out of pickers.', example: 'ACTIVE' },
   ],
 
@@ -64,16 +64,16 @@ export default {
     const byCode = new Map(state.lists.departments.entries.map((e) => [e.key.toLowerCase(), e]));
     const parent = row.entries.under ?? null;
     row.parentId = parent?.id ?? null;
-    if (!row.isNew && parent?.id === row.id) row.problems.push('Under: a department cannot be under itself.');
+    if (!row.isNew && parent?.id === row.id) row.problems.push('Under: an org unit cannot be under itself.');
     // Serves: codes, each a department of this company, none of them itself, only on a shared department.
     const codes = codesOf(row.values.serves);
     row.servesIds = [];
     const unknown = codes.filter((k) => !byCode.has(k.toLowerCase()));
-    if (unknown.length) row.problems.push(`Serves: ${unknown.map((k) => `“${k.slice(0, 30)}”`).join(', ')} ${unknown.length === 1 ? 'is not the code of a department' : 'are not codes of departments'}. Use the codes on the Lists sheet, separated by commas.`);
+    if (unknown.length) row.problems.push(`Serves: ${unknown.map((k) => `“${k.slice(0, 30)}”`).join(', ')} ${unknown.length === 1 ? 'is not the code of an org unit' : 'are not codes of org units'}. Use the codes on the Lists sheet, separated by commas.`);
     else {
       row.servesIds = codes.map((k) => byCode.get(k.toLowerCase()).id);
-      if (!row.isNew && row.servesIds.includes(row.id)) row.problems.push('Serves: a department cannot serve itself.');
-      if (codes.length && !yes(row.values.shared)) row.problems.push('Serves: only a shared department serves others. Set Shared to Yes, or clear Serves.');
+      if (!row.isNew && row.servesIds.includes(row.id)) row.problems.push('Serves: an org unit cannot serve itself.');
+      if (codes.length && !yes(row.values.shared)) row.problems.push('Serves: only a shared org unit serves others. Set Shared to Yes, or clear Serves.');
       row.values.serves = codes.map((k) => byCode.get(k.toLowerCase()).key).sort().join(', ') || null;
     }
     if (row.isNew && row.values.status == null) row.values.status = 'ACTIVE';
@@ -85,12 +85,12 @@ export default {
     if (!env.scope.all) {
       for (const row of rows) {
         if (row.problems.length || (!row.isNew && !row.changes.length)) continue;
-        if (!row.isNew && env.scope.rootIds.includes(row.id)) row.problems.push('This is your own department. Changing it needs somebody whose access covers the whole company.');
-        else if (!inScope(env, row.parentId)) row.problems.push('Under: choose a department inside your own. Your access covers your own department and the ones below it.');
+        if (!row.isNew && env.scope.rootIds.includes(row.id)) row.problems.push('This is your own org unit. Changing it needs somebody whose access covers the whole company.');
+        else if (!inScope(env, row.parentId)) row.problems.push('Under: choose an org unit inside your own. Your access covers your org unit and everything under it.');
       }
     }
     const now = new Map([...state.current.values()].map((d) => [d.id, d.parentId]));
-    for (const r of loops(rows, now, (row) => row.parentId)) r.problems.push('Under: this would put the department inside itself (the department you chose is below this one).');
+    for (const r of loops(rows, now, (row) => row.parentId)) r.problems.push('Under: this would put the org unit inside itself (the org unit you chose is below this one).');
   },
 
   async add(db, c, row) {

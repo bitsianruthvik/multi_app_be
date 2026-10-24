@@ -63,7 +63,7 @@ const onlyQuote = (s, quotes) => {
 
 const VERBS = 'add|ad|create|creat|make|put|place|move|change|set|assign|give|appoint|transfer|switch|open|new|fill|track|measure|shift|also add|please add|we need|then';
 const VERB_AHEAD = new RegExp(`^\\s*(?:${VERBS})\\b`, 'i');
-const NOUN_AHEAD = /^\s*(?:a|an|another|one more|1 more)\s+(?:new\s+)?(?:position|vacancy|seat|post|section|department|dept|role|kra|kpi|responsibility|duty|task)\b/i;
+const NOUN_AHEAD = /^\s*(?:a|an|another|one more|1 more)\s+(?:new\s+)?(?:position|vacancy|seat|post|section|department|dept|org\s+unit|machine|role|kra|kpi|responsibility|duty|task)\b/i;
 
 function splitClauses(masked) {
   const rough = masked
@@ -103,7 +103,8 @@ const NOUNS = {
   kpi: ['kpi', 'kpis'],
   responsibility: ['responsibility', 'responsibilities', 'responsible', 'duty', 'duties', 'task', 'tasks'],
   position: ['position', 'positions', 'vacancy', 'vacancies', 'seat', 'seats', 'post', 'opening', 'chair', 'headcount'],
-  department: ['department', 'departments', 'dept', 'section', 'sections', 'unit', 'division', 'sub-department', 'subdepartment'],
+  // "org unit" (spec §33) reads by its second word; "org-unit" / "orgunit" written as one.
+  department: ['department', 'departments', 'dept', 'section', 'sections', 'unit', 'units', 'org-unit', 'org-units', 'orgunit', 'orgunits', 'division', 'sub-department', 'subdepartment'],
   role: ['role', 'roles', 'designation', 'job'],
 };
 const PHRASE_NOUNS = [
@@ -318,6 +319,9 @@ const fieldsOf = (pairs) => Object.fromEntries(Object.entries(pairs).filter(([, 
 
 /* ── the readers, one per action ───────────────────────────────────────── */
 
+/** The thing-words of an org unit (spec §33: "org unit" beside the older "department"). */
+const THING = 'org(?:anisation(?:al)?)?[\\s-]?units?|department|dept|section|unit|division|machine';
+
 function readDepartment(cl, R) {
   const { masked, quotes } = cl;
   const lower = masked.toLowerCase();
@@ -335,10 +339,13 @@ function readDepartment(cl, R) {
     const called = /\b(?:called|named)\s+(.+)$/i.exec(body);
     // "a Machine department Printing 3": a label's name may stand before the thing-word.
     const kindWords = R.recs.labels.map((l) => escapeRe(l)).join('|') || 'department';
-    const lead = new RegExp(`^(?:new\\s+|sub-?)?(?:(?:${kindWords})\\s+)?(?:department|dept|section|unit|division|machine)\\s+(?:for\\s+|of\\s+)?`, 'i');
-    const raw = called ? called[1] : stripArticles(body)
+    const lead = new RegExp(`^(?:new\\s+|sub-?)?(?:(?:${kindWords})\\s+)?(?:${THING})\\s+(?:for\\s+|of\\s+)?`, 'i');
+    // "… Ink Kitchen as a section" / "…, a machine": the kind said after the name.
+    const asKind = new RegExp(`\\s*(?:,|\\bas|\\bwhich is)\\s+(?:an?\\s+|the\\s+)?(?:${kindWords}|${THING})(?:\\s+(?:${THING}))?$`, 'i');
+    const raw = called ? called[1].replace(asKind, '') : stripArticles(body)
+      .replace(asKind, '')
       .replace(lead, '')
-      .replace(/\s+(?:department|dept|section|unit|division|machine)$/i, '');
+      .replace(new RegExp(`\\s+(?:${THING})$`, 'i'), '');
     name = tidyName(unmask(stripArticles(raw), quotes));
   }
   return {

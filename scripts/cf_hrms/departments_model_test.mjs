@@ -202,13 +202,47 @@ else {
       const e6 = await refused(() => updateDepartment(conn, c, s.id, { serves: [a.id, other.id] }));
       ok(!!e6, 'refused: serving a department of ANOTHER company');
     }
+    // spec §33 isolation: another company's parent ("Sits under") or kind is refused, and nothing is written.
+    const count = async () => Number((await conn.query('SELECT COUNT(*) n FROM hrms_departments WHERE company_id = ?', [companyId]))[0][0].n);
+    const [[theirKind]] = await conn.query(
+      `SELECT l.id FROM hrms_department_labels l JOIN hrms_label_groups g ON g.id = l.group_id AND g.is_kind = 1
+        WHERE l.company_id <> ? AND l.deleted_at IS NULL ORDER BY l.id LIMIT 1`, [companyId]);
+    if (!other && !theirKind) skip('another company\'s parent or kind', 'no other company has departments or kinds');
+    else {
+      const before = await count();
+      const e8 = other ? await refused(() => createDepartment(conn, c, { name: `${tag} under theirs`, type: 'Section', parentId: other.id })) : 'skip';
+      const e9 = theirKind ? await refused(() => createDepartment(conn, c, { name: `${tag} their kind`, labelId: theirKind.id })) : 'skip';
+      const e10 = other ? await refused(() => updateDepartment(conn, c, b.id, { parentId: other.id })) : 'skip';
+      const e11 = theirKind ? await refused(() => updateDepartment(conn, c, b.id, { labelId: theirKind.id })) : 'skip';
+      const [[bNow]] = await conn.query('SELECT department_type, parent_department_id FROM hrms_departments WHERE id = ?', [b.id]);
+      ok([e8, e9, e10, e11].every((e) => e === 'skip' || (e && [404, 422].includes(e.status))) && await count() === before
+        && bNow.department_type === 'Section' && bNow.parent_department_id == null,
+        'refused: an org unit under ANOTHER company\'s org unit, or of another company\'s kind (create and update) — and no row written or changed',
+        [e8, e9, e10, e11].map((e) => (e === 'skip' ? '-' : e?.status ?? 'ACCEPTED')).join(' '));
+    }
+    // Codes: a new org unit takes its code from THIS company's own sequence; no other company's counter moves.
+    {
+      const seqs = async (cmp) => (await conn.query(
+        `SELECT q.company_id, q.seq_key, q.next_value FROM cf_code_sequences q JOIN cf_code_schemes s ON s.id = q.scheme_id
+          WHERE q.company_id ${cmp} ? AND s.entity_type = 'hrms_department' ORDER BY q.company_id, q.id`, [companyId]))[0]
+        .map((r) => `${r.company_id}:${r.seq_key}=${r.next_value}`).join(',');
+      const oursBefore = await seqs('=');
+      const theirsBefore = await seqs('<>');
+      const made = await createDepartment(conn, c, { name: `${tag} coded`, type: 'Section' });
+      const [[schemeOk]] = await conn.query(
+        `SELECT COUNT(*) n FROM cf_code_schemes s WHERE s.entity_type = 'hrms_department' AND s.company_id <> ? AND s.deleted_at IS NULL
+           AND EXISTS (SELECT 1 FROM cf_code_sequences q WHERE q.scheme_id = s.id AND q.company_id = ?)`, [companyId, companyId]);
+      ok(Boolean(made.code) && await seqs('=') !== oursBefore && await seqs('<>') === theirsBefore && Number(schemeOk.n) === 0,
+        'codes: the new org unit\'s code comes from this company\'s own sequence; no other company\'s counter moves, and no sequence of ours hangs off another company\'s rule',
+        `${made.code} · ours ${oursBefore} -> ${await seqs('=')}`);
+    }
 
     const s2 = await updateDepartment(conn, c, s.id, { serves: [a.id] });
     ok(s2.serves.join() === String(a.id), 'update: serves is replaced, not appended');
     const s3 = await updateDepartment(conn, c, s.id, { serves: [a.id, b.id] });
     ok(s3.serves.length === 2, 'update: a pair that was removed can be added again (soft-delete-aware key)');
     const e7 = await refused(() => deleteDepartment(conn, c, a.id));
-    ok(e7 && /shared department/i.test(JSON.stringify(e7.problems ?? e7.message)), 'refused: deleting a department a shared one still serves');
+    ok(e7 && /shared org unit/i.test(JSON.stringify(e7.problems ?? e7.message)), 'refused: deleting a department a shared one still serves');
     const s4 = await updateDepartment(conn, c, s.id, { isShared: false });
     ok(s4.isShared === false && s4.serves.length === 0, 'update: un-sharing retires what it served');
     const [[live]] = await conn.query('SELECT COUNT(*) n FROM hrms_department_serves WHERE company_id = ? AND department_id = ? AND deleted_at IS NULL', [companyId, s.id]);

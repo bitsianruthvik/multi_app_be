@@ -50,7 +50,7 @@ const A = PERM.attendance;
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 const reqId = (req) => req.id ?? req.headers['x-request-id'] ?? null;
-const WHOLE = companyWide('This belongs to the whole company. Your access covers your own department only.');
+const WHOLE = companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.');
 const inRequest = inEmployee('attendanceRequest');
 const inPenalty = inEmployee('attendancePenalty');
 const inBodyPerson = inEmployee('employee', (req) => req.body?.employeeId);
@@ -66,13 +66,13 @@ async function viewerOf(req) {
 }
 
 // ── the day, the month ───────────────────────────────────────────────────────
-router.get('/attendance/today', guard(A.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.get('/attendance/today', guard(A.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   todayBoard(pool, ctx(req), { date: req.query.date, departmentId: req.query.departmentId, scopeDeptIds: await peopleFilter(req) }))));
-router.get('/attendance/month', guard(A.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.get('/attendance/month', guard(A.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   monthGrid(pool, ctx(req), { month: req.query.month, departmentId: req.query.departmentId, q: req.query.q, scopeDeptIds: await peopleFilter(req) }))));
-router.get('/attendance/month/workbook', guard(A.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.get('/attendance/month/workbook', guard(A.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   musterWorkbook(pool, ctx(req), { month: req.query.month, departmentId: req.query.departmentId, q: req.query.q }, await peopleFilter(req)))));
-router.get('/attendance/summary', guard(A.view, { note: 'narrowed to the login’s department' }), handle(async (req) => {
+router.get('/attendance/summary', guard(A.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => {
   const c = ctx(req);
   const scope = await peopleFilter(req);
   const employeeIds = scope ? await peopleIn(pool, c.companyId, { scopeDeptIds: scope, on: localToday() }) : null;
@@ -83,7 +83,7 @@ router.put('/attendance/days', guard(A.edit, { note: 'never the login’s own da
   const employeeId = await employeeIdOfLogin(pool, ctx(req));
   return tx(req, (db, c) => setDayByHand(db, { ...c, employeeId }, req.body ?? {}, reqId(req)));
 }));
-router.post('/attendance/process', guard(A.edit, { note: 'a department-scoped login processes its own people only' }), handle(async (req) => {
+router.post('/attendance/process', guard(A.edit, { note: 'an org-unit-scoped login processes its own people only' }), handle(async (req) => {
   const b = req.body ?? {};
   const from = String(b.from ?? '').slice(0, 10);
   const to = String(b.to ?? b.from ?? '').slice(0, 10);
@@ -99,7 +99,7 @@ router.post('/attendance/process', guard(A.edit, { note: 'a department-scoped lo
 }));
 
 // ── requests ─────────────────────────────────────────────────────────────────
-router.get('/attendance/requests', guard(A.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.get('/attendance/requests', guard(A.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   listRequests(pool, ctx(req), req.query ?? {}, await peopleFilter(req), await viewerOf(req)))));
 router.post('/attendance/requests', guard(A.edit), inBodyPerson, handle((req) => tx(req, (db, c) => submitFor(db, c, Number(req.body?.employeeId), req.body ?? {}, { raisedByHr: true, requestId: reqId(req) }))));
 router.get('/attendance/requests/:id', guard(A.view), inRequest, handle(async (req) => readRequest(pool, ctx(req), await viewerOf(req), id(req))));
@@ -111,7 +111,7 @@ for (const [path, verdict] of [['approve', 'APPROVE'], ['reject', 'REJECT']]) {
 }
 
 // ── penalties ────────────────────────────────────────────────────────────────
-router.get('/attendance/penalties', guard(A.view, { note: 'narrowed to the login’s department' }), handle(async (req) => listPenalties(pool, ctx(req), req.query ?? {}, await peopleFilter(req))));
+router.get('/attendance/penalties', guard(A.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => listPenalties(pool, ctx(req), req.query ?? {}, await peopleFilter(req))));
 router.post('/attendance/penalties/:id/waive', guard(A.edit), inPenalty, handle(async (req) => {
   const employeeId = await employeeIdOfLogin(pool, ctx(req));
   return tx(req, (db, c) => waivePenalty(db, { ...c, employeeId }, id(req), req.body ?? {}, reqId(req)));

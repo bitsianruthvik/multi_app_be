@@ -542,7 +542,7 @@ export async function buildDepartmentRollup(db, companyId, { on } = {}) {
     ordered.push({
       id: 0,
       code: null,
-      name: 'Not in any department',
+      name: 'Not in any org unit',
       parentId: null,
       status: 'ACTIVE',
       depth: 0,

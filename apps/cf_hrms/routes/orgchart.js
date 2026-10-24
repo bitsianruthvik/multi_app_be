@@ -154,7 +154,7 @@ router.get('/orgchart/open-points', guard(PERM.positions.view), handle((req) => 
  * when, and it writes its audit row in the same transaction, because TiDB has
  * no triggers and an audit row written afterwards is one that can go missing.
  */
-router.put('/orgchart/open-points/:id', guard(PERM.positions.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => withTransaction(
+router.put('/orgchart/open-points/:id', guard(PERM.positions.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => withTransaction(
   (db) => updateOpenPoint(db, ctx(req), intParam(req.params.id), req.body ?? {}),
 )));
 

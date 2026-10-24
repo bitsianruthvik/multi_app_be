@@ -37,7 +37,7 @@ import * as PQ from '../services/payrollExtras/perquisites.js';
 import * as F10 from '../services/payrollExtras/form10e.js';
 
 const router = Router();
-const whole = companyWide('Payroll belongs to the whole company. Your access covers your own department only.');
+const whole = companyWide('Payroll belongs to the whole company. Your access covers your org unit and everything under it.');
 const view = [...guard(PERM.payroll.view, { note: 'amounts only with cf_hrms_pay_view' }), whole];
 const viewPay = [...guard(PERM.payroll.view, { also: [PERM.payView] }), whole];
 const editPay = [...guard(PERM.payroll.edit, { also: [PERM.payView] }), whole];

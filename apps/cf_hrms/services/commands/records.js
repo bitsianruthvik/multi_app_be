@@ -115,7 +115,8 @@ export function labelOf(kind, r, recs = null) {
     return `${r.name}${r.code ? ` (${r.code})` : ''}${dept ? ` — ${dept}` : ''}${r.occupantId == null ? ' · vacant' : ''}`;
   }
   if (kind === 'employee') return `${r.name}${r.code ? ` (${r.code})` : ''}`;
-  if (kind === 'department') return `${r.name}${r.label && r.label !== 'Department' ? ` (${r.label.toLowerCase()})` : ''}`;
+  // spec §33: an org unit always shows its kind — "Printing 2 (Machine)".
+  if (kind === 'department') return `${r.name}${r.label ? ` (${r.label})` : ''}`;
   return r.name;
 }
 

@@ -50,7 +50,7 @@ export const PLACEHOLDERS = [
   { key: 'candidate_phone', label: 'Candidate’s phone', example: '9000000000' },
   { key: 'candidate_address', label: 'Candidate’s address (prints on as many lines as were typed)', example: '12 Lake Road,\nHyderabad.' },
   { key: 'designation', label: 'Designation', example: 'Quality In-charge' },
-  { key: 'department', label: 'Department', example: 'Quality' },
+  { key: 'department', label: 'Department (the org unit the position sits in)', example: 'Quality' },
   { key: 'reporting_to_title', label: 'Reports to — the manager’s title', example: 'Production Manager' },
   { key: 'reporting_to_name', label: 'Reports to — the manager’s name', example: 'R. Kumar' },
   { key: 'place_of_posting', label: 'Place of posting', example: 'Unit-2, Bibi Nagar, Hyderabad' },

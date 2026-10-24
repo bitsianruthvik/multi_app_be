@@ -71,7 +71,7 @@ import * as F16 from '../services/payrollTax/form16.js';
 import { transport } from '../services/payrollTax/files.js';
 
 const router = Router();
-const whole = companyWide('Payroll belongs to the whole company. Your access covers your own department only.');
+const whole = companyWide('Payroll belongs to the whole company. Your access covers your org unit and everything under it.');
 const view = [...guard(PERM.payroll.view), whole];
 const viewPay = [...guard(PERM.payroll.view, { also: [PERM.payView] }), whole];
 const edit = [...guard(PERM.payroll.edit), whole];

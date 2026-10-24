@@ -16,7 +16,7 @@ const RIGHT_LABEL = { view: 'View', edit: 'Add and change', remove: 'Remove', up
 
 /** The areas, in the order the screen lists them. `rights` are the ones that exist. */
 export const AREAS = [
-  { key: 'org', label: 'Organisation', screens: ['Departments', 'Department labels', 'Locations'], rights: ['view', 'edit', 'remove', 'upload'] },
+  { key: 'org', label: 'Organisation', screens: ['Org units', 'Kinds of org unit', 'Locations'], rights: ['view', 'edit', 'remove', 'upload'] },
   { key: 'roles', label: 'Roles', screens: ['Roles', 'Job content of a role', 'Libraries'], rights: ['view', 'edit', 'remove', 'upload'] },
   {
     key: 'positions', label: 'Positions',
@@ -96,8 +96,10 @@ export const TEMPLATES = [
     tags: [...views(everyArea), ...edits(['employees', 'hiring', 'positions', 'documents', 'performance', 'payroll', 'attendance']), named('employeeCreate'), named('contactView'), named('payView'), named('selfView')],
   },
   {
-    key: 'DEPARTMENT_HEAD', label: 'Department head', platformName: 'Department head', scope: 'DEPARTMENT', locked: false,
-    description: 'Sees the organisation and the people of their own department and below; changes the positions there.',
+    // `label` is what setup stores (unchanged, so setup-access plans nothing new); `shownLabel` is what
+    // every screen shows since spec §33 — see shownRoleLabel(). Key and platform role name unchanged.
+    key: 'DEPARTMENT_HEAD', label: 'Department head', shownLabel: 'Unit head', platformName: 'Department head', scope: 'DEPARTMENT', locked: false,
+    description: 'Sees the organisation and the people of their org unit and everything under it; changes the positions there.',
     tags: [...views(['org', 'roles', 'positions', 'employees', 'time', 'leave', 'performance', 'attendance']), ...edits(['positions', 'performance']), named('contactView'), named('selfView')],
   },
   {
@@ -123,6 +125,18 @@ export const lateAreaTags = (area) => {
 export const templateOf = (key) => TEMPLATES.find((t) => t.key === String(key ?? '').toUpperCase()) ?? null;
 
 export const SCOPES = ['COMPANY', 'DEPARTMENT'];
+
+/**
+ * The name an access role is SHOWN by (spec §33). Companies set up before 2026-10-24 have the
+ * ready-made DEPARTMENT_HEAD row labelled "Department head" in hrms_access_roles (and a platform
+ * role of that name): that old default reads "Unit head". A label somebody chose is shown as it is.
+ * Display only — nothing in the database is renamed.
+ */
+export function shownRoleLabel(label, templateKey) {
+  const t = templateOf(templateKey);
+  if (label == null || !t) return label;
+  return t.shownLabel && String(label).trim().toLowerCase() === t.label.toLowerCase() ? t.shownLabel : label;
+}
 
 /**
  * The 14 old tags and what each becomes (spec §12.4 step 3). `cf_hrms_org_view`
@@ -225,7 +239,7 @@ export function catalog() {
     })),
     named: NAMED.map((n) => ({ tag: n.tag, label: n.label, hint: n.hint, sensitive: n.key !== 'selfView' })),
     // What a new role may be started from. Not the Owner (nobody else is everything) and not Employee (it is the self view alone).
-    templates: TEMPLATES.filter((t) => !t.locked).map((t) => ({ key: t.key, label: t.label, scope: t.scope, tags: [...t.tags], description: t.description })),
+    templates: TEMPLATES.filter((t) => !t.locked).map((t) => ({ key: t.key, label: t.shownLabel ?? t.label, scope: t.scope, tags: [...t.tags], description: t.description })),
   };
 }
 

@@ -61,12 +61,12 @@ const tokenCheck = (tokens, what) => async (db, companyId, key) => (
 
 const DEPARTMENT_TOKENS = [
   {
-    key: 'label', label: 'Label', available: true,
-    phrase: 'the label', example: 'Section', help: 'The department’s label — Department, Section, Machine, or whatever the company’s list holds. Give it a length limit to print a few letters.',
+    key: 'label', label: 'Kind', available: true,
+    phrase: 'the kind', example: 'Section', help: 'What kind of org unit it is — Department, Section, Machine, or whatever the company’s list holds. Give it a length limit to print a few letters.',
   },
   {
-    key: 'label.initial', label: 'First letter of the label', available: true,
-    phrase: 'the first letter of the label', example: 'S', help: 'The first letter of the label, in capitals: D for Department, S for Section, M for Machine.',
+    key: 'label.initial', label: 'First letter of the kind', available: true,
+    phrase: 'the first letter of the kind', example: 'S', help: 'The first letter of the kind, in capitals: D for Department, S for Section, M for Machine.',
   },
   {
     key: 'name.initials', label: 'Initials of the name', available: true,
@@ -77,8 +77,8 @@ const DEPARTMENT_TOKENS = [
     phrase: 'the name', example: 'Quality Control', help: 'The whole name. Long for a code — give it a length limit to print its first letters.',
   },
   {
-    key: 'parent.code', label: 'Code of the department above', available: true,
-    phrase: 'the code of the department above', example: 'D004', help: 'The code of the department this one is under. Empty for a department at the top.',
+    key: 'parent.code', label: 'Code of the org unit above', available: true,
+    phrase: 'the code of the org unit above', example: 'D004', help: 'The code of the org unit this one is under. Empty for an org unit at the top.',
   },
 ];
 
@@ -89,8 +89,8 @@ const DEPARTMENT_TOKENS = [
  */
 const DEPARTMENT_CONDITIONS = [
   {
-    key: 'label', label: 'Label', operators: ['eq', 'in'], valueKind: 'departmentLabel',
-    phrase: 'the label', help: 'Holds for departments with the labels you choose (Department, Section, Machine …), so machines can be coded one way and sections another. Scores 1 point.',
+    key: 'label', label: 'Kind', operators: ['eq', 'in'], valueKind: 'departmentLabel',
+    phrase: 'the kind', help: 'Holds for org units of the kinds you choose (Department, Section, Machine …), so machines can be coded one way and sections another. Scores 1 point.',
   },
 ];
 
@@ -129,15 +129,15 @@ async function departmentContext(db, companyId, draft = {}) {
 }
 
 const departmentProvider = {
-  label: 'Departments',
+  label: 'Org units',
   tokens: DEPARTMENT_TOKENS,
   tokenPatterns: [],
   conditionTokens: DEPARTMENT_CONDITIONS,
-  validateToken: tokenCheck(DEPARTMENT_TOKENS, 'a department code'),
+  validateToken: tokenCheck(DEPARTMENT_TOKENS, 'an org unit code'),
   async validateCondition(db, companyId, cond) {
     if (cond.token_key !== 'label') return null;
     const ids = idList(cond);
-    if (!ids.length || ids.some((v) => !Number.isInteger(v) || v <= 0)) return 'Choose from the company’s labels.';
+    if (!ids.length || ids.some((v) => !Number.isInteger(v) || v <= 0)) return 'Choose from the company’s kinds of org unit.';
     const [rows] = await db.query(
       `SELECT l.id FROM hrms_department_labels l
          JOIN hrms_label_groups gr ON gr.company_id = l.company_id AND gr.id = l.group_id AND gr.is_kind = 1 AND gr.deleted_at IS NULL
@@ -145,14 +145,14 @@ const departmentProvider = {
       [companyId, ids],
     );
     if (rows.length === new Set(ids).size) return null;
-    return 'Choose from the company’s labels.';
+    return 'Choose from the company’s kinds of org unit.';
   },
   async loadContext(db, companyId, entityId) {
     const [[d]] = await db.query(
       'SELECT name, department_type, parent_department_id FROM hrms_departments WHERE company_id = ? AND id = ? AND deleted_at IS NULL',
       [companyId, entityId],
     );
-    if (!d) throw notFoundError('Department');
+    if (!d) throw notFoundError('Org unit');
     return departmentContext(db, companyId, { name: d.name, type: d.department_type, parentId: d.parent_department_id });
   },
   async draftContext(db, companyId, draft) {
@@ -172,8 +172,8 @@ const ROLE_TOKENS = [
     phrase: 'the title', example: 'Shift In-charge', help: 'The whole title. Long for a code — give it a length limit to print its first letters.',
   },
   {
-    key: 'department.code', label: 'Department code', available: true,
-    phrase: 'the department code', example: 'D004', help: 'The code of the role’s usual department. Empty when the role has none.',
+    key: 'department.code', label: 'Org unit code', available: true,
+    phrase: 'the org unit code', example: 'D004', help: 'The code of the role’s usual org unit. Empty when the role has none.',
   },
 ];
 
@@ -229,8 +229,8 @@ const POSITION_TOKENS = [
     phrase: 'the role code', example: 'R014', help: 'The code of the position’s role.',
   },
   {
-    key: 'department.code', label: 'Department code', available: true,
-    phrase: 'the department code', example: 'D004', help: 'The code of the position’s department. Empty when the position has none.',
+    key: 'department.code', label: 'Org unit code', available: true,
+    phrase: 'the org unit code', example: 'D004', help: 'The code of the position’s org unit. Empty when the position has none.',
   },
   {
     key: 'shift.code', label: 'Shift code', available: true,
@@ -249,9 +249,9 @@ const POSITION_TOKENS = [
 
 const POSITION_CONDITIONS = [
   {
-    key: 'department', label: 'Department', operators: ['under', 'eq', 'in'], valueKind: 'department',
-    phrase: 'the department',
-    help: '“Is under” holds for the department you choose and every department below it, and scores more the deeper that department is: a top department 1, one below it 2. “Is” names exact departments and scores more than any “is under”.',
+    key: 'department', label: 'Org unit', operators: ['under', 'eq', 'in'], valueKind: 'department',
+    phrase: 'the org unit',
+    help: '“Is under” holds for the org unit you choose and every org unit below it, and scores more the deeper that org unit is: a top org unit 1, one below it 2. “Is” names exact org units and scores more than any “is under”.',
   },
   {
     key: 'role', label: 'Role', operators: ['eq', 'in'], valueKind: 'role',
@@ -334,7 +334,7 @@ const positionProvider = {
   conditionTokens: POSITION_CONDITIONS,
   validateToken: tokenCheck(POSITION_TOKENS, 'a position code'),
   async validateCondition(db, companyId, cond) {
-    if (cond.token_key === 'department') return (await idsExist(db, companyId, 'hrms_departments', idList(cond))) ? null : 'That department does not exist.';
+    if (cond.token_key === 'department') return (await idsExist(db, companyId, 'hrms_departments', idList(cond))) ? null : 'That org unit does not exist.';
     if (cond.token_key === 'role') return (await idsExist(db, companyId, 'hrms_roles', idList(cond))) ? null : 'That role does not exist.';
     return null;
   },

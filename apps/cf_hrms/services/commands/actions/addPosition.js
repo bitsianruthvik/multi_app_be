@@ -36,7 +36,7 @@ export default {
   template: 'Add a position for the role {role} in {department} on the {shift} shift, reporting to {reportsTo}',
   fields: [
     { name: 'role', kind: 'role', required: true, label: 'Role' },
-    { name: 'department', kind: 'department', required: true, label: 'Department' },
+    { name: 'department', kind: 'department', required: true, label: 'Org unit' },
     { name: 'shift', kind: 'shift', required: false, label: 'Shift' },
     { name: 'reportsTo', kind: 'position', required: false, label: 'Reports to' },
   ],
@@ -60,7 +60,7 @@ export default {
     const problems = [];
     needRight(ctx, PERM.positions.edit, 'add positions', problems);
     const role = resolve(ctx, step, 'role', 'role', problems);
-    const department = resolve(ctx, step, 'department', 'department', problems, { words: 'the department it is in' });
+    const department = resolve(ctx, step, 'department', 'department', problems, { words: 'the org unit it is in' });
     if (department && !department.inside) problems.push(OUTSIDE(department.name));
     const shift = said(step, 'shift') ? resolve(ctx, step, 'shift', 'shift', problems) : null;
     const reportsTo = said(step, 'reportsTo') ? resolve(ctx, step, 'reportsTo', 'position', problems, { words: 'the position it reports to' }) : null;
@@ -75,7 +75,7 @@ export default {
       departmentName: department?.name ?? null,
       path: department && !department.step ? pathOf(ctx.recs, department.id) : [],
       shiftName: choice.shift?.name ?? null,
-      // 'Starts on Day shift (from the label Machine)' — the shift it will use, and why.
+      // 'Starts on Day shift (from the kind Machine)' — the shift it will use, and why.
       shiftFrom: choice.from,
       shiftLine: choice.line,
       reportsToId: reportsTo?.step ? null : reportsTo?.id ?? null,

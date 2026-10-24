@@ -35,7 +35,7 @@
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { invalid, notFound, conflict, HrmsError } from '../lib/errors.js';
-import { ALL_TAGS, SCOPES, TEMPLATES, templateOf, tagSetProblems, orderTags, summaryOf, catalog as rightsCatalog } from '../lib/access.js';
+import { ALL_TAGS, SCOPES, TEMPLATES, templateOf, tagSetProblems, orderTags, summaryOf, shownRoleLabel, catalog as rightsCatalog } from '../lib/access.js';
 import { forgetAccess } from '../lib/accessContext.js';
 import { hrmsAppOf, ensureCatalog, tagsOfRoles, newTagsOf, setRoleTags } from './accessGrants.js';
 import { scopeFor } from './accessScope.js';
@@ -124,7 +124,7 @@ async function loadRoles(conn, companyId, appId, { roleId = null } = {}) {
         known: r.label != null || tags.length > 0 || Number(r.login_count) > 0 || owner,
         shape: {
           roleId: r.id,
-          label: r.label ?? (owner ? 'Owner' : r.name),
+          label: shownRoleLabel(r.label, r.template_key) ?? (owner ? 'Owner' : r.name),
           platformName: r.name,
           description: r.description ?? null,
           scope: owner ? 'COMPANY' : (r.scope === 'DEPARTMENT' ? 'DEPARTMENT' : 'COMPANY'),
@@ -168,7 +168,7 @@ const readDescription = (value) => {
 };
 function readScope(value) {
   const scope = String(value ?? '').trim().toUpperCase();
-  if (!SCOPES.includes(scope)) throw invalid('INVALID', 'Choose the scope: the whole company, or only their department and below.', { problems: ['Scope is COMPANY or DEPARTMENT.'] });
+  if (!SCOPES.includes(scope)) throw invalid('INVALID', 'Choose the scope: the whole company, or only their org unit and everything under it.', { problems: ['Scope is COMPANY or DEPARTMENT.'] });
   return scope;
 }
 
@@ -302,7 +302,7 @@ export async function deleteRole(conn, c, roleId, requestId = null) {
 const LOGIN_SELECT = (appIdParam = '?') => `
   SELECT u.id, u.name, u.email, u.role_id AS user_role_id,
          aua.id AS access_id, aua.role_id AS app_role_id, aua.deleted_at AS access_deleted_at,
-         r.id AS role_id, r.name AS role_name, har.label AS role_label,
+         r.id AS role_id, r.name AS role_name, har.label AS role_label, har.template_key AS role_template_key,
          e.id AS employee_id, e.employee_code, e.full_name, e.employment_status,
          p.position_code, d.name AS department_name
     FROM users u
@@ -320,7 +320,7 @@ const shapeLogin = (r, c) => ({
   userId: r.id,
   name: r.name,
   email: r.email,
-  role: { id: r.role_id ?? null, label: r.role_label ?? (isOwnerName(r.role_name) ? 'Owner' : (r.role_name ?? '')) },
+  role: { id: r.role_id ?? null, label: shownRoleLabel(r.role_label, r.role_template_key) ?? (isOwnerName(r.role_name) ? 'Owner' : (r.role_name ?? '')) },
   state: r.access_id != null && r.access_deleted_at == null ? 'ACTIVE' : 'DISABLED',
   employee: r.employee_id ? {
     id: r.employee_id, employeeCode: r.employee_code, fullName: r.full_name,

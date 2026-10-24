@@ -80,9 +80,9 @@ const reqId = (req) => req.id ?? req.headers['x-request-id'] ?? null;
 
 // ── leave types ─────────────────────────────────────────────────────────────
 router.get('/leave/types', guard(PERM.leave.view), handle((req) => listLeaveTypes(pool, ctx(req).companyId)));
-router.post('/leave/types', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createLeaveType(db, c, req.body ?? {}, reqId(req)))));
-router.put('/leave/types/:id', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => updateLeaveType(db, c, id(req), req.body ?? {}, reqId(req)))));
-router.delete('/leave/types/:id', guard(PERM.leave.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deleteLeaveType(db, c, id(req), reqId(req)))));
+router.post('/leave/types', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createLeaveType(db, c, req.body ?? {}, reqId(req)))));
+router.put('/leave/types/:id', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => updateLeaveType(db, c, id(req), req.body ?? {}, reqId(req)))));
+router.delete('/leave/types/:id', guard(PERM.leave.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deleteLeaveType(db, c, id(req), reqId(req)))));
 
 // ── policies ────────────────────────────────────────────────────────────────
 router.get('/leave/policy-templates', guard(PERM.leave.view), handle(async () => listTemplates()));
@@ -90,8 +90,8 @@ router.get('/leave/policies', guard(PERM.leave.view), listed('leavePolicies'), h
 // Before /leave/policies/:id, or "preview-summary" would be read as an id.
 router.post('/leave/policies/preview-summary', guard(PERM.leave.view), handle((req) => previewRuleSummary(pool, ctx(req).companyId, req.body ?? {})));
 router.get('/leave/policies/:id', guard(PERM.leave.view), handle((req) => getPolicy(pool, ctx(req).companyId, id(req))));
-router.post('/leave/policies', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => createPolicy(db, c, req.body ?? {}, reqId(req)))));
-router.put('/leave/policies/:id', guard(PERM.leave.edit, { note: 'archiving it, or saving it without a leave type it had, also needs cf_hrms_leave_remove' }), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle(async (req) => {
+router.post('/leave/policies', guard(PERM.leave.edit), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => createPolicy(db, c, req.body ?? {}, reqId(req)))));
+router.put('/leave/policies/:id', guard(PERM.leave.edit, { note: 'archiving it, or saving it without a leave type it had, also needs cf_hrms_leave_remove' }), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle(async (req) => {
   // Archiving a policy, and taking a leave type out of one, are removals.
   if (String(req.body?.status ?? '').toUpperCase() === 'ARCHIVED') need(req, PERM.leave.remove);
   if (Array.isArray(req.body?.rules)) {
@@ -101,11 +101,11 @@ router.put('/leave/policies/:id', guard(PERM.leave.edit, { note: 'archiving it, 
   }
   return tx(req, (db, c) => updatePolicy(db, c, id(req), req.body ?? {}, reqId(req)));
 }));
-router.delete('/leave/policies/:id', guard(PERM.leave.remove), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => tx(req, (db, c) => deletePolicy(db, c, id(req), reqId(req)))));
+router.delete('/leave/policies/:id', guard(PERM.leave.remove), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => tx(req, (db, c) => deletePolicy(db, c, id(req), reqId(req)))));
 
 // ── where a policy applies: company default -> location -> label -> role (spec §17) ──
 router.get('/leave/assignments', guard(PERM.leave.view), handle((req) => getAssignments(pool, ctx(req).companyId)));
-router.put('/leave/assignments', guard(PERM.leave.edit, { note: 'clearing one (policyId: null) also needs cf_hrms_leave_remove' }), companyWide('This belongs to the whole company. Your access covers your own department only.'), handle((req) => {
+router.put('/leave/assignments', guard(PERM.leave.edit, { note: 'clearing one (policyId: null) also needs cf_hrms_leave_remove' }), companyWide('This belongs to the whole company. Your access covers your org unit and everything under it.'), handle((req) => {
   if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'policyId') && (req.body.policyId === null || req.body.policyId === '')) need(req, PERM.leave.remove);
   return tx(req, (db, c) => putAssignment(db, c, req.body ?? {}, reqId(req)));
 }));
@@ -117,7 +117,7 @@ const viewerOf = async (req) => ({ userId: ctx(req).userId, employeeId: await em
 const inRequest = inEmployee('leaveRequest');
 const inBodyPerson = inEmployee('employee', (req) => req.body?.employeeId);
 
-router.get('/leave/requests', guard(PERM.leave.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.get('/leave/requests', guard(PERM.leave.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   listRequests(pool, ctx(req), req.query ?? {}, await peopleFilter(req), await viewerOf(req)))));
 // Before /leave/requests/:id, or "preview" would be read as an id.
 router.post('/leave/requests/preview', guard(PERM.leave.edit), inBodyPerson, handle((req) => previewForPerson(pool, ctx(req), req.body ?? {})));
@@ -140,7 +140,7 @@ router.post('/leave/requests/:id/cancel', guard(PERM.leave.edit), inRequest, han
 }));
 
 // ── balances: the person × type grid, and HR's opening balance ──────────────
-router.get('/leave/balances', guard(PERM.leave.view, { note: 'narrowed to the login’s department' }), handle(async (req) => (
+router.get('/leave/balances', guard(PERM.leave.view, { note: 'narrowed to the login’s org unit' }), handle(async (req) => (
   balancesGrid(pool, ctx(req), req.query ?? {}, await peopleFilter(req)))));
 router.put('/leave/balances', guard(PERM.leave.edit, { note: 'clearing one (opening: null) also needs cf_hrms_leave_remove' }), inBodyPerson, handle((req) => {
   if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'opening') && (req.body.opening === null || req.body.opening === '')) need(req, PERM.leave.remove);
