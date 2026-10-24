@@ -162,6 +162,13 @@ const AREAS = {
       `${H}/services/payrollExtras/**`, `${H}/services/attendance/month.js`, `${H}/services/attendance/settings.js`, `${H}/services/leave/requestService.js`,
       `${H}/routes/self.js`, `${H}/scripts/apply-payroll-exit-schema.mjs`, `${H}/scripts/demo-payroll.mjs`, 'scripts/cf_hrms/payroll_exit_test.mjs'],
   },
+  // A new empty company with CF_HRMS (scripts/setup-company.mjs): it runs the access setup, the payroll and
+  // performance seeds and the Kind list for one company, so a change to any of those runs it.
+  company: {
+    suites: ['company_setup_test'],
+    paths: [`${H}/scripts/setup-company.mjs`, `${H}/services/accessSetup.js`, `${H}/services/accessGrants.js`, `${H}/services/payroll/seed.js`,
+      `${H}/scripts/setup-performance.mjs`, `${H}/services/labelGroupService.js`, `${H}/models/seed.sql`, 'scripts/cf_hrms/company_setup_test.mjs'],
+  },
 };
 
 /** A change here can break any suite: --all, with the reason. */
