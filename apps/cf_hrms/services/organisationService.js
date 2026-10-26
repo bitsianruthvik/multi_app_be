@@ -38,7 +38,9 @@ import { DEPARTMENT_LABEL_ID_SQL, readModel, linkDepartmentLabel, retireDepartme
 import { issueDepartmentCode, issueLocationCode, acceptImportedCode } from './codeService.js';
 import { DEPARTMENT_ENTITY, LOCATION_ENTITY } from './codegenProvider.js';
 import { inBatch } from '../lib/batch.js';
-import { compareUnits, orderUnits } from '../lib/unitOrder.js';
+import { orderUnits } from '../lib/unitOrder.js';
+import { buildOrgTree } from './orgTree.js';
+import { allUnitFacts, moveReportsInto, applyMoveChoice, assertNoNewLoop, currentLoopKeys } from './unitReportingService.js';
 
 import {
   WEEKDAY_NAMES, hhmm, spanMinutes, shapeDay, defaultWeek, weekOf, summaryOf, weeklyHoursOf, mirrorOf, weekdayName,
@@ -441,11 +443,22 @@ export async function listDepartments(db, companyId) {
        FROM hrms_departments d WHERE d.company_id = ? AND d.deleted_at IS NULL`,
     [companyId],
   );
-  const serves = await servesByDepartment(db, companyId);
+  const [serves, facts] = await Promise.all([servesByDepartment(db, companyId), allUnitFacts(db, companyId)]);
+  // THE one tree (services/orgTree.js, spec §40.1) — the same walk the org chart ranks its units by.
   // Siblings (and the top level) by their stored order, then code — never by name (spec §34).
-  rows.sort(compareUnits);
+  const tree = buildOrgTree({ units: rows });
+  const out = tree.units.map((e) => ({
+    ...mapDepartment(e.row, serves.get(e.id) ?? []),
+    depth: e.depth,
+    childCount: e.childCount,
+    path: e.path,
+    orphaned: e.orphaned,
+    ...(e.inCycle ? { inCycle: true } : {}),
+    // §40: its head(s) and Reports into, and how many positions sit directly in it (additive).
+    ...(facts.get(e.id) ?? { heads: [], headsPerShift: false, reportsInto: null, positionCount: 0 }),
+  }));
   // `types`: the company's labels' names, in its order.
-  return { rows: toPreOrder(rows, 'parent_department_id', (r) => mapDepartment(r, serves.get(r.id) ?? [])), types };
+  return { rows: out, types };
 }
 
 /**
@@ -685,6 +698,9 @@ export async function moveCheck(db, companyId, id, parentIdRaw) {
   const positionsUnder = Number(pos.n);
   const unitsUnder = below.size - 1;
   const named = unit.department_type ? `${unit.name} (${unit.department_type})` : unit.name;
+  // §40.4: what happens to its Reports into — DEFAULT follows the new parent's head, CHOSEN asks keep or switch.
+  const reportsInto = problem ? null : await moveReportsInto(db, companyId, id, parentId);
+  const base = `Move ${named} from ${from ? from.name : 'the top level'} to ${to ? to.name : 'the top level'} — ${carriesSentence(positionsUnder, unitsUnder)}`;
   return {
     unit: short(unit),
     from: short(from),
@@ -693,7 +709,8 @@ export async function moveCheck(db, companyId, id, parentIdRaw) {
     positionsUnder,
     allowed: !problem,
     problem,
-    sentence: `Move ${named} from ${from ? from.name : 'the top level'} to ${to ? to.name : 'the top level'} — ${carriesSentence(positionsUnder, unitsUnder)}`,
+    sentence: reportsInto ? `${base}. ${reportsInto.sentence}` : base,
+    reportsInto: reportsInto ? { mode: reportsInto.mode, current: reportsInto.current, afterMove: reportsInto.afterMove, ask: reportsInto.ask } : null,
   };
 }
 
@@ -741,6 +758,10 @@ export async function updateDepartment(db, c, id, input = {}, options = {}) {
     await assertNoCycle(db, 'hrms_departments', 'parent_department_id', c.companyId, id, parentId, 'Org unit');
     fields.parent_department_id = parentId;
   }
+  // §40.4: on a move, a CHOSEN Reports into is kept unless the confirm said "switch" (KEEP is the default).
+  if (input.reportsInto !== undefined && input.reportsInto !== null && !['KEEP', 'SWITCH'].includes(input.reportsInto)) {
+    problems.push('Reports into on a move is KEEP or SWITCH.');
+  }
   const serves = servesInput(input, problems);
   const sortOrder = sortOrderInput(input, problems);
   assertNoProblems(problems);
@@ -749,14 +770,18 @@ export async function updateDepartment(db, c, id, input = {}, options = {}) {
   const moved = fields.parent_department_id !== undefined && (fields.parent_department_id ?? null) !== (before.parent_department_id ?? null);
   if (moved || sortOrder !== undefined) fields.sort_order = await placeAmongSiblings(db, c.companyId, parentAfter, id, sortOrder);
   const sharedAfter = fields.is_shared !== undefined ? fields.is_shared === 1 : Boolean(before.is_shared);
+  const loopsBefore = moved && !inBatch(db) ? await currentLoopKeys(db, c.companyId) : null;
   await updateRow(db, 'hrms_departments', c.companyId, id, fields);
+  const reportsIntoChange = moved ? await applyMoveChoice(db, c, id, input.reportsInto) : null;
+  // A move must not make a reporting loop through the units' heads (the transaction rolls back).
+  if (loopsBefore) await assertNoNewLoop(db, c.companyId, loopsBefore);
   // Un-sharing a department retires what it served: a serves row on a department
   // that is not shared is a line on the chart from a box that no longer has one.
   const served = serves !== undefined
     ? await writeServes(db, c, id, sharedAfter, serves)
     : (!sharedAfter && before.is_shared ? await writeServes(db, c, id, false, []) : null);
   const beforeServes = served ? served.before : [];
-  await audit(db, c, 'hrms_departments', id, 'UPDATE', mapDepartment(before, beforeServes), { ...fields, ...(label ? { labelId: label.id } : {}), ...(served ? { serves: served.after } : {}) });
+  await audit(db, c, 'hrms_departments', id, 'UPDATE', mapDepartment(before, beforeServes), { ...fields, ...(label ? { labelId: label.id } : {}), ...(served ? { serves: served.after } : {}), ...(reportsIntoChange ? { reportsInto: reportsIntoChange.after, reportsIntoBefore: reportsIntoChange.before } : {}) });
   if (inBatch(db)) return { id };
   return getDepartment(db, c.companyId, id);
 }
@@ -774,6 +799,8 @@ export async function deleteDepartment(db, c, id) {
   // What it served goes with it; what serves IT was refused above.
   const served = await writeServes(db, c, id, false, []);
   await softDelete(db, 'hrms_departments', c.companyId, id);
+  // Its heads go with it (§40); a unit that reported into one of its positions is refused above (the position blocks it).
+  await db.query('UPDATE hrms_unit_heads SET deleted_at = NOW() WHERE company_id = ? AND department_id = ? AND deleted_at IS NULL', [c.companyId, id]);
   await retireDepartmentLabels(db, c, id);
   await audit(db, c, 'hrms_departments', id, 'DELETE', mapDepartment(before, served.before), null);
   return { ok: true, id };

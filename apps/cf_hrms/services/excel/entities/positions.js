@@ -25,7 +25,7 @@ export default {
   maxAdds: 100,
   intro: [
     'One row is one position: one chair, for one person, on one shift. Seven helpers are seven rows.',
-    'Reports to: the position this one reports to (its main manager). Leave it blank for the top of the chart.',
+    'Reports to: the position this one reports to (its main manager). Leave it blank when it follows its org unit (the unit’s head, or the unit’s Reports into) or is the top of the chart.',
     'Changing a position’s shift moves the person in it to that shift too.',
   ],
   rules: [
@@ -85,7 +85,7 @@ export default {
     { key: 'department', header: 'Org unit', aliases: ['Department'], kind: 'list', list: 'departments', required: true, width: 34, meaning: 'The org unit the position sits in.', example: 'D004 — Production' },
     { key: 'shift', header: 'Shift', kind: 'list', list: 'shifts', width: 18, meaning: 'The one shift this position works. Blank on a new row: the shift its org unit’s kind starts new positions on, else the General shift.', example: 'D — Day' },
     { key: 'location', header: 'Location', kind: 'list', list: 'locations', width: 22, meaning: 'Where it is based, if the company has more than one place.', example: 'L01 — Unit 2' },
-    { key: 'reportsTo', header: 'Reports to', kind: 'list', list: 'positions', width: 34, meaning: 'The position this one reports to. Blank = the top of the chart.', example: 'P004 — Plant Head' },
+    { key: 'reportsTo', header: 'Reports to', kind: 'list', list: 'positions', width: 34, meaning: 'The position this one reports to. Blank = it follows its org unit (its head or Reports into), or it is the top.', example: 'P004 — Plant Head' },
     { key: 'status', header: 'Status', kind: 'list', list: 'status', width: 12, meaning: 'DRAFT, ACTIVE or FROZEN (kept, not to be filled).', example: 'ACTIVE' },
     { key: 'person', header: 'Person', kind: 'info', width: 30, meaning: 'Who is in the position today.', example: 'Asha Verma (KP0031)' },
     // Its department's label, for reading and sorting. Ignored on upload.

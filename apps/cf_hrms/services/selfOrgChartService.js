@@ -112,6 +112,11 @@ function sliceEdge(e) {
     scopeLabel: e.scopeLabel ?? null,
     scopeWorkContextName: e.scopeWorkContextName ?? null,
     scopeSentence: e.scopeSentence ?? null,
+    // §40: where the line comes from (EXPLICIT, or DERIVED from the org unit tree) and whether it leaves the tree.
+    origin: e.origin ?? 'EXPLICIT',
+    source: e.source ?? null,
+    crossTree: Boolean(e.crossTree),
+    crossTreeReason: e.crossTreeReason ?? null,
   };
 }
 

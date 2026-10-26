@@ -113,7 +113,7 @@ export async function loadCards(db, companyId, on) {
       [companyId, asOf, asOf],
     ),
     db.query(
-      `SELECT rr.from_position_id, rr.to_position_id
+      `SELECT rr.id, rr.from_position_id, rr.to_position_id, rr.scope_type
          FROM hrms_position_reporting_relationships rr
          JOIN hrms_reporting_relationship_types t ON t.company_id = rr.company_id AND t.id = rr.relationship_type_id
         WHERE rr.company_id = ? AND rr.deleted_at IS NULL AND t.code = '${PRIMARY_MANAGER}' AND ${LIVE_ON('rr')}
@@ -126,6 +126,16 @@ export async function loadCards(db, companyId, on) {
   }]));
   const primaryParentOf = new Map();
   for (const e of edgeRows) if (!primaryParentOf.has(e.from_position_id)) primaryParentOf.set(e.from_position_id, e.to_position_id);
+  // Spec §40.3: a position with no explicit primary line takes the one its org unit gives it — the same
+  // lines the chart lays its cards out on (orgChartService). Imported here at call time: reportingResolver
+  // imports positionService, which imports this file.
+  const { modelFromRows, MODEL_UNITS_SQL, MODEL_HEADS_SQL } = await import('./reportingResolver.js');
+  const [[unitRows], [headRows]] = await Promise.all([
+    db.query(MODEL_UNITS_SQL(true), [companyId]),
+    db.query(MODEL_HEADS_SQL, [companyId]),
+  ]);
+  const model = modelFromRows({ positionRows: positionRows.map((p) => ({ ...p, live: 1 })), unitRows, headRows, explicitRows: edgeRows });
+  for (const d of model.derivedLines()) if (!primaryParentOf.has(d.fromPositionId)) primaryParentOf.set(d.fromPositionId, d.toPositionId);
   const cardOf = computeCards([...positions.values()], primaryParentOf);
   return { cardOf, members: cardMembers(cardOf), positions, primaryParentOf };
 }

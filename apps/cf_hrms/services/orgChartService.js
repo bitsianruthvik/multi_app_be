@@ -64,11 +64,11 @@ import { openHiringsByPosition, shapePositionHiring, COMING_OR_LIVE_SQL, splitCo
 import { NOTICE_JOIN_SQL, NOTICE_COLUMNS_SQL, noticeOf } from './exitRead.js';
 import { SHIFT_SUMMARY_COLUMNS_SQL, summaryFromRow } from './shiftRead.js';
 import { effectiveFor } from './leavePolicyRead.js';
-import { resolvePositionReporting, scopeSentence } from './reportingResolver.js';
+import { resolvePositionReporting, scopeSentence, modelFromRows, MODEL_HEADS_SQL } from './reportingResolver.js';
+import { buildOrgTree } from './orgTree.js';
 import { getRoleContent, ROW_IN_FORCE } from './roleContentService.js';
 import { effectiveLinesForPositions } from './contentResolver.js';
 import { embed, dot, ModelUnavailable } from './semantic/embedder.js';
-import { compareUnits } from '../lib/unitOrder.js';
 import {
   DEFINITION_SOURCES, definitionText, loadDefinitions, vectorsFor,
 } from './semantic/searchIndex.js';
@@ -124,6 +124,7 @@ const POSITIONS_SQL = `
  */
 const DEPARTMENTS_SQL = `
   SELECT d.id, d.code, d.name, d.parent_department_id, d.sort_order, d.department_type, d.is_shared,
+         d.reports_into_position_id, d.reports_into_mode, d.reports_into_reason,
          ${DEPARTMENT_LABEL_ID_SQL('d')} AS label_id
     FROM hrms_departments d
    WHERE d.company_id = ? AND d.deleted_at IS NULL`;
@@ -141,7 +142,10 @@ const SERVES_SQL = `
  * `serves` are the facts. A serves row pointing at a department that is gone is
  * dropped rather than sent as a dangling id.
  */
-export function shapeDepartments(departmentRows, serveRows, rank) {
+export function shapeDepartments(departmentRows, serveRows, rank, headRows = []) {
+  // §40: each unit's head chairs, and its Reports into as stored (the derived lines carry what it resolves to).
+  const headsBy = new Map();
+  for (const h of headRows) headsBy.set(h.department_id, [...(headsBy.get(h.department_id) ?? []), h.position_id]);
   const live = new Set(departmentRows.map((r) => r.id));
   const servesBy = new Map();
   for (const r of serveRows) {
@@ -162,39 +166,27 @@ export function shapeDepartments(departmentRows, serveRows, rank) {
       isShared: Boolean(r.is_shared),
       serves: servesBy.get(r.id) ?? [],
       rank: rank.get(r.id) ?? null,
+      headPositionIds: headsBy.get(r.id) ?? [],
+      reportsIntoMode: r.reports_into_mode === 'CHOSEN' ? 'CHOSEN' : 'DEFAULT',
+      reportsIntoPositionId: r.reports_into_mode === 'CHOSEN' ? (r.reports_into_position_id ?? null) : null,
+      reportsIntoReason: r.reports_into_mode === 'CHOSEN' ? (r.reports_into_reason ?? null) : null,
     }))
     .sort((a, b) => (a.rank ?? 1e9) - (b.rank ?? 1e9));
 }
 
+/**
+ * A unit's rank = its place in THE one tree (services/orgTree.js, spec §40.1): the same pre-order walk
+ * the Org units list shows — siblings by stored order, then code, then id; a unit caught in a parent
+ * cycle ranks last rather than being dropped.
+ */
 function departmentRanks(rows) {
-  const kids = new Map();
-  const ids = new Set(rows.map((r) => r.id));
-  // Siblings by their stored order, then code, then id (spec §34; lib/unitOrder.js). It was code alone until 2026-10-24.
-  const byCode = compareUnits;
-  for (const r of rows) {
-    const parentId = r.parent_department_id != null && ids.has(r.parent_department_id) ? r.parent_department_id : 0;
-    if (!kids.has(parentId)) kids.set(parentId, []);
-    kids.get(parentId).push(r);
-  }
-  const rank = new Map();
-  const walk = (parentId, guard) => {
-    if (guard > 64) return;
-    for (const r of (kids.get(parentId) ?? []).sort(byCode)) {
-      if (rank.has(r.id)) continue;
-      rank.set(r.id, rank.size);
-      walk(r.id, guard + 1);
-    }
-  };
-  walk(0, 0);
-  // A unit caught in a parent cycle never reaches the walk; rank it last rather than drop it.
-  for (const r of [...rows].sort(byCode)) if (!rank.has(r.id)) rank.set(r.id, rank.size);
-  return rank;
+  return buildOrgTree({ units: rows }).rank;
 }
 
 /** Every live reporting edge in the company, typed and scoped. Never filtered by type. */
 const EDGES_SQL = `
   SELECT rr.id, rr.from_position_id, rr.to_position_id, rr.relationship_type_id, rr.is_primary,
-         rr.scope_type, rr.scope_label, rr.scope_work_context_id, rr.notes,
+         rr.scope_type, rr.scope_label, rr.scope_work_context_id, rr.notes, rr.cross_tree_reason,
          rr.effective_from, rr.effective_to,
          t.code AS type_code, t.name AS type_name, t.is_formal, t.sort_order,
          wc.name AS scope_context_name
@@ -372,15 +364,22 @@ function buildDisplayTitles(allPositions, primaryParentTitleById, primaryContext
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /** One live edge, in the shape the client draws. Scope travels on EVERY edge, not only dotted ones. */
-function shapeEdge(r) {
+function shapeEdge(r, model = null) {
   const scope = {
     type: r.scope_type,
     label: r.scope_label ?? null,
     workContextId: r.scope_work_context_id ?? null,
     workContextName: r.scope_context_name ?? null,
   };
+  const primary = r.type_code === 'PRIMARY_MANAGER';
   return {
     id: r.id,
+    // §40 (additive): `key` is unique in the payload (derived lines have no id); origin, source and the cross-tree flag.
+    key: `E:${r.id}`,
+    origin: 'EXPLICIT',
+    source: primary ? 'EXPLICIT' : null,
+    crossTree: primary && model ? !model.inTree(r.from_position_id, r.to_position_id) : false,
+    crossTreeReason: r.cross_tree_reason ?? null,
     fromPositionId: r.from_position_id,
     toPositionId: r.to_position_id,
     typeCode: r.type_code,
@@ -412,7 +411,7 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
 
   const [
     [positionRows], [edgeRows], [occupantAndComingRows], [serveRows],
-    [contentRows], [overrideRows], [openPointRows], [departmentRows],
+    [contentRows], [overrideRows], [openPointRows], [departmentRows], [headRows],
   ] = await Promise.all([
     db.query(POSITIONS_SQL, [companyId, asOf, asOf]),
     db.query(EDGES_SQL, [companyId, asOf, asOf]),
@@ -422,11 +421,23 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
     db.query(OVERRIDE_COUNTS_SQL, [companyId, asOf, asOf]),
     db.query(OPEN_POINT_COUNTS_SQL, [companyId]),
     db.query(DEPARTMENTS_SQL, [companyId]),
+    // §40: the heads of the units — the ninth company-wide read. Derived lines are computed from rows already here.
+    db.query(MODEL_HEADS_SQL, [companyId]),
   ]);
   // In the chair on the date, and due to join it later.
   const { live: occupantRows, joining: joiningByPosition } = splitComing(occupantAndComingRows, asOf);
   const departmentRank = departmentRanks(departmentRows);
-  const departments = shapeDepartments(departmentRows, serveRows, departmentRank);
+  const departments = shapeDepartments(departmentRows, serveRows, departmentRank, headRows);
+
+  // §40: reporting that follows the tree, from the rows above (reportingResolver.modelFromRows — the one order).
+  const reporting = modelFromRows({
+    positionRows: positionRows.map((p) => ({ ...p, title: p.position_title || p.role_title, live: 1 })),
+    unitRows: departmentRows,
+    headRows,
+    explicitRows: edgeRows.filter((e) => e.type_code === 'PRIMARY_MANAGER'),
+    occupantRows,
+  });
+  const derivedLines = reporting.derivedLines();
 
   const employeeIds = [...new Set(occupantRows.map((o) => o.employee_id))];
   const attendanceRows = employeeIds.length
@@ -482,6 +493,8 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
     if (e.type_code !== 'PRIMARY_MANAGER') continue;
     if (!primaryParentOf.has(e.from_position_id)) primaryParentOf.set(e.from_position_id, e.to_position_id);
   }
+  // A position with no explicit primary line takes the one its unit gives it (§40.3) — a real primary line.
+  for (const d of derivedLines) if (!primaryParentOf.has(d.fromPositionId)) primaryParentOf.set(d.fromPositionId, d.toPositionId);
 
   const baseTitleOf = new Map(positionRows.map((p) => [p.id, p.position_title || p.role_title || `Position ${p.id}`]));
   const primaryParentTitle = new Map();
@@ -640,7 +653,38 @@ export async function buildOrgChart(db, companyId, { on, root } = {}) {
       if (keep && (visible.has(r.from_position_id) || visible.has(r.to_position_id))) edgesOutsideSubtree += 1;
       continue;
     }
-    edges.push(shapeEdge(r));
+    edges.push(shapeEdge(r, reporting));
+  }
+  // The derived lines (§40): never stored, drawn plain. A chosen Reports into outside the tree is cross-tree.
+  const primaryType = edgeRows.find((e) => e.type_code === 'PRIMARY_MANAGER');
+  for (const d of derivedLines) {
+    const inside = visible.has(d.fromPositionId) && visible.has(d.toPositionId);
+    if (!inside) {
+      if (keep && (visible.has(d.fromPositionId) || visible.has(d.toPositionId))) edgesOutsideSubtree += 1;
+      continue;
+    }
+    edges.push({
+      id: null,
+      key: `D:${d.fromPositionId}`,
+      origin: 'DERIVED',
+      source: d.source,
+      crossTree: Boolean(d.chosen) && !reporting.inTreeAbove(d.settingUnitId ?? d.unitId, d.toPositionId),
+      crossTreeReason: d.chosen ? (d.reason ?? null) : null,
+      fromPositionId: d.fromPositionId,
+      toPositionId: d.toPositionId,
+      typeCode: 'PRIMARY_MANAGER',
+      typeName: primaryType?.type_name ?? 'Primary Manager',
+      isFormal: true,
+      isPrimary: true,
+      scopeType: 'GENERAL',
+      scopeLabel: null,
+      scopeWorkContextId: null,
+      scopeWorkContextName: null,
+      scopeSentence: scopeSentence({ type: 'GENERAL' }),
+      effectiveFrom: null,
+      effectiveTo: null,
+      unitId: d.unitId ?? null,
+    });
   }
 
   /* ── totals, over exactly the nodes being returned ─────────────────────── */

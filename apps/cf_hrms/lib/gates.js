@@ -38,6 +38,12 @@ export const newPositionBody = named('scope: the org unit it is created in', (re
 export const positionBody = named('scope: an org unit it is moved to', (req) => assertPositionBody(req, req.body ?? {}));
 /** A department being added (`creating`) or changed. */
 export const departmentWrite = ({ creating = false } = {}) => named('scope: the org unit', (req) => assertDepartmentWrite(req, creating ? null : req.params.id, req.body ?? {}));
+/** Spec §40.5: a fix to a position's own reporting line needs positions edit; a fix to a unit's head or Reports into, org edit. */
+export const reportingFixRight = named('a line fix needs positions edit, a unit fix org edit', (req) => {
+  const key = String(req.body?.key ?? '');
+  const line = key.startsWith('CROSS_TREE:E:') || (key.startsWith('NO_MANAGER:') && req.body?.action === 'CHOOSE') || (key.startsWith('LOOP:') && req.body?.edgeId != null);
+  need(req, line ? PERM.positions.edit : PERM.org.edit);
+});
 /** Something that belongs to no department: not for a login scoped to one. */
 export const companyWide = (sentence) => named('whole-company logins only', (req) => assertCompanyWide(req, sentence));
 /** A work assignment named in a body: the person and the position must both be inside. */
@@ -84,6 +90,6 @@ export const employeePaper = named('an identity paper needs cf_hrms_contact_view
 });
 
 export default {
-  inPosition, inEmployee, newPositionBody, positionBody, departmentWrite, companyWide, assignmentBody,
+  inPosition, inEmployee, newPositionBody, positionBody, departmentWrite, companyWide, assignmentBody, reportingFixRight,
   showsPeople, showsHiring, takesEmployee, takesHiring, employeePaper,
 };

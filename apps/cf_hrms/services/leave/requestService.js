@@ -33,7 +33,7 @@ import { HrmsError, invalid, notFound, conflict } from '../../lib/errors.js';
 import { audit } from '../peopleService.js';
 import { today as todayText, dateText, LIVE_ON } from '../positionService.js';
 import { loadAssignmentIndex, resolveEffective, rulesOfPolicies, applicability, noticeForQuantity } from '../leavePolicyRead.js';
-import { resolveReporting, resolvePositionReporting } from '../reportingResolver.js';
+import { resolveReporting, loadReportingModel } from '../reportingResolver.js';
 import { EMPLOYEE_IN_DEPARTMENTS_SQL } from '../accessScope.js';
 import { unitIdsAndBelow } from '../../lib/listFilters.js';
 import {
@@ -503,27 +503,50 @@ function chartLine(relationships) {
 /**
  * Walk up from the person's main position. Each step is a chair (or, for a line
  * recorded on the person's own work, a person) and who sits in it today.
- * @returns { approverId | null, chain: [{ positionId, employeeIds }] }  `full` walks to the top.
+ *
+ * Spec §40.3: the first step is the person's resolved line (their own assignment line, else the
+ * position's explicit primary line, else the line its org unit gives it — reportingResolver);
+ * every step after that is the ONE order in lib/unitReporting.js (explicit → unit head → Reports
+ * into), read from one company model, so a vacant chair walks up exactly as the chart draws it.
+ * @returns { approverId | null, approverSource, chain: [{ positionId, employeeIds, source }] }  `full` walks to the top.
+ *   approverSource: EXPLICIT | UNIT_HEAD | REPORTS_INTO, or WALKED_UP when it walked past a vacant chair; null with nobody.
  */
 export async function approverChain(db, companyId, w, { on = todayText(), full = false } = {}) {
   const chain = [];
   let approverId = null;
-  if (!w.seat) return { approverId, chain };
+  let approverSource = null;
+  if (!w.seat) return { approverId, approverSource, chain };
   const self = w.employee.id;
   const rep = await resolveReporting(db, companyId, w.seat.assignmentId, { on });
-  let line = chartLine(rep.relationships);
+  const line = chartLine(rep.relationships);
+  if (!line) return { approverId, approverSource, chain };
+  let positionId = line.origin === 'ASSIGNMENT' ? (line.manager?.positionId ?? null) : (line.managerPosition?.id ?? null);
+  let people = (line.origin === 'ASSIGNMENT' ? [line.manager?.employeeId] : line.managerCandidates.map((m) => m.employeeId))
+    .filter((id) => id != null && id !== self);
+  const firstSource = line.source ?? 'EXPLICIT';
+  chain.push({ positionId, employeeIds: people, source: firstSource });
+  if (people.length) {
+    approverId = people[0];
+    approverSource = firstSource;
+    if (!full) return { approverId, approverSource, chain };
+  }
+  const model = await loadReportingModel(db, companyId, { on });
   const seen = new Set([w.seat.positionId].filter(Boolean));
-  for (let hop = 0; line && hop < 40; hop += 1) {
-    const positionId = line.origin === 'ASSIGNMENT' ? (line.manager?.positionId ?? null) : (line.managerPosition?.id ?? null);
-    const people = (line.origin === 'ASSIGNMENT' ? [line.manager?.employeeId] : line.managerCandidates.map((m) => m.employeeId))
-      .filter((id) => id != null && id !== self);
-    chain.push({ positionId, employeeIds: people });
-    if (approverId === null && people.length) { approverId = people[0]; if (!full) break; }
+  for (let hop = 0; hop < 40; hop += 1) {
     if (!positionId || seen.has(positionId)) break;
     seen.add(positionId);
-    line = chartLine((await resolvePositionReporting(db, companyId, positionId, { on })).relationships);
+    const s = model.step(positionId);
+    if (!s) break;
+    positionId = s.managerId;
+    people = (model.positions.get(positionId)?.occupants ?? []).map((o) => o.employeeId).filter((id) => id != null && id !== self);
+    chain.push({ positionId, employeeIds: people, source: s.source });
+    if (approverId === null && people.length) {
+      approverId = people[0];
+      approverSource = 'WALKED_UP';
+      if (!full) break;
+    }
   }
-  return { approverId, chain };
+  return { approverId, approverSource, chain };
 }
 
 /** Is `employeeId` the approver of this request, or in a chair above the approver's in the same chain? */

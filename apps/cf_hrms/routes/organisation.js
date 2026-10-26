@@ -12,7 +12,16 @@
  *   PUT    /organisation/departments/order          { parentId: id | null, ids: [id] } — every sibling under one parent once,
  *                                                     in the order wanted -> { parentId, rows: [{ id, sortOrder }] }
  *   GET    /organisation/departments/:id/move-check ?parentId=  (blank = top) -> { unit, from, to, unitsUnder, positionsUnder,
- *                                                     allowed, problem, sentence } — the words of the move confirm; writes nothing
+ *                                                     allowed, problem, sentence, reportsInto } — the words of the move confirm; writes nothing
+ *                                                     (§40.4: reportsInto { mode, current, afterMove, ask } — ask = keep or switch)
+ *   PUT    /organisation/departments/:id { parentId, sortOrder?, reportsInto?: 'KEEP' | 'SWITCH' } — a move; SWITCH sets a chosen
+ *                                                     Reports into back to the default
+ *   GET    /organisation/departments/:id/reporting  §40: { unit, heads, perShift, reportsInto, candidates, shifts }
+ *   PUT    /organisation/departments/:id/reporting  { heads?: [{ positionId, shiftId|null }], reportsInto?: { mode: 'DEFAULT' } |
+ *                                                     { mode: 'CHOSEN', positionId, reason? } } — 422 VALIDATION / LOOP / REASON_NEEDED
+ *   GET    /organisation/consistency                §40.5: { asOf, counts, findings: [{ key, kind, sentence, unit, position, manager, loop, fixes }] }
+ *   POST   /organisation/consistency/fix            { key, action, positionId?, reason?, edgeId?, unitId? } -> { ok, fixed, consistency }
+ *                                                     (409 STALE; a line fix needs positions edit, a unit fix org edit)
  *   DELETE /organisation/departments/:id
  *   GET    /organisation/departments/staffing  ?on=  every department's roles and positions (seats, filled, vacant,
  *                                                    who is in each seat) in ONE answer, cut from the org chart's own nodes
@@ -73,7 +82,7 @@ import { Router } from 'express';
 import { listed } from '../lib/listFilters.js';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, ANY_VIEW, guard, handle, ctx, intParam, dateParam } from '../lib/http.js';
-import { departmentWrite, companyWide } from '../lib/gates.js';
+import { departmentWrite, companyWide, reportingFixRight } from '../lib/gates.js';
 import {
   lookups,
   listDepartments, createDepartment, updateDepartment, deleteDepartment, reorderDepartments, moveCheck,
@@ -87,6 +96,7 @@ import {
   listReportingTypes, createReportingType, updateReportingType, deleteReportingType,
 } from '../services/organisationService.js';
 import { departmentStaffing } from '../services/jobContentService.js';
+import { unitReporting, setUnitReporting, consistency, fixConsistency } from '../services/unitReportingService.js';
 import { listLabels, createLabel, updateLabel, reorderLabels, deleteLabel } from '../services/departmentLabelService.js';
 
 const router = Router();
@@ -112,6 +122,11 @@ router.post('/organisation/departments', guard(PERM.org.edit), departmentWrite({
 router.put('/organisation/departments/order', guard(PERM.org.edit), departmentWrite({ creating: true }), handle((req) => tx(req, (db, c) => reorderDepartments(db, c, req.body ?? {}))));
 router.get('/organisation/departments/:id/move-check', guard(PERM.org.edit), handle((req) => moveCheck(pool, ctx(req).companyId, intParam(req.params.id), req.query.parentId ?? null)));
 router.put('/organisation/departments/:id', guard(PERM.org.edit), departmentWrite(), handle((req) => tx(req, (db, c) => updateDepartment(db, c, intParam(req.params.id), req.body))));
+// Spec §40: a unit's Head (one, or one per shift) and Reports into; the consistency check and its fixes.
+router.get('/organisation/departments/:id/reporting', guard([PERM.org.view, PERM.positions.view]), handle((req) => unitReporting(pool, ctx(req).companyId, intParam(req.params.id))));
+router.put('/organisation/departments/:id/reporting', guard(PERM.org.edit), departmentWrite(), handle((req) => tx(req, (db, c) => setUnitReporting(db, c, intParam(req.params.id), req.body ?? {}))));
+router.get('/organisation/consistency', guard([PERM.org.view, PERM.positions.view]), handle((req) => consistency(pool, ctx(req).companyId)));
+router.post('/organisation/consistency/fix', guard([PERM.org.edit, PERM.positions.edit]), companyWide('Reporting fixes change lines across the organisation. Your access covers your org unit and everything under it.'), reportingFixRight, handle((req) => tx(req, (db, c) => fixConsistency(db, c, req.body ?? {}))));
 router.delete('/organisation/departments/:id', guard(PERM.org.remove), departmentWrite(), handle((req) => tx(req, (db, c) => deleteDepartment(db, c, intParam(req.params.id)))));
 
 // ----- department labels (spec §9) -------------------------------------------

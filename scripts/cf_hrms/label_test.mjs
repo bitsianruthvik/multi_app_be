@@ -962,10 +962,11 @@ try {
 
     const check = await call(O, 'GET', `/organisation/departments/${S1.id}/move-check?parentId=${S3.id}`);
     ok(check.status === 200 && check.json.allowed === true && check.json.unitsUnder === 1 && check.json.positionsUnder === 3
-      && check.json.sentence === `Move ${TAG} S1 renamed (Section) from ${TAG} Top to ${TAG} S3 — 3 positions and 1 unit under it move with it`,
+      // §40 may add a sentence about who it will report into after the move.
+      && check.json.sentence.startsWith(`Move ${TAG} S1 renamed (Section) from ${TAG} Top to ${TAG} S3 — 3 positions and 1 unit under it move with it`),
     'move-check: the confirm’s sentence, with the positions and units that go along', JSON.stringify(check.json));
     const toTop = await call(O, 'GET', `/organisation/departments/${M1.id}/move-check?parentId=`);
-    ok(toTop.json.allowed === true && /from .* S1 renamed to the top level — 2 positions under it move with it$/.test(toTop.json.sentence), 'move-check to the top level says so', toTop.json.sentence);
+    ok(toTop.json.allowed === true && /from .* S1 renamed to the top level — 2 positions under it move with it(.|$)/.test(toTop.json.sentence), 'move-check to the top level says so', toTop.json.sentence);
     const inside = await call(O, 'GET', `/organisation/departments/${S1.id}/move-check?parentId=${M1.id}`);
     ok(inside.status === 200 && inside.json.allowed === false && /under/.test(inside.json.problem), 'move-check under its own machine: not allowed, in words', inside.json.problem);
 

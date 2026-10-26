@@ -190,6 +190,14 @@ const AREAS = {
       `${H}/scripts/grant-platform-admin.mjs`, `${H}/services/law/**`, `${H}/services/payrollTax/settings.js`, `${H}/services/payrollTax/common.js`,
       'core/middleware/appContext.js', 'scripts/cf_hrms/compliance_test.mjs'],
   },
+  // Spec §40: reporting that follows the org unit tree — the order (lib/unitReporting.js), heads / Reports into, the
+  // consistency check, the migration, and every caller of the resolver (approvals, team scope, the chart, reviews).
+  unitReporting: {
+    suites: ['unit_reporting_test', 'leave_request_test', 'team_scope_test', 'departments_model_test', 'one_chair_test', 'attendance_test', 'reviews_test'],
+    paths: [`${H}/lib/unitReporting.js`, `${H}/services/unitReportingService.js`, `${H}/services/orgTree.js`, `${H}/services/reportingResolver.js`,
+      `${H}/scripts/apply-unit-reporting-schema.mjs`, `${H}/scripts/suggest-unit-reporting.mjs`, `${H}/services/orgChartService.js`, `${H}/services/positionCards.js`,
+      `${H}/routes/organisation.js`, 'scripts/cf_hrms/unit_reporting_test.mjs'],
+  },
   // Compliance checks (spec §36.2, §36.3, C2): checks on structure / salary / policy save and before a run's lock,
   // to-dos with a fix (after a publish, nightly, check now), the statutory top-up, the bonus run. They run inside the
   // salary save, the run's calculate and lock and the policy saves, so those suites run too.
@@ -231,7 +239,7 @@ const OWN = ['--changed', '--all', '--list'];
 const args = process.argv.slice(2);
 const val = (name) => { const a = args.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : null; };
 const has = (name) => args.includes(`--${name}`);
-const pass = args.filter((a) => !OWN.includes(a) && !/^--(area|suite|since)=/.test(a));
+const pass = args.filter((a) => !OWN.includes(a) && !/^--(area|suite|since|suite-timeout)=/.test(a));
 const VERBOSE = pass.includes('--verbose');
 
 const globRe = (g) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*\/?/g, '\u0000').replace(/\*/g, '[^/]*').replace(/\u0000/g, '.*')}$`);
@@ -286,15 +294,24 @@ function frontendChanges(base) {
 }
 
 /* ── run ─────────────────────────────────────────────────────────────────── */
+// A suite that hangs (a lock held by another process, a stuck model load) is stopped and counted as
+// failed instead of blocking the run for ever. --suite-timeout=<minutes>, default 15.
+const SUITE_TIMEOUT_MS = Number((process.argv.find((a) => a.startsWith('--suite-timeout=')) ?? '').split('=')[1] || 15) * 60_000;
+
 function runSuite(name) {
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn(process.execPath, [path.join(SUITES_DIR, `${name}.mjs`), ...pass], { cwd: BE, env: process.env });
     let out = '';
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; out += `
+  FAIL  timed out after ${SUITE_TIMEOUT_MS / 60_000} minutes — stopped (a lock or a stuck process?)
+`; child.kill(); }, SUITE_TIMEOUT_MS);
     const take = (d) => { const t = d.toString(); out += t; if (VERBOSE) process.stdout.write(t); };
     child.stdout.on('data', take);
     child.stderr.on('data', take);
     child.on('close', (code) => {
+      clearTimeout(timer);
       const ms = Date.now() - started;
       const m = /(\d+) passed, (\d+) failed/.exec(out.split('\n').filter((l) => /\d+ passed, \d+ failed/.test(l)).pop() ?? '');
       const logDir = path.join(os.tmpdir(), 'cf_hrms_test_logs');
@@ -302,7 +319,7 @@ function runSuite(name) {
       const log = path.join(logDir, `${name}.log`);
       fs.writeFileSync(log, out);
       const fails = out.split('\n').filter((l) => /^\s*(FAIL|-)\s/.test(l) && /FAIL/.test(l)).map((l) => l.trim());
-      resolve({ name, ok: code === 0, code, ms, passed: m ? Number(m[1]) : null, failed: m ? Number(m[2]) : null, log, fails });
+      resolve({ name, ok: code === 0 && !timedOut, code, ms, passed: m ? Number(m[1]) : null, failed: m ? Number(m[2]) : null, log, fails });
     });
   });
 }

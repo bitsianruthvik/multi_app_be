@@ -173,6 +173,10 @@ How to read the tables below:
 | `PUT /organisation/departments/order` | `cf_hrms_org_edit` | scope: the org unit |
 | `GET /organisation/departments/:id/move-check` | `cf_hrms_org_edit` |  |
 | `PUT /organisation/departments/:id` | `cf_hrms_org_edit` | scope: the org unit |
+| `GET /organisation/departments/:id/reporting` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
+| `PUT /organisation/departments/:id/reporting` | `cf_hrms_org_edit` | scope: the org unit |
+| `GET /organisation/consistency` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
+| `POST /organisation/consistency/fix` | `cf_hrms_org_edit` or `cf_hrms_positions_edit` | whole-company logins only; a line fix needs positions edit, a unit fix org edit |
 | `DELETE /organisation/departments/:id` | `cf_hrms_org_remove` | scope: the org unit |
 | `GET /organisation/department-labels` | `cf_hrms_org_view` or `cf_hrms_positions_view` |  |
 | `POST /organisation/department-labels` | `cf_hrms_org_edit` | whole-company logins only |
@@ -741,4 +745,4 @@ How to read the tables below:
 | `DELETE /payroll/bonus/:id` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `GET /payroll/bonus/:id/register` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
 
-634 routes.
+638 routes.

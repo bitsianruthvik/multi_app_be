@@ -51,7 +51,7 @@
  */
 import { pool } from '../lib/db.js';
 import { dateText, today, LIVE_ON } from './positionService.js';
-import { resolveReporting, scopeSentence } from './reportingResolver.js';
+import { resolveReporting, scopeSentence, loadReportingModel } from './reportingResolver.js';
 import { resolveContent } from './contentResolver.js';
 import { loadCards } from './positionCards.js';
 import { exitsForEmployees } from './exitRead.js';
@@ -355,6 +355,25 @@ async function reportsInto(db, companyId, { managerEmployeeIds, managerPositionI
       [companyId, on, on, ...managerPositionIds],
     );
 
+    // §40: the positions whose line comes from the org unit tree (a head, a Reports into) report here too.
+    const model = await loadReportingModel(db, companyId, { on });
+    const wanted = new Set(managerPositionIds.map(Number));
+    const derivedFrom = model.derivedLines().filter((d) => wanted.has(d.toPositionId));
+    if (derivedFrom.length) {
+      const [[t]] = await db.query(
+        "SELECT id, code, name, is_formal, sort_order FROM hrms_reporting_relationship_types WHERE company_id = ? AND code = 'PRIMARY_MANAGER' AND deleted_at IS NULL ORDER BY id LIMIT 1",
+        [companyId],
+      );
+      if (t) {
+        for (const d of derivedFrom) {
+          formal.push({
+            id: null, from_position_id: d.fromPositionId, to_position_id: d.toPositionId, relationship_type_id: t.id, scope_key: 'GENERAL::0',
+            is_primary: 1, scope_type: 'GENERAL', scope_label: null, scope_work_context_id: null, scope_notes: null,
+            type_code: t.code, type_name: t.name, is_formal: t.is_formal, sort_order: t.sort_order, scope_context_name: null,
+          });
+        }
+      }
+    }
     const fromIds = [...new Set(formal.map((r) => r.from_position_id))];
     if (fromIds.length) {
       const [people] = await db.query(

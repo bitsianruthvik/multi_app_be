@@ -1629,6 +1629,23 @@ export async function addPositionReporting(db, { companyId, userId }, positionId
       scope.scopeType, scope.scopeLabel, scope.scopeWorkContextId, effectiveFrom, effectiveTo,
       readText(body.notes, 'Notes', 2000, []), userId],
   );
+  // Spec §40: the explicit lines may be loop-free on their own and still close a loop through the lines the
+  // org units give (a head given a line to one of its own unit's people). Checked on the one order, after
+  // the insert, inside the caller's transaction — a refusal rolls it back. (Imported here: reportingResolver
+  // imports this file.)
+  // Only a company whose units give lines (a head, a chosen Reports into) can loop that way: one cheap read first.
+  const [[unitLines]] = type.code === 'PRIMARY_MANAGER' ? await db.query(
+    `SELECT (EXISTS (SELECT 1 FROM hrms_unit_heads WHERE company_id = ? AND deleted_at IS NULL)
+          OR EXISTS (SELECT 1 FROM hrms_departments WHERE company_id = ? AND deleted_at IS NULL AND reports_into_mode = 'CHOSEN')) AS any_lines`,
+    [companyId, companyId],
+  ) : [[null]];
+  if (unitLines && Number(unitLines.any_lines) && effectiveFrom <= today() && (!effectiveTo || effectiveTo >= today())) {
+    const { loadReportingModel } = await import('./reportingResolver.js');
+    const c = (await loadReportingModel(db, companyId, {})).chain(positionId);
+    if (c.loop && c.loopAt === positionId) {
+      throw conflict('REPORTING_CYCLE', 'That would make this position report, directly or indirectly, to itself (through the heads of its org units).');
+    }
+  }
   return { ok: true, id: res.insertId, replaced: replacesId ?? null };
 }
 

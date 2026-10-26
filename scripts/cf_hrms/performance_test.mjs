@@ -396,7 +396,7 @@ try {
     created = await PLAN.createPlans(box2.db, hr, { frequency: 'QUARTERLY', start: S });
     const ms = Date.now() - t1;
     note(`create ${Q.name}: ${created.created} plans, ${created.kpis.total} KPIs (${created.kpis.targetsAsNumbers} targets as numbers, ${created.kpis.targetsAsWords} as words) — ${box2.n} queries, ${ms} ms locally; at ~49 ms a round trip ≈ ${Math.round(box2.n * 49 / 100) / 10} s on production`);
-    ok(created.created === preview.counts.willGet && box2.n <= 14 + 6 * days, `create: ${created.created} plans in ${box2.n} queries (no query per person)`);
+    ok(created.created === preview.counts.willGet && box2.n <= 19 + 6 * days, /* +5 fixed reads since §40: unit heads and Reports into, once per create — not per person */ `create: ${created.created} plans in ${box2.n} queries (no query per person)`);
     const again = await PLAN.createPlans(db, hr, { frequency: 'QUARTERLY', start: S });
     ok(again.created === 0, 'create again: nobody gets a second plan (idempotent)');
     const pv2 = await PLAN.previewPlans(db, COMPANY, { frequency: 'QUARTERLY', start: S });

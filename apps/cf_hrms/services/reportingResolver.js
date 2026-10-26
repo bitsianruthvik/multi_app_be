@@ -81,6 +81,162 @@
  */
 import { notFound } from '../lib/errors.js';
 import { dateText, today, LIVE_ON } from './positionService.js';
+import { buildReportingModel } from '../lib/unitReporting.js';
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §40 — REPORTING THAT FOLLOWS THE ORG UNIT TREE
+ * ══════════════════════════════════════════════════════════════════════════
+ * A position with no explicit PRIMARY_MANAGER line gets one DERIVED line from
+ * its unit: the unit's head, or (for a head) the unit's Reports into. The order
+ * is lib/unitReporting.js; this file loads the rows for it and adds the derived
+ * line to the answers below (origin 'DERIVED', id null). Derived lines are never
+ * stored, so they cannot fall out of step with the tree.
+ *
+ *   loadReportingModel(db, companyId, { on })   5 company-wide queries, then
+ *     model.step(id)     one chair up: { managerId, source: EXPLICIT | UNIT_HEAD | REPORTS_INTO, … }
+ *     model.manager(id)  the first chair up with somebody in it: source WALKED_UP when it walked past vacant chairs
+ *     model.chain(id)    every chair up, with loop detection
+ *   modelFromRows(...)   the same model from rows a caller (the org chart) already read
+ *
+ * Every caller that needs "the manager" — leave, attendance and claim approvals
+ * (leave/requestService.approverChain), team scope and the employee chart (the
+ * org chart's edges), reviews (performance plans' manager chair), hiring letters,
+ * the chart — reads it through here.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+export const SOURCES = ['EXPLICIT', 'UNIT_HEAD', 'REPORTS_INTO', 'WALKED_UP'];
+
+/** Every position a line can name (live = drawn today). 2 `?` (on, on), then the company. */
+const MODEL_POSITIONS_SQL = `
+  SELECT p.id, p.position_code, COALESCE(p.position_title, r.title) AS title, r.title AS role_title,
+         p.department_id, p.default_shift_id, p.status,
+         (p.status <> 'CLOSED' AND ${LIVE_ON('p')}) AS live
+    FROM hrms_positions p
+    LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
+   WHERE p.company_id = ? AND p.deleted_at IS NULL`;
+
+export const MODEL_UNITS_SQL = (withReporting = true) => `
+  SELECT d.id, d.code, d.name, d.department_type, d.parent_department_id, d.sort_order,
+         ${withReporting ? 'd.reports_into_position_id, d.reports_into_mode, d.reports_into_reason' : "NULL AS reports_into_position_id, 'DEFAULT' AS reports_into_mode, NULL AS reports_into_reason"}
+    FROM hrms_departments d
+   WHERE d.company_id = ? AND d.deleted_at IS NULL`;
+
+export const MODEL_HEADS_SQL = `
+  SELECT h.id, h.department_id, h.position_id, h.shift_id
+    FROM hrms_unit_heads h
+   WHERE h.company_id = ? AND h.deleted_at IS NULL
+   ORDER BY h.department_id, h.shift_id, h.id`;
+
+/** Live PRIMARY_MANAGER lines in the chart's order. The company, then 2 `?` (on, on). */
+const MODEL_EXPLICIT_SQL = (withReason = true) => `
+  SELECT rr.id, rr.from_position_id, rr.to_position_id, rr.scope_type, rr.is_primary, rr.effective_from,
+         ${withReason ? 'rr.cross_tree_reason' : 'NULL AS cross_tree_reason'}
+    FROM hrms_position_reporting_relationships rr
+    JOIN hrms_reporting_relationship_types t ON t.company_id = rr.company_id AND t.id = rr.relationship_type_id
+   WHERE rr.company_id = ? AND rr.deleted_at IS NULL AND t.code = 'PRIMARY_MANAGER' AND ${LIVE_ON('rr')}
+   ORDER BY rr.is_primary DESC, t.sort_order, rr.id`;
+
+/** Who sits in each chair on the date — the same predicate as occupantsOf below. The company, then 2 `?`. */
+const MODEL_OCCUPANTS_SQL = `
+  SELECT wa.position_id, e.full_name, wa.employee_id
+    FROM hrms_work_assignments wa
+    JOIN hrms_employees e ON e.company_id = wa.company_id AND e.id = wa.employee_id
+   WHERE wa.company_id = ? AND wa.deleted_at IS NULL AND wa.status = 'ACTIVE' AND wa.position_id IS NOT NULL
+     AND (wa.effective_from IS NULL OR wa.effective_from <= ?)
+     AND (wa.effective_to IS NULL OR wa.effective_to >= ?)
+   ORDER BY wa.is_primary DESC, e.full_name`;
+
+/** Rows -> the model. Each argument is the raw rows of the matching query above (or the chart's own). */
+export function modelFromRows({ positionRows = [], unitRows = [], headRows = [], explicitRows = [], occupantRows = [] }) {
+  const occupants = new Map();
+  for (const o of occupantRows) {
+    if (o.position_id == null) continue;
+    const list = occupants.get(o.position_id) ?? [];
+    list.push({ employeeId: o.employee_id, name: o.full_name });
+    occupants.set(o.position_id, list);
+  }
+  return buildReportingModel({
+    positions: positionRows.map((p) => ({
+      id: p.id,
+      code: p.position_code ?? null,
+      title: p.title ?? p.position_title ?? p.role_title ?? `Position ${p.id}`,
+      departmentId: p.department_id ?? null,
+      shiftId: p.default_shift_id ?? null,
+      live: p.live == null ? p.status !== 'CLOSED' : Boolean(Number(p.live)),
+      occupied: (occupants.get(p.id) ?? []).length > 0,
+      occupantName: occupants.get(p.id)?.[0]?.name ?? null,
+      occupants: occupants.get(p.id) ?? [],
+    })),
+    units: unitRows.map((u) => ({
+      id: u.id,
+      code: u.code ?? null,
+      name: u.name,
+      type: u.department_type ?? null,
+      parentId: u.parent_department_id ?? null,
+      reportsIntoPositionId: u.reports_into_position_id ?? null,
+      reportsIntoMode: u.reports_into_mode === 'CHOSEN' ? 'CHOSEN' : 'DEFAULT',
+      reportsIntoReason: u.reports_into_reason ?? null,
+    })),
+    heads: headRows.map((h) => ({ id: h.id, unitId: h.department_id, positionId: h.position_id, shiftId: h.shift_id ?? null })),
+    explicit: explicitRows.map((e) => ({
+      id: e.id,
+      fromPositionId: e.from_position_id,
+      toPositionId: e.to_position_id,
+      scopeType: e.scope_type ?? 'GENERAL',
+      crossTreeReason: e.cross_tree_reason ?? null,
+    })),
+  });
+}
+
+/**
+ * The whole company's reporting, for a date: 5 queries, whatever the size.
+ * `unitReporting: false` reads a database without the §41 schema (a dry run on
+ * production before it is applied): no heads, every unit DEFAULT.
+ */
+export async function loadReportingModel(db, companyId, { on, unitReporting = true } = {}) {
+  const asOf = dateText(on) || today();
+  const [[positionRows], [unitRows], [headRows], [explicitRows], [occupantRows]] = await Promise.all([
+    db.query(MODEL_POSITIONS_SQL, [asOf, asOf, companyId]),
+    db.query(MODEL_UNITS_SQL(unitReporting), [companyId]),
+    unitReporting ? db.query(MODEL_HEADS_SQL, [companyId]) : Promise.resolve([[]]),
+    db.query(MODEL_EXPLICIT_SQL(unitReporting), [companyId, asOf, asOf]),
+    db.query(MODEL_OCCUPANTS_SQL, [companyId, asOf, asOf]),
+  ]);
+  const model = modelFromRows({ positionRows, unitRows, headRows, explicitRows, occupantRows });
+  model.asOf = asOf;
+  return model;
+}
+
+/** A chair in words: { positionId, code, title, unitId, unitName, unitType, shiftId, shiftCode, occupantName }. */
+export function posRef(model, positionId, shiftCodeOf = null) {
+  if (positionId == null) return null;
+  const p = model.positions.get(Number(positionId));
+  if (!p) return { positionId: Number(positionId), code: null, title: `Position ${positionId}`, unitId: null, unitName: null, unitType: null, shiftId: null, shiftCode: null, occupantName: null };
+  const u = p.departmentId != null ? model.units.get(Number(p.departmentId)) : null;
+  return {
+    positionId: p.id, code: p.code, title: p.title,
+    unitId: u?.id ?? null, unitName: u?.name ?? null, unitType: u?.type ?? null,
+    shiftId: p.shiftId ?? null, shiftCode: shiftCodeOf && p.shiftId != null ? (shiftCodeOf.get(p.shiftId) ?? null) : null,
+    occupantName: p.occupantName ?? null,
+  };
+}
+
+/** Why a derived line goes where it goes, in one sentence. */
+export function derivedSentence(model, s) {
+  if (!s) return null;
+  const u = s.unitId != null ? model.units.get(Number(s.unitId)) : null;
+  const name = u ? u.name : 'its org unit';
+  if (s.source === 'UNIT_HEAD') return `From the org unit: the head of ${name}.`;
+  if (s.source === 'REPORTS_INTO') {
+    if (s.chosen) {
+      const setting = s.settingUnitId != null ? model.units.get(Number(s.settingUnitId)) : u;
+      return `From the org unit: ${setting ? setting.name : name} reports into this position (chosen).`;
+    }
+    const from = s.fromUnitId != null ? model.units.get(Number(s.fromUnitId)) : null;
+    return `From the org unit: ${name} reports into ${from ? `the head of ${from.name}` : 'the unit above'}.`;
+  }
+  return null;
+}
 
 /* ── row loaders ────────────────────────────────────────────────────────── */
 
@@ -262,6 +418,7 @@ function shapeFormal(r, occupants) {
     effectiveTo: dateText(r.effective_to),
     endsOn: dateText(r.effective_to),
     supersededById: null,
+    crossTreeReason: r.cross_tree_reason ?? null,
     note: people.length === 0
       ? 'Inherited from the position. That position is vacant, so no person holds this line right now.'
       : people.length > 1
@@ -378,6 +535,11 @@ export async function resolveReporting(db, companyId, assignmentId, { on } = {})
     );
     const occupants = await occupantsOf(db, companyId, [...new Set(formalRows.map((r) => r.to_position_id))], asOf);
     formal = formalRows.map((r) => shapeFormal(r, occupants));
+    // §40: no explicit primary line on the position -> the one its org unit gives it.
+    const model = await loadReportingModel(db, companyId, { on: asOf });
+    markTree(model, head.position_id, formal);
+    const derived = await derivedRelationship(db, companyId, model, head.position_id, formal, asOf);
+    if (derived) formal.push(derived);
   }
 
   // Replacement is keyed on type + scope. Same kind of authority over the same
@@ -417,7 +579,7 @@ export async function resolveReporting(db, companyId, assignmentId, { on } = {})
  * it for its "Formal reporting" tab. Same shapes as above so a caller that can
  * render one can render the other.
  */
-export async function resolvePositionReporting(db, companyId, positionId, { on } = {}) {
+export async function resolvePositionReporting(db, companyId, positionId, { on, model: givenModel = null } = {}) {
   const asOf = dateText(on) || today();
   const [[p]] = await db.query(
     `SELECT p.id, p.position_code, COALESCE(p.position_title, r.title) AS title, r.title AS role_title
@@ -432,11 +594,89 @@ export async function resolvePositionReporting(db, companyId, positionId, { on }
     [companyId, positionId, asOf, asOf],
   );
   const occupants = await occupantsOf(db, companyId, [...new Set(rows.map((r) => r.to_position_id))], asOf);
-  const relationships = sortRows(rows.map((r) => shapeFormal(r, occupants)));
+  const formal = rows.map((r) => shapeFormal(r, occupants));
+  // §40: the line the org unit gives a position with no explicit primary line, and the resolved manager.
+  const model = givenModel ?? await loadReportingModel(db, companyId, { on: asOf });
+  markTree(model, p.id, formal);
+  const derived = await derivedRelationship(db, companyId, model, p.id, formal, asOf);
+  if (derived) formal.push(derived);
+  const relationships = sortRows(formal);
+  const m = model.manager(p.id);
   return {
     asOf,
     position: { id: p.id, code: p.position_code, title: p.title, roleTitle: p.role_title },
     relationships,
     summary: summarise(relationships),
+    resolvedManager: {
+      positionId: m.positionId,
+      source: m.source,
+      firstPositionId: m.firstPositionId,
+      firstSource: m.firstSource,
+      through: m.through,
+      occupantName: m.positionId != null ? (model.positions.get(m.positionId)?.occupantName ?? null) : null,
+    },
+  };
+}
+
+/* ── §40 helpers for the two reads above ────────────────────────────────── */
+
+/** Explicit PRIMARY rows say so (`source`), and whether the manager is outside the position's tree. */
+function markTree(model, positionId, formal) {
+  for (const r of formal) {
+    const primary = r.relationshipType?.code === 'PRIMARY_MANAGER';
+    r.source = primary ? 'EXPLICIT' : null;
+    r.crossTree = primary && r.managerPosition?.id != null ? !model.inTree(positionId, r.managerPosition.id) : false;
+    r.crossTreeReason = r.crossTreeReason ?? null;
+  }
+}
+
+/**
+ * The DERIVED primary line of a position, shaped like a formal row (origin 'DERIVED', id null),
+ * or null when the position has an explicit primary line or its unit gives it nobody.
+ */
+async function derivedRelationship(db, companyId, model, positionId, formal, asOf) {
+  if (formal.some((r) => r.relationshipType?.code === 'PRIMARY_MANAGER')) return null;
+  const s = model.step(positionId);
+  if (!s || s.source === 'EXPLICIT') return null;
+  const [[t]] = await db.query(
+    `SELECT id, code, name, is_formal, allow_multiple, sort_order FROM hrms_reporting_relationship_types
+      WHERE company_id = ? AND code = 'PRIMARY_MANAGER' AND deleted_at IS NULL ORDER BY id LIMIT 1`,
+    [companyId],
+  );
+  if (!t) return null;
+  const [[mp]] = await db.query(
+    `SELECT p.id, p.position_code, COALESCE(p.position_title, r.title) AS title, r.title AS role_title
+       FROM hrms_positions p LEFT JOIN hrms_roles r ON r.company_id = p.company_id AND r.id = p.role_id
+      WHERE p.company_id = ? AND p.id = ?`,
+    [companyId, s.managerId],
+  );
+  const occupants = await occupantsOf(db, companyId, [s.managerId], asOf);
+  const people = occupants.get(s.managerId) ?? [];
+  const unit = s.unitId != null ? model.units.get(Number(s.unitId)) : null;
+  const scope = { type: 'GENERAL', label: null, workContextId: null, workContextName: null, notes: null, key: 'GENERAL::0' };
+  return {
+    key: `DERIVED:${positionId}`,
+    id: null,
+    origin: 'DERIVED',
+    layer: 'FORMAL',
+    inherited: true,
+    source: s.source,
+    relationshipType: { id: t.id, code: t.code, name: t.name, isFormal: Boolean(t.is_formal), allowMultiple: Boolean(t.allow_multiple), sortOrder: Number(t.sort_order ?? 0) },
+    isPrimary: true,
+    scope,
+    scopeSentence: scopeSentence(scope),
+    manager: people[0] ?? null,
+    managerCandidates: people,
+    managerPosition: { id: s.managerId, code: mp?.position_code ?? null, title: mp?.title ?? null, roleTitle: mp?.role_title ?? null },
+    vacant: people.length === 0,
+    unit: unit ? { id: unit.id, name: unit.name, type: unit.type ?? null } : null,
+    chosen: Boolean(s.chosen),
+    crossTree: s.chosen ? !model.inTreeAbove(s.settingUnitId ?? s.unitId, s.managerId) : false,
+    crossTreeReason: s.chosen ? (s.reason ?? null) : null,
+    effectiveFrom: null,
+    effectiveTo: null,
+    endsOn: null,
+    supersededById: null,
+    note: `${derivedSentence(model, s)}${people.length === 0 ? ' That position is vacant, so no person holds this line right now.' : ''}`,
   };
 }

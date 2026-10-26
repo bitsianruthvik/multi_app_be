@@ -6673,3 +6673,63 @@ CREATE TABLE IF NOT EXISTS hrms_bonus_set_on_off (
   KEY idx_hbso_year (company_id, bonus_year),
   CONSTRAINT fk_hbso_company FOREIGN KEY (company_id) REFERENCES companies(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+
+-- ############################################################################
+-- ## 41. UNIT REPORTING (CF_HRMS_HIRING_SPEC.md §40)                         ##
+-- ############################################################################
+-- Added 2026-10-24. The org unit tree is the backbone; reporting is anchored on POSITIONS and
+-- follows the tree by default. A position's primary manager resolves in this order
+-- (services/reportingResolver.js, lib/unitReporting.js):
+--   1. its own explicit PRIMARY_MANAGER line (hrms_position_reporting_relationships)  -> EXPLICIT
+--   2. else the head of its own unit (the head on its shift when the unit has a head per shift) -> UNIT_HEAD
+--   3. for a head (or a unit with no head), the unit's Reports into                      -> REPORTS_INTO
+--      DEFAULT = the parent unit's head (or, when the parent has none, the parent's own Reports into)
+--      CHOSEN  = reports_into_position_id (the parent unit or a unit above; anywhere else needs a reason)
+--   4. a vacant chair: the person is found by walking up the same order                -> WALKED_UP
+--
+-- DERIVED LINES ARE NOT STORED. They are computed on read from the tables below, in a fixed number
+-- of company-wide queries, so they can never fall out of step with the tree, a head or a move.
+-- Only the explicit lines are rows; one that leaves the tree may carry a reason.
+--
+--   hrms_unit_heads   one live head per (unit, shift) — shift NULL = the unit's one head.
+--                     The head is a position of the unit or of a unit above (one position may
+--                     head several units). Soft-deleted, never erased.
+--   hrms_departments.reports_into_position_id / reports_into_mode / reports_into_reason
+--   hrms_position_reporting_relationships.cross_tree_reason  — "mark as intended" for a primary
+--                     line whose manager is outside the unit and the units above it.
+-- Guarded ALTERs and the table: apps/cf_hrms/scripts/apply-unit-reporting-schema.mjs (dry run by default).
+
+CREATE TABLE IF NOT EXISTS hrms_unit_heads (
+  id               INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT          NOT NULL,
+  department_id    INT          NOT NULL,            -- the unit it heads
+  position_id      INT          NOT NULL,            -- the chair (never a person)
+  shift_id         INT          NULL,                -- NULL = the unit's one head; set = the head for that shift
+
+  deleted_at       DATETIME     DEFAULT NULL,
+  created_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by       INT          NULL,
+
+  head_key         VARCHAR(40)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, CONCAT(department_id, ':', IFNULL(shift_id, 0)), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_huh_tenant (company_id, id),
+  UNIQUE KEY uq_huh_live   (company_id, head_key),
+  KEY idx_huh_unit     (company_id, department_id),
+  KEY idx_huh_position (company_id, position_id),
+  CONSTRAINT fk_huh_company  FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_huh_unit     FOREIGN KEY (company_id, department_id) REFERENCES hrms_departments(company_id, id),
+  CONSTRAINT fk_huh_position FOREIGN KEY (company_id, position_id) REFERENCES hrms_positions(company_id, id),
+  CONSTRAINT fk_huh_shift    FOREIGN KEY (company_id, shift_id) REFERENCES hrms_shifts(company_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 41b. hrms_departments: Reports into -------------------------------------------------------
+-- "ALTER TABLE hrms_departments ADD COLUMN reports_into_position_id INT NULL AFTER sort_order"
+-- "ALTER TABLE hrms_departments ADD COLUMN reports_into_mode ENUM('DEFAULT','CHOSEN') NOT NULL DEFAULT 'DEFAULT' AFTER reports_into_position_id"
+-- "ALTER TABLE hrms_departments ADD COLUMN reports_into_reason VARCHAR(500) NULL AFTER reports_into_mode"
+-- "ALTER TABLE hrms_departments ADD KEY idx_hdep_reports_into (company_id, reports_into_position_id)"
+
+-- ----- 41c. hrms_position_reporting_relationships: a cross-tree line marked as intended ----------
+-- "ALTER TABLE hrms_position_reporting_relationships ADD COLUMN cross_tree_reason VARCHAR(500) NULL AFTER notes"

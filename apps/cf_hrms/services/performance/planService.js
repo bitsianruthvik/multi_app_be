@@ -26,6 +26,7 @@ import { audit } from '../peopleService.js';
 import { HOLDS_SEAT_SQL } from '../seatCount.js';
 import { dateText, today } from '../positionService.js';
 import { resolveJobsForAssignments, wholeWording } from '../contentResolver.js';
+import { loadReportingModel } from '../reportingResolver.js';
 import { readSettings } from './settingsService.js';
 import {
   FREQUENCIES, FREQUENCY_LABEL, isFrequency, periodStartingOn, periodsOfYear, yearOf, yearLabel,
@@ -281,8 +282,12 @@ export async function createPlans(db, c, body = {}, scopeDeptIds = null) {
       ORDER BY rr.is_primary DESC, rr.id`,
     [c.companyId, positionIds, period.end, period.start],
   ) : [[]];
+  // Spec §40.3: a position with no explicit line on its copy day takes the one its org unit gives it
+  // (the unit's head, or for a head its unit's Reports into) — reportingResolver, the one order.
+  const reporting = positionIds.length ? await loadReportingModel(db, c.companyId, {}) : null;
   const managerOf = (p) => edges.find((e) => Number(e.from_position_id) === Number(p.positionId)
-    && iso(e.effective_from) <= p.copyOn && (!e.effective_to || iso(e.effective_to) >= p.copyOn))?.to_position_id ?? null;
+    && iso(e.effective_from) <= p.copyOn && (!e.effective_to || iso(e.effective_to) >= p.copyOn))?.to_position_id
+    ?? (p.positionId && reporting ? (() => { const s = reporting.step(p.positionId); return s && s.source !== 'EXPLICIT' ? s.managerId : null; })() : null);
 
   // 1. the plans, in one statement; read back their ids in one.
   await db.query(

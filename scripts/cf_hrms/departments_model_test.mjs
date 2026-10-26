@@ -55,7 +55,9 @@ const companyId = company.id;
 const counted = counting(pool);
 const chart = await buildOrgChart(counted, companyId, {});
 // labelId joined on 2026-10-16 (one label per department; it was `labels` while labels had groups) — read in the same query, so the count below is unchanged.
-const DEPT_KEYS = 'code,id,isShared,labelId,name,parentId,rank,serves,type';
+// headPositionIds / reportsInto* joined on 2026-10-24 (spec §40) — read in the same department query.
+const DEPT_KEYS = 'code,headPositionIds,id,isShared,labelId,name,parentId,rank,reportsIntoMode,reportsIntoPositionId,reportsIntoReason,serves,type';
+const SLICE_DEPT_KEYS = 'code,id,isShared,labelId,name,parentId,rank,serves,type';
 ok(Array.isArray(chart.departments) && chart.departments.length > 0, 'orgchart carries departments');
 ok(chart.departments.every((d) => keysOf(d) === DEPT_KEYS), 'every department has exactly the contract\'s fields',
   chart.departments.find((d) => keysOf(d) !== DEPT_KEYS) ? keysOf(chart.departments.find((d) => keysOf(d) !== DEPT_KEYS)) : '');
@@ -77,7 +79,8 @@ ok(chart.nodes.every((n) => n.departmentId == null
 ok(chart.nodes.every((n) => Array.isArray(n.contexts) && n.contexts.length === 0), 'node.contexts is an empty array');
 // 8 company-wide reads + attendance when anyone is seated. It was 9 until 2026-10-10: one position is one chair, so the
 // manpower-requirements read is gone (services/seatCount.js). Cards are computed in memory from rows already read.
-const expectedQueries = 8 + (chart.nodes.some((n) => n.occupants.length) ? 1 : 0);
+// 9 since 2026-10-24: the units' heads (spec §40); derived lines are computed from rows already read.
+const expectedQueries = 9 + (chart.nodes.some((n) => n.occupants.length) ? 1 : 0);
 ok(counted.n === expectedQueries, 'the chart still costs the same number of queries', `${counted.n} (expected ${expectedQueries})`);
 const sharedDepts = chart.departments.filter((d) => d.isShared);
 if (!sharedDepts.length) skip('shared departments in the payload', 'this company has none');
@@ -121,7 +124,7 @@ else {
     if ([...ids].some((id) => !allowed.has(id))) leaks += 1;
     if ([...allowed].some((id) => !ids.has(id))) missing += 1;
     if (slice.departments.some((d) => (d.parentId != null && !ids.has(d.parentId)) || d.serves.some((s) => !ids.has(s)))) dangling += 1;
-    if (slice.departments.some((d) => keysOf(d) !== DEPT_KEYS) || slice.nodes.some((n) => keysOf(n) !== NODE_KEYS)) badKeys += 1;
+    if (slice.departments.some((d) => keysOf(d) !== SLICE_DEPT_KEYS) || slice.nodes.some((n) => keysOf(n) !== NODE_KEYS)) badKeys += 1;
     if (slice.nodes.some((n) => n.contexts.length)) emptyCtx += 1;
     if (ids.size === chart.departments.length && slice.nodes.length < chart.nodes.length) wide += 1;
     if (slice.departments.some((d) => d.isShared)) withShared += 1;

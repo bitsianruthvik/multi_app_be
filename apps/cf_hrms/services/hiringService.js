@@ -51,6 +51,7 @@
  */
 import { HrmsError, invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { dateText, today, requirePosition, LIVE_ON } from './positionService.js';
+import { loadReportingModel } from './reportingResolver.js';
 import { createEmployee, createEvent, audit, addDocument, deleteDocument } from './peopleService.js';
 import { createAssignment } from './assignmentService.js';
 import {
@@ -527,7 +528,17 @@ async function positionFacts(db, companyId, positionId, on, { lock = false } = {
       ORDER BY rr.is_primary DESC, rr.id, wa.is_primary DESC, wa.id LIMIT 1`,
     [on, on, companyId, positionId, on, on],
   );
-  return { ...position, role_title: facts?.role_title ?? null, department_name: facts?.department_name ?? null, manager: manager ?? null };
+  // Spec §40.3: no explicit line -> the manager its org unit gives it (the unit's head, or its Reports into).
+  let resolved = manager ?? null;
+  if (!resolved) {
+    const model = await loadReportingModel(db, companyId, { on });
+    const s = model.step(positionId);
+    if (s && s.source !== 'EXPLICIT') {
+      const m = model.positions.get(s.managerId);
+      resolved = { id: s.managerId, title: m?.title ?? null, occupant_name: m?.occupantName ?? null, source: s.source };
+    }
+  }
+  return { ...position, role_title: facts?.role_title ?? null, department_name: facts?.department_name ?? null, manager: resolved };
 }
 
 /**
