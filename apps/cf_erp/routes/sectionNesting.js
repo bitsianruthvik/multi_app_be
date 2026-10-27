@@ -15,7 +15,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, contentDisposition } from '../lib/http.js';
 import { assertLineOnOrder } from '../services/nestingService.js';
 import {
   getSectionNesting, planSectionNesting, acceptSectionNesting, takeBackSectionNesting,
@@ -52,7 +52,7 @@ router.delete(BASE, manage, handle((req) => write(req, (db, c, id) => takeBackSe
 router.get(`${BASE}/sheet`, view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => exportSectionSheet(db, companyId, id));
   res.setHeader('Content-Type', out.contentType);
-  res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   res.setHeader('X-CF-Sheet-Rows', String(out.rows));
   res.setHeader('X-CF-Sheet-Bars', String(out.bars));

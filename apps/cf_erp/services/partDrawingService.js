@@ -66,7 +66,7 @@
  * one, a new revision), every delete and every late read, so no part keeps the area of a drawing
  * it no longer has.
  */
-import { invalid, notFound } from '../lib/errors.js';
+import { CfError, invalid, notFound } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
 import { memoized } from '../lib/requestMemo.js';
@@ -327,16 +327,28 @@ async function registerRefs(db, companyId, ids) {
   const out = new Map();
   const want = [...new Set(ids.filter((x) => x != null).map(Number))];
   if (!want.length) return out;
-  const [rows] = await db.query('SELECT id, code, number, revision, status, title, root_id FROM cf_drawings WHERE company_id = ? AND id IN (?)', [companyId, want]);
+  const [rows] = await db.query('SELECT id, code, number, revision, status, title, url, root_id FROM cf_drawings WHERE company_id = ? AND id IN (?)', [companyId, want]);
   const roots = [...new Set(rows.map((r) => Number(r.root_id ?? r.id)))];
   const [revs] = roots.length ? await db.query('SELECT id, revision, status, root_id FROM cf_drawings WHERE company_id = ? AND deleted_at IS NULL AND root_id IN (?) ORDER BY id', [companyId, roots]) : [[]];
-  const [filed] = revs.length ? await db.query('SELECT drawing_id, file_name FROM cf_part_drawings WHERE company_id = ? AND drawing_id IN (?) ORDER BY deleted_at IS NULL, id', [companyId, revs.map((r) => r.id)]) : [[]];
-  // Each revision's newest file name (live last, so it wins).
+  const revIds = [...new Set([...revs.map((r) => Number(r.id)), ...want])];
+  // Where a revision's file is: uploaded on an order line, or held by a standard drawing (its sheet, a version's part file).
+  const [filed] = await db.query(
+    `SELECT drawing_id, file_name, file_kind FROM (
+       SELECT drawing_id, file_name, file_kind, deleted_at IS NULL AS live, id, 0 AS std FROM cf_part_drawings WHERE company_id = ? AND drawing_id IN (?) AND dxf_text IS NOT NULL
+       UNION ALL
+       SELECT drawing_id, file_name, file_kind, deleted_at IS NULL AS live, id, 1 AS std FROM cf_standard_drawing_files WHERE company_id = ? AND drawing_id IN (?) AND file_text IS NOT NULL
+     ) f ORDER BY std DESC, live, id`,
+    [companyId, revIds, companyId, revIds],
+  );
+  // Each revision's file (an order line's live upload last, so it wins).
   const fileName = new Map(filed.map((f) => [Number(f.drawing_id), f.file_name]));
+  const fileKind = new Map(filed.map((f) => [Number(f.drawing_id), f.file_kind === 'pdf' ? 'pdf' : 'dxf']));
   for (const r of rows) {
     const root = Number(r.root_id ?? r.id);
     out.set(Number(r.id), {
       id: Number(r.id), code: r.code, number: r.number, revision: r.revision, status: r.status, title: r.title,
+      // Where the sheet lives when no file is kept here (an RDSO standard's series PDF), and whether one is kept.
+      url: r.url ?? null, hasFile: fileName.has(Number(r.id)), fileName: fileName.get(Number(r.id)) ?? null, fileKind: fileKind.get(Number(r.id)) ?? null,
       earlier: revs.filter((v) => Number(v.root_id) === root && Number(v.id) < Number(r.id)).map((v) => ({ id: Number(v.id), revision: v.revision, status: v.status, hasFile: fileName.has(Number(v.id)), fileName: fileName.get(Number(v.id)) ?? null })),
     });
   }
@@ -412,7 +424,14 @@ export async function drawingTree(db, companyId, orderId, lineId) {
   const line = await requireLine(db, companyId, orderId, lineId);
   const rows = await rowsOfLine(db, companyId, line);
   const drawings = await liveDrawings(db, companyId, line.id);
-  const refs = await registerRefs(db, companyId, drawings.map((d) => d.drawing_id));
+  const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
+  // A row with no file on the line may still be covered by a register drawing: one whose file a standard holds (it
+  // opens with GET /drawings/:id/file), else one kept elsewhere (its link — an RDSO series sheet). Its file first.
+  const sheetOf = (p) => {
+    const cands = p.drawingIds.map((id) => refs.get(id)).filter((r) => r && r.status !== 'withdrawn');
+    const r = cands.find((x) => x.hasFile) ?? cands.find((x) => x.url) ?? cands[0] ?? null;
+    return r ? { id: r.id, number: r.number, revision: r.revision, title: r.title, status: r.status, url: r.url, hasFile: r.hasFile, fileName: r.fileName, fileKind: r.fileKind } : null;
+  };
   return {
     line: { id: line.id, lineNo: line.line_no, orderId: line.order_id, orderCode: line.order_code, released: !!Number(line.released) },
     rows: rows.map((p) => {
@@ -422,6 +441,8 @@ export async function drawingTree(db, companyId, orderId, lineId) {
         rowId: p.id, parentId: p.parentId, code: p.code, name: p.name, level: p.level, depth: p.depth, seq: p.seq, mark: p.mark,
         hasDrawing: !!d, drawingId: d ? Number(d.id) : null, fileKind: d ? d.file_kind ?? 'dxf' : null, fileName: d?.file_name ?? null,
         number: ref?.number ?? null, revision: ref?.revision ?? null, status: ref?.status ?? null,
+        // No file on the line: the register drawing that covers the row (opens by its file, or by its link), else null.
+        sheet: d ? null : sheetOf(p),
         // A plate part's cut plates, so the nesting screen (which knows cut plates, not rows) can find the part's drawing.
         isPlatePart: p.isPlatePart, cutPlateIds: p.cutPlateIds,
       };
@@ -1109,7 +1130,18 @@ export async function registerFile(db, companyId, drawingId) {
     'SELECT file_name, file_kind, dxf_text FROM cf_part_drawings WHERE company_id = ? AND drawing_id = ? AND dxf_text IS NOT NULL ORDER BY deleted_at IS NULL DESC, id DESC LIMIT 1',
     [companyId, Number(drawingId)],
   );
-  if (!d) throw notFound('Drawing file');
-  const kind = d.file_kind ?? 'dxf';
-  return { filename: d.file_name, contentType: KINDS[kind], buffer: kind === 'pdf' ? Buffer.from(d.dxf_text, 'base64') : Buffer.from(d.dxf_text, 'latin1') };
+  // Not uploaded on any order line: a standard drawing may hold it (its own sheet, or a part file of a version).
+  const [[s]] = d ? [[null]] : await db.query(
+    "SELECT file_name, file_kind, file_text AS dxf_text FROM cf_standard_drawing_files WHERE company_id = ? AND drawing_id = ? AND file_text IS NOT NULL ORDER BY deleted_at IS NULL DESC, kind = 'source' DESC, id DESC LIMIT 1",
+    [companyId, Number(drawingId)],
+  );
+  const f = d ?? s;
+  if (!f) {
+    const [[reg]] = await db.query('SELECT number, revision, url FROM cf_drawings WHERE company_id = ? AND id = ?', [companyId, Number(drawingId)]);
+    if (!reg) throw notFound('Drawing');
+    const where = reg.url ? ` It is kept at ${reg.url} — open it there.` : ' Attach the file to the drawing to see it here.';
+    throw new CfError(404, 'NO_FILE', `${reg.number} rev ${reg.revision} has no file in the system.${where}`, { detail: { url: reg.url ?? null } });
+  }
+  const kind = f.file_kind === 'pdf' ? 'pdf' : 'dxf';
+  return { filename: f.file_name, contentType: KINDS[kind], buffer: kind === 'pdf' ? Buffer.from(f.dxf_text, 'base64') : Buffer.from(f.dxf_text, 'latin1') };
 }

@@ -87,6 +87,23 @@ export const handle = (fn) => async (req, res) => {
   }
 };
 
+/**
+ * The Content-Disposition header for a file sent back: `attachment; filename="<ASCII>"; filename*=UTF-8''<encoded>`
+ * (RFC 6266 / RFC 5987). Node refuses a header value with a character above U+00FF (ERR_INVALID_CHAR, so a 500), and
+ * a drawing named "BLB(1-60).dxf" with an en dash is exactly that: the plain `filename` gets an ASCII stand-in, the
+ * real name travels in `filename*`. Quotes, backslashes and control characters never reach the header.
+ */
+const CONTROL = /[\u0000-\u001f\u007f]/g;
+const ACCENTS = /[\u0300-\u036f]/g;
+const DASHES = /[\u2010-\u2015]/g;
+const NOT_ASCII = /[^\u0020-\u007e]/g;
+export function contentDisposition(filename, type = 'attachment') {
+  const name = String(filename ?? 'file').replace(CONTROL, ' ').trim() || 'file';
+  const ascii = name.normalize('NFKD').replace(ACCENTS, '').replace(DASHES, '-').replace(NOT_ASCII, '_').replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${type}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
 /** Positive integer from a route param or body field, or a 422. */
 export function intParam(value, name = 'id') {
   const n = Number(value);

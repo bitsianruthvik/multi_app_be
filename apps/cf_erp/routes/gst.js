@@ -29,7 +29,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam, contentDisposition } from '../lib/http.js';
 import { fail } from '../../../core/middleware/requirePerm.js';
 import { translateDbError } from '../lib/errors.js';
 import { getTaxSettings, putTaxSettings, GST_STATES, validateGstin } from '../services/taxService.js';
@@ -84,7 +84,7 @@ const attachment = (build, kind) => async (req, res) => {
   try {
     const inv = await getInvoice(pool, company(req), id(req));
     const body = build(inv);
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName(inv, kind)}"`);
+    res.setHeader('Content-Disposition', contentDisposition(fileName(inv, kind)));
     res.type('application/json').send(JSON.stringify(body, null, 2));
   } catch (err) { fail(res, translateDbError(err)); }
 };

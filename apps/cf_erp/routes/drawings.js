@@ -28,7 +28,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, contentDisposition } from '../lib/http.js';
 import {
   listDrawings, getDrawing, createDrawing, updateDrawing, issueDrawing, retireDrawing,
   reviseDrawing, deleteDrawing, linkDrawing, removeLink, drawingCoverage, drawingsForRecord,
@@ -54,7 +54,7 @@ router.delete('/drawings/:id', manage, handle((req) => tx(req, (db, c) => delete
 router.get('/drawings/:id/file', view, handle(async (req, res) => {
   const out = await registerFile(pool, company(req), id(req));
   res.setHeader('Content-Type', out.contentType);
-  res.setHeader('Content-Disposition', `attachment; filename="${String(out.filename).replace(/["\\]/g, '')}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   res.send(out.buffer);
 }));

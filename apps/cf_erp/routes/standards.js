@@ -19,7 +19,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam, contentDisposition } from '../lib/http.js';
 import {
   listStandards, getStandard, createStandard, updateStandard, standardFile,
   addLineFromStandard, lineStandard, saveLineToStandard, keepStandard,
@@ -36,7 +36,7 @@ router.get('/standard-drawings', view, handle((req) => listStandards(pool, compa
 router.get('/standard-drawings/files/:fileId', view, handle(async (req, res) => {
   const out = await standardFile(pool, company(req), intParam(req.params.fileId, 'fileId'));
   res.setHeader('Content-Type', out.contentType);
-  res.setHeader('Content-Disposition', `attachment; filename="${String(out.filename).replace(/["\\]/g, '')}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   res.send(out.buffer);
 }));

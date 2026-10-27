@@ -930,6 +930,12 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
     if (d) links.push([companyId, d, 'master_record', rowIdOf(r.key), c.userId ?? null]);
   }
   await insertRows(db, 'cf_drawing_links', ['company_id', 'drawing_id', 'subject_type', 'subject_id', 'created_by'], links, 500);
+  // ---- 5b. the series' sheets on the assembly rows they draw (segment, X-frame, splice set, bearing …) ----
+  const { attachSheetsOnImport } = await import('./standardSheetService.js');
+  const sheetsOut = await attachSheetsOnImport(db, c, {
+    bom, mainDrawingId: drawingId, seriesNumber: s.registerNumber, mainRevision: s.revision, sourceUrl: s.sourceUrl, internal: !!s.internal, codeBase: mainCode?.code ?? null,
+    rows: tempRows.filter((r) => r.node).map((r) => ({ id: rowIdOf(r.key), isRoot: r.depth === 0, text: [r.node.kind, r.node.name, r.def?.name, r.mark].filter(Boolean).join(' ') })),
+  });
 
   // ---- 6. the files ------------------------------------------------------------
   const cols = ['company_id', 'version_id', 'standard_id', 'kind', 'drawing_id', 'mark', 'mark_norm', 'file_name', 'file_kind', 'length_mm', 'width_mm', 'area_mm2',
@@ -945,7 +951,7 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
     batch.push(row); bytes += f.text.length;
   }
   await flush();
-  return { plan, report: { ...report, written: { standardId, versionId, drawingId, rows: tempRows.length, files: okFiles.length, newDefinitions: [...made.values()].map((d) => ({ id: d.id, code: d.code, name: d.name })) } }, standardId };
+  return { plan, report: { ...report, written: { standardId, versionId, drawingId, rows: tempRows.length, files: okFiles.length, sheets: sheetsOut, newDefinitions: [...made.values()].map((d) => ({ id: d.id, code: d.code, name: d.name })) } }, standardId };
 }
 
 /** The mapping report a person reads before --apply: every row → definition, the new ones, the notes, the files. */

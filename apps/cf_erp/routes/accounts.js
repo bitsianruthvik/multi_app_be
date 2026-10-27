@@ -15,7 +15,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam, contentDisposition } from '../lib/http.js';
 import { billingBoard, raiseInvoice, invoicePdf } from '../services/billingService.js';
 import { recordReceipt, removeReceipt, listReceipts, orderPayments } from '../services/receiptService.js';
 import { costingList, costSheet } from '../services/costingService.js';
@@ -34,7 +34,7 @@ router.get('/accounts/invoices/:id/pdf', guardAny(PERM.accountsView, PERM.orders
   try {
     const out = await invoicePdf(pool, ctx(req).companyId, id(req));
     res.setHeader('Content-Type', out.contentType);
-    res.setHeader('Content-Disposition', `inline; filename="${out.filename}"`);
+    res.setHeader('Content-Disposition', contentDisposition(out.filename, 'inline'));
     res.setHeader('Content-Length', String(out.buffer.length));
     res.send(out.buffer);
   } catch (err) {

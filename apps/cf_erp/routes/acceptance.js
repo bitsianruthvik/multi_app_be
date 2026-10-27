@@ -18,7 +18,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam, contentDisposition } from '../lib/http.js';
 import { APPROVAL_PERMS } from '../services/approvalService.js';
 import {
   listTemplates, createTemplate, updateTemplate, deleteTemplate, getAcceptance, saveAcceptance, withdrawAcceptance, orderEvents,
@@ -51,7 +51,7 @@ router.get('/orders/:id/mr-document', guardAny(PERM.ordersView, PERM.inventoryVi
   try {
     const out = await mrDocument(pool, ctx(req).companyId, id(req), req.query.format);
     res.setHeader('Content-Type', out.contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
+    res.setHeader('Content-Disposition', contentDisposition(out.filename));
     res.setHeader('Content-Length', String(out.buffer.length));
     res.send(out.buffer);
   } catch (err) {

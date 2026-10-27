@@ -72,7 +72,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam, assertPerm } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, assertPerm, contentDisposition } from '../lib/http.js';
 import {
   planNesting, acceptNesting, getNesting, assertLineOnOrder, nestingChoices, saveNestingChoices, setNestPlates,
 } from '../services/nestingService.js';
@@ -199,7 +199,7 @@ router.put('/orders/:orderId/lines/:lineId/nesting/plates', manage,
 router.get('/orders/:orderId/lines/:lineId/nesting/sheet', view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => exportSheet(db, companyId, id));
   res.setHeader('Content-Type', out.contentType);
-  res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   // Says what the caller got without having to open the file: how many pieces,
   // how many plates, and whether this is the saved plan or a proposal made
@@ -232,7 +232,7 @@ router.post('/orders/:orderId/lines/:lineId/drawings/start', manage,
 router.get('/orders/:orderId/lines/:lineId/drawings/:drawingId/file', view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => drawingFile(db, companyId, null, id, intParam(req.params.drawingId, 'drawingId')));
   res.setHeader('Content-Type', out.contentType);
-  res.setHeader('Content-Disposition', `attachment; filename="${String(out.filename).replace(/["\\]/g, '')}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   res.send(out.buffer);
 }));
@@ -252,7 +252,7 @@ router.post('/orders/:orderId/lines/:lineId/nesting/files', manage,
 router.get('/orders/:orderId/lines/:lineId/nesting/files/:lotId', view, handle(async (req, res) => {
   const out = await read(req, (db, companyId, id) => nestFileOf(db, companyId, id, intParam(req.params.lotId, 'lotId')));
   res.setHeader('Content-Type', out.contentType);
-  res.setHeader('Content-Disposition', `attachment; filename="${String(out.filename).replace(/["\\]/g, '')}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   res.send(out.buffer);
 }));
@@ -307,7 +307,7 @@ router.post('/orders/:orderId/lines/:lineId/nesting/alternative/swap', manage,
 /** A file out: the buffer, its type, and a download name. */
 const sendFile = (res, out, type) => {
   res.setHeader('Content-Type', type);
-  res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   res.send(out.buffer);
 };

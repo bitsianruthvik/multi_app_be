@@ -245,8 +245,9 @@ try {
     `SELECT l.notes FROM cf_bom_lines l JOIN cf_spec_values v ON v.subject_id = l.child_id AND v.deleted_at IS NULL JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'DRAWING_MARK'
       WHERE l.child_id IN (?) AND v.value_text = 'BF1' AND l.deleted_at IS NULL`, [vt.ids]);
   ok('the BF1 row\'s BOM line carries its drilling note', notes.length === 1 && /drill/i.test(notes[0].notes ?? ''));
-  const [links] = await conn.query("SELECT COUNT(*) AS n FROM cf_drawing_links WHERE subject_id IN (?) AND deleted_at IS NULL", [vt.ids]);
+  const [links] = await conn.query("SELECT SUM(note IS NULL) AS n, SUM(note = 'Sheet of the standard') AS sheets FROM cf_drawing_links WHERE subject_id IN (?) AND deleted_at IS NULL", [vt.ids]);
   eq('each part row is linked to its drawing, the root to the sheet (47 + 1)', Number(links[0].n), 48);
+  ok('and the other sheets of the series are on the assembly rows (2026-10-27: drawings at the structure levels)', Number(links[0].sheets) >= 10, `${links[0].sheets}`);
   const again = await refusal(() => STD.importStandard(conn, c, { ...t11751, apply: true }));
   ok('importing the same number again is refused', again?.code === 'DUPLICATE', again?.message);
   // Round trips do not grow with the tree: 18.3 m and 30.5 m sets differ in rows and files, not in statements.
@@ -255,7 +256,11 @@ try {
   says(`11753R3: ${a3.out.report.written.rows} rows, ${a3.n} trips · 11754R3: ${a4.out.report.written.rows} rows, ${a4.n} trips`);
   ok('the same number of round trips for two sets of different sizes', a3.n === a4.n && a3.out.report.written.newDefinitions.length === 0, `${a3.n} vs ${a4.n}`);
   ok('…and few of them (production ~49 ms each)', a3.n <= 40, `${a3.n}`);
+  // Where the setup step already ran on this DB the first try simply applies: a savepoint takes it back, so the import
+  // below is the one made after the setup step, as on a fresh DB.
+  await conn.query('SAVEPOINT before_1623');
   const noSetup = await refusal(() => STD.importStandard(conn, c, { ...readSet('RDSO_1623', true), apply: true }));
+  await conn.query('ROLLBACK TO SAVEPOINT before_1623');
   const [[aOpt]] = await conn.query("SELECT COUNT(*) AS n FROM cf_spec_options o JOIN cf_specifications s ON s.id = o.specification_id WHERE o.company_id = ? AND s.code = 'IMPACT_CLASS' AND o.value = 'A' AND o.deleted_at IS NULL", [COMPANY]);
   if (!Number(aOpt.n)) ok('an older set without the setup step is refused, and says to run it', noSetup?.code === 'OPTIONS_MISSING', noSetup?.message);
   const setup1 = await STD.importSetup(conn, c, { apply: true });
@@ -315,7 +320,7 @@ try {
   const [pd] = await conn.query('SELECT COUNT(*) AS n, SUM(drawing_id IS NOT NULL) AS reg, SUM(geometry_json IS NOT NULL) AS shaped FROM cf_part_drawings WHERE order_line_id = ? AND deleted_at IS NULL', [lineA.id]);
   ok('its 36 part drawings are on the line, each on its register revision, with its shape', Number(pd[0].n) === 36 && Number(pd[0].reg) === 36 && Number(pd[0].shaped) === 36);
   const [ll] = await conn.query('SELECT COUNT(*) AS n FROM cf_drawing_links WHERE subject_id IN (?) AND deleted_at IS NULL', [lt.ids]);
-  eq('the rows are linked to the same drawings (48 links)', Number(ll[0].n), 48);
+  eq('the rows are linked to the same drawings (48 links + the sheets on the assembly rows)', Number(ll[0].n), 48 + Number(links[0].sheets));
   const view = await (await imp('apps/cf_erp/services/partDrawingService.js')).getDrawings(conn, COMPANY, order.id, lineA.id);
   ok('the Drawings screen finds every part row\'s file by its mark', view.summary.rows > 0 && view.drawings.length === 36 && view.drawings.every((d) => d.rows.length >= 1), JSON.stringify(view.summary));
   const stA = await STD.lineStandard(conn, COMPANY, lineA.id);

@@ -17,7 +17,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam, assertPerm } from '../lib/http.js';
+import { PERM, guard, handle, ctx, intParam, assertPerm, contentDisposition } from '../lib/http.js';
 import { requireMaster } from '../services/records.js';
 import { bomTypeOf } from '../services/bomGraph.js';
 import { exportRecordSheet, importRecordSheet } from '../services/bomSheetService.js';
@@ -30,7 +30,7 @@ const id = (req) => intParam(req.params.id);
 router.get('/order-lines/:id/sheet', guard(PERM.ordersView), handle(async (req, res) => {
   const out = await exportOrderSheet(pool, ctx(req).companyId, id(req));
   res.setHeader('Content-Type', out.contentType);
-  res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   // Tells a caller what it got without having to open the file.
   res.setHeader('X-CF-Sheet-Rows', String(out.rows));
@@ -50,7 +50,7 @@ router.post('/order-lines/:id/sheet', guard(PERM.orders), handle((req) => withTr
 router.get('/records/:id/bom/sheet', guard(PERM.view), handle(async (req, res) => {
   const out = await exportRecordSheet(pool, ctx(req).companyId, id(req), { format: req.query.format });
   res.setHeader('Content-Type', out.contentType);
-  res.setHeader('Content-Disposition', `attachment; filename="${out.filename}"`);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
   res.setHeader('Content-Length', String(out.buffer.length));
   res.setHeader('X-CF-Sheet-Rows', String(out.rows));
   res.send(out.buffer);
