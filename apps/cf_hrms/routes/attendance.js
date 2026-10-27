@@ -22,6 +22,9 @@
  *   GET  /attendance/imports/template?kind=punches|days · POST /attendance/imports/:kind/preview | /apply
  *   GET  /attendance/settings · PUT /attendance/settings
  *   GET  /attendance/months?year= · POST /attendance/months/:month/close · POST /attendance/months/:month/reopen (the Owner)
+ *   GET  /attendance/alerts                             absence alerts (spec §42.3): settings, channels, what is due now, last runs
+ *   PUT  /attendance/alerts/settings                    on/off, delay, who hears, channels
+ *   POST /attendance/alerts/check-now                   run the check for this company now (what is due and not sent yet)
  *
  * The device push (/iclock/*) and the integration API (/api/integrations/attendance/punches) are
  * outside this router: routes/iclock.js and routes/integrations.js, mounted by the server's index.js.
@@ -44,6 +47,7 @@ import { listMappings, putMapping, autoMap, unmappedQueue, processAfterCommit } 
 import { template, previewImport, applyImport } from '../services/attendance/imports.js';
 import { settingsOf, putSettings } from '../services/attendance/settings.js';
 import { serverToday as localToday } from '../services/attendance/time.js';
+import { alertsScreen, putAlertSettings, alertPass } from '../services/attendance/absenceAlerts.js';
 
 const router = Router();
 const A = PERM.attendance;
@@ -169,5 +173,14 @@ router.put('/attendance/settings', guard(A.edit), WHOLE, handle((req) => tx(req,
 router.get('/attendance/months', guard(A.view), handle((req) => listMonths(pool, ctx(req), { year: req.query.year })));
 router.post('/attendance/months/:month/close', guard(A.edit), WHOLE, handle((req) => tx(req, (db, c) => closeMonth(db, c, monthParam(req.params.month), reqId(req)))));
 router.post('/attendance/months/:month/reopen', guard(A.edit, { note: 'the Owner only, with a reason' }), WHOLE, handle((req) => tx(req, (db, c) => reopenMonth(db, c, monthParam(req.params.month), req.body ?? {}, reqId(req)))));
+
+// ── absence alerts (spec §42.3) ─────────────────────────────────────────────
+router.get('/attendance/alerts', guard(A.view), handle((req) => alertsScreen(pool, ctx(req))));
+router.put('/attendance/alerts/settings', guard(A.edit), WHOLE, handle((req) => tx(req, (db, c) => putAlertSettings(db, c, req.body ?? {}, reqId(req)))));
+router.post('/attendance/alerts/check-now', guard(A.edit, { note: 'sends what is due and not sent yet; once per shift and day' }), WHOLE, handle(async (req) => {
+  const c = ctx(req);
+  const done = await alertPass({ companyIds: [c.companyId], trigger: 'BY_HAND', userId: c.userId });
+  return { sent: done.map((d) => ({ runKey: d.runKey, absent: d.absent, digests: d.digests.length })), screen: await alertsScreen(pool, c) };
+}));
 
 export default router;

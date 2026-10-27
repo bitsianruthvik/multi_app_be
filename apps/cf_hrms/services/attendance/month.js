@@ -30,8 +30,14 @@
  *       ncpDays,                // = lopDays (non-contributory period, PF ECR)
  *       esiDays,                // = payableDays (days wages are paid for, ESI return)
  *       lateMarks, earlyMinutes, lateMinutes,
+ *       duty: {                 // spec §42.4 — work on a weekly off / a festival holiday, by the policy's duty rules
+ *         sunday:   { days, hours, amount },            // amount → SUNDAY_DUTY
+ *         festival: { days, hours, amount, wageDays },  // amount + wageDays × the day's wage → FESTIVAL_DUTY (payroll's sum)
+ *         compOffDays,                                  // credited to an EARNED_BY_WORK leave type (leave/balance.js)
+ *         days: [{ date, kind: SUNDAY | FESTIVAL, hours, amount, wageDays, compOff }],
+ *       },                      // (a month closed before 2026-10-27 has no `duty`: read it as none)
  *     }],
- *     totals: { people, present, absentLop, lopDays, overtimeMinutes, penaltyAmount },
+ *     totals: { people, present, absentLop, lopDays, overtimeMinutes, penaltyAmount, dutyAmount, dutyDays, compOffDays },
  *   }
  *
  * Payroll reads CLOSED months (final: true). Until attendance is live payroll keeps reading LOP from
@@ -48,6 +54,9 @@ import { audit } from '../peopleService.js';
 import { loadInputs } from './process.js';
 import { settingsOf } from './settings.js';
 import { MONTH_RE, monthStart, monthEnd, daysInMonth, monthWords, day, nowIn } from './time.js';
+import { emptyDuty, dutyOfDay, addDuty } from './duty.js';
+
+export { emptyDuty, dutyOfDay };
 
 const r2 = (n) => Math.round(Number(n) * 100) / 100;
 const json = (v) => { if (v == null) return null; if (typeof v !== 'string') return v; try { return JSON.parse(v); } catch { return null; } };
@@ -70,11 +79,11 @@ async function compute(db, companyId, month, { employeeIds = null } = {}) {
   const { people } = await loadInputs(db, companyId, { from, to, employeeIds, on: today < to ? today : to, summaryOnly: true });
   const ids = people.map((p) => p.employee.id);
   const base = { month, from, to, calendarDays: daysInMonth(month), live: Boolean(settings.liveFrom && settings.liveFrom <= to), liveFrom: settings.liveFrom };
-  if (!ids.length) return { ...base, people: [], totals: { people: 0, present: 0, absentLop: 0, lopDays: 0, overtimeMinutes: 0, penaltyAmount: 0 } };
+  if (!ids.length) return { ...base, people: [], totals: { people: 0, present: 0, absentLop: 0, lopDays: 0, overtimeMinutes: 0, penaltyAmount: 0, dutyAmount: 0, dutyDays: 0, compOffDays: 0 } };
   const [[records], [penalties], [types]] = await Promise.all([
     db.query(
       `SELECT r.employee_id, r.attendance_date, r.status, r.present_value, r.leave_value, r.absent_value, r.overtime_minutes, r.late_mark, r.late_minutes, r.early_minutes,
-              r.policy_id, lr.leave_type_id
+              r.worked_minutes, r.policy_id, lr.leave_type_id
          FROM hrms_attendance_records r
          LEFT JOIN hrms_leave_requests lr ON lr.company_id = r.company_id AND lr.id = r.leave_request_id
         WHERE r.company_id = ? AND r.employee_id IN (?) AND r.deleted_at IS NULL AND r.attendance_date BETWEEN ? AND ?`, [companyId, ids, from, to]),
@@ -84,7 +93,7 @@ async function compute(db, companyId, month, { employeeIds = null } = {}) {
   const typeOf = new Map(types.map((t) => [t.id, t]));
   const [policies] = await db.query('SELECT id, rules_json FROM hrms_attendance_policies WHERE company_id = ?', [companyId]);
   const rulesOf = new Map(policies.map((p) => [p.id, json(p.rules_json) ?? {}]));
-  const totals = { people: 0, present: 0, absentLop: 0, lopDays: 0, overtimeMinutes: 0, penaltyAmount: 0 };
+  const totals = { people: 0, present: 0, absentLop: 0, lopDays: 0, overtimeMinutes: 0, penaltyAmount: 0, dutyAmount: 0, dutyDays: 0, compOffDays: 0 };
   // Grouped once by person (a filter per person over every row was people × rows).
   const group = (rows) => { const m = new Map(); for (const r of rows) { const l = m.get(r.employee_id); if (l) l.push(r); else m.set(r.employee_id, [r]); } return m; };
   const recordsBy = group(records);
@@ -100,6 +109,7 @@ async function compute(db, companyId, month, { employeeIds = null } = {}) {
       overtime: { minutes: 0, hours: 0, multiplier: person.rules?.overtime?.rateMultiplier ?? null },
       penalties: { leaveDays: 0, lopDays: 0, amount: 0, warnings: 0 }, lopDays: 0, payableDays: 0, ncpDays: 0, esiDays: 0,
       lateMarks: 0, lateMinutes: 0, earlyMinutes: 0,
+      duty: emptyDuty(),
     };
     const byType = new Map();
     let known = 0;
@@ -112,7 +122,10 @@ async function compute(db, companyId, month, { employeeIds = null } = {}) {
       if (r.status === 'HALF_DAY') p.halfDays += 1;
       if (r.status === 'WEEKLY_OFF') p.weeklyOffs += 1;
       if (r.status === 'HOLIDAY') p.holidays += 1;
-      p.overtime.minutes += Number(r.overtime_minutes) || 0;
+      // Sunday / festival duty (spec §42.4): a day off worked, under the rule of the policy the day was processed with.
+      const d = dutyOfDay(r, rules);
+      if (d) addDuty(p.duty, d);
+      p.overtime.minutes += d && !d.alsoOvertime ? 0 : (Number(r.overtime_minutes) || 0);
       if (r.late_mark) p.lateMarks += 1;
       p.lateMinutes += Number(r.late_minutes) || 0;
       p.earlyMinutes += Number(r.early_minutes) || 0;
@@ -144,9 +157,10 @@ async function compute(db, companyId, month, { employeeIds = null } = {}) {
     p.esiDays = p.payableDays;
     totals.people += 1; totals.present += p.present; totals.absentLop += p.absentLop; totals.lopDays += p.lopDays;
     totals.overtimeMinutes += p.overtime.minutes; totals.penaltyAmount += p.penalties.amount;
+    totals.dutyAmount += p.duty.sunday.amount + p.duty.festival.amount; totals.dutyDays += p.duty.sunday.days + p.duty.festival.days; totals.compOffDays += p.duty.compOffDays;
     return p;
   });
-  for (const k of ['present', 'absentLop', 'lopDays', 'penaltyAmount']) totals[k] = r2(totals[k]);
+  for (const k of ['present', 'absentLop', 'lopDays', 'penaltyAmount', 'dutyAmount', 'compOffDays']) totals[k] = r2(totals[k]);
   return { ...base, people: out, totals };
 }
 
@@ -232,4 +246,4 @@ export async function reopenMonth(conn, c, month, body = {}, requestId = null) {
   return { month: (await listMonths(conn, c, { year: month.slice(0, 4) })).months.find((m) => m.month === month) };
 }
 
-export default { attendanceMonth, listMonths, closeMonth, reopenMonth };
+export default { attendanceMonth, listMonths, closeMonth, reopenMonth, dutyOfDay, emptyDuty };

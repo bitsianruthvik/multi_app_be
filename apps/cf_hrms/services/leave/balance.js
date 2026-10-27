@@ -19,7 +19,9 @@
  *                                  half day, never more than `days` — an ESTIMATE: there is
  *                                  no attendance yet, and the why line says so
  *            ON_REQUEST            `days` (prorated like UPFRONT), a yearly limit
- *            EARNED_BY_WORK        nothing automatic: only what HR enters as the opening
+ *            EARNED_BY_WORK        HR's opening, plus (once attendance is live, spec §42.4) the comp-off
+ *                                  days earned on weekly offs / festival holidays worked, by the
+ *                                  attendance policy's duty rule (`attendance.compOff`)
  *            PER_EVENT             `days` each occasion; `maxTimesInService` counts every
  *                                  APPROVED request of the type, ever
  *            UNLIMITED_UNPAID      no limit (available is null)
@@ -148,7 +150,15 @@ export function earnedOf(rule, { year, joinDate = null, asOf = null, calendar = 
   const days = rule.days === null || rule.days === undefined ? null : Number(rule.days);
   if (rule.basis === 'UNLIMITED_UNPAID') return { amount: 0, limited: false, text: 'Unpaid, with no fixed limit' };
   if (rule.basis === 'PER_EVENT') return { amount: days ?? 0, limited: days !== null, text: days === null ? 'Given each time it is needed' : `${plain(days)} each time` };
-  if (rule.accrual === 'EARNED_BY_WORK') return { amount: 0, limited: true, text: 'Earned by working on a holiday or a weekly off, as HR enters it' };
+  if (rule.accrual === 'EARNED_BY_WORK') {
+    // Spec §42.4: once attendance is live, comp-off earned on a weekly off or a festival holiday worked (the
+    // attendance policy's duty rule) is credited here; HR's opening covers what came before.
+    const upTo = asOf === null || asOf > year.to ? year.to : asOf;
+    const earned = (attendance?.compOff ?? []).filter((x) => x.date >= year.from && x.date <= upTo);
+    if (!earned.length) return { amount: 0, limited: true, text: 'Earned by working on a holiday or a weekly off, as HR enters it' };
+    const amount = r2(earned.reduce((s, x) => s + Number(x.days), 0));
+    return { amount, limited: true, text: `${plain(amount)} earned by working on a weekly off or a holiday (${earned.length} day${s(earned.length)}, from attendance)` };
+  }
   if (days === null) return { amount: 0, limited: false, text: 'No fixed number of days' };
   if (joinDate && joinDate > year.to) return { amount: 0, limited: true, text: 'Joins after this year' };
   const eff = effectiveFrom || null;

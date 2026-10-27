@@ -115,6 +115,9 @@ export async function monthGrid(db, c, { month = null, departmentId = null, q = 
   ]);
   const cell = new Map(recs.map((r) => [`${r.employee_id}|${day(r.attendance_date)}`, r]));
   const totals = new Map(summary.people.map((p) => [p.employeeId, p]));
+  // Sunday / festival duty days (spec §42.4), from the month's own summary — no read of its own.
+  const dutyAt = new Map();
+  for (const p of summary.people) for (const d of p.duty?.days ?? []) dutyAt.set(`${p.employeeId}|${d.date}`, d);
   const rows = ids.map((id) => ({
     person: persons.get(id),
     cells: dates.map(({ date }) => {
@@ -123,6 +126,7 @@ export async function monthGrid(db, c, { month = null, departmentId = null, q = 
       return {
         date, letter: LETTER[r.status] ?? '?', status: r.status, late: Boolean(r.late_mark), missing: Boolean(r.missing_punch), overtime: Number(r.overtime_minutes) || 0,
         inTime: wall(r.in_time), outTime: wall(r.out_time), why: r.status_reason ?? null, source: r.source,
+        duty: dutyAt.get(`${id}|${date}`) ?? null,
       };
     }),
     totals: totals.get(id) ?? null,
@@ -138,17 +142,20 @@ export async function musterWorkbook(db, c, query = {}, scopeDeptIds = null) {
   const ws = wb.addWorksheet('Muster roll', { views: [{ state: 'frozen', xSplit: 3, ySplit: 3 }] });
   ws.addRow([`Muster roll — ${g.label}${g.final ? ' (closed)' : ''}`]);
   ws.getRow(1).font = { bold: true, size: 13 };
-  ws.addRow(['Legend: ' + g.legend.map((l) => `${l.letter} ${l.words}`).join(' · ')]);
-  const head = ['Code', 'Name', 'Org unit', ...g.dates.map((d) => `${d.day} ${d.weekday}`), 'Present', 'Absent (LOP)', 'Leave paid', 'Leave unpaid', 'Weekly offs', 'Holidays', 'Late marks', 'OT hours', 'Penalty LOP', 'LOP days', 'Payable days'];
+  ws.addRow(['Legend: ' + g.legend.map((l) => `${l.letter} ${l.words}`).join(' · ') + ' · + worked a weekly off / festival holiday (duty)']);
+  const head = ['Code', 'Name', 'Org unit', ...g.dates.map((d) => `${d.day} ${d.weekday}`), 'Present', 'Absent (LOP)', 'Leave paid', 'Leave unpaid', 'Weekly offs', 'Holidays', 'Late marks', 'OT hours', 'Penalty LOP', 'LOP days', 'Payable days',
+    'Sunday duty days', 'Sunday duty ₹', 'Festival duty days', 'Festival duty ₹', 'Festival wage days', 'Comp-off days'];
   ws.addRow(head);
   ws.getRow(3).font = { bold: true };
   for (const r of g.rows) {
     const t = r.totals ?? {};
-    ws.addRow([r.person?.employeeCode ?? '', r.person?.name ?? '', r.person?.departmentName ?? '', ...r.cells.map((x) => (x.letter === '·' ? '' : `${x.letter}${x.late ? '*' : ''}`)),
-      t.present ?? 0, t.absentLop ?? 0, t.leave?.paid ?? 0, t.leave?.unpaid ?? 0, t.weeklyOffs ?? 0, t.holidays ?? 0, t.lateMarks ?? 0, t.overtime?.hours ?? 0, t.penalties?.lopDays ?? 0, t.lopDays ?? 0, t.payableDays ?? 0]);
+    const du = t.duty ?? {};
+    ws.addRow([r.person?.employeeCode ?? '', r.person?.name ?? '', r.person?.departmentName ?? '', ...r.cells.map((x) => (x.letter === '·' ? '' : `${x.letter}${x.late ? '*' : ''}${x.duty ? '+' : ''}`)),
+      t.present ?? 0, t.absentLop ?? 0, t.leave?.paid ?? 0, t.leave?.unpaid ?? 0, t.weeklyOffs ?? 0, t.holidays ?? 0, t.lateMarks ?? 0, t.overtime?.hours ?? 0, t.penalties?.lopDays ?? 0, t.lopDays ?? 0, t.payableDays ?? 0,
+      du.sunday?.days ?? 0, du.sunday?.amount ?? 0, du.festival?.days ?? 0, du.festival?.amount ?? 0, du.festival?.wageDays ?? 0, du.compOffDays ?? 0]);
   }
   ws.addRow([]);
-  ws.addRow(['* a late mark']);
+  ws.addRow(['* a late mark · + a weekly off or festival holiday worked, paid as duty (Sunday / festival duty allowance, comp-off)']);
   ws.getColumn(1).width = 12; ws.getColumn(2).width = 26; ws.getColumn(3).width = 20;
   for (let i = 4; i < 4 + g.dates.length; i += 1) ws.getColumn(i).width = 6;
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
@@ -176,6 +183,8 @@ export async function personMonth(db, c, employeeId, { month = null } = {}) {
   const { people } = await loadInputs(db, c.companyId, { from, to, employeeIds: [employeeId], on: now.slice(0, 10) });
   const p = people[0];
   const byDate = new Map(recs.map((r) => [day(r.attendance_date), r]));
+  const summaryP = await attendanceMonth(c.companyId, m, { db, employeeIds: [employeeId] });
+  const dutyAt = new Map((summaryP.people[0]?.duty?.days ?? []).map((d) => [d.date, d]));
   const punchList = punches.map((x) => ({ at: wall(x.punched_at), direction: x.direction, method: x.method, source: x.source }));
   const days = [];
   for (let d = from; d <= to; d = addDays(d, 1)) {
@@ -188,21 +197,27 @@ export async function personMonth(db, c, employeeId, { month = null } = {}) {
       shift: plan ? (plan.start ? `${plan.start}–${plan.end}${plan.crosses ? ' (next day)' : ''}` : (plan.kind === 'WORKING' ? 'Flexible' : plan.kind === 'HOLIDAY' ? plan.holidayName : 'Weekly off')) : null,
       punches: punchList.filter((x) => (plan ? x.at >= plan.windowFrom && x.at <= plan.windowTo : x.at.startsWith(d))),
       future: d > now.slice(0, 10),
+      duty: dutyAt.get(d) ?? null,
     });
   }
-  const [summary, penalties] = await Promise.all([
-    attendanceMonth(c.companyId, m, { db, employeeIds: [employeeId] }),
-    listPenalties(db, c, { month: m }, null, { employeeIds: [employeeId] }),
-  ]);
+  const summary = summaryP;
+  const penalties = await listPenalties(db, c, { month: m }, null, { employeeIds: [employeeId] });
   let approver = null;
   const w = (await loadWorlds(db, c.companyId, [employeeId])).get(employeeId);
   if (w) { const { approverId } = await approverChain(db, c.companyId, w); if (approverId) approver = (await loadPersons(db, c.companyId, [approverId])).get(approverId) ?? null; }
+  // Comp-off (spec §42.4): credited to the person's EARNED_BY_WORK leave type when their leave policy has one; else HR credits it.
+  const compOffDays = summary.people[0]?.duty?.compOffDays ?? 0;
+  const coRule = (w?.rules ?? []).find((r) => r.accrual === 'EARNED_BY_WORK');
+  const compOff = compOffDays > 0 ? {
+    days: compOffDays, leaveTypeId: coRule?.leaveTypeId ?? null, leaveTypeName: coRule?.leaveTypeName ?? null,
+    note: coRule ? `Credited to ${coRule.leaveTypeName ?? 'comp-off leave'} automatically.` : 'No comp-off leave in this person’s leave policy: HR credits it by hand (an opening balance).',
+  } : null;
   const todayPunches = punchList.filter((x) => x.at.startsWith(now.slice(0, 10)));
   return {
     month: m, label: monthWords(m), person: persons.get(employeeId) ?? null, liveFrom: s.liveFrom, live: Boolean(s.liveFrom),
     shift: p?.shift ? { id: p.shift.id, name: p.shift.name } : null,
     policy: { line: p?.effective?.line ?? 'No attendance policy', sentences: p ? sentencesOf(p.rules, { typeNames: names }) : [], shortPermission: p?.rules?.shortPermission ?? null },
-    days, summary: summary.people[0] ?? null, status: summary.status, penalties: penalties.items,
+    days, summary: summary.people[0] ?? null, status: summary.status, penalties: penalties.items, compOff,
     requests: reqs.map((r) => ({
       id: r.id, kind: r.kind, date: day(r.attendance_date), status: r.status, minutes: r.permission_minutes, requestedStatus: r.requested_status,
       inTime: wall(r.requested_in_time), outTime: wall(r.requested_out_time), reason: r.reason, decisionNote: r.decision_note, submittedAt: r.created_at ? new Date(r.created_at).toISOString() : null,

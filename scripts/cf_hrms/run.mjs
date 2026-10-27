@@ -207,6 +207,19 @@ const AREAS = {
       `${H}/services/law/**`, `${H}/services/payroll/**`, `${H}/services/leavePolicyService.js`, `${H}/services/attendance/policy.js`,
       'scripts/cf_hrms/compliance_checks_test.mjs'],
   },
+  // Spec §42 (Karni's requirements round): the management dashboard and the manpower report (they read people, chairs,
+  // attendanceMonth and the payroll runs), absence alerts (the attendance inputs, the §40 resolver, the compliance outbox),
+  // Sunday / festival duty (policy rules → the month → comp-off in leave balances → the run). A change to any of those runs it.
+  dashboardAlerts: {
+    suites: ['dashboard_alerts_test', 'attendance_test', 'payroll_exit_test'],
+    paths: [`${H}/services/dashboard/**`, `${H}/routes/dashboard.js`, `${H}/routes/notifications.js`, `${H}/services/notifications.js`,
+      `${H}/services/attendance/absenceAlerts.js`, `${H}/services/attendance/channels.js`, `${H}/services/attendance/duty.js`,
+      `${H}/services/attendance/month.js`, `${H}/services/attendance/policy.js`, `${H}/services/attendance/reads.js`, `${H}/services/attendance/process.js`,
+      `${H}/services/payrollExit/attendancePay.js`, `${H}/services/payroll/runService.js`, `${H}/services/payroll/seed.js`,
+      `${H}/services/leave/balance.js`, `${H}/services/leave/requestService.js`, `${H}/services/reportingResolver.js`, `${H}/lib/unitReporting.js`,
+      `${H}/services/compliance/notify.js`, `${H}/services/compliance/mailer.js`, `${H}/scripts/apply-dashboard-alerts-schema.mjs`,
+      'scripts/cf_hrms/dashboard_alerts_test.mjs'],
+  },
 };
 
 /** A change here can break any suite: --all, with the reason. */

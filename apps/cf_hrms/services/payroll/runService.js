@@ -397,6 +397,30 @@ async function calculateRunInLaw(db, c, id, requestId = null) {
         }
       }
     }
+    // Sunday and festival duty (spec §42.4): the closed month's amounts; a festival day paid as N× the day's wage at the
+    // overtime hourly rate × 8 (the payroll policy's formula, default (BASIC + DA) ÷ 26 ÷ 8 × 8 = (BASIC + DA) ÷ 26).
+    if (attP?.duty) {
+      const duty = attP.duty;
+      const dutyLine = (code, amount, basis) => {
+        if (!(amount > 0)) return;
+        if (comps.byCode.get(code)?.status === 'ACTIVE') extraItems.push({ code, amount, source: 'ATTENDANCE', basis });
+        else warnings.push(W('DUTY', `₹${amount.toLocaleString('en-IN')} of ${code === 'SUNDAY_DUTY' ? 'Sunday' : 'festival'} duty is due, but the ${code} component is missing or inactive: not paid. Add it under Payroll › Components (or run the payroll setup).`));
+      };
+      if (duty.sunday?.amount > 0) dutyLine('SUNDAY_DUTY', Math.round(duty.sunday.amount), `${duty.sunday.days} weekly off${duty.sunday.days === 1 ? '' : 's'} worked (${duty.sunday.hours} h) in ${b.label}`);
+      let festival = Number(duty.festival?.amount) || 0;
+      const parts = festival > 0 ? [`₹${festival.toLocaleString('en-IN')} fixed`] : [];
+      if (duty.festival?.wageDays > 0) {
+        const lastLines = (await bd(lastSeg.salary, b.from)).lines ?? [];
+        const rate = rateOf(policy.overtimeRateFormula, formulaValues(lastLines, comps.byCode.keys(), { annualCtc: lastSeg.salary.annualCtc }));
+        if (!rate.ok) warnings.push(W('DUTY', `Festival duty of ${duty.festival.wageDays} day's wage not paid: the day's wage (${policy.overtimeRateFormula} × 8) cannot be worked out — ${rate.problem}`));
+        else {
+          const dayWage = Math.round(rate.value * 8 * 100) / 100;
+          festival += duty.festival.wageDays * dayWage;
+          parts.push(`${duty.festival.wageDays} × ₹${dayWage.toLocaleString('en-IN')} a day ((${policy.overtimeRateFormula}) × 8)`);
+        }
+      }
+      if (festival > 0) dutyLine('FESTIVAL_DUTY', Math.round(festival), `${duty.festival.days} festival holiday${duty.festival.days === 1 ? '' : 's'} worked: ${parts.join(' + ')}`);
+    }
     if (attP && attP.penaltyAmount > 0) {
       const code = comps.byCode.get('ATT_PENALTY')?.status === 'ACTIVE' ? 'ATT_PENALTY' : 'OTHER_DED';
       extraItems.push({ code, amount: attP.penaltyAmount, source: 'ATTENDANCE', basis: `attendance penalties of ${b.label}` });

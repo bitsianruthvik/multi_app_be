@@ -5,6 +5,7 @@ import indexRoutes from './routes/index.js';
 import codegenModule from '../cf_erp/modules/codegen/index.js';
 import { PERM } from './lib/http.js';
 import { startNightly } from './services/attendance/scheduler.js';
+import { startAbsenceAlerts } from './services/attendance/absenceAlerts.js';
 import platformRoutes from './routes/platform.js';
 import { startCompliance } from './services/compliance/scheduler.js';
 import { listenForPublishes } from './services/compliance/notices.js';
@@ -81,6 +82,9 @@ export default {
     // Attendance (spec §28.2): the nightly run for yesterday — in the real server only, never in a
     // test script that mounts these routes (services/attendance/scheduler.js says why it is restart-safe).
     if (/[\\/]index\.js$/.test(process.argv[1] ?? '')) startNightly();
+    // Absence alerts (spec §42.3): every 5 minutes, the shifts whose start + grace + delay has passed — once per
+    // shift and day, claimed in the database (restart-safe, safe with two instances). Real server only.
+    if (/[\\/]index\.js$/.test(process.argv[1] ?? '')) startAbsenceAlerts();
     // Compliance (spec §36.4): the product team's console, outside any company — /api/platform/* (appContext lets
     // it through without a company; every route checks platform_admins, routes/platform.js). A law version
     // published anywhere is announced to every company; the hourly pass (watcher, reminders, re-sends, outbox)

@@ -16,6 +16,13 @@
  *   sandwich        weekly offs / holidays between two absent days count as absent
  *   shortPermission { perMonth, maxMinutes }               a request; within it a late / early is excused
  *   overtime        { afterMinutes, rateMultiplier, minMinutes, maxMinutesPerDay }
+ *   weeklyOffDuty   (spec §42.4) work on a weekly off ("Sunday duty"):
+ *                   { pay: PER_DAY | PER_HOUR | null, amount, minHours, compOffDays: 0.5 | 1 | null, alsoOvertime }
+ *   holidayDuty     (spec §42.4) work on a festival holiday (a full holiday of the shift's calendar):
+ *                   { pay: FIXED | DAY_WAGE | null, amount (FIXED), wageMultiple (DAY_WAGE), minHours, compOffDays, alsoOvertime }
+ *                   A day counts when the hours worked reach minHours (none = any work). The month summary
+ *                   (month.js) turns them into amounts and comp-off days; payroll pays SUNDAY_DUTY / FESTIVAL_DUTY.
+ *                   alsoOvertime false (the default): the day's hours are NOT also paid as overtime.
  * An ACTION: { type: LEAVE | LOP | AMOUNT | WARNING, days (LEAVE, LOP: 0.5 | 1),
  *              leaveTypeIds (LEAVE, in order of preference), elseLop (LEAVE), amount (AMOUNT) }
  */
@@ -31,8 +38,10 @@ export const SCOPES = ['COMPANY', 'LOCATION', 'ROLE', 'LABEL'];
 
 export const RULE_DEFAULTS = Object.freeze({
   graceInMinutes: null, graceOutMinutes: null, lateMarks: null, shortDay: null, missingPunch: null,
-  absentIsLop: true, sandwich: false, shortPermission: null, overtime: null,
+  absentIsLop: true, sandwich: false, shortPermission: null, overtime: null, weeklyOffDuty: null, holidayDuty: null,
 });
+export const WEEKLY_OFF_PAY = ['PER_DAY', 'PER_HOUR'];
+export const HOLIDAY_PAY = ['FIXED', 'DAY_WAGE'];
 
 /* ══ reading a body ═════════════════════════════════════════════════════════ */
 
@@ -95,7 +104,29 @@ export function readRules(input = {}, problems = [], { typeIds = null } = {}) {
     if (maxMinutesPerDay !== null && minMinutes > maxMinutesPerDay) problems.push('Overtime: the least counted is more than the most in a day.');
     r.overtime = { afterMinutes, rateMultiplier, minMinutes, maxMinutesPerDay };
   }
+  if (src.weeklyOffDuty) r.weeklyOffDuty = readDuty(src.weeklyOffDuty, problems, { what: 'Work on a weekly off', pays: WEEKLY_OFF_PAY });
+  if (src.holidayDuty) r.holidayDuty = readDuty(src.holidayDuty, problems, { what: 'Work on a festival holiday', pays: HOLIDAY_PAY });
   return r;
+}
+
+/** A duty rule (spec §42.4): an allowance and/or comp-off. Pushes problems in words. */
+function readDuty(d, problems, { what, pays }) {
+  const pay = blank(d.pay) ? null : String(d.pay).toUpperCase();
+  if (pay !== null && !pays.includes(pay)) { problems.push(`${what}: choose how it is paid.`); return null; }
+  const low = what.toLowerCase();
+  const out = { pay, amount: null, wageMultiple: null, minHours: null, compOffDays: null, alsoOvertime: flag(d.alsoOvertime) };
+  if (pay === 'PER_DAY' || pay === 'PER_HOUR' || pay === 'FIXED') {
+    out.amount = num(d.amount, `${low}: the amount (₹${pay === 'PER_HOUR' ? ' an hour' : ' a day'})`, problems, { min: 1, max: 100000, required: true });
+  }
+  if (pay === 'DAY_WAGE') out.wageMultiple = num(d.wageMultiple, `${low}: how many times the day’s wage`, problems, { min: 0.5, max: 5, required: true });
+  out.minHours = num(d.minHours, `${low}: the least hours worked for it to count`, problems, { min: 0, max: 24 }) || null;
+  if (!blank(d.compOffDays)) {
+    const c = Number(d.compOffDays);
+    if (c !== 0.5 && c !== 1 && c !== 0) problems.push(`${what}: comp-off is half a day or a whole day.`);
+    else out.compOffDays = c || null;
+  }
+  if (!out.pay && !out.compOffDays) problems.push(`${what}: choose an allowance, a comp-off, or both.`);
+  return out;
 }
 
 function readAction(a, problems, { typeIds, what }) {
@@ -174,9 +205,30 @@ export function sentencesOf(rules, { typeNames = new Map() } = {}) {
     const parts = [`Overtime counts ${o.afterMinutes ? `once someone works ${minutesWords(o.afterMinutes)} or more beyond the shift` : 'for time worked beyond the shift'}, at ${o.rateMultiplier} times the hourly rate`];
     if (o.minMinutes) parts.push(`at least ${minutesWords(o.minMinutes)}`);
     if (o.maxMinutesPerDay) parts.push(`at most ${minutesWords(o.maxMinutesPerDay)} a day`);
-    out.push(`${parts.join('; ')}. Work on a weekly off or holiday is all overtime.`);
+    const asDuty = [r.weeklyOffDuty && !r.weeklyOffDuty.alsoOvertime ? 'WO' : null, r.holidayDuty && !r.holidayDuty.alsoOvertime ? 'H' : null].filter(Boolean);
+    const tail = !asDuty.length ? 'Work on a weekly off or holiday is all overtime.'
+      : asDuty.length === 2 ? 'Work on a weekly off or a festival holiday is paid as duty (below), not as overtime.'
+        : asDuty[0] === 'WO' ? 'Work on a weekly off is paid as duty (below), not as overtime; work on a holiday is all overtime.'
+          : 'Work on a festival holiday is paid as duty (below), not as overtime; work on a weekly off is all overtime.';
+    out.push(`${parts.join('; ')}. ${tail}`);
   } else out.push('No overtime is counted.');
+  if (r.weeklyOffDuty) out.push(dutySentence(r.weeklyOffDuty, 'weekly off', 'Sunday duty allowance'));
+  if (r.holidayDuty) out.push(dutySentence(r.holidayDuty, 'festival holiday', 'festival duty allowance'));
   return out;
+}
+
+const rupees = (n) => `₹${Number(n).toLocaleString('en-IN')}`;
+const multipleWords = (m) => (Number(m) === 1 ? 'the day’s wage' : Number(m) === 2 ? 'twice the day’s wage' : `${m} times the day’s wage`);
+
+/** "Work on a weekly off (at least 4 hours): ₹500 a day as Sunday duty allowance, and half a day of comp-off." */
+export function dutySentence(d, dayName, allowance) {
+  const when = d.minHours ? ` (at least ${hoursWords(d.minHours)})` : '';
+  const parts = [];
+  if (d.pay === 'PER_DAY' || d.pay === 'FIXED') parts.push(`${rupees(d.amount)} a day as ${allowance}`);
+  else if (d.pay === 'PER_HOUR') parts.push(`${rupees(d.amount)} an hour as ${allowance}`);
+  else if (d.pay === 'DAY_WAGE') parts.push(`${multipleWords(d.wageMultiple)} as ${allowance}`);
+  if (d.compOffDays) parts.push(`${dayWord(d.compOffDays)} of comp-off`);
+  return `Work on a ${dayName}${when}: ${parts.join(', and ')}.`;
 }
 
 /* ══ a policy on the wire ═══════════════════════════════════════════════════ */
@@ -369,5 +421,5 @@ export async function putAssignment(conn, c, body = {}, requestId = null) {
   return { assignment: { scope, targetId, policyId } };
 }
 
-export default { RULE_DEFAULTS, readRules, sentencesOf, actionWords, shapePolicy, loadAttendanceIndex, resolveAttendance, listPolicies, readPolicy, createPolicy, updatePolicy, removePolicy, putAssignment, previewSentences, leaveTypeNames };
+export default { RULE_DEFAULTS, readRules, sentencesOf, dutySentence, actionWords, shapePolicy, loadAttendanceIndex, resolveAttendance, listPolicies, readPolicy, createPolicy, updatePolicy, removePolicy, putAssignment, previewSentences, leaveTypeNames };
 export { HrmsError };

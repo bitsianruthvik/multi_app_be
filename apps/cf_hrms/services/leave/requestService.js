@@ -39,6 +39,7 @@ import { unitIdsAndBelow } from '../../lib/listFilters.js';
 import {
   makeCalendar, countDays, isDate, addDays, daysBetween, spanText, dayText, daysWords, daysOffPhrase, MAX_RANGE_DAYS,
 } from './days.js';
+import { dutyOfDay } from '../attendance/duty.js';
 import { balanceOf, leaveYearOf, yearOfKey, yearFromStart, plain, presentBetween } from './balance.js';
 
 const iso = (v) => (v == null ? null : (v instanceof Date ? v.toISOString() : new Date(v).toISOString()));
@@ -219,9 +220,24 @@ async function loadAttendance(db, companyId, ids) {
       `SELECT employee_id, attendance_date, present_value FROM hrms_attendance_records
         WHERE company_id = ? AND employee_id IN (?) AND deleted_at IS NULL AND attendance_date >= ? AND present_value > 0`, [companyId, ids, liveFrom]);
   }
-  for (const id of ids) out.set(id, { liveFrom, presentByMonth: new Map(), presentByDay: ids.length <= 5 ? new Map() : null });
+  // Comp-off earned by working on a weekly off or a festival holiday (spec §42.4): the policy's duty rule of the day.
+  const [offWorked] = await db.query(
+    `SELECT r.employee_id, r.attendance_date, r.status, r.worked_minutes, r.policy_id FROM hrms_attendance_records r
+      WHERE r.company_id = ? AND r.employee_id IN (?) AND r.deleted_at IS NULL AND r.attendance_date >= ?
+        AND r.status IN ('WEEKLY_OFF', 'HOLIDAY') AND r.worked_minutes > 0 AND r.policy_id IS NOT NULL`, [companyId, ids, liveFrom]);
+  const rulesOf = new Map();
+  const policyIds = [...new Set(offWorked.map((r) => r.policy_id))];
+  if (policyIds.length) {
+    const [pols] = await db.query('SELECT id, rules_json FROM hrms_attendance_policies WHERE company_id = ? AND id IN (?)', [companyId, policyIds]);
+    for (const p of pols) rulesOf.set(p.id, typeof p.rules_json === 'string' ? JSON.parse(p.rules_json) : (p.rules_json ?? {}));
+  }
+  for (const id of ids) out.set(id, { liveFrom, presentByMonth: new Map(), presentByDay: ids.length <= 5 ? new Map() : null, compOff: [] });
   for (const r of months) out.get(r.employee_id)?.presentByMonth.set(r.m, Number(r.p) || 0);
   for (const r of days) out.get(r.employee_id)?.presentByDay?.set(dateText(r.attendance_date), Number(r.present_value) || 0);
+  for (const r of offWorked) {
+    const d = dutyOfDay(r, rulesOf.get(r.policy_id));
+    if (d?.compOff) out.get(r.employee_id)?.compOff.push({ date: d.date, days: d.compOff });
+  }
   return out;
 }
 

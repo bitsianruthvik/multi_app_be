@@ -6733,3 +6733,123 @@ CREATE TABLE IF NOT EXISTS hrms_unit_heads (
 
 -- ----- 41c. hrms_position_reporting_relationships: a cross-tree line marked as intended ----------
 -- "ALTER TABLE hrms_position_reporting_relationships ADD COLUMN cross_tree_reason VARCHAR(500) NULL AFTER notes"
+
+
+
+-- ############################################################################
+-- ## 43. DASHBOARD AND ALERTS (CF_HRMS_HIRING_SPEC.md §42)                   ##
+-- ############################################################################
+-- Added 2026-10-27, from Karni's requirements round. The management dashboard and the manpower
+-- report are READS ONLY (services/dashboard/): they keep nothing. Sunday and festival duty are
+-- attendance-policy rules (rules_json of hrms_attendance_policies, no new column) that the month
+-- summary turns into amounts and comp-off days, and payroll into the ready-made components
+-- SUNDAY_DUTY and FESTIVAL_DUTY (added to every company with components by the apply script).
+-- What is stored here is the ABSENCE ALERT (services/attendance/absenceAlerts.js):
+--
+--   hrms_absence_alert_settings  one row a company: on/off, the delay after a shift's start + grace,
+--                                who hears (HR access templates, each person's resolved manager §40)
+--                                and on which channels (in-app, email, SMS, WhatsApp).
+--   hrms_absence_alert_runs      one row per company, date and shift that was checked — the CLAIM:
+--                                run_key "<date>:<shift id>" is unique per company, so a restart or
+--                                a second server never sends a shift's alert twice.
+--   hrms_notifications           a login's own in-app notifications (the bell, Notifications page);
+--                                dedupe_key unique per login: one digest per recipient per run.
+--   hrms_alert_deliveries        what each channel did for each digest: SENT / QUEUED (email outbox,
+--                                hrms_compliance_emails) / NOT_CONFIGURED (SMS and WhatsApp until a
+--                                provider is set) / NO_ADDRESS / FAILED. Nothing leaves a stub.
+-- Guarded creates and the two components: apps/cf_hrms/scripts/apply-dashboard-alerts-schema.mjs
+-- (dry run by default).
+
+CREATE TABLE IF NOT EXISTS hrms_absence_alert_settings (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  enabled          TINYINT(1)    NOT NULL DEFAULT 0,
+  delay_minutes    INT           NOT NULL DEFAULT 30,     -- after the shift's start + its grace
+  hr_templates_json JSON         NULL,                    -- access templates that hear of everyone: ["OWNER","HR_MANAGER"]
+  notify_managers  TINYINT(1)    NOT NULL DEFAULT 1,      -- each person's resolved manager hears of their people
+  channels_json    JSON          NULL,                    -- { inApp, email, sms, whatsapp }
+
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by       INT           NULL,
+
+  UNIQUE KEY uq_haas_company (company_id),
+  CONSTRAINT fk_haas_company FOREIGN KEY (company_id) REFERENCES companies(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_absence_alert_runs (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  alert_date       DATE          NOT NULL,
+  shift_id         INT           NULL,
+  run_key          VARCHAR(60)   NOT NULL,                -- "<date>:<shift id>" — the claim
+  due_at           DATETIME      NULL,                    -- wall-clock: start + grace + delay
+  started_at       DATETIME      NOT NULL,
+  finished_at      DATETIME      NULL,
+  absent_count     INT           NOT NULL DEFAULT 0,
+  digest_count     INT           NOT NULL DEFAULT 0,
+  absent_json      JSON          NULL,                    -- [employee id] listed
+  trigger_kind     ENUM('SCHEDULED','BY_HAND') NOT NULL DEFAULT 'SCHEDULED',
+
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by       INT           NULL,
+
+  UNIQUE KEY uq_haar_tenant (company_id, id),
+  UNIQUE KEY uq_haar_key    (company_id, run_key),
+  KEY idx_haar_date (company_id, alert_date),
+  CONSTRAINT fk_haar_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_haar_shift   FOREIGN KEY (company_id, shift_id) REFERENCES hrms_shifts(company_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_notifications (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  user_id          INT           NOT NULL,                -- the login it is for (never anybody of another company)
+  kind             VARCHAR(40)   NOT NULL,                -- ABSENCE_DIGEST …
+  title            VARCHAR(300)  NOT NULL,
+  body             TEXT          NULL,
+  data_json        JSON          NULL,                    -- { runId, date, shift, people: [{ employeeId, code, name, unit }] }
+  link             VARCHAR(300)  NULL,                    -- a path inside the app: "attendance?tab=today&date=…"
+  dedupe_key       VARCHAR(120)  NOT NULL,
+  read_at          DATETIME      NULL,
+
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_hnot_tenant (company_id, id),
+  UNIQUE KEY uq_hnot_dedupe (company_id, user_id, dedupe_key),
+  KEY idx_hnot_user (company_id, user_id, read_at),
+  CONSTRAINT fk_hnot_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hnot_user    FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS hrms_alert_deliveries (
+  id               INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id       INT           NOT NULL,
+  run_id           INT           NOT NULL,
+  user_id          INT           NOT NULL,
+  channel          ENUM('IN_APP','EMAIL','SMS','WHATSAPP') NOT NULL,
+  status           ENUM('SENT','QUEUED','NOT_CONFIGURED','NO_ADDRESS','FAILED') NOT NULL,
+  detail           VARCHAR(500)  NULL,
+  notification_id  INT           NULL,
+  email_id         INT           NULL,                    -- hrms_compliance_emails (the outbox)
+
+  deleted_at       DATETIME      DEFAULT NULL,
+  created_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY uq_hald_tenant (company_id, id),
+  KEY idx_hald_run (company_id, run_id),
+  CONSTRAINT fk_hald_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_hald_run     FOREIGN KEY (company_id, run_id) REFERENCES hrms_absence_alert_runs(company_id, id),
+  CONSTRAINT fk_hald_user    FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ----- 43b. ready-made payroll components (data, not DDL) ----------------------------------------
+-- SUNDAY_DUTY   "Sunday duty allowance"    EARNING, taxable, in the ESI wage, not PF / gratuity, MONTHLY, no proration
+-- FESTIVAL_DUTY "Festival duty allowance"  the same
+-- services/payroll/seed.js has them for a new company; the apply script adds them where components exist.

@@ -31,6 +31,8 @@ import payrollExitRoutes from './payrollExit.js';
 import lawRoutes from './law.js';
 import complianceRoutes from './compliance.js';
 import complianceChecksRoutes from './complianceChecks.js';
+import dashboardRoutes from './dashboard.js';
+import notificationRoutes from './notifications.js';
 
 const router = Router();
 
@@ -168,5 +170,9 @@ router.use(lawRoutes);
 router.use(complianceRoutes);
 // Compliance checks, to-dos with a proposed fix, the bonus run (spec §36.2, §36.3 — C2).
 router.use(complianceChecksRoutes);
+// Karni's requirements round (spec §42): the management dashboard and the manpower report (routes/dashboard.js), and
+// a login's own in-app notifications — the absence digests (routes/notifications.js). The alert settings are in attendance.js.
+router.use(dashboardRoutes);
+router.use(notificationRoutes);
 
 export default router;

@@ -629,6 +629,9 @@ How to read the tables below:
 | `GET /attendance/months` | `cf_hrms_attendance_view` |  |
 | `POST /attendance/months/:month/close` | `cf_hrms_attendance_edit` | whole-company logins only |
 | `POST /attendance/months/:month/reopen` | `cf_hrms_attendance_edit` | whole-company logins only; the Owner only, with a reason |
+| `GET /attendance/alerts` | `cf_hrms_attendance_view` |  |
+| `PUT /attendance/alerts/settings` | `cf_hrms_attendance_edit` | whole-company logins only |
+| `POST /attendance/alerts/check-now` | `cf_hrms_attendance_edit` | whole-company logins only; sends what is due and not sent yet; once per shift and day |
 | `GET /tax/years` | `cf_hrms_payroll_view` | whole-company logins only |
 | `GET /tax/years/:year` | `cf_hrms_payroll_view` | whole-company logins only |
 | `PUT /tax/years/:year` | `cf_hrms_payroll_edit` | whole-company logins only |
@@ -744,5 +747,11 @@ How to read the tables below:
 | `POST /payroll/bonus/:id/unschedule` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `DELETE /payroll/bonus/:id` | `cf_hrms_payroll_edit` **and** `cf_hrms_pay_view` | whole-company logins only |
 | `GET /payroll/bonus/:id/register` | `cf_hrms_payroll_view` **and** `cf_hrms_pay_view` | whole-company logins only |
+| `GET /dashboard` | `cf_hrms_employees_view` or `cf_hrms_attendance_view` or `cf_hrms_positions_view` or `cf_hrms_payroll_view` | each tile needs its own right (pay tiles: payroll view + cf_hrms_pay_view); narrowed to the login’s org unit |
+| `GET /dashboard/manpower` | `cf_hrms_positions_view` | present today needs cf_hrms_attendance_view; narrowed to the login’s org unit |
+| `GET /dashboard/manpower/workbook` | `cf_hrms_positions_view` | present today needs cf_hrms_attendance_view; narrowed to the login’s org unit |
+| `GET /notifications` | any login with access to the app | only the login’s own notifications |
+| `POST /notifications/read-all` | any login with access to the app | only the login’s own notifications |
+| `POST /notifications/:id/read` | any login with access to the app | only the login’s own notifications |
 
-638 routes.
+647 routes.

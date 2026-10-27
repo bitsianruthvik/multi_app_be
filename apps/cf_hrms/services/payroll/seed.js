@@ -51,6 +51,10 @@ export const READY_MADE_COMPONENTS = [
   ['REIMB_TAX', 'Reimbursement (taxable)', 'REIMBURSEMENT', 'YES', null, 0, 0, 0, 'MONTHLY', 0, null],
   ['REIMB_LTA', 'Leave travel (claimed)', 'REIMBURSEMENT', 'PARTLY', 'LTA', 0, 0, 0, 'MONTHLY', 0, null],
   ['FLEXI_PAY', 'Flexible benefit balance', 'EARNING', 'YES', null, 0, 0, 0, 'YEARLY', 0, null],
+  // Spec §42.4: work on a weekly off / a festival holiday, from the closed attendance month (attendance policy rules
+  // weeklyOffDuty / holidayDuty). One-time lines of the run, like overtime: in the ESI wage, not PF or gratuity.
+  ['SUNDAY_DUTY', 'Sunday duty allowance', 'EARNING', 'YES', null, 0, 1, 0, 'MONTHLY', 0, null],
+  ['FESTIVAL_DUTY', 'Festival duty allowance', 'EARNING', 'YES', null, 0, 1, 0, 'MONTHLY', 0, null],
 ].map(([code, name, kind, taxable, exemptionRule, inPf, inEsi, inGratuity, frequency, prorate, statutoryKey], i) => ({
   code, name, kind, taxable, exemptionRule, inPfWage: inPf, inEsiWage: inEsi, inGratuityWage: inGratuity, frequency, prorateOnLop: prorate, statutoryKey, sortOrder: (i + 1) * 10,
 }));

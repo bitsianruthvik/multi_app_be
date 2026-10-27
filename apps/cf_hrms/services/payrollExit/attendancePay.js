@@ -13,7 +13,9 @@
  *                           the snapshot wins: the rest is put on, or taken off, the last days, and said.
  *                OVERTIME the month's hours × the policy's multiplier × the hourly rate (the company payroll
  *                           policy's formula, default (BASIC + DA) ÷ 26 ÷ 8) — an OVERTIME earning;
- *                PENALTY  the month's penalty amounts — a deduction (ATT_PENALTY, else OTHER_DED).
+ *                PENALTY  the month's penalty amounts — a deduction (ATT_PENALTY, else OTHER_DED);
+ *                DUTY     (spec §42.4) Sunday duty → SUNDAY_DUTY (the month's amount); festival duty → FESTIVAL_DUTY
+ *                           (the amount + wageDays × the day's wage = the overtime hourly rate × 8) — earnings.
  *   LIVE, OPEN calculating is refused: "Close attendance for October 2026 first." — unless HR overrides this
  *              run with a reason ("pay without attendance", hrms_pay_attendance_overrides): then LOP from
  *              unpaid leave, no overtime, no penalties (mode OVERRIDE), and the run says so.
@@ -126,6 +128,8 @@ export async function attendanceForRun(db, companyId, month, ids, runId, leaveLo
       lopDates: [...byDate.entries()].filter(([, a]) => a > 0).sort(([x], [y]) => x.localeCompare(y)).map(([date, amount]) => ({ date, amount })),
       lopDays: r2(Number(p.lopDays) + before), overtime: p.overtime ?? { minutes: 0, hours: 0, multiplier: null }, penaltyAmount: r2(p.penalties?.amount ?? 0), note,
       parts: { unpaidLeave: p.leave?.unpaid ?? 0, absentLop: p.absentLop ?? 0, penaltyLop: p.penalties?.lopDays ?? 0 },
+      // Sunday / festival duty (spec §42.4): a month closed before it has none.
+      duty: p.duty ?? null,
     });
   }
   return { state, people };
