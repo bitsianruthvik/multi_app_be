@@ -189,6 +189,22 @@ try {
     const target = [...model.units.values()].find((u) => u.id !== unit.id && u.id !== parent.id && !below.has(u.id));
     const mc = await moveCheck(conn, companyId, unit.id, target.id);
     ok(mc.reportsInto?.ask === true && /keep that, or switch/.test(mc.sentence), 'move-check: a CHOSEN Reports into asks keep or switch', mc.sentence);
+    // A new parent with NO head: the default walks up, and the words say so — never "the new parent's head"
+    // for a grand-parent's head (browser check 2026-10-27: "BFL" had no head, the question named Chairman).
+    const headed = [...model.units.values()].find((x) => x.id !== unit.id && !below.has(x.id) && model.headsOf(x.id).length);
+    if (headed) {
+      const [nu] = await conn.query("INSERT INTO hrms_departments (company_id, code, name, status, parent_department_id) VALUES (?, 'ZZNOHEAD', 'Test unit without a head', 'ACTIVE', ?)", [companyId, headed.id]);
+      const mn = await moveCheck(conn, companyId, unit.id, nu.insertId);
+      const r = mn.reportsInto;
+      ok(r?.ask === true && r.newParent?.id === nu.insertId && r.newParent.hasHead === false && !/new parent's head/.test(mn.sentence)
+        && (r.afterMove ? /the default: .+, the nearest head above \(Test unit without a head has no head yet\)\?$/.test(mn.sentence) && r.afterMoveFrom && r.afterMoveFrom.id !== nu.insertId
+          : /the default: nobody/.test(mn.sentence)),
+      'move-check under a unit with no head: "switch to the default — <head>, the nearest head above (<unit> has no head yet)"', mn.sentence);
+      const mh = await moveCheck(conn, companyId, unit.id, headed.id);
+      if (mh.reportsInto?.afterMoveFrom?.id === headed.id) {
+        ok(mh.reportsInto.newParent.hasHead === true && /switch to the new parent's head, /.test(mh.sentence), 'move-check under a unit with a head: "the new parent\'s head, <head>"', mh.sentence);
+      }
+    }
     await updateDepartment(conn, c, unit.id, { parentId: target.id, reportsInto: 'KEEP' });
     ok((await unitReporting(conn, companyId, unit.id)).reportsInto.mode === 'CHOSEN', 'move with KEEP keeps the chosen one');
     await updateDepartment(conn, c, unit.id, { parentId: parent.id, reportsInto: 'SWITCH' });

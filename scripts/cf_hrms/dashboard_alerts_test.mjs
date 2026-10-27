@@ -417,6 +417,10 @@ try {
     ok(mine.status === 200 && mine.json.unread === 2 && mine.json.items.some((x) => x.data?.shiftId === SD && x.data.people.some((y) => y.employeeId === AE.d1)) && note?.kind === 'ABSENCE_DIGEST' && /^1 not punched in — /.test(note.title) && note.data.people[0].employeeId === AE.a2 && note.link === `attendance?tab=today&date=${D}`, 'M1’s bell: two unread digests (one per shift), the AL one with A2 and the link', J(mine.json));
     ok((await call(UL.HR, 'POST', `/notifications/${note.id}/read`, {})).json?.updated === 0, 'another login cannot mark it');
     ok((await call(UL.M1, 'POST', `/notifications/${note.id}/read`, {})).json?.updated === 1 && (await call(UL.M1, 'GET', '/notifications')).json.unread === 1, 'M1 marks it read');
+    // The time on a notification is the real instant (it read 5½ h late on an IST MySQL when created_at was the column default).
+    const readBack = (await call(UL.M1, 'GET', '/notifications')).json.items.find((x) => x.id === note.id);
+    const skew = (s) => Math.abs(Date.parse(s) - Date.now());
+    ok(skew(note.createdAt) < 10 * 60 * 1000 && skew(readBack.readAt) < 10 * 60 * 1000, 'its createdAt and readAt are now, in any server zone (not +5:30)', J([note.createdAt, readBack.readAt, new Date().toISOString()]));
 
     // Settings respected: managers off, in the app only (3 Sep).
     await ALERT.putAlertSettings(db, hr, { notifyManagers: false, channels: { inApp: true, email: false, sms: false, whatsapp: false } });

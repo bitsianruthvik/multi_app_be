@@ -710,7 +710,12 @@ export async function moveCheck(db, companyId, id, parentIdRaw) {
     allowed: !problem,
     problem,
     sentence: reportsInto ? `${base}. ${reportsInto.sentence}` : base,
-    reportsInto: reportsInto ? { mode: reportsInto.mode, current: reportsInto.current, afterMove: reportsInto.afterMove, ask: reportsInto.ask } : null,
+    reportsInto: reportsInto
+      ? {
+        mode: reportsInto.mode, current: reportsInto.current, afterMove: reportsInto.afterMove, ask: reportsInto.ask,
+        afterMoveFrom: reportsInto.afterMoveFrom, newParent: reportsInto.newParent,
+      }
+      : null,
   };
 }
 

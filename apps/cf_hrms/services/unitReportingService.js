@@ -298,7 +298,9 @@ export async function setUnitReporting(db, c, unitId, body = {}) {
 
 /**
  * What a move does to a unit's Reports into, for move-check:
- *   { mode, current: PosRef|null, afterMove: PosRef|null, ask, sentence }
+ *   { mode, current: PosRef|null, afterMove: PosRef|null, ask, sentence,
+ *     afterMoveFrom: { id, name, type }|null   — the unit whose head the default is (parent, or nearest above)
+ *     newParent: { id, name, type, hasHead }|null }
  * DEFAULT re-points by itself (afterMove = the new parent's head, or further up); CHOSEN asks keep or switch.
  */
 export async function moveReportsInto(db, companyId, unitId, parentId) {
@@ -315,11 +317,27 @@ export async function moveReportsInto(db, companyId, unitId, parentId) {
   const afterMove = def ? posRef(model, def.positionId) : null;
   const ask = u.reportsIntoMode === 'CHOSEN' && u.reportsIntoPositionId != null;
   const name = (r) => (r ? `${r.title}${r.occupantName ? ` (${r.occupantName})` : ''}` : 'nobody');
+  // Where the default comes from after the move: the new parent's own head, or (it has none) the nearest head
+  // further up. The words must not call a grand-parent's head "the new parent's head" (browser check 2026-10-27).
+  const parent = parentId != null ? model.units.get(Number(parentId)) ?? null : null;
+  const fromUnit = def?.fromUnitId != null ? model.units.get(def.fromUnitId) ?? null : null;
+  const parentHasHead = parent ? model.headsOf(parent.id).length > 0 : false;
+  const fromParent = !!(fromUnit && parent && fromUnit.id === parent.id);
+  const noHeadYet = parent && !parentHasHead ? ` (${parent.name} has no head yet)` : '';
+  const defaultWords = afterMove
+    ? (fromParent
+      ? `the new parent's head, ${name(afterMove)}`
+      : `the default: ${name(afterMove)}${fromUnit ? `, the head of ${fromUnit.name}` : ''}, the nearest head above${noHeadYet}`)
+    : `the default: nobody (${parent ? `no unit from ${parent.name} up has a head yet` : 'a unit at the top reports into nobody'})`;
   let sentence;
-  if (ask) sentence = `It reports into ${name(current)} by choice: keep that, or switch to the new parent's head (${name(afterMove)})?`;
-  else if (afterMove) sentence = `Its Reports into follows: ${name(afterMove)}${def?.fromUnitId != null ? `, the head of ${model.units.get(def.fromUnitId)?.name ?? 'the new parent'}` : ''}.`;
+  if (ask) sentence = `It reports into ${name(current)} by choice: keep that, or switch to ${defaultWords}?`;
+  else if (afterMove) sentence = `Its Reports into follows: ${name(afterMove)}${fromUnit ? `, the head of ${fromUnit.name}` : ''}${fromParent ? '' : noHeadYet}.`;
   else sentence = 'It will report into nobody until a unit above it has a head.';
-  return { mode: u.reportsIntoMode, current, afterMove, ask, sentence };
+  return {
+    mode: u.reportsIntoMode, current, afterMove, ask, sentence,
+    afterMoveFrom: fromUnit ? { id: fromUnit.id, name: fromUnit.name, type: fromUnit.type ?? null } : null,
+    newParent: parent ? { id: parent.id, name: parent.name, type: parent.type ?? null, hasHead: parentHasHead } : null,
+  };
 }
 
 /** Called by updateDepartment after a move: SWITCH -> back to the default. Returns the before/after for the audit. */
@@ -401,7 +419,9 @@ function describe(model, findings, shiftById) {
       const target = def ? ref(model, def.positionId, shiftById) : null;
       const fixes = [];
       if (target) fixes.push(fix('USE_DEFAULT', `Use the default: ${named(target)}`, { target, unitId: u.id }));
-      fixes.push(fix('CHOOSE', 'Choose from the units above', { needsPosition: true, candidates: aboveCandidates(model, f.unitId, shiftById), unitId: u.id }));
+      // A unit at the top (or with no position above it) has nothing to choose from: no such fix.
+      const above = aboveCandidates(model, f.unitId, shiftById);
+      if (above.length) fixes.push(fix('CHOOSE', 'Choose from the units above', { needsPosition: true, candidates: above, unitId: u.id }));
       fixes.push(fix('MARK_INTENDED', 'It is meant: say why', { needsReason: true, unitId: u.id }));
       return { ...base, unit: unitShort(u), manager: m, sentence: `${u.name} reports into ${named(m)} in ${m.unitName ?? 'no org unit'}, which is not above it, and no reason is given.`, fixes };
     }

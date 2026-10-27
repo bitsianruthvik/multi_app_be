@@ -57,9 +57,12 @@ const inApp = {
   configured: () => true,
   async deliver(db, { companyId, recipient, digest }) {
     await db.query(
-      `INSERT INTO hrms_notifications (company_id, user_id, kind, title, body, data_json, link, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      // created_at is written here as a UTC Date, never left to DEFAULT CURRENT_TIMESTAMP: that one is the DB
+      // session's zone (IST on a local MySQL), while the pool reads every date as UTC (db.js timezone 'Z'), so a
+      // default-stamped row showed 5½ hours late locally. Same rule as read_at, queued_at, processed_at.
+      `INSERT INTO hrms_notifications (company_id, user_id, kind, title, body, data_json, link, dedupe_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE id = id`,
-      [companyId, recipient.userId, digest.kind, digest.title.slice(0, 300), digest.text, JSON.stringify(digest.data ?? null), digest.link ?? null, digest.dedupeKey]);
+      [companyId, recipient.userId, digest.kind, digest.title.slice(0, 300), digest.text, JSON.stringify(digest.data ?? null), digest.link ?? null, digest.dedupeKey, new Date()]);
     const [[row]] = await db.query('SELECT id FROM hrms_notifications WHERE company_id = ? AND user_id = ? AND dedupe_key = ?', [companyId, recipient.userId, digest.dedupeKey]);
     return { status: 'SENT', notificationId: row?.id ?? null };
   },
