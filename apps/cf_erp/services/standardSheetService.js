@@ -127,7 +127,7 @@ export async function missingLinks(db, companyId, pairs) {
   }
   const seen = new Set();
   return pairs.filter((p) => {
-    const k = `${p.drawingId}:${p.rowId}`;
+    const k = `${p.drawingId ?? p.key}:${p.rowId}`;
     if (seen.has(k)) return false;
     seen.add(k);
     return p.drawingId == null || !have.has(k);
@@ -203,7 +203,7 @@ export async function attachSheetsOnImport(db, c, { bom, rows, mainDrawingId, se
   const ids = await registerSheets(db, c, { sheets, mainDrawingId, seriesNumber: `${seriesNumber}${mainRevision ?? ''}`, sourceUrl, internal, codeBase });
   // The rows were just written: none has a sheet yet, so nothing is read to find out.
   const seen = new Set();
-  const pairs = plan.links.map((l) => ({ drawingId: ids.get(l.key) ?? null, rowId: l.rowId })).filter((p) => { const k = `${p.drawingId}:${p.rowId}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  const pairs = plan.links.map((l) => ({ drawingId: ids.get(l.key) ?? null, rowId: l.rowId, key: l.key })).filter((p) => { const k = `${p.drawingId}:${p.rowId}`; if (seen.has(k)) return false; seen.add(k); return true; });
   return { sheets: sheets.length, links: await attachLinks(db, c, pairs) };
 }
 
@@ -253,7 +253,7 @@ export async function repairStandardSheets(db, c, { standard, bom, commit = fals
       keysOf.set(l.rowId, [...(keysOf.get(l.rowId) ?? []), l.key]);
     }
     planOf.set(Number(v.id), byPath);
-    const pairs = await missingLinks(db, companyId, plan.links.map((l) => ({ drawingId: ids.get(l.key) ?? null, rowId: l.rowId })));
+    const pairs = await missingLinks(db, companyId, plan.links.map((l) => ({ drawingId: ids.get(l.key) ?? null, rowId: l.rowId, key: l.key })));
     const assemblies = rows.filter((r) => r.isAssembly && !r.isRoot);
     out.versions.push({
       id: Number(v.id), versionNo: Number(v.version_no), assemblies: assemblies.length,
@@ -274,7 +274,7 @@ export async function repairStandardSheets(db, c, { standard, bom, commit = fals
     for (const [p, keys] of byPath) {
       const rowId = rowAt.get(p);
       if (rowId == null) { unmatched++; continue; }
-      for (const k of keys) want.push({ drawingId: ids.get(k) ?? null, rowId });
+      for (const k of keys) want.push({ drawingId: ids.get(k) ?? null, rowId, key: k });
     }
     const pairs = await missingLinks(db, companyId, want);
     out.lines.push({ id: Number(l.id), order: l.order_code, add: commit ? await attachLinks(db, c, pairs) : pairs.length, unmatched });
