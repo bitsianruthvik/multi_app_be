@@ -8151,3 +8151,67 @@ UPDATE cf_requisitions SET internal_pr = 1
 
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'internal_pr') = 1,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §94  ORDER DELETION IS THE MD's — feature cf_erp_orders_delete (2026-10-27)
+-- The same text as multi_app_be/apps/cf_erp/models/init.sql §94. Grants only, no schema. Guarded and idempotent:
+-- safe to re-run (every INSERT is NOT EXISTS).
+--
+-- User decisions 2026-10-27 (cf_erp_orders_manage was too broad):
+--   * DELETE /orders/:id asks cf_erp_orders_delete (or an admin), no longer orders manage. Status changes (close,
+--     cancel, lost) and revisions stay on orders manage.
+--   * Tax invoices (raise — from dispatches too — edit, issue, cancel, IRN, e-way bills), Company tax details and
+--     Setup › Templates are written with cf_erp_accounts_manage only (code change; no grant here). The MD and the
+--     tester hold accounts manage already, so they keep all of it.
+--
+-- What this grants (Placebo, company 30005, its cf_erp app found by slug; ids by SELECT, nothing hard-coded but the
+-- company):
+--   1. the feature cf_erp_orders_delete (type 'frontend', like the other cf_erp tags) and its single-feature
+--      capability (features_capability.name = the tag);
+--   2. that capability to company 30005's roles named 'MD', 'tester' and 'admin' (any case) on app cf_erp.
+-- Then it LISTS (does not change) those roles with whether each holds cf_erp_accounts_manage. Users log in again to
+-- see a new grant (the permissions are in the token).
+-- ============================================================================
+
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: delete sales orders (MD)', 'cf_erp_orders_delete', 'frontend'
+  FROM DUAL
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_orders_delete' AND f.deleted_at IS NULL);
+
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id)
+  FROM features f
+ WHERE f.feature_tag = 'cf_erp_orders_delete' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = 'cf_erp_orders_delete' AND fc.deleted_at IS NULL)
+ LIMIT 1;
+
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_orders_delete' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL AND a.company_id = 30005
+   AND LOWER(TRIM(r.name)) IN ('md', 'tester', 'admin')
+   AND fc.capability_id IS NOT NULL
+   AND NOT EXISTS (
+     SELECT 1 FROM role_capability x
+      WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+-- Report (read only): the three roles, whether they now hold orders_delete, and whether they hold accounts manage
+-- (they need it to keep invoices, tax details and templates).
+SELECT r.company_id, r.id AS role_id, r.name AS role_name,
+       EXISTS (SELECT 1 FROM role_capability y
+                 JOIN features_capability fy ON fy.capability_id = y.capability_id AND fy.deleted_at IS NULL AND fy.name = 'cf_erp_orders_delete'
+                WHERE y.role_id = r.id AND y.app_id = a.id AND y.deleted_at IS NULL) AS has_orders_delete,
+       EXISTS (SELECT 1 FROM role_capability y
+                 JOIN features_capability fy ON fy.capability_id = y.capability_id AND fy.deleted_at IS NULL AND fy.name = 'cf_erp_accounts_manage'
+                WHERE y.role_id = r.id AND (y.app_id = a.id OR y.app_id IS NULL) AND y.deleted_at IS NULL) AS has_accounts_manage
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL AND a.company_id = 30005
+   AND LOWER(TRIM(r.name)) IN ('md', 'tester', 'admin')
+ ORDER BY r.name;
+
+SELECT IF((SELECT COUNT(*) FROM features WHERE deleted_at IS NULL AND feature_tag = 'cf_erp_orders_delete') >= 1
+      AND (SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL AND name = 'cf_erp_orders_delete') >= 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;

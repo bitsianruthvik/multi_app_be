@@ -33,11 +33,15 @@ const view = guard(PERM.ordersView);
 const manage = guard(PERM.orders);
 // Management reads an order's acceptance from the inbox without the order grants.
 const viewAcceptance = guardAny(PERM.ordersView, ...APPROVAL_PERMS);
+// Setup › Templates (charges, payment milestones, post-production stages): read by Sales or Accounts, kept by ACCOUNTS
+// MANAGE ONLY (user 2026-10-27, init.sql §94). An order's own acceptance stays on orders manage.
+const templatesView = guardAny(PERM.ordersView, PERM.accountsView);
+const templatesManage = guard(PERM.accounts);
 
-router.get('/term-templates', view, handle((req) => listTemplates(pool, ctx(req).companyId, req.query)));
-router.post('/term-templates', manage, handle((req) => tx(req, (db, c) => createTemplate(db, c, req.body ?? {}))));
-router.put('/term-templates/:id', manage, handle((req) => tx(req, (db, c) => updateTemplate(db, c, id(req), req.body ?? {}))));
-router.delete('/term-templates/:id', manage, handle((req) => tx(req, (db, c) => deleteTemplate(db, c, id(req)))));
+router.get('/term-templates', templatesView, handle((req) => listTemplates(pool, ctx(req).companyId, req.query)));
+router.post('/term-templates', templatesManage, handle((req) => tx(req, (db, c) => createTemplate(db, c, req.body ?? {}))));
+router.put('/term-templates/:id', templatesManage, handle((req) => tx(req, (db, c) => updateTemplate(db, c, id(req), req.body ?? {}))));
+router.delete('/term-templates/:id', templatesManage, handle((req) => tx(req, (db, c) => deleteTemplate(db, c, id(req)))));
 
 router.get('/orders/:id/acceptance', viewAcceptance, handle((req) => getAcceptance(pool, ctx(req).companyId, id(req))));
 // A dry run writes nothing, so it needs no transaction (the step's live preview calls it on every change).

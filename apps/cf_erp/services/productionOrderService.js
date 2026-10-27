@@ -361,7 +361,7 @@ export async function takeBackProductionOrder(db, c, id) {
 }
 
 /**
- * POST /production-orders/:id/dispatch { reference?, movementDate? } — ships what it has finished of each line
+ * POST /production-orders/:id/dispatch { reference?, movementDate?, invoice? } — ships what it has finished of each line
  * (dispatchService.shipLine: the stock issue, the invoice / billing "dispatched"); Closed when it has all gone.
  */
 export async function dispatchProductionOrder(db, c, id, input = {}) {
@@ -383,6 +383,8 @@ export async function dispatchProductionOrder(db, c, id, input = {}) {
         quantity: want, view: 'none', movementDate: input.movementDate,
         reference: blank(input.reference) ? `${po.code}` : String(input.reference).slice(0, 100),
         notes: `Dispatched with production order ${po.code} (${po.label})`.slice(0, 500),
+        // invoice: false = no draft tax invoice (the route sends it for anyone without accounts manage, 2026-10-27).
+        ...(input.invoice === false ? { invoice: false } : {}),
       });
       shipped[u.lineId] = r3(Number(shipped[u.lineId] ?? 0) + Number(out.shipped));
       shipments.push({ lineId: u.lineId, shipped: Number(out.shipped), movementId: out.movement?.id ?? null, invoice: out.invoice ?? null });

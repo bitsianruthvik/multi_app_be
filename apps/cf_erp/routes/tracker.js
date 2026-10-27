@@ -42,7 +42,8 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
+import { isPermitted } from '../../../core/middleware/requirePerm.js';
 import {
   releaseCheck, releasePreview, releaseLine, getRelease, unrelease, orderProduction, orderProductionSummary, releaseRequirements,
   takeMrEarmarks, releaseAfterWrite,
@@ -61,7 +62,12 @@ const id = (req) => intParam(req.params.id);
 const company = (req) => ctx(req).companyId;
 const view = guard(PERM.productionView);
 const manage = guard(PERM.production);
-const stock = guard(PERM.inventory);
+// Reserving / issuing stock to production and shipping a line: Stores (inventory manage) OR PPC (production manage) —
+// user 2026-10-27. Receipts, transfers, counts, scrap and GRNs stay Stores' (routes/inventory.js, grn.js).
+const stock = guardAny(PERM.inventory, PERM.production);
+/** A shipment drafts the tax invoice only for Accounts (invoices are accounts manage only, 2026-10-27, init.sql §94):
+ *  anyone else ships and the dispatch waits un-invoiced on the order's Invoices card for Accounts to raise. */
+export const shipInput = (req) => ({ ...(req.body ?? {}), ...(isPermitted(req.user, PERM.accounts) ? {} : { invoice: false }) });
 /** What a write answers with: ?view=summary | none, else the whole release. */
 const view_ = (req) => (req.query.view === 'summary' || req.query.view === 'none' ? String(req.query.view) : undefined);
 const body = (req) => ({ ...(req.body ?? {}), view: view_(req) });
@@ -82,9 +88,9 @@ router.get('/orders/:id/production', view, handle((req) => (String(req.query.ful
   ? orderProduction(pool, company(req), id(req))
   : orderProductionSummary(pool, company(req), id(req)))));
 router.get('/releases/:id/requirements', view, handle((req) => releaseRequirements(pool, company(req), id(req))));
-// Shipping is an inventory action: it takes finished stock off the dispatch shelf.
+// Shipping takes finished stock off the dispatch shelf: Stores or PPC (above).
 router.get('/order-lines/:id/shipment', guard(PERM.ordersView), handle((req) => shipmentView(pool, company(req), id(req))));
-router.post('/order-lines/:id/ship', stock, handle((req) => tx(req, (db, c) => shipLine(db, c, id(req), req.body ?? {}))));
+router.post('/order-lines/:id/ship', stock, handle((req) => tx(req, (db, c) => shipLine(db, c, id(req), shipInput(req)))));
 router.get('/tracker/steps', view, handle((req) => listTrackerSteps(pool, company(req), req.query)));
 router.get('/tracker/materials', view, handle((req) => listTrackerMaterials(pool, company(req), req.query)));
 router.get('/tracker/tree', view, handle((req) => trackerTree(pool, company(req), req.query)));

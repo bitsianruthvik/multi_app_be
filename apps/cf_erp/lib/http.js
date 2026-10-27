@@ -13,7 +13,8 @@ export const PERM = {
   setup: 'cf_erp_setup_manage',      // classification, specifications, formulas, spec rules
   codegen: 'cf_erp_codegen_manage',  // coding rules
   ordersView: 'cf_erp_orders_view',  // see sales orders, their structures and customers
-  orders: 'cf_erp_orders_manage',    // sales orders, their lines and custom BOMs
+  orders: 'cf_erp_orders_manage',    // sales orders, their lines and custom BOMs (not invoices, tax details, templates: accounts)
+  ordersDelete: 'cf_erp_orders_delete', // §94 (2026-10-27): deleting a sales order — the MD (and admin)
   parties: 'cf_erp_parties_manage',  // customers, suppliers, subcontractors
   productionView: 'cf_erp_production_view', // see machines, operations and flows
   production: 'cf_erp_production_manage',   // machines, shifts, operations, timing rules, flows and their waits

@@ -23,9 +23,10 @@
  *   GET  /orders/:id/invoices             { rows, uninvoiced }
  *   POST /orders/:id/invoices             { movementIds?, invoiceId? } → Invoice (draft)
  *
- * Reads take cf_erp_orders_view, writes cf_erp_orders_manage. The company tax details also take Accounts (2026-10-24:
- * accounts own tax) — read with accounts view, saved with accounts manage; HSN / GST by family: catalog manage OR
- * accounts manage.
+ * Reads take cf_erp_orders_view OR cf_erp_accounts_view. EVERY WRITE IS ACCOUNTS' (user 2026-10-27, init.sql §94):
+ * raising an invoice (from the order's dispatches too), editing, issuing, cancelling, a draft or its line removed, IRN
+ * and e-way bills, and the company tax details — cf_erp_accounts_manage; orders manage no longer writes here. HSN / GST
+ * by family stays catalog manage OR accounts manage.
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
@@ -44,11 +45,12 @@ const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 const company = (req) => ctx(req).companyId;
-const view = guard(PERM.ordersView);
-const manage = guard(PERM.orders);
-/** The company's tax details and the tax look-ups: the people who invoice, Sales or Accounts. */
-const taxView = guardAny(PERM.ordersView, PERM.accountsView);
-const taxManage = guardAny(PERM.orders, PERM.accounts);
+/** Invoices, the company's tax details and the tax look-ups are read by Sales (orders view) or Accounts. */
+const view = guardAny(PERM.ordersView, PERM.accountsView);
+/** Every invoice write and the company tax details: Accounts manage only (2026-10-27). */
+const manage = guard(PERM.accounts);
+const taxView = view;
+const taxManage = manage;
 
 router.get('/settings/tax', taxView, handle((req) => getTaxSettings(pool, company(req))));
 router.put('/settings/tax', taxManage, handle((req) => tx(req, (db, c) => putTaxSettings(db, c, req.body ?? {}))));

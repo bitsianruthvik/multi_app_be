@@ -6,8 +6,8 @@
  *   1  a machine's Tools & spares list (routes/toolsResources.js): read with production view OR maintenance, kept with
  *      production manage OR maintenance — what maintenance MRs start from; the machine itself, its shifts and values stay
  *      on production manage (routes/production.js, unchanged);
- *   2  Company tax details (routes/gst.js): read with orders view OR accounts view, saved with orders manage OR accounts
- *      manage; HSN & GST by family: catalog manage OR accounts manage; invoices themselves unchanged (orders);
+ *   2  Company tax details (routes/gst.js): read with orders view OR accounts view, saved with accounts manage only (since
+ *      2026-10-27, role_perms_test.mjs); HSN & GST by family: catalog manage OR accounts manage; invoices accounts manage;
  *   3  the scrap rate on Setup › Cutting (routes/inventory.js): catalog OR inventory, read and write; the rest of stock
  *      unchanged (inventory);
  *   4  the older work order page's reply says its kind ('cells' / 'po'), so the page can point to the contractor page.
@@ -73,13 +73,13 @@ const TABLE = [
   ['1', 'machines', 'DELETE', '/machines/:id', ['prodManage', 'admin']],
   // 2. Company tax details and the family card
   ['2', 'gst', 'GET', '/settings/tax', ['ordersView', 'ordersManage', 'accountsView', 'accountsManage', 'admin']],
-  ['2', 'gst', 'PUT', '/settings/tax', ['ordersManage', 'accountsManage', 'admin']],
+  ['2', 'gst', 'PUT', '/settings/tax', ['accountsManage', 'admin']],
   ['2', 'gst', 'GET', '/tax/states', ['ordersView', 'ordersManage', 'accountsView', 'accountsManage', 'admin']],
   ['2', 'gst', 'GET', '/tax/validate-gstin', ['ordersView', 'ordersManage', 'accountsView', 'accountsManage', 'admin']],
   ['2', 'gst', 'GET', '/tax/families', ['catalogView', 'catalogManage', 'accountsView', 'accountsManage', 'admin']],
   ['2', 'gst', 'PUT', '/tax/families/:id', ['catalogManage', 'accountsManage', 'admin']],
-  // ... invoices are as they were: orders.
-  ['2', 'gst', 'POST', '/invoices/:id/issue', ['ordersManage', 'admin']],
+  // ... invoices: accounts manage only (2026-10-27).
+  ['2', 'gst', 'POST', '/invoices/:id/issue', ['accountsManage', 'admin']],
   // 3. Scrap rate
   ['3', 'inventory', 'GET', '/stock/scrap-rate', ['catalogView', 'catalogManage', 'inventoryView', 'inventoryManage', 'admin']],
   ['3', 'inventory', 'PUT', '/stock/scrap-rate', ['catalogManage', 'inventoryManage', 'admin']],

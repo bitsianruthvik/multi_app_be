@@ -12,12 +12,14 @@
  *   POST /production-orders/:id/take-back         Planned → Yet to plan while nothing started
  *   POST /production-orders/:id/dispatch          { reference?, movementDate? } — ships its finished units
  *
- * Grants: production view to read; production manage to create, release, take back and re-time; dispatch is an
- * inventory action (it takes finished stock off the dispatch shelf), as shipping a line always was.
+ * Grants: production view to read; production manage to create, release, take back and re-time; dispatch (it takes
+ * finished stock off the dispatch shelf) is inventory manage OR production manage (PPC, user 2026-10-27), and drafts
+ * the tax invoice only for accounts manage (invoices are Accounts' only, init.sql §94).
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
+import { shipInput } from './tracker.js';
 import {
   getOrderProductionOrders, createProductionOrders, setTimeOverride, listProductionOrders, readProductionOrder,
   releaseProductionOrders, takeBackProductionOrder, dispatchProductionOrder,
@@ -40,6 +42,6 @@ router.get('/production-orders', view, handle((req) => listProductionOrders(pool
 router.post('/production-orders/release', manage, handle((req) => tx(req, (db, c) => releaseProductionOrders(db, c, req.body ?? {}))));
 router.get('/production-orders/:id', view, handle((req) => readProductionOrder(pool, company(req), id(req))));
 router.post('/production-orders/:id/take-back', manage, handle((req) => tx(req, (db, c) => takeBackProductionOrder(db, c, id(req)))));
-router.post('/production-orders/:id/dispatch', guard(PERM.inventory), handle((req) => tx(req, (db, c) => dispatchProductionOrder(db, c, id(req), req.body ?? {}))));
+router.post('/production-orders/:id/dispatch', guardAny(PERM.inventory, PERM.production), handle((req) => tx(req, (db, c) => dispatchProductionOrder(db, c, id(req), shipInput(req)))));
 
 export default router;

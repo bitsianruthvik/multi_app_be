@@ -8,7 +8,8 @@
  *   POST   /orders/:id/status          { status }  — inquiry, quoted, closed, lost, cancelled (customer: CONFIRMED only through its
  *                                                   Customer acceptance, §73 — routes/acceptance.js)
  *                                                   draft, confirmed, closed, cancelled (stock)
- *   DELETE /orders/:id                 draft, inquiry, lost or cancelled orders only — not a revision (discard it)
+ *   DELETE /orders/:id                 draft, inquiry, lost or cancelled orders only — not a revision (discard it);
+ *                                      cf_erp_orders_delete (the MD) or an admin, not orders manage (2026-10-27)
  *   POST   /orders/:id/revise          the next revision of the order: a copy of it, unlocked (revisionService)
  *   DELETE /orders/:id/revision        takes the latest revision away while none of its lines is locked
  *   POST   /orders/:id/lines           { recordId, quantity, committedDate?, description?, lineNo?, notes?, rate?, rateBasis? }
@@ -51,7 +52,9 @@ router.post('/orders', guard(PERM.orders), handle((req) => tx(req, (db, c) => cr
 router.get('/orders/:id', guard(PERM.ordersView), handle((req) => getOrder(pool, ctx(req).companyId, id(req))));
 router.put('/orders/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => updateOrder(db, c, id(req), req.body ?? {}))));
 router.post('/orders/:id/status', guard(PERM.orders), handle((req) => tx(req, (db, c) => setOrderStatus(db, c, id(req), req.body?.status, { fromRoute: true }))));
-router.delete('/orders/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => deleteOrder(db, c, id(req)))));
+// Deleting an order is the MD's (or an admin's): cf_erp_orders_delete (user 2026-10-27, init.sql §94). Status changes
+// (close, cancel, lost) stay on orders manage.
+router.delete('/orders/:id', guard(PERM.ordersDelete), handle((req) => tx(req, (db, c) => deleteOrder(db, c, id(req)))));
 // A change after lock is a new revision of the same order (init.sql §27). Both
 // write the whole order in one transaction, so a refusal leaves nothing behind.
 router.post('/orders/:id/revise', guard(PERM.orders), handle((req) => tx(req, (db, c) => reviseOrder(db, c, id(req)))));
