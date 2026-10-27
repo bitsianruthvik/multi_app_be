@@ -144,6 +144,8 @@ const T_VIEWER = mint(COMPANY, userA?.id, SEE);
 const T_BUYER = mint(COMPANY, userA?.id, [...SEE, 'cf_erp_purchase']);
 const T_BUYER_ONLY = mint(COMPANY, userA?.id, ['cf_erp_purchase']);
 const T_NONE = mint(COMPANY, userA?.id, ['cf_erp_orders_view']);
+// User 2026-10-27: Sales (orders manage, no inventory grant) raises the sales order's MR — a request to Stores.
+const T_SALES = mint(COMPANY, userA?.id, ['cf_erp_orders_view', 'cf_erp_orders_manage']);
 const APPROVE_PO = ['cf_erp_approve_purchase_order', 'cf_erp_approve_po_close_short'];
 const T_B = mint(COMPANY_B, userB?.id ?? userA?.id, [...SEE, 'cf_erp_inventory_manage', 'cf_erp_purchase', 'cf_erp_production_manage', ...APPROVE_PO]);
 // Management (§73): sees purchasing and approves POs and closing them short — through the approvals inbox.
@@ -189,13 +191,33 @@ try {
   let r = await call('GET', `/orders/${fx.O1.id}/requisitions`);
   ok('GET the order\'s requisitions before any is raised: none, and the line says it can be', r.status === 200 && r.json.requisitions.length === 0 && r.json.linesWithout.length === 1 && r.json.linesWithout[0].canRaise === true && r.json.linesWithout[0].materials.length === 3, J(r.json));
   r = await call('POST', `/orders/${fx.O1.id}/requisitions`, { token: T_VIEWER, body: {} });
-  ok('raising without cf_erp_inventory_manage → 403', r.status === 403, `${r.status} ${r.text.slice(0, 120)}`);
+  ok('raising with neither orders manage nor inventory manage (views only) → 403', r.status === 403, `${r.status} ${r.text.slice(0, 120)}`);
+  r = await call('POST', `/orders/${fx.O1.id}/requisitions`, { token: T_BUYER, body: {} });
+  ok('raising as Purchase (cf_erp_purchase + views) → 403', r.status === 403, `${r.status} ${r.text.slice(0, 120)}`);
+  r = await call('GET', `/orders/${fx.O1.id}/requisitions`, { token: T_SALES });
+  ok("Sales (orders view) reads the order's MR stage → 200", r.status === 200, `${r.status} ${r.text.slice(0, 120)}`);
   r = await call('POST', `/orders/${fx.O1.id}/requisitions`, { body: {}, as: 'raise' });
   ok('POST raise → 200, one requisition, three lines, nothing earmarked', r.status === 200 && r.json.raised === 1 && r.json.requisitions[0].lines.length === 3 && r.json.requisitions[0].status === 'open', J([r.status, r.json?.raised]));
   const prId = r.json.requisitions[0].id;
   const lineA = byItem(r.json.requisitions[0], fx.A).id; const lineB = byItem(r.json.requisitions[0], fx.B).id; const lineC = byItem(r.json.requisitions[0], fx.C).id;
-  r = await call('POST', `/orders/${fx.O2.id}/requisitions`, { body: {} });
+  // Customer acceptance › Material: the per-line supply select — orders manage OR inventory manage, as the order-level one.
+  r = await call('PUT', `/order-lines/${fx.O2.line.id}/material-supply`, { token: T_SALES, body: { supply: 'we_buy' } });
+  // (The fixture's order is confirmed, so the service then says the supply is fixed — the point is it is no 403.)
+  ok("Sales (orders manage alone) passes the line-supply permission: the service answers (fixed once accepted), not 403",
+    r.status !== 403 && r.json?.code === 'INVALID' && /cannot be changed/.test(r.json?.message ?? ''), `${r.status} ${r.text.slice(0, 160)}`);
+  r = await call('PUT', `/order-lines/${fx.O2.line.id}/material-supply`, { token: T_BUYER, body: { supply: null } });
+  ok("a line's material supply as Purchase (neither manage grant) → 403", r.status === 403, `${r.status} ${r.text.slice(0, 120)}`);
+  r = await call('POST', `/orders/${fx.O2.id}/requisitions`, { token: T_SALES, body: {} });
+  ok("Sales (orders manage alone) raises O2's MR → 200", r.status === 200 && r.json.raised === 1, `${r.status} ${r.text.slice(0, 160)}`);
   const pr2 = r.json.requisitions[0].id;
+  // MR vs PR (user 2026-10-27): Stores' own "New PR" goes straight to a PR; its MR is not in the MR inbox.
+  r = await call('POST', '/stores/purchase-requests', { token: T_SALES, body: { forType: 'stock', lines: [{ itemId: fx.C, qty: 1 }] } });
+  ok('New PR as Sales (no Stores grant) → 403', r.status === 403, `${r.status} ${r.text.slice(0, 120)}`);
+  r = await call('POST', '/stores/purchase-requests', { body: { forType: 'stock', note: `${tag} New PR`, lines: [{ itemId: fx.C, qty: 4 }] }, as: 'newPr' });
+  ok('New PR as Stores → 200: the PR made at once, the MR underneath internal', r.status === 200 && /^PR-/.test(r.json?.purchaseRequest?.code ?? '') && r.json?.materialRequest?.internal === true, `${r.status} ${r.text.slice(0, 200)}`);
+  const newPrMr = r.json?.requisition?.id;
+  r = await call('GET', `/material-requests?search=${encodeURIComponent(tag)}`);
+  ok('…the MR inbox does not list its MR', r.status === 200 && !r.json.rows.some((x) => x.id === newPrMr), J(r.json?.rows?.map((x) => x.code)));
   r = await call('POST', `/orders/${fx.O1.id}/requisitions`, { body: {} });
   ok('raising again only refreshes (raised 0, refreshed 1)', r.status === 200 && r.json.raised === 0 && r.json.refreshed === 1);
 

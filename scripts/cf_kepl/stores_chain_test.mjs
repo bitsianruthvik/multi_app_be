@@ -15,9 +15,12 @@
  *      method inherited by its temporary item, an override, clear → inherit again, refusals
  *   4  the reorder engine (by AI): min / max (min order qty + multiple), periodic (used since the period began), on
  *      requirement never, a periodic item not due yet never
- *   5  ticked rows → ONE MR for stock → its PR; the list empties; a stock MR takes nothing from stock; its GRN is FREE
- *      stock (no hold) and the engine pools it
+ *   5  ticked rows → "Raise PR": ONE PR for stock (an internal MR underneath, §93 — not in the MR inbox, reachable from
+ *      its PR); the list empties; a stock MR takes nothing from stock; its GRN is FREE stock (no hold) and the engine pools it
  *   6  a machine's own store (found or made once); round trips of createRequisition
+ *   7  Stores' own "New PR" (§93, user 2026-10-27): straight to a PR (general charged to a sales order, stock, a
+ *      maintenance order), the MR underneath internal and out of the inbox; the same refusals as New MR; a department's
+ *      New MR is a real request (in the inbox); a request body cannot make an MR internal
  */
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -200,6 +203,16 @@ try {
   section('5. Ticked rows → ONE MR for stock → its PR');
   const rr = await PM.raiseReorder(db, c, { rows: [{ itemId: D, qty: row(D).suggest }, { itemId: E, qty: row(E).suggest }] });
   ok('one MR for stock, saved at once → its PR', /^MR-\d{6,}$/.test(rr.requisition.code) && !!rr.purchaseRequest && rr.materialRequest.forType === 'stock', j([rr.requisition, rr.purchaseRequest]));
+  // §93 (user 2026-10-27): "Raise PR" — the MR underneath is Stores' own bookkeeping, not a request waiting for Stores.
+  const [[rrRow]] = await db.query('SELECT internal_pr FROM cf_requisitions WHERE id = ?', [rr.requisition.id]);
+  ok('§93: the MR under "Raise PR" is internal (stored internal_pr = 1; the screen says internal)', Number(rrRow.internal_pr) === 1 && rr.materialRequest.internal === true, j([rrRow, rr.materialRequest.internal]));
+  const inboxR = await PRS.listMrs(db, COMPANY, {});
+  ok('§93: the MR inbox does NOT list it (All, and For = stock)', !inboxR.rows.some((r) => r.id === rr.requisition.id) && !(await PRS.listMrs(db, COMPANY, { for: 'stock' })).rows.some((r) => r.id === rr.requisition.id));
+  ok('§93: …and its counts leave it out', inboxR.counts.all === inboxR.rows.length, j(inboxR.counts));
+  const allR = await PRS.listMrs(db, COMPANY, { internal: 'all', search: rr.requisition.code });
+  ok('§93: internal=all still finds it (internal: true)', allR.rows.some((r) => r.id === rr.requisition.id && r.internal === true), j(allR.rows.map((r) => [r.code, r.internal])));
+  ok('§93: it stays reachable from its PR (the PR names it)', (await PRS.getPr(db, COMPANY, rr.purchaseRequest.id)).requisition?.id === rr.requisition.id);
+  ok("§93: its screen says it is Stores' own purchase, naming the PR", rr.materialRequest.sentence.includes(rr.purchaseRequest.code) && /not in the MR inbox/.test(rr.materialRequest.sentence), rr.materialRequest.sentence);
   const sPr = await PRS.getPr(db, COMPANY, rr.purchaseRequest.id);
   ok('the PR buys everything: D 50, E 6 (nothing taken from stock)', prl(sPr, D)?.needed === 50 && prl(sPr, E)?.needed === 6 && sPr.requisition.forType === 'stock', j(sPr.lines.map((l) => [l.item.code, l.needed])));
   ok('the stock MR offers nothing to take from stock (take max 0), but shows what is free', rr.materialRequest.lines.every((l) => l.takeMax === 0) && rr.materialRequest.lines.find((l) => Number(l.item.id) === D).inStock === 3, j(rr.materialRequest.lines.map((l) => [l.takeMax, l.inStock])));
@@ -233,6 +246,29 @@ try {
   } else ok('(no machine in this company — skipped)', true);
   const noMc = await refusal(() => SA.machineStore(db, c, 999999999));
   ok('an unknown machine is refused', noMc?.status === 404 || /not found/i.test(noMc?.message ?? ''), noMc?.message);
+
+  /* ════════════════════ 7. Stores' own New PR ════════════════════ */
+  section("7. Stores' own NEW PR — straight to a PR for Purchase; a department's New MR stays a request to Stores");
+  const np = await PRS.raiseStoresPr(db, c, { forType: 'general', orderId: SO.id, note: `${tag} gas cylinders`, lines: [{ itemId: A, qty: 2 }, { itemId: B, qty: 3 }] });
+  ok('New PR → { requisition, materialRequest, purchaseRequest }: a PR made at once', /^MR-\d{6,}$/.test(np.requisition.code) && /^PR-/.test(np.purchaseRequest?.code ?? ''), j([np.requisition, np.purchaseRequest]));
+  const npPr = await PRS.getPr(db, COMPANY, np.purchaseRequest.id);
+  ok('the PR buys everything typed (nothing taken from stock): A 2, B 3', prl(npPr, A)?.needed === 2 && prl(npPr, B)?.needed === 3, j(npPr.lines.map((l) => [l.item.code, l.needed])));
+  ok('the PR is For general, charged to the sales order named', npPr.requisition.forType === 'general' && npPr.order?.id === SO.id, j([npPr.requisition, npPr.order]));
+  const [npHolds] = await db.query("SELECT COUNT(*) n FROM cf_stock_reservations WHERE pr_line_id IN (?) AND status = 'active'", [np.materialRequest.lines.map((l) => l.id)]);
+  ok('nothing was held from stock for it', Number(npHolds[0].n) === 0, j(npHolds));
+  ok('the MR underneath is internal and NOT in the MR inbox', np.materialRequest.internal === true && !(await PRS.listMrs(db, COMPANY, { search: tag })).rows.some((r) => r.id === np.requisition.id));
+  ok("Purchase's PR list shows the PR", (await PRS.listPrs(db, COMPANY, { search: np.requisition.code })).rows.some((r) => r.id === np.purchaseRequest.id));
+  const npStock = await PRS.raiseStoresPr(db, c, { forType: 'stock', lines: [{ itemId: C, qty: 5 }] });
+  ok('New PR for stock → a PR (C 5), internal', (await PRS.getPr(db, COMPANY, npStock.purchaseRequest.id)).lines.find((l) => Number(l.item.id) === C)?.needed === 5 && npStock.materialRequest.internal === true);
+  const npMo = await PRS.raiseStoresPr(db, c, { forType: 'maintenance_order', maintenanceOrderId: 987655, lines: [{ itemId: C, qty: 1 }] });
+  ok('New PR for a maintenance order → a PR, internal; the inbox by that maintenance order does not list it', !!npMo.purchaseRequest && !(await PRS.listMrs(db, COMPANY, { maintenanceOrderId: 987655 })).rows.length);
+  const npBad = await refusal(() => PRS.raiseStoresPr(db, c, { forType: 'sales_order', lines: [{ itemId: A, qty: 0 }] }));
+  ok('refused as New MR is, every problem at once: a sales order PR names the order, a zero quantity', (npBad?.problems ?? []).length >= 2 && /names the order/.test(j(npBad.problems)), j(npBad?.problems));
+  const dept = await RQ.createRequisition(db, c, { forType: 'general', note: `${tag} paint for the yard`, internal: true, lines: [{ itemId: D, qty: 1 }] });
+  const [[deptRow]] = await db.query('SELECT internal_pr FROM cf_requisitions WHERE id = ?', [dept.id]);
+  ok("a department's New MR (POST /requisitions) is a real request: internal_pr 0 — a body's \"internal\" is ignored", Number(deptRow.internal_pr) === 0, j(deptRow));
+  const deptInbox = (await PRS.listMrs(db, COMPANY, { search: tag })).rows.find((r) => r.id === dept.id);
+  ok('…it is in the MR inbox (internal false), with no PR until Stores saves it', !!deptInbox && deptInbox.internal === false && deptInbox.purchaseRequest === null, j(deptInbox));
 } finally {
   MRS.setToday(null);
   await db.rollback();

@@ -36,6 +36,8 @@ const routers = {
   grn: (await imp('apps/cf_erp/routes/grn.js')).default,
   inventory: (await imp('apps/cf_erp/routes/inventory.js')).default,
   stockMoney: (await imp('apps/cf_erp/routes/stockMoney.js')).default,
+  stores: (await imp('apps/cf_erp/routes/stores.js')).default,
+  purchaseFlow: (await imp('apps/cf_erp/routes/purchaseFlow.js')).default,
 };
 const { harness, simple, quietCodes } = await imp('scripts/cf_kepl/lib/buyingFixture.mjs');
 
@@ -53,6 +55,10 @@ const USERS = {
   md: { role: 'operator', uiPermissions: ['cf_erp_approve_purchase_order', 'cf_erp_approve_po_close_short'] },
   viewer: { role: 'operator', uiPermissions: ['cf_erp_inventory_view'] },
   admin: { role: 'admin', uiPermissions: [] },
+  // user 2026-10-27: Sales (orders manage) raises the sales order's MR; maintenance raises its own MRs (New MR).
+  sales: { role: 'operator', uiPermissions: ['cf_erp_orders_view', 'cf_erp_orders_manage'] },
+  salesView: { role: 'operator', uiPermissions: ['cf_erp_orders_view'] },
+  maint: { role: 'operator', uiPermissions: ['cf_erp_maintenance'] },
 };
 /** Runs a route's permission middleware (everything between `protect` and the handler) for a user: true = it passed. */
 function passes(router, method, routePath, user) {
@@ -99,12 +105,25 @@ const TABLE = [
   ['plateChanges', 'POST', '/plate-changes/:id/checklist', ['buyer', 'admin']],
   ['inventory', 'POST', '/movements', ['stores', 'admin']],
   ['stockMoney', 'POST', '/customer-material/receive', ['stores', 'admin']],
+  // MR vs PR (user 2026-10-27): an MR is a request TO Stores — New MR for everyone who asks Stores; a PR is what Stores
+  // raises TO Purchase — New PR and To reorder's Raise PR are Stores' alone.
+  ['stores', 'POST', '/requisitions', ['stores', 'storesTag', 'sales', 'maint', 'admin']],
+  ['stores', 'POST', '/stores/purchase-requests', ['stores', 'storesTag', 'admin']],
+  ['stores', 'POST', '/stores/reorder/raise', ['stores', 'storesTag', 'admin']],
+  // the sales order's Material request stage: Raise MR and who supplies a line — orders manage OR inventory manage
+  ['purchaseFlow', 'POST', '/orders/:id/requisitions', ['stores', 'sales', 'admin']],
+  ['purchaseFlow', 'PUT', '/order-lines/:id/material-supply', ['stores', 'sales', 'admin']],
+  ['purchaseFlow', 'GET', '/orders/:id/requisitions', ['stores', 'viewer', 'sales', 'salesView', 'admin']],
+  ['purchaseFlow', 'GET', '/order-lines/:id/material-ready', ['stores', 'viewer', 'sales', 'salesView', 'admin']],
 ];
 for (const [r, method, p, expected] of TABLE) {
   const got = who(routers[r], method, p);
   ok(`${method} ${p}: ${expected.join(', ')}`, same(got, expected), `passed: ${got.join(', ')}`);
 }
 ok('a pure Purchase user can read the PO list it works from (it could not before)', passes(routers.purchase, 'GET', '/purchase-orders', USERS.buyer));
+ok("the order's Raise MR: orders manage ALONE passes", passes(routers.purchaseFlow, 'POST', '/orders/:id/requisitions', { role: 'operator', uiPermissions: ['cf_erp_orders_manage'] }));
+ok("the order's Raise MR: neither orders manage nor inventory manage → refused (orders view, Purchase, maintenance, cf_erp_stores alone)",
+  ['salesView', 'buyer', 'maint', 'storesTag', 'viewer'].every((k) => !passes(routers.purchaseFlow, 'POST', '/orders/:id/requisitions', USERS[k])));
 ok('Stores with inventory manage can no longer type a quote', !passes(routers.purchaseRequests, 'PUT', '/purchase-request-vendors/:id/quotes', USERS.stores));
 {
   const res = { statusCode: 200, body: null, status(n) { this.statusCode = n; return this; }, json(b) { this.body = b; return this; } };

@@ -24,15 +24,14 @@
  *                 period began, less what is already coming for stock. Raising an MR for it starts the next period.
  *   Every suggestion is raised to the minimum order quantity, then up to a whole order multiple.
  *   Make, on-requirement, customer-supplied and subcontracted items never appear.
- * Ticked rows → ONE MR for stock (requisitionService.createRequisition, for_type 'stock') → saved at once with nothing taken
- * from stock → its PR (purchaseRequestService.saveMr). Fixed round trips: the list = 4 reads (settings, availability ×2,
+ * Ticked rows → "Raise PR": ONE PR for stock (purchaseRequestService.raiseStoresPr — an internal MR for stock underneath,
+ * saved at once with nothing taken from stock → its PR; §93). Fixed round trips: the list = 4 reads (settings, availability ×2,
  * pipeline, issues); raising = createRequisition (≤ 5) + saveMr + 1.
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { availability } from './rollOutService.js';
 import { today as clockToday } from './materialReadyService.js';
-import { createRequisition } from './requisitionService.js';
-import { saveMr, mrScreen } from './purchaseRequestService.js';
+import { raiseStoresPr } from './purchaseRequestService.js';
 
 export const METHODS = ['make', 'buy_on_requirement', 'buy_min_max', 'buy_periodic', 'customer_supplies', 'subcontract'];
 export const METHOD_LABEL = {
@@ -309,19 +308,18 @@ export async function reorderSuggestions(db, companyId, q = {}) {
 }
 
 /**
- * POST /stores/reorder/raise { rows: [{ itemId, qty }], note? } — the ticked rows become ONE MR for stock, saved at once
- * (nothing taken from stock — it refills it) → its PR. A periodic item's next period starts today.
- * → { requisition: { id, code }, materialRequest (the MR screen), purchaseRequest }.
+ * POST /stores/reorder/raise { rows: [{ itemId, qty }], note? } — Stores › To reorder › "Raise PR": the ticked rows go
+ * straight on ONE PR for Purchase (purchaseRequestService.raiseStoresPr: an INTERNAL MR for stock underneath, saved at
+ * once with nothing taken from stock — it refills it; not in the MR inbox, §93). A periodic item's next period starts today.
+ * → { requisition: { id, code } (the MR underneath), materialRequest (its screen), purchaseRequest }.
  */
 export async function raiseReorder(db, c, input = {}) {
   const rows = Array.isArray(input.rows) ? input.rows : [];
   if (!rows.length) throw invalid('INVALID', 'Tick at least one row to reorder.');
   const lines = rows.map((r) => ({ itemId: r?.itemId, qty: r?.qty ?? r?.quantity, uom: r?.uom }));
   const note = blank(input.note) ? 'Reorder (by AI) — Stores › To reorder.' : String(input.note);
-  const made = await createRequisition(db, c, { forType: 'stock', note, lines });
-  const screen = await mrScreen(db, c.companyId, made.id);
-  const saved = await saveMr(db, c, made.id, { lines: screen.lines.map((l) => ({ lineId: l.id, takeFromStock: 0 })) });
+  const out = await raiseStoresPr(db, c, { forType: 'stock', note, lines });
   const itemIds = [...new Set(lines.map((l) => Number(l.itemId)))];
   await db.query("UPDATE cf_procurement_settings SET periodic_from = ? WHERE company_id = ? AND master_id IN (?) AND method = 'buy_periodic'", [clockToday(), c.companyId, itemIds]);
-  return { requisition: made, materialRequest: saved, purchaseRequest: saved.purchaseRequest };
+  return out;
 }

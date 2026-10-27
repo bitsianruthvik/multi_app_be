@@ -31,6 +31,7 @@ import { availability } from './rollOutService.js';
 import { lineReadiness, openLines, today as clockToday, OPEN_ORDER_STATUSES } from './materialReadyService.js';
 import {
   readRequisitions, syncLines, claimRows, askCustomer, supplyOf, requireOrderRow, SUPPLY_LABEL, heldMessage, forTypeOf, FOR_LABEL,
+  createRequisition,
 } from './requisitionService.js';
 import { getPurchaseOrder, poStage, PO_STAGE_LABEL, askPoApproval } from './purchaseService.js';
 import { CURRENCY } from './priceService.js';
@@ -138,6 +139,7 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
   return {
     id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel,
     forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes, raisedAt: v.raisedAt, raisedBy: v.raisedBy,
+    internal: !!v.internal,
     order: v.order, line: v.line, status: v.status, statusLabel: v.statusLabel, stale: v.stale, needKnown: v.needKnown, needComplete: v.needComplete,
     heldForAcceptance: heldMr,
     canEdit: open && !heldMr,
@@ -145,7 +147,9 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
     lines,
     purchaseRequest: prOf.get(v.id) ?? null,
     purchaseOrders: [...pos.values()],
-    sentence: customer
+    sentence: v.internal
+      ? `Stores' own purchase — raised straight to ${prOf.get(v.id)?.code ?? 'its purchase request'} for Purchase. Not a request waiting for Stores, so it is not in the MR inbox.`
+      : customer
       ? 'The customer supplies this material. What is not in their stock here is asked of them on a purchase order (₹0).'
       : forStock ? 'An MR for stock: everything on it is bought — save to put it on the purchase request.'
         : 'Take what you can from stock; the rest goes on the purchase request.',
@@ -153,16 +157,20 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
 }
 
 /**
- * GET /material-requests?orderId=&search=&open= — every MR, one row each, with its PR. open (default true): of open
- * orders only. Fixed reads (one requisition read for all of them).
+ * GET /material-requests?orderId=&search=&open=&internal= — every MR, one row each, with its PR. open (default true): of
+ * open orders only. §93: only REAL requests to Stores (a sales order's, a maintenance order's, a department's New MR) —
+ * the MRs under Stores' own "Raise PR" / "New PR" are left out (internal=all lists them too, internal=only alone).
+ * Fixed reads (one requisition read for all of them).
  */
 export async function listMrs(db, companyId, q = {}) {
   const onlyOpen = !(q.open === false || q.open === 'false' || q.open === '0');
+  const internal = q.internal === 'all' ? null : (q.internal === 'only' || q.internal === true || q.internal === 'true' || q.internal === '1');
   // §79: Stores' MR inbox filters by "For" (sales_order | maintenance_order | stock | general).
   const views = await readRequisitions(db, companyId, {
     open: onlyOpen, orderId: blank(q.orderId) ? null : Number(q.orderId), search: q.search,
     forType: blank(q.for ?? q.forType) ? null : String(q.for ?? q.forType),
     maintenanceOrderId: blank(q.maintenanceOrderId) ? null : Number(q.maintenanceOrderId),
+    ...(internal == null ? {} : { internal }),
   });
   const prOf = await prsOfRequisitions(db, companyId, views.map((v) => v.id));
   const counts = { all: views.length, sales_order: 0, maintenance_order: 0, stock: 0, general: 0 };
@@ -174,7 +182,7 @@ export async function listMrs(db, companyId, q = {}) {
       const lockedLines = live.filter((l) => (l.cover.earmarked ?? 0) + EPS >= l.need).length;
       return {
         id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel, order: v.order, line: v.line,
-        forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes,
+        forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes, internal: !!v.internal,
         status: v.status, statusLabel: v.statusLabel, materials: live.length, lockedLines, heldForAcceptance: !!v.heldForAcceptance,
         lockedWords: live.length ? `${lockedLines} of ${live.length} locked` : 'Nothing to buy',
         purchaseRequest: prOf.get(v.id) ?? null, raisedAt: v.raisedAt,
@@ -302,6 +310,22 @@ export async function saveMr(db, c, id, input = {}) {
   }
   const out = await mrScreen(db, c.companyId, head.id, manual ? { R: null } : {});
   return { ...out, saved: { held: holdRows.length, released: releaseAll.length + releasePart.length }, customerPurchaseOrders };
+}
+
+/**
+ * STORES' OWN PURCHASE (init.sql §93, user 2026-10-27) — POST /stores/purchase-requests (Stores › MR inbox › "New PR")
+ * and Stores › To reorder › "Raise PR" (procurementMethodService.raiseReorder). Straight to a PR for Purchase:
+ *   input = createRequisition's: { forType: 'stock' | 'general' | 'sales_order' | 'maintenance_order', orderId?,
+ *           maintenanceOrderId?, note?, lines: [{ itemId, qty, uom? }] } — the same refusals, every one at once.
+ * The data model keeps its MR underneath: made INTERNAL (not in the MR inbox — it is no request to Stores), then saved
+ * at once with nothing taken from stock, so every line is to buy → its PR.
+ * → { requisition: { id, code }, materialRequest (the MR screen), purchaseRequest: { id, code, status, statusLabel } }.
+ */
+export async function raiseStoresPr(db, c, input = {}) {
+  const made = await createRequisition(db, c, input, { internal: true });
+  const screen = await mrScreen(db, c.companyId, made.id, { R: null });
+  const saved = await saveMr(db, c, made.id, { lines: screen.lines.map((l) => ({ lineId: l.id, takeFromStock: 0 })) });
+  return { requisition: made, materialRequest: saved, purchaseRequest: saved.purchaseRequest };
 }
 
 /** Makes or updates THE PR of an MR: one line per MR line, quantity = to buy. No PR is made while nothing is to buy. */

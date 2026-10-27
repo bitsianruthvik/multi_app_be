@@ -87,6 +87,31 @@ export const FOR_LABEL = { sales_order: 'Sales order', maintenance_order: 'Maint
 export const forTypeOf = (v) => (FOR_TYPES.includes(v) ? v : 'sales_order');
 
 /*
+ * STORES' OWN PURCHASES (init.sql §93, user 2026-10-27). An MR is a request TO STORES; a PR is what Stores raises TO
+ * PURCHASE. When Stores buys for itself — To reorder › "Raise PR", MR inbox › "New PR" (purchaseRequestService
+ * .raiseStoresPr) — an MR is still made underneath (saved at once, nothing taken from stock → its PR), but it is
+ * INTERNAL (cf_requisitions.internal_pr = 1): bookkeeping, not a request waiting for Stores. The MR inbox leaves it out
+ * (listMrs); it stays reachable from its PR. Only the server sets it — never a request body.
+ * TOLERANT OF THE COLUMN MISSING (s93 not applied yet): reads fall back to "nothing is internal", writes leave it out.
+ * Known once per process (tried again a minute after it was found missing); no extra round trip when it is there.
+ */
+let internalCol = { known: null, at: 0 };
+const missingInternal = (e) => (e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054) && /internal_pr/.test(String(e?.sqlMessage ?? e?.message ?? ''));
+/** run(has) with has = whether cf_requisitions.internal_pr is there; run once more without it when it is not. */
+export async function withInternalColumn(run) {
+  const has = internalCol.known !== false || Date.now() - internalCol.at > 60_000;
+  try {
+    const out = await run(has);
+    if (has) internalCol = { known: true, at: Date.now() };
+    return out;
+  } catch (e) {
+    if (!has || !missingInternal(e)) throw e;
+    internalCol = { known: false, at: Date.now() };
+    return run(false);
+  }
+}
+
+/*
  * MATERIAL REQUEST (init.sql §66, 2026-10-16). The requisition is called a MATERIAL REQUEST (MR) on every
  * screen; a new one is numbered MR-<order>-<line> (one raised before keeps its PR- number). Who supplies
  * the material is asked when the order is made — the order's `material_supply`, a line may say otherwise —
@@ -265,9 +290,11 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
   // An MR raised by hand (no order line) stays in the open list whatever its order (if any) is doing.
   if (filter.open) { where.push('(r.order_line_id IS NULL OR o.status IN (?))'); args.push(OPEN_ORDER_STATUSES); }
   if (!blank(filter.search)) { where.push('(r.code LIKE ? OR o.code LIKE ? OR cu.name LIKE ? OR r.notes LIKE ?)'); args.push(...Array(4).fill(`%${String(filter.search).trim()}%`)); }
-  const [heads] = await db.query(
+  // §93: internal false = real requests to Stores only (the MR inbox); true = only Stores' own (its "Raise PR" / "New PR").
+  const internalWhere = (has) => (has && filter.internal === false ? ['r.internal_pr = 0'] : has && filter.internal === true ? ['r.internal_pr = 1'] : []);
+  const [heads] = await withInternalColumn((has) => (filter.internal === true && !has ? [[]] : db.query(
     `SELECT r.id, r.code, r.order_id, r.order_line_id, r.notes, r.synced_at, r.created_at, r.created_by, r.supply, r.held_for_acceptance, r.customer_date, u.name AS raised_by_name,
-            r.for_type, r.maintenance_order_id,
+            r.for_type, r.maintenance_order_id, ${has ? 'r.internal_pr' : '0 AS internal_pr'},
             o.code AS order_code, o.status AS order_status, o.customer_id, cu.name AS customer_name,
             l.line_no, l.quantity AS line_quantity, l.locked_at, l.description, m.code AS item_code, m.name AS item_name,
             (SELECT pr.id FROM cf_production_releases pr WHERE pr.company_id = l.company_id AND pr.order_line_id = l.id AND pr.deleted_at IS NULL LIMIT 1) AS release_id
@@ -277,10 +304,10 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
        LEFT JOIN cf_master_records m ON m.id = l.item_id
        LEFT JOIN cf_parties cu ON cu.id = o.customer_id
        LEFT JOIN users u ON u.id = r.created_by
-      WHERE ${where.join(' AND ')}
+      WHERE ${[...where, ...internalWhere(has)].join(' AND ')}
       ORDER BY r.order_line_id IS NULL, o.code, l.line_no, r.id`,
     args,
-  );
+  )));
   if (!heads.length) return [];
   // The engine only answers for MRs of an order line; MRs raised by hand alone skip it (its reads are the costly part).
   const R = given ?? (heads.some((h) => h.order_line_id != null) ? await lineReadiness(db, companyId, { full: true }) : { needs: new Map(), byLine: new Map(), today: clockToday() });
@@ -354,6 +381,8 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
       id: h.id, code: h.code, supply, supplyLabel: SUPPLY_LABEL[supply],
       // §79: what it is for (the cost follows it); an MR raised by hand has no line, and may have no order.
       forType, forLabel: FOR_LABEL[forType], manual, maintenanceOrderId: h.maintenance_order_id ?? null, notes: h.notes ?? null,
+      // §93: made under Stores' own PR (To reorder / New PR) — not a request to Stores, not in the MR inbox.
+      internal: !!Number(h.internal_pr ?? 0),
       order: h.order_id == null ? null : { id: h.order_id, code: h.order_code, status: h.order_status, customer: h.customer_id ? { id: h.customer_id, name: h.customer_name } : null },
       line: manual ? null : { id: lineId, lineNo: h.line_no, name: h.item_name ?? h.description ?? `Line ${h.line_no}`, quantity: Number(h.line_quantity), frozen: !!h.locked_at, released: !!h.release_id },
       status, statusLabel: REQUISITION_STATUS_LABEL[status], done: live.length > 0 ? live.every((l) => l.resolved) : true,
@@ -456,8 +485,10 @@ export async function lineRequisition(db, companyId, lineId) {
  *   lines    catalog items, quantity > 0; the same item twice is added up; uom defaults to the item's.
  * The MR has no order line: it goes to STORES (Stores' MR inbox), who take from stock and raise the PR for the rest
  * (purchaseRequestService.saveMr). Numbered MR-000123. Every problem at once. Fixed round trips: ≤ 2 reads + 3 writes.
+ * opts.internal (§93; never from a request body): Stores' own purchase — the caller (purchaseRequestService.raiseStoresPr)
+ * saves the MR at once to its PR, and the MR stays out of the MR inbox.
  */
-export async function createRequisition(db, c, input = {}) {
+export async function createRequisition(db, c, input = {}, { internal = false } = {}) {
   const problems = [];
   const forType = String(input.forType ?? '');
   if (!FOR_TYPES.includes(forType)) problems.push(`"For" is one of: ${FOR_TYPES.join(', ')}.`);
@@ -503,11 +534,14 @@ export async function createRequisition(db, c, input = {}) {
   }
   assertNoProblems(problems, 'The material request cannot be raised.');
   const note = blank(input.note ?? input.notes) ? null : String(input.note ?? input.notes).trim().slice(0, 500);
-  const [ins] = await db.query(
-    `INSERT INTO cf_requisitions (company_id, code, order_id, order_line_id, for_type, maintenance_order_id, supply, notes, created_by, held_for_acceptance)
-     VALUES (?, ?, ?, NULL, ?, ?, 'we_buy', ?, ?, 0)`,
-    [c.companyId, `TMP-MR-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, order?.id ?? null, forType, maintId, note, c.userId ?? null],
+  const tmpCode = `TMP-MR-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const insert = (flag) => db.query(
+    `INSERT INTO cf_requisitions (company_id, code, order_id, order_line_id, for_type, maintenance_order_id, supply, notes, created_by, held_for_acceptance${flag ? ', internal_pr' : ''})
+     VALUES (?, ?, ?, NULL, ?, ?, 'we_buy', ?, ?, 0${flag ? ', 1' : ''})`,
+    [c.companyId, tmpCode, order?.id ?? null, forType, maintId, note, c.userId ?? null],
   );
+  // A real request never names the column (its round trips, and the old schema, stay as they were).
+  const [ins] = internal ? await withInternalColumn((has) => insert(has)) : await insert(false);
   const id = ins.insertId;
   const code = `MR-${String(id).padStart(6, '0')}`;
   await db.query('UPDATE cf_requisitions SET code = ? WHERE company_id = ? AND id = ?', [code, c.companyId, id]);

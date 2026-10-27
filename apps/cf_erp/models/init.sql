@@ -8124,3 +8124,30 @@ SELECT r.company_id, r.id AS role_id, r.name AS role_name, 'has cf_erp_inventory
 
 SELECT IF((SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL AND name = 'cf_erp_purchase') >= 1,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §93  STORES' OWN PURCHASES — the MR under a PR Stores raises itself is INTERNAL (2026-10-27)
+-- The same text as multi_app_be/apps/cf_erp/models/init.sql §93. One additive column, guarded and idempotent: safe to
+-- re-run. The backend works without it (the reorder / New PR bookkeeping MRs then still show in the MR inbox).
+--
+-- User, 2026-10-27: an MR (material request) is a request TO STORES; a PR (purchase request) is what Stores raises TO
+-- PURCHASE. When Stores buys for itself — Stores › To reorder › "Raise PR", or Stores › MR inbox › "New PR" — the
+-- data model still makes an MR (saved at once, nothing taken from stock) and its PR. That MR is bookkeeping, not a
+-- request waiting for Stores:
+--   cf_requisitions.internal_pr   1 = made by Stores' own "Raise PR" / "New PR": it is NOT listed in the MR inbox (it
+--                                 stays reachable from its PR). 0 = a real request to Stores (a sales order's MR, a
+--                                 maintenance order's MR, a department's "New MR").
+-- Backfill: the MRs for stock raised from "To reorder" before this change (their note is the reorder's default
+-- "Reorder (by AI) …", no order line) are marked internal.
+-- ============================================================================
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'internal_pr');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_requisitions ADD COLUMN internal_pr TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+UPDATE cf_requisitions SET internal_pr = 1
+ WHERE internal_pr = 0 AND for_type = 'stock' AND order_line_id IS NULL AND deleted_at IS NULL
+   AND notes LIKE 'Reorder (by AI)%';
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'internal_pr') = 1,
+      'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
