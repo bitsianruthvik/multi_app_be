@@ -195,6 +195,40 @@ export async function orderInvoices(db, companyId, orderId) {
   return { rows, uninvoiced: uninvoiced.map(({ itemId, orderLineId, ...s }) => ({ ...s, orderLineId })) };
 }
 
+/**
+ * GET /invoices/uninvoiced → every customer order with shipments not on an invoice yet, oldest first (2026-10-27).
+ * Accounts raises them from Accounts › Invoices without needing the sales order open. Orders billed by their
+ * payment milestones are left out (Billing raises those), as are stock orders. Same shipment rule as
+ * uninvoicedShipments; 1 query. Rows: { orderId, orderCode, customer, shipments: [{ movementId, movementCode, date, lineNo, quantity }] }.
+ */
+export async function uninvoicedOrders(db, companyId) {
+  const [rows] = await db.query(
+    `SELECT v.order_id, o.code AS order_code, p.name AS customer_name, v.id AS movement_id, v.code AS movement_code,
+            v.movement_date, l.line_no, -SUM(k.quantity) AS quantity
+       FROM cf_stock_movements v
+       JOIN cf_sales_orders o ON o.id = v.order_id AND o.company_id = v.company_id AND o.order_type = 'customer' AND o.deleted_at IS NULL
+       LEFT JOIN cf_parties p ON p.id = o.customer_id
+       JOIN cf_sales_order_lines l ON l.id = v.order_line_id AND l.company_id = v.company_id
+       JOIN cf_stock_ledger k ON k.company_id = v.company_id AND k.movement_id = v.id AND k.item_id = l.item_id AND k.deleted_at IS NULL
+       JOIN cf_stocking_areas a ON a.id = k.stocking_area_id AND a.purpose = 'dispatch'
+      WHERE v.company_id = ? AND v.movement_type = 'issue' AND v.deleted_at IS NULL
+        AND v.reversed_by_id IS NULL AND v.reversal_of_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM cf_invoice_lines il WHERE il.company_id = v.company_id AND il.movement_id = v.id AND il.claim = 1)
+        AND NOT EXISTS (SELECT 1 FROM cf_order_acceptances ac WHERE ac.company_id = v.company_id AND ac.order_id = v.order_id AND ac.status = 'approved' AND ac.deleted_at IS NULL)
+      GROUP BY v.order_id, o.code, p.name, v.id, v.code, v.movement_date, l.line_no
+      HAVING quantity > 0
+      ORDER BY v.movement_date, v.id
+      LIMIT 500`,
+    [companyId],
+  );
+  const byOrder = new Map();
+  for (const r of rows) {
+    if (!byOrder.has(r.order_id)) byOrder.set(r.order_id, { orderId: r.order_id, orderCode: r.order_code, customer: r.customer_name ?? null, shipments: [] });
+    byOrder.get(r.order_id).shipments.push({ movementId: r.movement_id, movementCode: r.movement_code, date: dateOnly(r.movement_date), lineNo: r.line_no, quantity: Number(r.quantity) });
+  }
+  return { rows: [...byOrder.values()] };
+}
+
 // --- reading: drafts worked out live, issued ones from their frozen columns --------
 
 const INVOICE_SELECT = `SELECT inv.*, o.code AS order_code, p.name AS customer_name, p.code AS customer_code,

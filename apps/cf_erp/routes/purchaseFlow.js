@@ -11,6 +11,7 @@
  *   GET  /order-lines/:id/material-ready            the line's material-ready state, material by material
  *   GET  /requisitions/:id
  *   PUT  /order-lines/:id/material-supply           { supply: 'we_buy' | 'customer' | null } — who supplies the line's material (§66)
+ *   PUT  /orders/:id/material-supply                { supply: 'we_buy' | 'customer' } — the order's default (same checks as PUT /orders/:id)
  *   GET  /customer-material/returns?orderId=&partyId= customer material to go back, and substitutes (§68)
  * PURCHASE FLOW v3 (§71, 2026-10-18) REMOVED from here: the purchase board and a sales order's lanes (/purchase/board,
  * /orders/:id/purchase), the requested-PO flow (/orders/:id/purchase-request, /purchase-orders/:id/stock-check|rfq|quotes|place),
@@ -22,7 +23,7 @@ import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import { orderRequisitions, raiseRequisitions, lineRequisition, getRequisition } from '../services/requisitionService.js';
 import { lineMaterialReady } from '../services/materialReadyService.js';
-import { setLineSupply } from '../services/salesOrderService.js';
+import { setLineSupply, updateOrder } from '../services/salesOrderService.js';
 import { customerReturns } from '../services/customerMaterialService.js';
 
 const router = Router();
@@ -41,6 +42,8 @@ router.get('/order-lines/:id/requisition', orderView, handle((req) => lineRequis
 router.get('/order-lines/:id/material-ready', orderView, handle((req) => lineMaterialReady(pool, ctx(req).companyId, id(req))));
 router.get('/requisitions/:id', view, handle((req) => getRequisition(pool, ctx(req).companyId, id(req))));
 router.put('/order-lines/:id/material-supply', manage, handle((req) => tx(req, (db, c) => setLineSupply(db, c, id(req), body(req)))));
+// 2026-10-27: the order's default too, so Stores (inventory manage without orders manage) can set it — only this field passes.
+router.put('/orders/:id/material-supply', manage, handle((req) => tx(req, (db, c) => updateOrder(db, c, id(req), { materialSupply: body(req).supply }))));
 // §68: customer material to go back (extra, a substitute not accepted) and the substitutes, by order or customer.
 router.get('/customer-material/returns', view, handle((req) => customerReturns(pool, ctx(req).companyId, req.query)));
 

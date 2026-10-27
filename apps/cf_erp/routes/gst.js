@@ -21,6 +21,7 @@
  *   POST /invoices/:id/eway-bills         { ewayNo, vehicleNo, validUntil }
  *   DELETE /invoices/:id/eway-bills/:ewbId
  *   GET  /orders/:id/invoices             { rows, uninvoiced }
+ *   GET  /invoices/uninvoiced             every order's shipments not on an invoice yet (Accounts › Invoices)
  *   POST /orders/:id/invoices             { movementIds?, invoiceId? } → Invoice (draft)
  *
  * Reads take cf_erp_orders_view OR cf_erp_accounts_view. EVERY WRITE IS ACCOUNTS' (user 2026-10-27, init.sql §94):
@@ -37,7 +38,7 @@ import { getTaxSettings, putTaxSettings, GST_STATES, validateGstin } from '../se
 import { familyTaxView, applyFamilyTax } from '../services/taxFamilyService.js';
 import {
   listInvoices, getInvoice, updateInvoice, deleteInvoice, removeInvoiceLine, issueInvoice, cancelInvoice,
-  setIrn, addEwayBill, removeEwayBill, orderInvoices, createInvoice,
+  setIrn, addEwayBill, removeEwayBill, orderInvoices, createInvoice, uninvoicedOrders,
 } from '../services/invoiceService.js';
 import { printHtml, einvoiceJson, ewaybillJson, COPY_LABELS } from '../services/invoiceDocuments.js';
 
@@ -62,6 +63,8 @@ router.put('/tax/families/:id', guardAny(PERM.catalog, PERM.accounts), handle((r
 router.get('/tax/validate-gstin', taxView, handle((req) => validateGstin(req.query.gstin)));
 
 router.get('/invoices', view, handle((req) => listInvoices(pool, company(req), req.query)));
+// Shipped, not invoiced — every order's, so Accounts can raise them without the sales order (before /invoices/:id).
+router.get('/invoices/uninvoiced', view, handle((req) => uninvoicedOrders(pool, company(req))));
 router.get('/invoices/:id', view, handle((req) => getInvoice(pool, company(req), id(req))));
 router.put('/invoices/:id', manage, handle((req) => tx(req, (db, c) => updateInvoice(db, c, id(req), req.body ?? {}))));
 router.delete('/invoices/:id', manage, handle((req) => tx(req, (db, c) => deleteInvoice(db, c, id(req)))));

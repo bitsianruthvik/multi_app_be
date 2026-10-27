@@ -30,7 +30,7 @@ import { gstinCheckChar } from '../../apps/cf_erp/modules/parties/gstin.js';
 import { createParty, updateParty, createAddress, listAddresses } from '../../apps/cf_erp/modules/parties/service.js';
 import {
   getInvoice, listInvoices, createInvoice, orderInvoices, updateInvoice, removeInvoiceLine, deleteInvoice, issueInvoice, cancelInvoice,
-  setIrn, addEwayBill, removeEwayBill, uninvoicedShipments,
+  setIrn, addEwayBill, removeEwayBill, uninvoicedShipments, uninvoicedOrders,
 } from '../../apps/cf_erp/services/invoiceService.js';
 import { printHtml, einvoiceJson, ewaybillJson } from '../../apps/cf_erp/services/invoiceDocuments.js';
 
@@ -230,12 +230,17 @@ try {
   ok('no problems: it can be issued', inv.problems.length === 0, JSON.stringify(inv.problems));
   let oi = await orderInvoices(db, COMPANY, soIntra.id);
   ok('GET /orders/:id/invoices: 1 invoice, 1 uninvoiced shipment', oi.rows.length === 1 && oi.uninvoiced.length === 1 && oi.uninvoiced[0].lineNo === lA.lineNo, JSON.stringify(oi.uninvoiced));
+  // Accounts › Invoices "Shipped, not invoiced" (2026-10-27): every order's, the same shipment as the order's card.
+  const across = (await uninvoicedOrders(db, COMPANY)).rows.find((r) => r.orderId === soIntra.id);
+  ok('GET /invoices/uninvoiced: the order with its 1 shipment, its code and customer', across?.shipments.length === 1 && across.shipments[0].movementId === oi.uninvoiced[0].movementId && across.orderCode === soIntra.code && !!across.customer, JSON.stringify(across));
+  ok('...and no order there without one (all have at least one shipment)', (await uninvoicedOrders(db, COMPANY)).rows.every((r) => r.shipments.length > 0));
   e = await refusal(() => createInvoice(db, c, soIntra.id, { movementIds: [s1.movement.id] }));
   ok('a shipment already on an invoice cannot be invoiced twice', e?.code === 'NOT_UNINVOICED', e?.message);
   const draft2 = await createInvoice(db, c, soIntra.id, {});
   ok('POST /orders/:id/invoices takes the un-invoiced shipment onto a new draft', draft2.status === 'draft' && draft2.lines.length === 1 && draft2.lines[0].quantity === 1);
   e = await refusal(() => createInvoice(db, c, soIntra.id, {}));
   ok('...and then there is nothing left to invoice', e?.code === 'NOTHING_TO_INVOICE');
+  ok('...and the order leaves Shipped, not invoiced', !(await uninvoicedOrders(db, COMPANY)).rows.some((r) => r.orderId === soIntra.id));
   await deleteInvoice(db, c, draft2.id);
   ok('deleting a draft frees its shipment', (await uninvoicedShipments(db, COMPANY, soIntra.id)).length === 1);
 

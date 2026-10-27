@@ -278,7 +278,12 @@ try {
     `SELECT o.value, COUNT(*) AS n FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'IMPACT_CLASS'
        JOIN cf_spec_options o ON o.id = v.option_id WHERE v.subject_id IN (?) AND v.deleted_at IS NULL GROUP BY o.value ORDER BY o.value`, [r1623.ids]);
   eq('…its rows hold IMPACT_CLASS A ×11 and BR ×18', impact.map((x) => [x.value, Number(x.n)]), [['A', 11], ['BR', 18]]);
-  const pbDef = t1623.report.written.newDefinitions.find((d) => d.name === 'Phosphor bronze plate');
+  // New on a fresh DB; on one where an earlier import already made it, the import reuses it — take it from the rows.
+  const [[usedPb]] = await conn.query(
+    `SELECT d.id FROM cf_item_details i JOIN cf_master_records d ON d.id = i.source_definition_id
+      WHERE i.master_id IN (?) AND d.name = 'Phosphor bronze plate' AND i.deleted_at IS NULL LIMIT 1`, [r1623.ids]);
+  const pbDef = t1623.report.written.newDefinitions.find((d) => d.name === 'Phosphor bronze plate') ?? (usedPb ? { id: usedPb.id } : undefined);
+  ok('the 1623 rows use a "Phosphor bronze plate" definition', !!pbDef);
   const [[pbv]] = await conn.query(
     `SELECT o.value FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'MATERIAL' JOIN cf_spec_options o ON o.id = v.option_id
       WHERE v.subject_type = 'master' AND v.subject_id = ? AND v.deleted_at IS NULL`, [pbDef?.id ?? 0]);

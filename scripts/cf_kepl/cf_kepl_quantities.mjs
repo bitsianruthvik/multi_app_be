@@ -452,7 +452,8 @@ export async function projectTimes(db, companyId, data, writes, { estimateFor = 
       const setup = ov?.setup_minutes != null ? Number(ov.setup_minutes) : f.setup;
       if (!byCode.has(o.code)) byCode.set(o.code, { name: o.name, minutes: null });
       if (work != null) {
-        const m = ((setup ?? 0) + work * Number(n.total)) * o.passes;
+        // Setup is per piece too (user, 2026-10-18, §76): the grid takes (setup + work) × quantity.
+        const m = ((setup ?? 0) + work) * Number(n.total) * o.passes;
         byCode.get(o.code).minutes = (byCode.get(o.code).minutes ?? 0) + m;
         all += m;
       } else {

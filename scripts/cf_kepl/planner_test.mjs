@@ -266,7 +266,10 @@ try {
   const lots = s.supply[plate.itemId].lots;
   console.log(`        supply of ${s.supply[plate.itemId].code}: ${lots.map((l) => `${l.date} ${l.qty} ${l.source}`).join(' | ')}`);
   ok('free stock comes first, dated today, received', lots[0]?.source === 'stock' && lots[0].received === true && lots[0].date === s.horizon.today && lots[0].qty >= 2);
-  ok('then the open purchase lines by date, what is still to come', lots.filter((l) => l.source.startsWith(tag)).map((l) => `${l.date}:${l.qty}`).join(',') === '2026-10-20:3,2026-11-14:3');
+  // The fixture's dates are fixed, so as the calendar passes them they fall overdue: an overdue line is dated today, its due kept.
+  const poLots = lots.filter((l) => l.source.startsWith(tag));
+  ok('then the open purchase lines, what is still to come (by their due dates)', poLots.map((l) => `${l.due ?? l.date}:${l.qty}`).sort().join(',') === '2026-10-20:3,2026-11-14:3', poLots.map((l) => `${l.date}/${l.due ?? '-'}:${l.qty}`).join(','));
+  ok('an overdue purchase line is dated today, never in the past, and says it is late', poLots.every((l) => String(l.date) >= s.horizon.today && (l.due == null || (l.late === true && l.due < s.horizon.today && l.date === s.horizon.today))));
   ok('a draft suggestion is not supply', !lots.some((l) => l.source.startsWith(`${tag}-draft`)));
   ok('lots are in date order', lots.every((l, i) => i === 0 || String(lots[i - 1].date) <= String(l.date)));
 

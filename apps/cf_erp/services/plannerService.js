@@ -960,7 +960,9 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
   }
   for (const p of mr.supply.poLines) {
     if (!supply[p.itemId] || !OPEN_PO_STATUSES.includes(p.status)) continue;
-    supply[p.itemId].lots.push({ date: p.due ?? null, qty: r6(p.quantity - p.received), source: p.code ?? `PO-${p.poId}`, received: false });
+    // An overdue PO cannot arrive in the past: it is dated today (after the stock in hand), its own due date kept.
+    const late = p.due != null && String(p.due) < today;
+    supply[p.itemId].lots.push({ date: late ? today : p.due ?? null, qty: r6(p.quantity - p.received), source: p.code ?? `PO-${p.poId}`, received: false, ...(late ? { due: p.due, late: true } : {}) });
   }
   // By date — stock (today) first; a line with no date waits at the end.
   for (const s of Object.values(supply)) {

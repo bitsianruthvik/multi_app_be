@@ -28,7 +28,7 @@ const R = async (f) => (await imp(`apps/cf_erp/routes/${f}.js`)).default;
 const routers = {
   gst: await R('gst'), acceptance: await R('acceptance'), accounts: await R('accounts'), orders: await R('orders'),
   tracker: await R('tracker'), productionOrders: await R('productionOrders'), inventory: await R('inventory'), grn: await R('grn'),
-  planner3: await R('planner3'), maintenance: await R('maintenance'), approvals: await R('approvals'),
+  planner3: await R('planner3'), maintenance: await R('maintenance'), approvals: await R('approvals'), purchaseFlow: await R('purchaseFlow'),
 };
 const { shipInput } = await imp('apps/cf_erp/routes/tracker.js');
 
@@ -93,6 +93,8 @@ const TABLE = [
   ['gst', 'GET', '/invoices/:id/einvoice.json', READERS],
   ['gst', 'GET', '/invoices/:id/ewaybill.json', READERS],
   ['gst', 'GET', '/orders/:id/invoices', READERS],
+  // Shipped, not invoiced across orders (Accounts › Invoices) — so Accounts raise them without the sales order open.
+  ['gst', 'GET', '/invoices/uninvoiced', READERS],
   ['A2', 'Company tax details — accounts manage only; HSN & GST by family unchanged'],
   ['gst', 'PUT', '/settings/tax', ACCOUNTS_ONLY],
   ['gst', 'GET', '/settings/tax', READERS],
@@ -124,6 +126,9 @@ const TABLE = [
   ['inventory', 'POST', '/stocking-areas', STORES_ONLY],
   ['inventory', 'PUT', '/batches/:id', STORES_ONLY],
   ['grn', 'POST', '/purchase-orders/:id/grn', STORES_ONLY],
+  ['C1', 'Who supplies the material — the order default and each line: orders manage OR inventory manage (Stores alone too)'],
+  ['purchaseFlow', 'PUT', '/orders/:id/material-supply', ['ordersOnly', 'ppc', 'stores', 'md', 'admin']],
+  ['purchaseFlow', 'PUT', '/order-lines/:id/material-supply', ['ordersOnly', 'ppc', 'stores', 'md', 'admin']],
   ['B2', 'Plan health — read with production view or an approval tag; the plan\'s writes and approvals unchanged'],
   ['planner3', 'GET', '/planner3/health', PROD_VIEW],
   ['planner3', 'POST', '/planner3/rebaseline', ['ppc', 'md', 'admin']],
