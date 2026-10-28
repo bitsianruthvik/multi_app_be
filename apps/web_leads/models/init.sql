@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS web_leads (
   page_url       VARCHAR(500) NULL,
   referrer       VARCHAR(500) NULL,
   utm            JSON NULL,
+  attribution    JSON NULL,                 -- product, pageId, landingUrl, landingPageId, cluster (website page context)
   consent_marketing TINYINT(1) NOT NULL DEFAULT 0,
   capi_context   JSON NULL,
   received_at    DATETIME(3) NOT NULL,

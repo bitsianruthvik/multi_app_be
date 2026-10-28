@@ -71,6 +71,7 @@ try {
   const lead1 = {
     eventId: e1, name: 'Test Person', email: 'Test@Example.com', phone: '98765 43210', message: 'Hello',
     pageUrl: 'https://ceofactory.vc/contact', utm: { source: 'google', bogus: 'x' }, consent: { marketing: true },
+    attribution: { pageId: 'erp.problems.raw-material-shortages', landingPageId: 'erp', cluster: 'erp_material_shortage_mid_order', product: 'erp', junk: 'x' },
     context: { ip: '203.0.113.9', userAgent: 'UA', fbp: 'fb.1.1.1' },
   };
   const r1 = await post(lead1);
@@ -91,6 +92,9 @@ try {
   ok(ev?.user_data.em[0] === crypto.createHash('sha256').update('test@example.com').digest('hex'), 'email hashed, lower-cased');
   ok(ev?.user_data.ph[0] === crypto.createHash('sha256').update('919876543210').digest('hex'), '10-digit phone hashed with 91');
   ok(!JSON.stringify(got.meta[0].body).includes('Test Person'), 'no plain name sent to Meta');
+  const [[at1]] = await pool.query(`SELECT attribution FROM web_leads WHERE id = ?`, [j1.id]);
+  const atj = typeof at1.attribution === 'string' ? JSON.parse(at1.attribution) : at1.attribution;
+  ok(atj?.landingPageId === 'erp' && atj.cluster === 'erp_material_shortage_mid_order' && !('junk' in atj), 'attribution kept, unknown keys dropped');
   ok(st.crm_webhook?.status === 'pending' && st.crm_webhook.attempts === 1, 'CRM down → pending for retry');
   const [[row1]] = await pool.query(`SELECT capi_context, utm FROM web_leads WHERE id = ?`, [j1.id]);
   ok(row1.capi_context === null, 'IP / browser dropped after Meta delivery');
@@ -105,6 +109,7 @@ try {
   const last = got.crm.at(-1);
   ok(last.headers['x-signature'] === crypto.createHmac('sha256', 'shh').update(last.body).digest('hex'), 'CRM body signed');
   ok(!last.body.includes('203.0.113.9'), 'CRM does not get the IP');
+  ok(JSON.parse(last.body).attribution?.pageId === 'erp.problems.raw-material-shortages', 'CRM gets the attribution');
 
   console.log('lead without consent');
   const r2 = await post({ eventId: eid(), name: 'No Consent', email: 'nc@example.com', context: { ip: '1.2.3.4' } });

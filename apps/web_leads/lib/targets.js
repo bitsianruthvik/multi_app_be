@@ -101,7 +101,7 @@ export const crmWebhook = {
       event_id: lead.event_id, received_at: lead.received_at.toISOString(), site: lead.site, form: lead.form,
       name: lead.name, email: lead.email, phone: lead.phone, organisation: lead.organisation,
       subject: lead.subject, message: lead.message, page_url: lead.page_url, referrer: lead.referrer,
-      utm: lead.utm, consent_marketing: Boolean(lead.consent_marketing),
+      utm: lead.utm, attribution: lead.attribution, consent_marketing: Boolean(lead.consent_marketing),
     };
     const secret = process.env.WEB_LEADS_CRM_SECRET;
     const headers = secret

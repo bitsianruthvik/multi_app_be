@@ -32,7 +32,7 @@ async function loadLead(id) {
   const [[row]] = await pool.query(`SELECT * FROM web_leads WHERE id = ? AND deleted_at IS NULL`, [id]);
   if (!row) return null;
   const json = (v) => (typeof v === 'string' ? JSON.parse(v) : v);
-  return { ...row, utm: json(row.utm), capi_context: json(row.capi_context) };
+  return { ...row, utm: json(row.utm), attribution: json(row.attribution), capi_context: json(row.capi_context) };
 }
 
 async function finish(leadId, target, status, attempts, error, nextAt = null) {

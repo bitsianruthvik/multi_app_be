@@ -54,6 +54,14 @@ export function readLead(body) {
     if (v) utm[k] = v;
   }
   lead.utm = Object.keys(utm).length ? JSON.stringify(utm) : null;
+  // Where on the website it came from (page IDs, topic cluster, landing URL already cut to campaign parameters).
+  const at = {};
+  const a = b.attribution || {};
+  for (const [k, max] of [['product', 10], ['pageId', 120], ['landingUrl', 500], ['landingPageId', 120], ['cluster', 80]]) {
+    const v = str(a[k], max);
+    if (v) at[k] = v;
+  }
+  lead.attribution = Object.keys(at).length ? JSON.stringify(at) : null;
   const c = b.context || {};
   const ctx = { ip: str(c.ip, 64), userAgent: str(c.userAgent, 500), fbp: str(c.fbp, 200), fbc: str(c.fbc, 300) };
   // Without marketing consent nothing goes to Meta, so there is no reason to keep these.
