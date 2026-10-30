@@ -144,16 +144,17 @@ app.get("/debug/jwt", protect, requireAdmin, (req, res) => {
 // =====================
 // Rate Limiting
 // =====================
-// Logins are limited per ACCOUNT on an address (5 a minute — password guessing) and per address overall (60 a
-// minute). One limit of 5 per address stopped the sixth person of an office on one connection from signing in
-// (2026-10-31, before the Placebo demo).
+// Logins are limited per ACCOUNT (5 a minute — password guessing) and per address overall (60 a minute). One limit
+// of 5 per address stopped the sixth person of an office on one connection from signing in (2026-10-31, before the
+// Placebo demo). The account key is the email alone: behind Render's proxies the address a request arrives from
+// changes request by request, so an address-and-email key never added up there.
 const loginMessage = { message: "Too many login attempts. Please try again in a minute." };
 const loginPerAccount = rateLimit({
   windowMs: 60 * 1000,
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => `${ipKeyGenerator(req.ip)}|${String(req.body?.email ?? req.body?.username ?? "").trim().toLowerCase()}`,
+  keyGenerator: (req) => String(req.body?.email ?? req.body?.username ?? "").trim().toLowerCase() || ipKeyGenerator(req.ip),
   message: loginMessage,
 });
 const loginPerAddress = rateLimit({
