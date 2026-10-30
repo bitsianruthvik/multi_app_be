@@ -5,7 +5,7 @@ import dotenv from "dotenv";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import jwt from "jsonwebtoken";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import pinoHttp from "pino-http";
 import { logger } from "./core/utils/logger.js";
 import authRoutes from "./core/auth/authRoute.js";
@@ -144,13 +144,26 @@ app.get("/debug/jwt", protect, requireAdmin, (req, res) => {
 // =====================
 // Rate Limiting
 // =====================
-const loginLimiter = rateLimit({
+// Logins are limited per ACCOUNT on an address (5 a minute — password guessing) and per address overall (60 a
+// minute). One limit of 5 per address stopped the sixth person of an office on one connection from signing in
+// (2026-10-31, before the Placebo demo).
+const loginMessage = { message: "Too many login attempts. Please try again in a minute." };
+const loginPerAccount = rateLimit({
   windowMs: 60 * 1000,
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { message: "Too many login attempts. Please try again in a minute." },
+  keyGenerator: (req) => `${ipKeyGenerator(req.ip)}|${String(req.body?.email ?? req.body?.username ?? "").trim().toLowerCase()}`,
+  message: loginMessage,
 });
+const loginPerAddress = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: loginMessage,
+});
+const loginLimiter = [loginPerAddress, loginPerAccount];
 
 const publicLimiter = rateLimit({
   windowMs: 60 * 1000,
