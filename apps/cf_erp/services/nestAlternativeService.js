@@ -135,7 +135,7 @@ export function alternativeView({ alt, swapped, autoSide, blocker, differ = [], 
   let reason = null;
   if (blocker) reason = blocker.message;
   else if (to === 'ai' && (!autoSide || !['ready', 'accepted', 'discarded'].includes(autoSide.status))) reason = "AI's nesting of these pieces is not ready yet.";
-  else if (to === 'ai' && additions > 0) reason = `${plural(additions, 'piece', 'pieces')} that AI added onto the customer's plates would lose their plate. Take them off (nest the rest again) first.`;
+  else if (to === 'ai' && additions > 0) reason = `${plural(additions, 'piece', 'pieces')} that AI added onto the manual nesting's plates would lose their plate. Take them off (nest the rest again) first.`;
   return {
     main, runId: autoSide?.runId ?? alt?.runUid ?? null, swapCount: alt?.swapCount ?? 0, swappedAt: alt?.swappedAt ?? null,
     locked: !!blocker, lockReason: blocker?.message ?? null,
@@ -180,13 +180,13 @@ export async function swapAlternative(db, c, lineId, body = {}) {
 async function makeAiMain(db, c, line, alt, body) {
   const companyId = c.companyId;
   const st = await compareState(db, companyId, line.id, { alt });
-  if (!st.uploadedLots.length) throw invalid('NOTHING_UPLOADED', "No customer's nesting is saved on this line, so there is nothing to swap with AI's.");
+  if (!st.uploadedLots.length) throw invalid('NOTHING_UPLOADED', "No manual nesting is saved on this line, so there is nothing to swap with AI's.");
   if (st.demandError) throw invalid(st.demandError.code, st.demandError.message);
   const row = st.rowSubset;
   if (!row) throw invalid('NO_ALTERNATIVE', "AI's nesting of these pieces is not ready yet (or the line changed since it ran). Wait for it, or run it again on the Compare tab.");
   if (body.runId && String(body.runId) !== String(row.run_uid)) throw invalid('STALE_RUN', "The comparison on your screen is out of date — AI's nesting was run again since. Look again, then swap.");
   const added = st.uploadedLots.reduce((a, l) => a + l.pieces.filter((p) => !isUploadedPiece(l, p)).length, 0);
-  if (added) throw invalid('ADDED_PIECES', `${plural(added, 'piece', 'pieces')} that AI added onto the customer's plates would lose their plate. Take them off (nest the rest again) first.`);
+  if (added) throw invalid('ADDED_PIECES', `${plural(added, 'piece', 'pieces')} that AI added onto the manual nesting's plates would lose their plate. Take them off (nest the rest again) first.`);
   const plan = (await plansOf(db, companyId, [row.id])).get(row.id);
   if (!plan) throw invalid('NO_ALTERNATIVE', "AI's nesting of these pieces has no layout stored. Run it again on the Compare tab.");
   const aiNests = (plan.groups ?? []).flatMap((g) => g.nests ?? []);
@@ -208,14 +208,14 @@ async function makeAiMain(db, c, line, alt, body) {
   return {
     main: 'ai', runId: row.run_uid, plates: aiLotIds.length, pieces: accepted.pieces, replacedPlates: uploadLotIds.length, keptPlates: rest.length, leftOver,
     quantities: accepted.quantities,
-    message: `AI's nesting is now the main one: ${plural(aiLotIds.length, 'plate', 'plates')} in place of the customer's ${plural(uploadLotIds.length, 'plate', 'plates')}.${leftOver ? ` ${plural(leftOver, 'piece is', 'pieces are')} left over.` : ''} The customer's nesting is kept — switch back any time before production.`,
+    message: `AI's nesting is now the main one: ${plural(aiLotIds.length, 'plate', 'plates')} in place of the manual nesting's ${plural(uploadLotIds.length, 'plate', 'plates')}.${leftOver ? ` ${plural(leftOver, 'piece is', 'pieces are')} left over.` : ''} The manual nesting is kept — switch back any time before production.`,
   };
 }
 
 async function switchBack(db, c, line, alt, swapped) {
   const companyId = c.companyId;
-  if (!alt || alt.main !== 'ai') throw invalid('ALREADY_MAIN', "The customer's nesting is already the main one.");
-  if (!swapped) throw invalid('ALTERNATIVE_STALE', "The line's nesting changed since AI's was made the main one, so the customer's plates cannot be brought back as they were. Upload the customer's nesting again.");
+  if (!alt || alt.main !== 'ai') throw invalid('ALREADY_MAIN', "The manual nesting is already the main one.");
+  if (!swapped) throw invalid('ALTERNATIVE_STALE', "The line's nesting changed since AI's was made the main one, so the manual nesting's plates cannot be brought back as they were. Upload the manual nesting again.");
   // AI's plates go (kept as rows); the customer's come back exactly as they were.
   await clearLots(db, c, line.id, { ids: alt.aiLotIds });
   await db.query('UPDATE cf_plate_lots SET deleted_at = NULL WHERE company_id = ? AND order_line_id = ? AND id IN (?)', [companyId, line.id, alt.uploadLotIds]);
@@ -240,7 +240,7 @@ async function switchBack(db, c, line, alt, swapped) {
   const leftOver = leftOverOfNests(cutPlates, lots);
   return {
     main: 'uploaded', runId: alt.runUid, plates: alt.uploadLotIds.length, replacedPlates: alt.aiLotIds.length, leftOver, quantities,
-    message: `The customer's nesting is the main one again: ${plural(alt.uploadLotIds.length, 'plate', 'plates')} back in place of AI's ${plural(alt.aiLotIds.length, 'plate', 'plates')}. AI's nesting stays beside it.`,
+    message: `The manual nesting is the main one again: ${plural(alt.uploadLotIds.length, 'plate', 'plates')} back in place of AI's ${plural(alt.aiLotIds.length, 'plate', 'plates')}. AI's nesting stays beside it.`,
   };
 }
 

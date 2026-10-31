@@ -8243,3 +8243,18 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements'
             AND COLUMN_NAME IN ('requisition_id', 'maintenance_order_id')) = 2, 'S95-OK', 'S95-MISSING') AS result;
+
+-- ============================================================================
+-- §96  FREE-SIZE NESTING — a line's plates sized to their layouts within a range (2026-11-01)
+-- ============================================================================
+-- cf_sales_order_lines.nest_plates takes a third value, 'free': every plate is laid out on the largest plate the range
+-- allows and ordered at the size its layout needs (nestingService.sizeFreeNests); the sizes become catalog plates when
+-- the nesting is used, as a §90 custom size does.
+--   cf_sales_order_lines.nest_free_range  JSON { minLength, maxLength, minWidth, maxWidth } in mm; NULL or a blank key =
+--                                         Setup › Cutting's custom-plate limits, else the catalog's range. Idempotent.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'nest_free_range');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN nest_free_range JSON NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines'
+            AND COLUMN_NAME = 'nest_free_range') = 1, 'S96-OK', 'S96-MISSING') AS result;

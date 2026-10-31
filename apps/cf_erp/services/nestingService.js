@@ -150,7 +150,33 @@ export const NEST_MANUAL_SPEC_CODE = 'NEST_MANUAL';
  * one of the two. A plate that does not say counts as custom.
  */
 export const PLATE_KIND_SPEC_CODE = 'PLATE_KIND';
-export const NEST_PLATE_CHOICES = ['standard', 'any'];
+export const NEST_PLATE_CHOICES = ['standard', 'any', 'free'];
+/*
+ * FREE SIZE (user, 2026-11-01: "free size in a range of length and width"): the line's nesting is not held to the
+ * catalog's sizes at all — every plate is laid out on the largest plate the range allows and then ordered at the size
+ * its layout needs (its extent + the ordering margins, up to the order step: orderedSize), never under the range's
+ * shortest / narrowest. The range is the line's (cf_sales_order_lines.nest_free_range, §96), else the custom-plate
+ * limits of Setup › Cutting, else the catalog's own range. Each size becomes a catalog plate when the nesting is used
+ * (customStandIns / catalogCustomPlates), exactly as a §90 custom size.
+ */
+const FREE_KEYS = ['minLength', 'maxLength', 'minWidth', 'maxWidth'];
+export function freeRangeOf(v) {
+  let o = v;
+  if (o == null) return null;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
+  if (!o || typeof o !== 'object') return null;
+  const out = {};
+  for (const k of FREE_KEYS) { const n = Number(o[k]); if (Number.isFinite(n) && n > 0) out[k] = n; }
+  return Object.keys(out).length ? out : null;
+}
+/** The free-size limits of one thickness: the line's range over the custom-plate limits (customLimits). */
+function freeLimits(line, setting, plates, thickness, band) {
+  const base = customLimits(setting, plates, thickness, band);
+  const own = freeRangeOf(line.nest_free_range) ?? {};
+  const out = { ...base, ...own };
+  if (Object.keys(own).length) out.basis = Object.keys(own).length < 4 ? `the line's free-size range, the rest ${base.basis}` : "the line's free-size range";
+  return out;
+}
 const isStandard = (p) => p.kind === 'STANDARD';
 const allowedBy = (choice) => (p) => choice !== 'standard' || isStandard(p);
 /** The line's plate choice, NULL (never set) read as the default: standard and custom. */
@@ -1272,6 +1298,8 @@ export async function nestingChoices(db, companyId, orderLineId) {
     line: lineHead(line),
     // §44: which plates this line's nesting may use ('any' unless set to 'standard').
     plateChoice: line.nest_plates,
+    // §96: the free-size range the line keeps (null = Setup › Cutting's limits, else the catalog's range).
+    freeRange: freeRangeOf(line.nest_free_range),
     plateKinds: kinds,
     canSave: !blocker,
     readOnlyReason: blocker?.message ?? null,
@@ -1303,10 +1331,23 @@ export async function setNestPlates(db, c, orderLineId, input = {}) {
   const line = await requireLine(db, c.companyId, orderLineId, { lock: true });
   assertNestable(line);
   const choice = String(input.plates ?? '').trim().toLowerCase();
-  if (!NEST_PLATE_CHOICES.includes(choice)) throw invalid('INVALID', 'Plates is "standard" (standard plates only) or "any" (standard and custom).');
-  await db.query('UPDATE cf_sales_order_lines SET nest_plates = ? WHERE company_id = ? AND id = ?', [choice, c.companyId, line.id]);
+  if (!NEST_PLATE_CHOICES.includes(choice)) throw invalid('INVALID', 'Plates is "standard" (standard sizes only), "any" (standard and custom sizes) or "free" (any size within a range).');
+  // The free-size range: kept when another choice is made, so switching back finds it.
+  let range = freeRangeOf(line.nest_free_range);
+  if (input.range !== undefined) {
+    const r = input.range == null ? null : freeRangeOf(input.range);
+    const problems = [];
+    if (input.range != null) {
+      for (const k of FREE_KEYS) if (input.range[k] != null && input.range[k] !== '' && !(Number(input.range[k]) > 0)) problems.push(`${k} must be a length in mm.`);
+      if (r?.minLength && r?.maxLength && r.minLength > r.maxLength) problems.push('The shortest length is more than the longest.');
+      if (r?.minWidth && r?.maxWidth && r.minWidth > r.maxWidth) problems.push('The narrowest width is more than the widest.');
+    }
+    if (problems.length) throw invalid('INVALID', problems.join(' '), { problems });
+    range = r;
+  }
+  await db.query('UPDATE cf_sales_order_lines SET nest_plates = ?, nest_free_range = ? WHERE company_id = ? AND id = ?', [choice, range ? JSON.stringify(range) : null, c.companyId, line.id]);
   forget(db, `line:${c.companyId}:`);
-  return { lineId: line.id, plateChoice: choice };
+  return { lineId: line.id, plateChoice: choice, freeRange: range };
 }
 
 const noPlatesLeft = (g) => `${fmt(g.thickness)} mm ${[g.grade, g.material].filter(Boolean).join(' ')}: every plate it could be cut from is unticked, so its pieces have nothing to be nested on. Tick at least one plate, or untick the pieces too.`;
@@ -1820,7 +1861,22 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   for (const g of [...byGroup.values()].sort((a, b) => a.thickness - b.thickness || String(a.key).localeCompare(String(b.key)))) {
     const settings = pickCutSettings(settingRows, g.thickness);
     const guillotine = input.guillotine == null ? settings.guillotine : !!input.guillotine;
-    const candidates = groupSheets(plates, g).filter((p) => !excl.plates.has(p.id));
+    let candidates = groupSheets(plates, g).filter((p) => !excl.plates.has(p.id));
+    if (line.nest_plates === 'free') {
+      // FREE SIZE: one plate, the largest the range allows, of the pieces' own steel; each layout is cut down to size after.
+      const lim = freeLimits(line, settingRows.customPlates ?? null, everyPlate, g.thickness, settings);
+      const asks = g.cutPlates.map((cp) => cp.steel.impactClass).filter((v) => !blank(v)).sort((a, b) => (impactRankOf(b) ?? -1) - (impactRankOf(a) ?? -1));
+      const density = g.cutPlates.find((cp) => cp.steel.density > 0)?.steel.density ?? FALLBACK_DENSITY;
+      if (!(lim.maxLength > 0 && lim.maxWidth > 0)) {
+        problems.push(`${fmt(g.thickness)} mm ${[g.grade, g.material].filter(Boolean).join(' ')}: the free-size range has no longest length or widest width, and the catalog has no plate to take them from. Set the range (Nesting › Plates).`);
+        groups.push(emptyGroup(g, settings, guillotine, 'no free-size range'));
+        continue;
+      }
+      candidates = [{
+        id: -(prepared.length + 1), code: customPlateCode(lim.maxLength, lim.maxWidth), name: `Free-size plate up to ${fmt(lim.maxLength)} × ${fmt(lim.maxWidth)}`, kind: 'CUSTOM', free: lim,
+        steel: { thickness: g.thickness, length: lim.maxLength, width: lim.maxWidth, grade: g.grade ?? null, material: g.material ?? null, impactClass: asks[0] ?? null, density },
+      }];
+    }
     if (!candidates.length && g.steelPlates?.length) {
       // Plates of this thickness and grade exist, but none of the impact class (or grade, by the rule) its pieces ask.
       const have = [...new Set(g.steelPlates.map((p) => norm(p.steel.impactClass) ?? 'no stated class'))].join(', ');
@@ -2187,6 +2243,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     }));
     const fromById = new Map(g.cutPlates.map((cp) => [cp.id, fromOf(cp).shapeFrom]));
     for (const n of nests) for (const p of n.pieces) p.shapeFrom = fromById.get(p.cutPlateId) ?? 'dimensions';
+    if (line.nest_plates === 'free') sizeFreeNests(nests, { g, sheets, settings, everyPlate });
     /*
      * THE DRAWING SHOULD HAVE DECIDED AND DID NOT (packJob.js `rowsBecause`): this steel has a cut
      * plate whose drawing is not a rectangle, and its row layout stands all the same. Said in the
@@ -2204,7 +2261,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     }
     // ONE CUSTOM PLATE SIZE (§90, nestCustomPlate.js): the plates whose layouts stop short move to the size they need,
     // when that saves steel by the packers' own cost. Off unless the company switched it on (or the caller asks).
-    const custom = customSetting && line.nest_plates !== 'standard' && nests.length
+    const custom = customSetting && line.nest_plates === 'any' && nests.length
       ? customSizeFor(nests, { g, sheets, settings, everyPlate, customSetting, maxPlateSizes: settingRows.maxPlateSizes, discipline: input.plateDiscipline !== false })
       : null;
     if (custom) {
@@ -2685,6 +2742,39 @@ function drawOnto(n, pieceByKey, shapeOf, g) {
 }
 
 /** "Custom 9100 × 2400" — what a custom plate is called until the catalog has it. */
+/**
+ * FREE SIZE: each layout of a free-size line, laid out on the range's largest plate, is ordered at the size it needs —
+ * its extent + the ordering margins, up to the order step (orderedSize) — never under the range's shortest / narrowest,
+ * never over the plate it was laid out on. A size the catalog already has (same steel) is that plate; any other is a
+ * custom plate (`plateItemId` empty, `customPlate` set) that becomes a catalog plate when the nesting is used.
+ * Mutates nests.
+ */
+function sizeFreeNests(nests, { g, sheets, settings, everyPlate }) {
+  const clamp = (v, lo, hi) => Math.min(hi ?? v, Math.max(lo ?? 0, v));
+  for (const n of nests) {
+    const sheet = sheets.find((s) => s.id === n.plateItemId);
+    const lim = sheet?.plate?.free;
+    if (!lim) continue;
+    const step = lim.step ?? settings.orderStepMm;
+    const L = clamp(orderedSize(n.requiredLength ?? n.length, settings.orderMarginLengthMm, step), lim.minLength, n.length);
+    const W = clamp(orderedSize(n.requiredWidth ?? n.width, settings.orderMarginWidthMm, step), lim.minWidth, n.width);
+    const steel = { ...sheet.plate.steel, length: L, width: W };
+    const sameSize = (p) => Math.abs(p.steel.thickness - steel.thickness) <= 0.01
+      && ((Math.abs(p.steel.length - L) <= 0.5 && Math.abs(p.steel.width - W) <= 0.5) || (Math.abs(p.steel.length - W) <= 0.5 && Math.abs(p.steel.width - L) <= 0.5))
+      && norm(p.steel.grade) === norm(steel.grade) && norm(p.steel.impactClass) === norm(steel.impactClass) && agrees(p.steel.material, steel.material);
+    const existing = everyPlate.find(sameSize) ?? null;
+    const area = L * W; const density = n.density ?? steel.density;
+    Object.assign(n, {
+      plateItemId: existing?.id ?? null, plateCode: existing?.code ?? customPlateCode(L, W),
+      plateName: existing?.name ?? `Custom plate ${fmt(steel.thickness)} x ${fmt(W)} x ${fmt(L)}${steel.grade ? ` ${steel.grade}` : ''}${steel.impactClass ? ` ${steel.impactClass}` : ''}`,
+      length: L, width: W, density,
+      sheetArea: round3(area), wasteArea: round3(area - n.usedArea), wastePct: area > 0 ? round3(((area - n.usedArea) / area) * 100) : 0,
+      weightKg: kgOf(area, g.thickness, density), wasteTotalKg: kgOf(area - n.usedArea, g.thickness, density),
+      customPlate: { ...steel, inCatalog: !!existing, itemId: existing?.id ?? null, code: existing?.code ?? null, free: true, replaces: null, ...(existing ? {} : { note: CUSTOM_NOT_IN_CATALOG }) },
+    });
+  }
+}
+
 export const customPlateCode = (length, width) => `CUSTOM ${fmt(Math.max(length, width))} × ${fmt(Math.min(length, width))}`;
 export const CUSTOM_NOT_IN_CATALOG = 'Custom size, not in the catalog yet — it is added to the catalog when this nesting is used.';
 
@@ -3160,14 +3250,15 @@ function customStandIns(submitted, { line, cpById, plates, plateById, settingRow
     const label = `Lot ${n.lotNo ?? i + 1}`;
     if (line.nest_plates === 'standard') { problems.push(`${label}: it is on a custom plate size, and this line takes standard plates only (Nesting › Plates).`); return; }
     const setting = settingRows.customPlates;
-    if (!setting) { problems.push(`${label}: it is on a custom plate size, and custom plate sizes are switched off in Setup › Cutting. Nest the line again.`); return; }
+    const freeLine = line.nest_plates === 'free';
+    if (!setting && !freeLine) { problems.push(`${label}: it is on a custom plate size, and custom plate sizes are switched off in Setup › Cutting. Nest the line again.`); return; }
     const cps = (Array.isArray(n.pieces) ? n.pieces : []).map((p) => cpById.get(Number(p.cutPlateId))).filter(Boolean);
     if (!cps.length) return;                         // verifyLot says what is wrong with its pieces
     const s0 = cps[0].steel;
     const L = Math.max(Number(n.customPlate.length ?? n.length) || 0, Number(n.customPlate.width ?? n.width) || 0);
     const W = Math.min(Number(n.customPlate.length ?? n.length) || 0, Number(n.customPlate.width ?? n.width) || 0);
     const band = pickCutSettings(settingRows, s0.thickness);
-    const lim = customLimits(setting, plates, s0.thickness, band);
+    const lim = freeLine ? freeLimits(line, setting, plates, s0.thickness, band) : customLimits(setting, plates, s0.thickness, band);
     const tol = 0.5;
     if (!(L > 0 && W > 0) || (lim.maxLength && L > lim.maxLength + tol) || (lim.maxWidth && W > lim.maxWidth + tol) || (lim.minLength && L + tol < lim.minLength) || (lim.minWidth && W + tol < lim.minWidth)) {
       problems.push(`${label}: the custom plate ${fmt(L)} × ${fmt(W)} is outside the plate sizes the mill can roll (${fmt(lim.minLength)}–${fmt(lim.maxLength)} long, ${fmt(lim.minWidth)}–${fmt(lim.maxWidth)} wide; ${lim.basis}). Nest the line again.`);
@@ -3176,8 +3267,10 @@ function customStandIns(submitted, { line, cpById, plates, plateById, settingRow
     const asked = n.customPlate.impactClass;
     const holdsAll = !blank(asked) && cps.every((cp) => { const v = gradeFits({ grade: s0.grade, impactClass: asked }, cp.steel, gradeRule); return v.ok && v.sure; });
     const strictest = cps.map((cp) => cp.steel.impactClass).filter((v) => !blank(v)).sort((a, b) => (impactRankOf(b) ?? -1) - (impactRankOf(a) ?? -1))[0] ?? null;
-    const steel = { thickness: s0.thickness, length: L, width: W, grade: s0.grade, material: s0.material, density: s0.density ?? null, impactClass: holdsAll ? String(asked).trim() : strictest ?? (blank(asked) ? null : String(asked).trim()) };
-    const key = [fmt(steel.thickness), fmt(L), fmt(W), norm(steel.grade) ?? '', norm(steel.impactClass) ?? '', norm(steel.material) ?? ''].join('|');
+    // The plate keeps the layout's own way round (a free-size layout may be taller than it is long); the limits read it long side first.
+    const asLaid = { length: Number(n.customPlate.length ?? n.length) || L, width: Number(n.customPlate.width ?? n.width) || W };
+    const steel = { thickness: s0.thickness, length: asLaid.length, width: asLaid.width, grade: s0.grade, material: s0.material, density: s0.density ?? null, impactClass: holdsAll ? String(asked).trim() : strictest ?? (blank(asked) ? null : String(asked).trim()) };
+    const key = [fmt(steel.thickness), fmt(steel.length), fmt(steel.width), norm(steel.grade) ?? '', norm(steel.impactClass) ?? '', norm(steel.material) ?? ''].join('|');
     let e = byKey.get(key);
     if (!e) {
       const standIn = { id: -(out.length + 1), code: customPlateCode(L, W), name: `Custom plate ${fmt(steel.thickness)} x ${fmt(W)} x ${fmt(L)}`, steel, kind: 'CUSTOM', standIn: true };
@@ -3399,7 +3492,7 @@ function verifyAddition(ad, il, { cpById, required, placed, problems, importedCo
     placed.set(cp.id, (placed.get(cp.id) ?? 0) + 1);
   }
   const theirs = l.pieces.filter((p) => isUploadedPiece(l, p));
-  const nameAt = (i) => (i >= 0 ? `${pieces[i].cutPlateCode} at (${fmt(pieces[i].x)}, ${fmt(pieces[i].y)})` : `the customer's ${theirs[-1 - i].cutPlateCode ?? 'part'} at (${fmt(theirs[-1 - i].x)}, ${fmt(theirs[-1 - i].y)})`);
+  const nameAt = (i) => (i >= 0 ? `${pieces[i].cutPlateCode} at (${fmt(pieces[i].x)}, ${fmt(pieces[i].y)})` : `the manual nesting's ${theirs[-1 - i].cutPlateCode ?? 'part'} at (${fmt(theirs[-1 - i].x)}, ${fmt(theirs[-1 - i].y)})`);
   if (pieces.length) {
     pending.push({
       args: {

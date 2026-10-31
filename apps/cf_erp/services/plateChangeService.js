@@ -381,7 +381,7 @@ function sentenceOf(kind, before, after, plates, delta, extra) {
 /** What a choices / plate-setting change changes, in words (the saved plates do not move with it). */
 async function choiceWords(db, companyId, kind, before, after) {
   if (kind === 'nest_plates') {
-    const w = (v) => (v === 'standard' ? 'standard plates only' : 'standard and custom plates');
+    const w = (v) => (v === 'standard' ? 'standard sizes only' : v === 'free' ? "any size within the line's range" : 'standard and custom sizes');
     return { from: before.state.nestPlates, to: after.state.nestPlates, text: `Nesting may use ${w(after.state.nestPlates)} (it was ${w(before.state.nestPlates)}). The saved plates stay as they are until a new nesting is saved — that is its own request.` };
   }
   if (kind !== 'choices') return null;
