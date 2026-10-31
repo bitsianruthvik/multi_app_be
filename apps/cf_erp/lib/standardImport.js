@@ -54,6 +54,24 @@ export function sentence(s) {
 
 const BOUGHT_ROLES = new Set(['bolt', 'bearing_elastomeric', 'bearing_guide', 'holding_down_bolt']);
 
+/**
+ * A bolt as the BOM names it: { dia, length, grade } (any of them null). Reads "M24 x 95", "M22", "HSFG BOLT 22 MM DIA
+ * PROPERTY CLASS 8.8", "class 10.9" from the item's profile, description and material. Pure.
+ */
+export function boltWanted(it) {
+  const s = `${it?.profile ?? ''} ${it?.description ?? ''} ${it?.material ?? ''}`;
+  const m = /\bM\s?(\d{2})(?:\s*[x×]\s*(\d{2,3}))?/i.exec(s) ?? /\b(\d{2})\s*MM\s*DIA/i.exec(s);
+  const len = /\bM\s?\d{2}\s*[x×]\s*(\d{2,3})/i.exec(s)?.[1] ?? (Number(it?.lengthMm) > 0 ? String(it.lengthMm) : null);
+  const g = /(?:class|grade)\s*(\d{1,2}\.\d)/i.exec(s)?.[1] ?? null;
+  return { dia: m ? Number(m[1]) : null, length: len ? Number(len) : null, grade: g };
+}
+/** A catalog bolt set's name ("HSFG bolt set M24 x 95, class 10.9 (bolt + nut + 2 washers)") → { dia, length, grade } | null. */
+export function boltOf(name) {
+  const m = /\bM(\d{2})\s*x\s*(\d{2,3})\b/i.exec(String(name ?? ''));
+  if (!m) return null;
+  return { dia: Number(m[1]), length: Number(m[2]), grade: /class\s*(\d{1,2}\.\d)/i.exec(String(name))?.[1] ?? null };
+}
+
 /** The definition names a part may take, best first — by its role (IMPORT_FORMAT.md `items[].role`). */
 export function partCandidates(item, place = {}) {
   const holed = Number(item?.holes?.count ?? 0) > 0;
@@ -120,6 +138,7 @@ export function partCandidates(item, place = {}) {
     case 'pad_plate': return ['Pad plate'];
     case 'packing_plate': return ['Packing plate'];
     case 'shear_stud': return ['Shear stud'];
+    case 'bolt': return ['Bolt set'];
     case 'angle':
       if (/LATERAL\s+BRAC/.test(desc)) return ['Bottom lateral bracing member', 'Bottom bracings lateral', 'Bracing'];
       if (/DIAGONAL|DIGONAL/.test(desc)) return ['X-frame diagonal angle'];
@@ -358,6 +377,10 @@ export function planImport(bom, catalog) {
    * are the same. Without that definition they stay direct parts, and the plan says so.
    */
   const stopperDef = pick(['Seismic stopper'], 'template');
+  // The bolt sets' selection (Fasteners › Bolt set) — null on a tenant that has none (bolts are then listed, as before).
+  const boltHit = pick(['Bolt set'], 'selection');
+  const boltDef = boltHit ? { id: boltHit.def.id, code: boltHit.def.code, name: boltHit.def.name, classification_id: boltHit.def.classification_id, default_flow_id: boltHit.def.default_flow_id, bom_id: null } : null;
+  const what2Of = (it) => `${it.mark} ${it.description}`;
   const info = [];
   const withStopper = (node) => {
     const children = node.children ?? [];
@@ -384,7 +407,7 @@ export function planImport(bom, catalog) {
     const children = withStopper(node);
     const leaves = children.filter((c) => c.item != null);
     // A node of bought items only is not made: list it, write nothing.
-    if (node.item == null && leaves.length && leaves.length === children.length && leaves.every((l) => BOUGHT_ROLES.has(items.get(l.item)?.role))) {
+    if (node.item == null && leaves.length && leaves.length === children.length && leaves.every((l) => BOUGHT_ROLES.has(items.get(l.item)?.role) && !(boltDef && items.get(l.item)?.role === 'bolt'))) {
       for (const l of leaves) { const it = items.get(l.item); bought.push({ mark: it?.mark ?? l.item, description: it?.description ?? l.item, quantity: Number(l.qtyPerParent) * (place.mult ?? 1), profile: it?.profile ?? null }); }
       return;
     }
@@ -416,6 +439,22 @@ export function planImport(bom, catalog) {
       const it = items.get(c.item);
       if (!it) { problems.push(`${node.name}: item ${c.item} is not in items[] — left out.`); continue; }
       const q = Number(c.qtyPerParent ?? 1);
+      // BOLTS ARE ROWS (user, 2026-11-01: "are these … bolts selected of the right dia and length … in the BOM?"): a bolt
+      // item becomes a "Bolt set" selection row, its catalog size chosen when the BOM names diameter, length and class —
+      // else left to choose, and said. A tenant without the "Bolt set" selection keeps the old way (listed, not a row).
+      if (it.role === 'bolt' && boltDef) {
+        const want = boltWanted(it);
+        const match = want.dia && want.length ? (catalog.bolts ?? []).find((b) => boltOf(b.name)?.dia === want.dia && boltOf(b.name)?.length === want.length && (!want.grade || boltOf(b.name)?.grade === want.grade)) : null;
+        rows.push({
+          key: `n${++seq}`, parentKey: key, kind: 'selection', depth: depth + 1, lineNo, position: null,
+          role: roleText(it.description), quantity: q, mark: it.mark,
+          notes: match ? (it.notes?.length ? it.notes.join(' ') : null)
+            : `Choose the bolt size: ${want.dia ? `M${want.dia}` : (it.profile ?? 'diameter not stated')}${want.length ? ` x ${want.length}` : ' — length by grip (plies + nut + 2 washers + 3 threads)'}${want.grade ? `, class ${want.grade}` : ''}.`,
+          def: boltDef, chosen: match ? { id: match.id, code: match.code, name: match.name } : null, values: [], item: it, weightKg: null, children: [],
+        });
+        mappings.push({ what: what2Of(it), asked: ['Bolt set'], to: { id: boltDef.id, code: boltDef.code, name: boltDef.name }, fallback: false, chosen: match ? match.name : null });
+        continue;
+      }
       if (BOUGHT_ROLES.has(it.role) || (it.category === 'bought' && it.role !== 'shear_stud')) {
         bought.push({ mark: it.mark ?? it.id, description: it.description, quantity: q * (place.mult ?? 1), profile: it.profile ?? null });
         continue;

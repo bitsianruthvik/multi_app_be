@@ -627,7 +627,7 @@ export async function updateStandard(db, c, id, input = {}) {
 
 /** What planImport needs to know about the tenant. 5 queries. */
 export async function importCatalog(db, companyId) {
-  const [[defs], [specs], [grades], [studs], [existing]] = await Promise.all([
+  const [[defs], [specs], [grades], [bought], [existing]] = await Promise.all([
     db.query(
       `SELECT m.id, m.code, m.name, m.short_name, m.status, m.classification_id, m.default_flow_id, d.definition_type, b.id AS bom_id, b.status AS bom_status
          FROM cf_master_records m
@@ -644,11 +644,15 @@ export async function importCatalog(db, companyId) {
     ),
     db.query(
       `SELECT m.id, m.code, m.name FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog' AND i.deleted_at IS NULL
-        WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' AND LOWER(m.name) LIKE '%stud%'`,
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' AND (LOWER(m.name) LIKE '%stud%' OR LOWER(m.name) LIKE '%bolt set m%')`,
       [companyId],
     ),
     db.query('SELECT id, number FROM cf_standard_drawings WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
   ]);
+  // The studs the Shear stud selection takes, and the bolt sets the "Bolt set" selection chooses from (bolts-load.mjs makes them) — one read.
+  const bolts = bought.filter((r) => /bolt set m/i.test(r.name));
+  const studs = bought.filter((r) => !/bolt set m/i.test(r.name));
+
   const optionMap = (code) => {
     const m = new Map();
     for (const g of grades.filter((x) => x.spec === code)) {
@@ -664,6 +668,7 @@ export async function importCatalog(db, companyId) {
     impactOption: optionMap('IMPACT_CLASS'),
     materialOption: optionMap('MATERIAL'),
     studs: studs.map((s) => ({ id: Number(s.id), code: s.code, name: s.name })),
+    bolts: bolts.map((b) => ({ id: Number(b.id), code: b.code, name: b.name })),
     standards: new Map(existing.map((s) => [String(s.number).toLowerCase(), Number(s.id)])),
   };
 }
