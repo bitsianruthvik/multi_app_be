@@ -9,7 +9,8 @@
  * What: every row of the company in every table whose name starts cf_ and has a company_id column (orders, stock,
  * buying, production, invoices, maintenance, master data, sequences — all of it), ids kept. Restore deletes the
  * company's rows in those tables and writes the saved ones back with the same ids, inside one transaction.
- * Not touched: users, roles, logins and grants (they are not cf_ tables).
+ * Not touched: users, roles, logins and grants (they are not cf_ tables), and the tables in KEEP — files a demo never
+ * changes (the standards' DXFs and the RDSO sheets' pages, ~100 MB), so a reset neither drops nor re-sends them.
  *
  * GUARDS: the company is named by SLUG and must end in "sandbox" (never a live tenant); every statement filters on that
  * company's id; restore refuses a file saved from another company.
@@ -36,7 +37,8 @@ try {
   const [tables] = await db.query(
     `SELECT TABLE_NAME t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = 'company_id'
         AND TABLE_NAME LIKE 'cf\\_%' ORDER BY TABLE_NAME`);
-  const names = tables.map((r) => r.t);
+  const KEEP = new Set(['cf_standard_drawing_files']);
+  const names = tables.map((r) => r.t).filter((t) => !KEEP.has(t));
   const [cols] = await db.query(
     `SELECT TABLE_NAME t, COLUMN_NAME c, EXTRA x FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?) ORDER BY TABLE_NAME, ORDINAL_POSITION`, [names]);
   const writable = new Map(names.map((t) => [t, []]));
@@ -68,6 +70,7 @@ try {
     await db.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const t of names) await db.query(`DELETE FROM \`${t}\` WHERE company_id = ?`, [CO]);
     for (const [t, { cols: c, rows }] of Object.entries(snap.tables)) {
+      if (KEEP.has(t)) continue;
       const live = new Set(writable.get(t) ?? []);
       const keep = c.map((x, i) => [x, i]).filter(([x]) => live.has(x));
       if (!keep.length) continue;
