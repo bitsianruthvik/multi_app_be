@@ -15,10 +15,11 @@
  * `mark` / `in` are the drawing marks of the line's rows, so the viewer can light up the level that is open.
  */
 import { notFound } from '../lib/errors.js';
+import { rowsOfLine } from './partDrawingService.js';
 
 /** GET /orders/:orderId/lines/:lineId/model3d → the model, or 404 NO_MODEL when the line's standard has none. */
 export async function lineModel3d(db, companyId, orderId, lineId) {
-  const [[line]] = await db.query('SELECT id, standard_id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(orderId), Number(lineId)]);
+  const [[line]] = await db.query('SELECT l.*, o.code AS order_code FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id WHERE l.company_id = ? AND l.order_id = ? AND l.id = ? AND l.deleted_at IS NULL', [companyId, Number(orderId), Number(lineId)]);
   if (!line) throw notFound('Order line');
   const [[f]] = line.standard_id ? await db.query(
     "SELECT id, file_name, file_text, created_at FROM cf_standard_drawing_files WHERE company_id = ? AND standard_id = ? AND kind = 'model' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
@@ -27,5 +28,12 @@ export async function lineModel3d(db, companyId, orderId, lineId) {
   if (!f) throw notFound('3D model');
   let model;
   try { model = JSON.parse(f.file_text); } catch { throw notFound('3D model'); }
-  return { fileId: Number(f.id), fileName: f.file_name, savedAt: f.created_at, model };
+  // Each mark's code on this line, without the order's prefix ("STS(1,2,3)-MTA1-JL2A") — the 3D view's Codes labels (user, 2026-11-01).
+  const codes = {};
+  for (const r of await rowsOfLine(db, companyId, line)) {
+    if (!r.markNorm || !r.code || codes[r.markNorm]) continue;
+    const pre = `${line.order_code}-`;
+    codes[r.markNorm] = r.code.startsWith(pre) ? r.code.slice(pre.length) : r.code;
+  }
+  return { fileId: Number(f.id), fileName: f.file_name, savedAt: f.created_at, model, codes };
 }

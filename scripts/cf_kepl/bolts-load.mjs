@@ -74,7 +74,14 @@ try {
                             JOIN cf_drawing_links k ON k.subject_id = l.child_id AND k.deleted_at IS NULL JOIN cf_drawings d ON d.id = k.drawing_id
                            WHERE b.company_id = ? AND b.parent_id = ? AND b.deleted_at IS NULL`, [COMPANY, r.id]);
     const pre = [...new Set(kids.map((k) => k.number).filter((n) => n.startsWith(so)).map((n) => n.slice(so.length).split('-')[0]))];
-    return pre.length === 1 && BOLTS.byAssembly[pre[0]] ? pre[0] : null;
+    if (pre.length === 1 && BOLTS.byAssembly[pre[0]]) return pre[0];
+    // …or its parts' DRAWING_MARK values (a splice set whose parts have files but no register link).
+    const vals = await q(`SELECT DISTINCT v.value_text AS mark FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL
+                            JOIN cf_spec_values v ON v.subject_id = l.child_id AND v.subject_type = 'master' AND v.deleted_at IS NULL
+                            JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'DRAWING_MARK'
+                           WHERE b.company_id = ? AND b.parent_id = ? AND b.deleted_at IS NULL`, [COMPANY, r.id]);
+    const pre2 = [...new Set(vals.map((v) => String(v.mark ?? '').split('-')[0]).filter(Boolean))];
+    return pre2.length === 1 && BOLTS.byAssembly[pre2[0]] ? pre2[0] : null;
   };
 
   // 3. One selection row per bolt group, its size chosen. A row that already has bolt rows is left (run once).

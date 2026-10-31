@@ -8258,3 +8258,29 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines'
             AND COLUMN_NAME = 'nest_free_range') = 1, 'S96-OK', 'S96-MISSING') AS result;
+
+-- ============================================================================
+-- §97  BATCHES — several units or sub-assemblies of a line in ONE production order (2026-11-01)
+-- ============================================================================
+-- User: "they can group different things in a level into a PO and it need not be every piece of that level or entire
+-- level as PO but it can break into different sizes for each PO". A plan split per unit or per sub-assembly may put
+-- pieces of that level in BATCHES — of 12 girder lines, 4 in one production order and 8 in another, rows mixed freely;
+-- a piece in no batch is its own production order, as before (executionPlanModel BATCHES, productionOrderModel).
+--   cf_order_execution_plans.groups_json  JSON [{ name, keys: [piece key, …] }] — each batch's pieces by the scope key
+--                                         each would have on its own ("L12U1A55:301/302#2", "L12U3"). The order's
+--                                         row holds the batches of the lines that follow it; a line's row its own.
+--                                         NULL = no batches.
+--   cf_production_orders.members_json     JSON [piece key, …] — a batch's production order (scope key L<line>G<k>):
+--                                         the pieces it holds; release stamps each piece by its key (assignPieces).
+-- The code reads both with SELECT p.* / po.* and writes them only when there is a batch, so it runs on a database
+-- without them. Idempotent; safe to run again.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_order_execution_plans' AND COLUMN_NAME = 'groups_json');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_order_execution_plans ADD COLUMN groups_json JSON NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_orders' AND COLUMN_NAME = 'members_json');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_orders ADD COLUMN members_json JSON NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+            AND ((TABLE_NAME = 'cf_order_execution_plans' AND COLUMN_NAME = 'groups_json')
+              OR (TABLE_NAME = 'cf_production_orders' AND COLUMN_NAME = 'members_json'))) = 2, 'S97-OK', 'S97-MISSING') AS result;

@@ -25,7 +25,7 @@ import { invalid, notFound, conflict } from '../lib/errors.js';
 import { likeOf } from '../lib/listing.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
 import { loadAll, madeOf } from './executionPlanService.js';
-import { effectivePlan, levelsOf, checkLinePlan } from './executionPlanModel.js';
+import { effectivePlan, levelsOf, checkLinePlan, lineGroupProblems } from './executionPlanModel.js';
 import { PO_STATES, PO_STATE_LABEL, assignPieces, plannedProductionOrders, stateOf } from './productionOrderModel.js';
 import { releaseLine, takeMrEarmarks, unrelease, evaluatedTracker, shapeStep } from './releaseService.js';
 import { shipLine } from './dispatchService.js';
@@ -105,6 +105,7 @@ function shape(po, figures) {
     lineIds: parseJson(po.lines_json, []),
     unitNo: po.unit_no ?? null,
     scopeKey: po.scope_key,
+    members: parseJson(po.members_json, null),
     dispatch: { level: po.dispatch_level, levelId: po.dispatch_level_id ?? null },
     status: po.status,
     state,
@@ -173,7 +174,8 @@ export async function stampLines(db, c, lineIds) {
   const [[rels], [orders]] = await Promise.all([
     db.query('SELECT id, order_id, order_line_id FROM cf_production_releases WHERE company_id = ? AND order_line_id IN (?) AND deleted_at IS NULL', [c.companyId, ids]),
     db.query(
-      `SELECT po.id, po.scope_key, po.level, po.level_id, po.lines_json FROM cf_production_orders po
+      // po.*: members_json (§97 — a batch's pieces) when the database has it.
+      `SELECT po.* FROM cf_production_orders po
         WHERE po.company_id = ? AND po.deleted_at IS NULL
           AND po.order_id IN (SELECT order_id FROM cf_sales_order_lines WHERE company_id = ? AND id IN (?))`,
       [c.companyId, c.companyId, ids],
@@ -233,7 +235,9 @@ async function planOf(db, companyId, orderId, { lock = false } = {}) {
   const shaped = made.map((l) => {
     const { plan } = effectivePlan(rows, l.id);
     problems.push(...checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shapes.get(l.id), names));
-    return { lineId: l.id, lineNo: l.line_no, quantity: Number(l.quantity), itemName: l.item_name ?? l.item_code ?? null, plan, shape: shapes.get(l.id), tree: trees.get(l.id) ?? null };
+    const x = { lineId: l.id, lineNo: l.line_no, quantity: Number(l.quantity), itemName: l.item_name ?? l.item_code ?? null, plan, shape: shapes.get(l.id), tree: trees.get(l.id) ?? null };
+    problems.push(...lineGroupProblems(x, defOf));
+    return x;
   });
   const planned = plannedProductionOrders(order.code, shaped, defOf);
   let why = null;
@@ -269,15 +273,18 @@ export async function createProductionOrders(db, c, orderId, input = {}) {
   // A line released the old way joins its production orders at once: they start Planned.
   const releasedLines = new Set(p.lines.filter((l) => Number(l.releases) > 0).map((l) => Number(l.id)));
   let seq = existing.reduce((m, e) => Math.max(m, Number(e.seq)), 0);
+  // members_json (§97): a batch's pieces — written only when the plan has a batch, so an older database still works.
+  const withMembers = toMake.some((x) => x.members?.length);
   const rows = toMake.map((x) => {
     seq += 1;
     const legacy = x.lineIds.some((id) => releasedLines.has(id));
     return [c.companyId, p.order.id, seq, `${p.order.code}-P${pad2(seq)}`, x.label.slice(0, 400), x.level, x.levelId, x.lineId, x.unitNo, x.scopeKey.slice(0, 400),
-      JSON.stringify(x.lineIds), x.dispatchLevel, x.dispatchLevelId, legacy ? 'planned' : 'yet_to_plan', legacy ? new Date() : null, legacy ? c.userId ?? null : null, c.userId ?? null];
+      JSON.stringify(x.lineIds), x.dispatchLevel, x.dispatchLevelId, legacy ? 'planned' : 'yet_to_plan', legacy ? new Date() : null, legacy ? c.userId ?? null : null, c.userId ?? null,
+      ...(withMembers ? [x.members?.length ? JSON.stringify(x.members) : null] : [])];
   });
   await db.query(
     `INSERT INTO cf_production_orders (company_id, order_id, seq, code, label, level, level_id, order_line_id, unit_no, scope_key,
-       lines_json, dispatch_level, dispatch_level_id, status, released_at, released_by, created_by) VALUES ?`,
+       lines_json, dispatch_level, dispatch_level_id, status, released_at, released_by, created_by${withMembers ? ', members_json' : ''}) VALUES ?`,
     [rows],
   );
   const touched = [...new Set(toMake.flatMap((x) => x.lineIds))].filter((id) => releasedLines.has(id));
