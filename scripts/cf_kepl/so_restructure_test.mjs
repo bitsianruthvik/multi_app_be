@@ -189,7 +189,7 @@ try {
   /* ------------------------------------------------------------------------ */
   section('3. The execution plan');
   let plan = await EP.getExecutionPlan(conn, COMPANY, order.id);
-  eq('nothing saved: the default is one production order per line, dispatched the same way', [plan.saved, plan.plan], [null, { production: { level: 'line', levelId: null }, dispatch: { level: 'same', levelId: null } }]);
+  eq('nothing saved: the default is one production order per line, dispatched the same way', [plan.saved, plan.plan], [null, { production: { level: 'line', levelId: null }, dispatch: { level: 'same', levelId: null }, groups: [] }]);
   ok('editable, with the note that the Production step makes the production orders (§76)', plan.editable === true && /makes the production orders from this plan/.test(plan.note));
   eq('the stock item makes nothing: no production order for it', plan.lines.map((l) => [l.lineNo, l.made, l.productionCount]), [[1, true, 1], [2, true, 1], [3, false, 0]]);
   eq('preview: 2 production orders, one per span line', [plan.preview.production.count, plan.preview.production.items], [2, [`${RUN} · Line 1 · Bridge span ×3`, `${RUN} · Line 2 · Bridge span ×1`]]);
@@ -241,7 +241,7 @@ try {
   d = await tryPlan({ production: { level: 'assembly', levelId: GL }, dispatch: { level: 'assembly', levelId: GS } });
   ok('a Girder segment inside a per-Girder-line production order is fine', d.problems.length === 0, JSON.stringify(d.problems));
   d = await tryPlan({ production: { level: 'assembly' } });
-  ok('per sub-assembly needs its BOM level', d.problems.some((p) => /choose the BOM level/i.test(p)));
+  ok('per sub-assembly needs its level', d.problems.some((p) => /choose what to split it by/i.test(p)));
   const notJson = await refusal(() => EP.saveExecutionPlan(conn, c, order.id, { production: { level: 'girders' } }));
   ok('an unknown level is refused, the choices named', said(notJson, /choose one of order, line, unit, assembly/));
 

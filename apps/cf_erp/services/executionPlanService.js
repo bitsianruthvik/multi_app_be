@@ -7,6 +7,10 @@
  *   PUT /orders/:id/execution-plan  { production?: { level, levelId? }, dispatch?: { level, levelId? },
  *                                     lines?: [{ lineId, own: null | { production, dispatch } }], dryRun? }
  *       own: null = the line follows the order's choice; a plan = the line's own. Lines not listed keep theirs.
+ *       groups? (top level, and in a line's own plan): BATCHES (§97, 2026-11-01) — [{ name?, keys: [piece key, …] }],
+ *       each one production order of those pieces of the split level (a line's `pieces` in the answer). The top-level
+ *       list holds the batches of every line that follows the order; a batch keeps to one line. Not sent = kept,
+ *       unless the level changes (then none). The answer's lines carry `pieces`, `piecesTotal` and `groups`.
  *       dryRun: nothing is written, and problems come back in the answer instead of a refusal — the screen's
  *       live preview.
  *
@@ -27,10 +31,14 @@ import { invalid, notFound, conflict } from '../lib/errors.js';
 import { explode } from './bomService.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
 import {
-  DEFAULT_PLAN, DISPATCH_LEVELS, PRODUCTION_LEVELS, PREVIEW_LIMIT,
-  checkLinePlan, choicesOf, effectivePlan, levelsOf, nothingToChoose, planSummary, planWords, previewOrder, samePlan,
-  sharedLevels, templatesFor,
+  DEFAULT_PLAN, DISPATCH_LEVELS, MAX_GROUPS, MAX_GROUP_KEYS, PRODUCTION_LEVELS, PREVIEW_LIMIT, SPLIT_LEVELS,
+  checkGroups, checkLinePlan, choicesOf, effectivePlan, keyLineId, levelsOf, lineGroupProblems, nothingToChoose, planForLine,
+  planSummary, planWords, previewOrder, sameChoice, samePlan, sharedLevels, templatesFor,
 } from './executionPlanModel.js';
+import { levelPieces } from './productionOrderModel.js';
+
+/** At most this many pieces a line are sent to the screen for its batches (a bigger line still saves and checks). */
+export const PIECES_LIMIT = 3000;
 
 /** The table is §72: a database without it answers "no plan saved" rather than failing the order page. */
 export const planTableMissing = (e) => e?.code === 'ER_NO_SUCH_TABLE' || e?.errno === 1146;
@@ -40,8 +48,8 @@ export async function planRowsOf(db, companyId, orderIds) {
   if (!orderIds.length) return [];
   try {
     const [rows] = await db.query(
-      `SELECT p.id, p.order_id, p.order_line_id, p.production_level, p.production_level_id, p.dispatch_level, p.dispatch_level_id,
-              p.saved_at, p.saved_by, u.name AS saved_by_name
+      // p.*: groups_json (§97, batches) when the database has it — an older one reads without batches.
+      `SELECT p.*, u.name AS saved_by_name
          FROM cf_order_execution_plans p
          LEFT JOIN users u ON u.id = p.saved_by
         WHERE p.company_id = ? AND p.order_id IN (?) AND p.deleted_at IS NULL`,
@@ -147,7 +155,10 @@ export function linePlanStates(rows, lines, trees, defOf, { isMade = () => true 
       saved: source !== 'default',
       source,
       plan,
-      problems: checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shape, names),
+      problems: [
+        ...checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shape, names),
+        ...lineGroupProblems({ lineId: l.id, lineNo: l.line_no, quantity: Number(l.quantity), itemName: l.item_name ?? null, plan, shape, tree: trees.get(l.id) ?? null }, defOf),
+      ],
       words: planWords(plan, { levels: [...names].map(([id, name]) => ({ id, name })) }),
       frozen: !!l.locked_at,
       nothingToChoose: nothing,
@@ -196,17 +207,22 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
   for (const s of shapes.values()) for (const lv of s?.levels ?? []) names.set(lv.id, lv.name);
   const allLevels = { levels: [...names].map(([id, name]) => ({ id, name })) };
   const orderRow = rows.find((r) => r.order_line_id == null) ?? null;
-  const orderPlan = orderRow ? effectivePlan([orderRow], -1).plan : { production: { ...DEFAULT_PLAN.production }, dispatch: { ...DEFAULT_PLAN.dispatch } };
+  const orderPlan = orderRow ? effectivePlan([orderRow], -1).plan : { production: { ...DEFAULT_PLAN.production }, dispatch: { ...DEFAULT_PLAN.dispatch }, groups: [] };
   const stopped = LOCKED_ORDER_STATUSES.has(order.status);
   const shaped = lines.map((l) => {
     const { plan, source } = effectivePlan(rows, l.id);
     const shape = shapes.get(l.id);
-    return {
+    const base = {
       lineId: l.id, lineNo: l.line_no, lineType: l.line_type, quantity: Number(l.quantity),
       itemName: l.item_name ?? l.item_code ?? null, item: l.item_id ? { id: l.item_id, code: l.item_code ?? null, name: l.item_name ?? null } : null,
       plan, source, shape, tree: trees.get(l.id) ?? null, frozen: frozenOf(l), released: Number(l.releases) > 0, made: madeOf(order, l),
-      problems: madeOf(order, l) ? checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shape, names) : [],
     };
+    // The pieces of the split level (each unit, or each sub-assembly) — what the screen's batches are made of.
+    const pieces = base.made ? levelPieces(base, defOf) : [];
+    const problems = base.made
+      ? [...checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shape, names), ...checkGroups(base, plan, pieces)]
+      : [];
+    return { ...base, pieces, problems };
   });
   const madeLines = shaped.filter((l) => l.made);
   const preview = previewOrder(order.code, madeLines, defOf);
@@ -252,6 +268,10 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
       rows: l.shape?.rows ?? 0,
       productionCount: preview.perLine.get(l.lineId)?.production ?? 0,
       dispatchCount: preview.perLine.get(l.lineId)?.dispatch ?? null,
+      // Batches (§97): the line's pieces at its split level, in tree order ({ key, label, unitNo }), and its batches.
+      pieces: l.pieces.slice(0, PIECES_LIMIT),
+      piecesTotal: l.pieces.length,
+      groups: l.plan.groups ?? [],
       problems: l.problems,
       // The line's selects, labelled like the bars (null for a line from stock).
       options: choices.perLine.get(l.lineId) ?? null,
@@ -279,16 +299,46 @@ function readChoice(raw, levels, what, problems) {
   let levelId = null;
   if (level === 'assembly') {
     const id = Number(raw?.levelId);
-    if (!Number.isInteger(id) || id <= 0) { problems.push(`${what}: choose the BOM level.`); return undefined; }
+    if (!Number.isInteger(id) || id <= 0) { problems.push(`${what}: choose what to split it by.`); return undefined; }
     levelId = id;
   }
   return { level, levelId };
 }
 
-/** A virtual stored row (the shape effectivePlan reads). */
+/**
+ * Batches from the body (§97): [{ name?, keys: [scope key, …] }] → [{ name, keys }]; problems said once each.
+ * lineOf(key) → the line's number for a key of a line of this order, else null. onlyLine: the line every key must be
+ * of (a line's own plan); otherwise each batch must keep to one line. Whether the keys are real pieces of the line's
+ * split level is checked with the view (checkGroups).
+ */
+function readGroups(raw, what, problems, { lineOf, onlyLine = null }) {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) { problems.push(`${what}: batches must be a list.`); return []; }
+  if (raw.length > MAX_GROUPS) { problems.push(`${what}: at most ${MAX_GROUPS} batches.`); return []; }
+  const out = [];
+  let total = 0;
+  raw.forEach((g, i) => {
+    const name = typeof g?.name === 'string' && g.name.trim() ? g.name.trim().slice(0, 80) : null;
+    const label = name ?? `Batch ${i + 1}`;
+    const keys = Array.isArray(g?.keys) ? [...new Set(g.keys.map((k) => String(k ?? '').trim()).filter(Boolean))] : null;
+    if (!keys) { problems.push(`${what}: ${label} must list its pieces.`); return; }
+    if (!keys.length) { problems.push(`${what}: ${label} is empty — put pieces in it or remove it.`); return; }
+    total += keys.length;
+    const lineIds = new Set(keys.map(keyLineId));
+    if ([...lineIds].some((id) => id == null || lineOf(id) == null)) { problems.push(`${what}: ${label} names a piece that is not on this order.`); return; }
+    if (onlyLine != null && [...lineIds].some((id) => id !== Number(onlyLine))) { problems.push(`${what}: ${label} holds pieces of another line.`); return; }
+    if (lineIds.size > 1) { problems.push(`${what}: ${label} mixes lines ${[...lineIds].map(lineOf).join(' and ')} — a batch holds pieces of one line.`); return; }
+    out.push({ name, keys });
+  });
+  if (total > MAX_GROUP_KEYS) { problems.push(`${what}: too many pieces in batches (${total}; at most ${MAX_GROUP_KEYS}).`); return []; }
+  return out;
+}
+
+/** A virtual stored row (the shape effectivePlan reads). Batches only on a split level. */
 const rowOf = (lineId, plan) => ({
   order_line_id: lineId, production_level: plan.production.level, production_level_id: plan.production.levelId,
   dispatch_level: plan.dispatch.level, dispatch_level_id: plan.dispatch.levelId,
+  groups_json: SPLIT_LEVELS.has(plan.production.level) && (plan.groups ?? []).length ? JSON.stringify(plan.groups) : null,
 });
 
 export async function saveExecutionPlan(db, c, orderId, input = {}) {
@@ -304,13 +354,22 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
 
   // The order's own choice: what was sent, over what is stored, over the house default.
   const cur = rows.find((r) => r.order_line_id == null);
-  const curOrder = cur ? effectivePlan([cur], -1).plan : { production: { ...DEFAULT_PLAN.production }, dispatch: { ...DEFAULT_PLAN.dispatch } };
+  const curOrder = cur ? effectivePlan([cur], -1).plan : { production: { ...DEFAULT_PLAN.production }, dispatch: { ...DEFAULT_PLAN.dispatch }, groups: [] };
   const prod = readChoice(input.production, PRODUCTION_LEVELS, 'Production orders', problems);
   const disp = readChoice(input.dispatch, DISPATCH_LEVELS, 'Dispatch', problems);
-  const nextOrder = { production: prod ?? curOrder.production, dispatch: disp ?? curOrder.dispatch };
+  const byId = new Map(lines.map((l) => [Number(l.id), l]));
+  const lineOf = (id) => byId.get(Number(id))?.line_no ?? null;
+  // Batches (§97): what was sent, else the stored ones — unless the level changed (then they no longer fit: none).
+  const groupsNext = (sent, stored, changed, what, onlyLine) => (sent !== undefined
+    ? readGroups(sent, what, problems, { lineOf, onlyLine }) : changed ? [] : stored ?? []);
+  const nextProd = prod ?? curOrder.production;
+  const nextOrder = {
+    production: nextProd,
+    dispatch: disp ?? curOrder.dispatch,
+    groups: SPLIT_LEVELS.has(nextProd.level) ? groupsNext(input.groups, curOrder.groups, !sameChoice(nextProd, curOrder.production), 'Batches', null) : [],
+  };
 
   // The lines' own plans: the stored ones, with what was sent on top.
-  const byId = new Map(lines.map((l) => [Number(l.id), l]));
   const own = new Map(rows.filter((r) => r.order_line_id != null).map((r) => [Number(r.order_line_id), effectivePlan([r], r.order_line_id).plan]));
   const asked = new Set();
   for (const x of Array.isArray(input.lines) ? input.lines : []) {
@@ -322,7 +381,12 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
     const at = `Line ${line.line_no}`;
     const p = readChoice(x.own.production ?? DEFAULT_PLAN.production, PRODUCTION_LEVELS, `${at}, production orders`, problems);
     const d = readChoice(x.own.dispatch ?? DEFAULT_PLAN.dispatch, DISPATCH_LEVELS, `${at}, dispatch`, problems);
-    if (p && d) own.set(lineId, { production: p, dispatch: d });
+    if (p && d) {
+      const before = own.get(lineId);
+      const groups = SPLIT_LEVELS.has(p.level)
+        ? groupsNext(x.own.groups, before?.groups, !before || !sameChoice(p, before.production), `${at}, batches`, lineId) : [];
+      own.set(lineId, { production: p, dispatch: d, groups });
+    }
   }
 
   // Frozen lines never move: one the person changed is refused; one that only followed the order is pinned.
@@ -341,8 +405,10 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
   // A line's own plan that equals the order's is not worth a row of its own (unless it is frozen and pinned).
   for (const [id, plan] of own) {
     const l = byId.get(id);
-    if (samePlan(plan, nextOrder) && !frozenOf(l)) own.delete(id);
+    if (samePlan(plan, planForLine(nextOrder, id)) && !frozenOf(l)) own.delete(id);
   }
+  // The order's row keeps only the batches of lines that follow it (a line of its own holds its own).
+  nextOrder.groups = nextOrder.groups.filter((g) => !own.has(keyLineId(g.keys[0])));
 
   const nextRows = nextRowsOf();
   const view = buildView({ ...loaded, rows: nextRows.map((r) => ({ ...r, saved_at: new Date(), saved_by: c.userId ?? null })) }, { dryRun, problems, savedRows: rows });
@@ -367,11 +433,14 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
     await db.query('UPDATE cf_order_execution_plans SET deleted_at = NOW() WHERE company_id = ? AND id IN (?) AND deleted_at IS NULL', [c.companyId, gone]);
   }
   if (write.length) {
+    // groups_json (§97) only when a row has batches, so a database without the column still saves a plain plan.
+    const withGroups = write.some((w) => w.groups_json != null);
     await db.query(
       `INSERT INTO cf_order_execution_plans
-         (company_id, order_id, order_line_id, production_level, production_level_id, dispatch_level, dispatch_level_id, saved_by, saved_at)
-       VALUES ${write.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, NOW())').join(', ')}`,
-      write.flatMap((w) => [c.companyId, order.id, w.order_line_id, w.production_level, w.production_level_id, w.dispatch_level, w.dispatch_level_id, c.userId ?? null]),
+         (company_id, order_id, order_line_id, production_level, production_level_id, dispatch_level, dispatch_level_id,${withGroups ? ' groups_json,' : ''} saved_by, saved_at)
+       VALUES ${write.map(() => `(?, ?, ?, ?, ?, ?, ?,${withGroups ? ' ?,' : ''} ?, NOW())`).join(', ')}`,
+      write.flatMap((w) => [c.companyId, order.id, w.order_line_id, w.production_level, w.production_level_id, w.dispatch_level, w.dispatch_level_id,
+        ...(withGroups ? [w.groups_json] : []), c.userId ?? null]),
     );
   }
   return getExecutionPlan(db, c.companyId, order.id);

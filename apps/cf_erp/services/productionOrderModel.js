@@ -9,6 +9,9 @@
  *   L<line>U<u>                         unit u of a line (each span of a line of 3)
  *   L<line>U<u>A<level>:<path>#<n>      the n-th sub-assembly of that BOM level with that BOM path in unit u
  *   L<line>U<u>R                        the rest of unit u and its final assembly
+ *   L<line>G<k>                         the k-th BATCH of the line (§97): several units or sub-assemblies in one
+ *                                       production order; its members (cf_production_orders.members_json) are the
+ *                                       scope keys those pieces would have on their own
  * <path> is the chain of BOM line ids from the unit down to the sub-assembly's row — the same on the BOM tree (when
  * the orders are made) and on the tracker (when its pieces are stamped), so the two always meet.
  *
@@ -73,9 +76,115 @@ export function instancesOf(tree, defOf, levelId) {
 }
 
 /**
+ * The level a line is really made at: per unit / per sub-assembly fall back to one per line for a line with no rows
+ * under its item, a quantity that is not whole, or a sub-assembly level the line does not have.
+ */
+function madeLevel(l) {
+  const P = l.plan.production;
+  const qty = Number(l.quantity);
+  const hasRows = (l.tree?.root?.children?.length ?? 0) > 0;
+  let level = P.level;
+  if ((level === 'unit' || level === 'assembly') && (!hasRows || !isWhole(qty))) level = 'line';
+  if (level === 'assembly' && !(l.shape?.levels ?? []).some((x) => Number(x.id) === Number(P.levelId))) level = 'line';
+  return level;
+}
+
+/**
+ * BATCHES (user, 2026-11-01: "they can group different things in a level into a PO … it can break into different
+ * sizes for each PO"). The PIECES of a line at its split level, in tree order: each unit (per unit), or each
+ * sub-assembly of the level in each unit (per sub-assembly). `key` is the production order the piece would be on its
+ * own — its scope key; a batch (plan.groups: [{ name, keys }]) puts several pieces in ONE production order.
+ * → [{ key, label, unitNo }] — empty when the line is not split (or falls back to one per line).
+ */
+export function levelPieces(l, defOf) {
+  const level = madeLevel(l);
+  if (level !== 'unit' && level !== 'assembly') return [];
+  const units = Math.max(1, Math.round(Number(l.quantity) || 1));
+  const unitName = l.itemName ?? 'Unit';
+  const out = [];
+  if (level === 'unit') {
+    for (let u = 1; u <= units; u += 1) out.push({ key: `L${l.lineId}U${u}`, label: `${unitName} ${u}`, unitNo: u });
+    return out;
+  }
+  const levelId = Number(l.plan.production.levelId);
+  const inst = instancesOf(l.tree, defOf, levelId);
+  for (let u = 1; u <= units; u += 1) {
+    for (const x of inst) {
+      out.push({ key: `L${l.lineId}U${u}A${levelId}:${x.path}#${x.n}`, label: units > 1 ? `${unitName} ${u} · ${x.label}` : x.label, unitNo: u });
+    }
+  }
+  return out;
+}
+
+/** "Batch 2: G1, G2 (+3 more)" — a batch's production order, named by its first pieces. */
+function groupLabel(name, k, labels) {
+  const shown = labels.slice(0, 2).join(', ');
+  const more = labels.length - 2;
+  return `${name || `Batch ${k}`}: ${shown}${more > 0 ? ` (+${more} more)` : ''}`;
+}
+
+/**
+ * One line's production orders (not the 'order' level — the order makes that one). manyLines: the order has more
+ * than one line that makes something (then labels name the line).
+ */
+export function lineProductionOrders(orderCode, manyLines, l, defOf) {
+  const out = [];
+  const P = l.plan.production;
+  const D = l.plan.dispatch;
+  const head = manyLines ? `${orderCode} · Line ${l.lineNo}` : orderCode;
+  const qty = Number(l.quantity);
+  const units = Math.max(1, Math.round(qty || 1));
+  const unitName = l.itemName ?? 'Unit';
+  const base = { lineId: Number(l.lineId), lineIds: [Number(l.lineId)], dispatchLevel: D.level, dispatchLevelId: D.levelId ?? null, members: null };
+  const level = madeLevel(l);
+  if (level === 'line') {
+    out.push({ ...base, scopeKey: `L${l.lineId}`, level: 'line', levelId: null, unitNo: null, label: `${head} · ${unitName} ×${qty}` });
+    return out;
+  }
+  const unitLabel = (u) => `${head} · ${unitName} ${u} of ${units}`;
+  if (level === 'unit') {
+    for (let u = 1; u <= units; u += 1) out.push({ ...base, scopeKey: `L${l.lineId}U${u}`, level: 'unit', levelId: null, unitNo: u, label: unitLabel(u) });
+  } else {
+    const inst = instancesOf(l.tree, defOf, P.levelId);
+    const rest = !!(l.shape?.outside?.get(P.levelId) || l.shape?.hasRootFlow);
+    for (let u = 1; u <= units; u += 1) {
+      for (const x of inst) {
+        out.push({ ...base, scopeKey: `L${l.lineId}U${u}A${P.levelId}:${x.path}#${x.n}`, level: 'assembly', levelId: Number(P.levelId), unitNo: u, label: `${unitLabel(u)} · ${x.label}` });
+      }
+      if (rest || !inst.length) out.push({ ...base, scopeKey: `L${l.lineId}U${u}R`, level: 'assembly', levelId: Number(P.levelId), unitNo: u, label: `${unitLabel(u)} · the rest and final assembly` });
+    }
+  }
+  // Batches: each becomes ONE production order, where its first piece stood; a piece in no batch stays on its own.
+  const groups = (l.plan.groups ?? []).filter((g) => (g?.keys ?? []).length);
+  if (!groups.length) return out;
+  const groupOf = new Map();
+  groups.forEach((g, i) => { for (const k of g.keys) if (!groupOf.has(k)) groupOf.set(k, i); });
+  const pieceLabel = new Map(levelPieces(l, defOf).map((p) => [p.key, p.label]));
+  const members = groups.map(() => []);
+  for (const x of out) { const gi = groupOf.get(x.scopeKey); if (gi != null) members[gi].push(x); }
+  const done = new Set();
+  const merged = [];
+  for (const x of out) {
+    const gi = groupOf.get(x.scopeKey);
+    if (gi == null) { merged.push(x); continue; }
+    if (done.has(gi)) continue;
+    done.add(gi);
+    const m = members[gi];
+    const unitNos = new Set(m.map((y) => y.unitNo));
+    merged.push({
+      ...base, scopeKey: `L${l.lineId}G${gi + 1}`, level: x.level, levelId: x.levelId, unitNo: unitNos.size === 1 ? m[0].unitNo : null,
+      label: `${head} · ${groupLabel(groups[gi].name, gi + 1, m.map((y) => pieceLabel.get(y.scopeKey) ?? y.scopeKey))}`,
+      members: m.map((y) => y.scopeKey),
+    });
+  }
+  return merged;
+}
+
+/**
  * Every production order the plan asks for, in order.
  * lines: [{ lineId, lineNo, quantity, itemName, plan, shape, tree }] — the lines that MAKE something, in order.
- * → [{ scopeKey, level, levelId, lineId, unitNo, lineIds, label, dispatchLevel, dispatchLevelId }]
+ * → [{ scopeKey, level, levelId, lineId, unitNo, lineIds, label, dispatchLevel, dispatchLevelId, members }]
+ *   members: a batch's pieces (their own scope keys), else null.
  * A line whose item has no rows under it is made whole: per unit / per sub-assembly fall back to one per line.
  */
 export function plannedProductionOrders(orderCode, lines, defOf) {
@@ -87,41 +196,22 @@ export function plannedProductionOrders(orderCode, lines, defOf) {
     out.push({
       scopeKey: 'O', level: 'order', levelId: null, lineId: null, unitNo: null, lineIds: together.map((l) => Number(l.lineId)),
       label: lines.length === together.length ? `${orderCode} · whole order` : `${orderCode} · ${together.length === 1 ? 'line' : 'lines'} ${together.map((l) => l.lineNo).join(', ')} together`,
-      dispatchLevel: d.level, dispatchLevelId: d.levelId ?? null,
+      dispatchLevel: d.level, dispatchLevelId: d.levelId ?? null, members: null,
     });
   }
   for (const l of lines) {
-    const P = l.plan.production;
-    if (P.level === 'order') continue;
-    const D = l.plan.dispatch;
-    const head = manyLines ? `${orderCode} · Line ${l.lineNo}` : orderCode;
-    const qty = Number(l.quantity);
-    const units = Math.max(1, Math.round(qty || 1));
-    const unitName = l.itemName ?? 'Unit';
-    const hasRows = (l.tree?.root?.children?.length ?? 0) > 0;
-    const base = { lineId: Number(l.lineId), lineIds: [Number(l.lineId)], dispatchLevel: D.level, dispatchLevelId: D.levelId ?? null };
-    let level = P.level;
-    if ((level === 'unit' || level === 'assembly') && (!hasRows || !isWhole(qty))) level = 'line';
-    if (level === 'assembly' && !(l.shape?.levels ?? []).some((x) => Number(x.id) === Number(P.levelId))) level = 'line';
-    if (level === 'line') {
-      out.push({ ...base, scopeKey: `L${l.lineId}`, level: 'line', levelId: null, unitNo: null, label: `${head} · ${unitName} ×${qty}` });
-      continue;
-    }
-    const unitLabel = (u) => `${head} · ${unitName} ${u} of ${units}`;
-    if (level === 'unit') {
-      for (let u = 1; u <= units; u += 1) out.push({ ...base, scopeKey: `L${l.lineId}U${u}`, level: 'unit', levelId: null, unitNo: u, label: unitLabel(u) });
-      continue;
-    }
-    const inst = instancesOf(l.tree, defOf, P.levelId);
-    const rest = !!(l.shape?.outside?.get(P.levelId) || l.shape?.hasRootFlow);
-    for (let u = 1; u <= units; u += 1) {
-      for (const x of inst) {
-        out.push({ ...base, scopeKey: `L${l.lineId}U${u}A${P.levelId}:${x.path}#${x.n}`, level: 'assembly', levelId: Number(P.levelId), unitNo: u, label: `${unitLabel(u)} · ${x.label}` });
-      }
-      if (rest || !inst.length) out.push({ ...base, scopeKey: `L${l.lineId}U${u}R`, level: 'assembly', levelId: Number(P.levelId), unitNo: u, label: `${unitLabel(u)} · the rest and final assembly` });
-    }
+    if (l.plan.production.level === 'order') continue;
+    out.push(...lineProductionOrders(orderCode, manyLines, l, defOf));
   }
   return out;
+}
+
+/** A production order's batch members (a stored row's members_json, or a planned one's members) as a list. */
+function membersOf(o) {
+  const v = o.members ?? o.members_json ?? null;
+  if (v == null) return [];
+  if (Array.isArray(v)) return v;
+  try { const a = JSON.parse(v); return Array.isArray(a) ? a : []; } catch { return []; }
 }
 
 /**
@@ -144,19 +234,26 @@ export function assignPieces(lineId, items, orders, defOf) {
     if (!kids.has(k)) kids.set(k, []);
     kids.get(k).push(it);
   }
-  const firstOf = [...orders].sort((a, b) => a.id - b.id)[0];
+  const byId = [...orders].sort((a, b) => a.id - b.id);
+  const firstOf = byId[0];
+  // A batch's production order holds its pieces by their own scope keys: the piece's key is worked out as always,
+  // then looked up among the members.
+  const memberOf = new Map();
+  for (const o of orders) for (const k of membersOf(o)) if (!memberOf.has(k)) memberOf.set(k, o);
+  const find = (key) => byKey.get(key) ?? memberOf.get(key) ?? null;
   const roots = kids.get(0) ?? [];
   roots.forEach((root, i) => {
     const u = root.piece_no == null && Number(root.quantity) > 1 ? 1 : i + 1;
-    const unitPo = byKey.get(`L${lineId}U${u}`);
+    const unitPo = find(`L${lineId}U${u}`);
     if (unitPo) {
       const all = (x) => { out.set(x.id, unitPo.id); for (const k of kids.get(x.id) ?? []) all(k); };
       all(root);
       return;
     }
     // Per sub-assembly: the topmost piece of the level opens an instance; everything else is the unit's rest.
+    const inUnit = (k) => String(k).startsWith(`L${lineId}U${u}A`);
     const rest = byKey.get(`L${lineId}U${u}R`)
-      ?? orders.find((o) => String(o.scope_key).startsWith(`L${lineId}U${u}A`))
+      ?? byId.find((o) => inUnit(o.scope_key) || membersOf(o).some(inUnit))
       ?? firstOf;
     const count = new Map();
     const walk = (x, path, inside) => {
@@ -170,7 +267,7 @@ export function assignPieces(lineId, items, orders, defOf) {
           const n = (count.get(key) ?? 0) + 1;
           const many = x.piece_no == null ? Math.max(1, Math.round(Number(x.quantity) || 1)) : 1;
           count.set(key, n + many - 1);
-          mine = byKey.get(`L${lineId}U${u}A${lvl.level_id}:${key}#${n}`)?.id ?? rest.id;
+          mine = find(`L${lineId}U${u}A${lvl.level_id}:${key}#${n}`)?.id ?? rest.id;
         }
       }
       out.set(x.id, mine ?? rest.id);
