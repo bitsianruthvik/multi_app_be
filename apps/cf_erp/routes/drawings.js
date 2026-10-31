@@ -34,10 +34,15 @@ import {
   reviseDrawing, deleteDrawing, linkDrawing, removeLink, drawingCoverage, drawingsForRecord,
 } from '../services/drawingService.js';
 import { registerFile } from '../services/partDrawingService.js';
+import { lineModel3d } from '../services/model3dService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
+
+// THE 3D MODEL kept with an order line's standard drawing (view permission) — the drawing tool's 3D view (model3dService).
+router.get('/orders/:orderId/lines/:lineId/model3d', guard(PERM.ordersView),
+  handle((req) => lineModel3d(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'))));
 const company = (req) => ctx(req).companyId;
 const view = guard(PERM.view);
 const manage = guard(PERM.catalog);

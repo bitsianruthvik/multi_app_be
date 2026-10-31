@@ -202,7 +202,7 @@ async function filesOf(db, companyId, standardId, versionId) {
   const [rows] = await db.query(
     `SELECT id, version_id, kind, drawing_id, mark, mark_norm, file_name, file_kind, length_mm, width_mm, area_mm2, holes, created_at
        FROM cf_standard_drawing_files
-      WHERE company_id = ? AND standard_id = ? AND deleted_at IS NULL AND (version_id IS NULL OR version_id = ?)
+      WHERE company_id = ? AND standard_id = ? AND deleted_at IS NULL AND (version_id IS NULL OR version_id = ?) AND kind <> 'model'
       ORDER BY kind DESC, mark, id`,
     [companyId, Number(standardId), versionId == null ? 0 : Number(versionId)],
   );
