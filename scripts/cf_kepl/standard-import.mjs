@@ -15,6 +15,7 @@
  *                               order's on these sets); without it they are left to choose. Values the drawing settles
  *                               (segment lengths, girder type, segment holes / drilled thickness, assembly surface)
  *                               and flows by usage are filled either way (lib/standardGaps.js, 2026-10-18).
+ *        [--no-gap-fill]        skip the gap fill (a set that carries its own values)
  *        [--json]               the report as JSON
  *        [--prod]               the production database: DB_* from TM/.env.tidb (the same way the other cf_kepl scripts reach it)
  *
@@ -82,7 +83,9 @@ try {
   // The setup step (options the standards need, the BO label) — in this same transaction when applying.
   const setup = await STD.importSetup(conn, c, { apply: APPLY });
   const out = await STD.importStandard(conn, c, { bom, files, apply: APPLY, sourceUrl: arg('source-url') });
-  if (APPLY && out.standardId) {
+  // --no-gap-fill: a set that carries every value itself skips the fill (on TiDB a write in it went through another
+  // connection and waited on this transaction's own locks — 50 s a time — 2026-10-31).
+  if (APPLY && out.standardId && !process.argv.includes('--no-gap-fill')) {
     const { fillImportedGaps } = await imp('apps/cf_erp/services/standardGapFixService.js');
     try { out.report.gapFill = await fillImportedGaps(conn, c, { standardId: out.standardId, bom, sectionClass: arg('section-class') ? String(arg('section-class')).toUpperCase() : null }); } catch (e) { out.report.gapFill = { error: e.message }; }
   }

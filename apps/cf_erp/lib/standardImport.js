@@ -101,6 +101,22 @@ export function partCandidates(item, place = {}) {
     case 'jacking_bracket':
       if (/BRACKET\s+PLATE/.test(desc)) return ['Bracket plate', 'Jacking bracket plate'];
       return [plainName(item?.description ?? 'Jacking bracket part')];
+    // Truss parts (2026-10-31, the 75 m Thane truss): the catalog's girder splice names, and short generic names.
+    case 'web_splice': return ['Web splice'];
+    case 'top_outer_splice': return ['Top outer splice'];
+    case 'top_inner_splice': return ['Top inner splice'];
+    case 'bottom_outer_splice': return ['Bottom outer splice'];
+    case 'bottom_inner_splice': return ['Bottom inner splice'];
+    case 'flange_cover_plate': return ['Flange cover plate'];
+    case 'connection_plate': return ['Connection plate'];
+    case 'spade_plate': return ['Spade plate'];
+    case 'access_hole_cover_plate': return ['Access hole cover plate'];
+    case 'jacking_plate': return ['Jacking plate'];
+    case 'diaphragm_plate': return ['Diaphragm plate'];
+    case 'bracket_plate': return ['Bracket plate'];
+    case 'stiffener_plate': return ['Stiffener plate'];
+    case 'bottom_lateral_bracing_member': return ['Bottom lateral bracing member'];
+    case 'top_lateral_bracing_member': return ['Top lateral bracing member'];
     case 'pad_plate': return ['Pad plate'];
     case 'packing_plate': return ['Packing plate'];
     case 'shear_stud': return ['Shear stud'];
@@ -140,7 +156,8 @@ export function nodeCandidates(node, items = null) {
   const setOf = () => (items && kids.length === 1 && kids[0].item != null && items.get(kids[0].item) ? `${partCandidates(items.get(kids[0].item))[0]} set` : null);
   switch (node?.kind) {
     // A launching / lifting tackle is not a bridge span: it gets its own name.
-    case 'span': return /LAUNCH|TACKLE|LIFTING\s+ARRANGEMENT/.test(name) ? [plainName(nodeTitle(name))] : ['Bridge span'];
+    // A truss span is its own kind of span (user, 2026-10-31: a 75 m through truss), never the girder span.
+    case 'span': return /LAUNCH|TACKLE|LIFTING\s+ARRANGEMENT/.test(name) ? [plainName(nodeTitle(name))] : /\bTRUSS\b/.test(name) ? ['Steel truss span'] : ['Bridge span'];
     case 'girder': return ['Girder line'];
     case 'girder_segment': return ['Girder segment'];
     case 'splice_set': return ['Splice set'];
