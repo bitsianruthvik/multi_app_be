@@ -75,7 +75,7 @@ try {
   const schema = new Map(TABLES.map((t) => [t, { cols: [], gen: new Set(), nullable: new Set(), pk: [], refs: new Map() }]));
   for (const r of cols) {
     const s = schema.get(r.t);
-    if (/GENERATED/i.test(r.x)) s.gen.add(r.c); else s.cols.push(r.c);
+    if (/(VIRTUAL|STORED) GENERATED/i.test(r.x)) s.gen.add(r.c); else s.cols.push(r.c);
     if (r.n === 'YES') s.nullable.add(r.c);
   }
   for (const t of TABLES) if (!schema.get(t).cols.length) throw new Error(`Table ${t} is missing here`);

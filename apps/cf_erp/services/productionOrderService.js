@@ -525,41 +525,52 @@ export async function setTimeOverride(db, c, orderId, input = {}) {
     retimed = r.affectedRows;
   } else {
     // The formulas (and typed times) again, line by line — the estimator release itself uses.
-    const [steps] = await db.query(
-      `SELECT s.id, s.operation_id, s.quantity, s.machine_id, s.state, s.started_at, pi.item_id, pi.bom_line_id, r.order_line_id
-         FROM cf_production_steps s
-         JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
-         JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
-        WHERE s.company_id = ? AND r.order_id = ? AND s.deleted_at IS NULL AND s.state <> 'done'`,
-      [c.companyId, order.id],
-    );
-    const byLine = new Map();
-    for (const s of steps) { if (!byLine.has(s.order_line_id)) byLine.set(s.order_line_id, []); byLine.get(s.order_line_id).push(s); }
-    const writes = [];
-    for (const [lineId, list] of byLine) {
-      const est = await estimatorForLine(db, c.companyId, lineId, list.map((s) => ({ bomLineId: s.bom_line_id, itemId: s.item_id, operationId: s.operation_id })));
-      for (const s of list) {
-        const t = est(s.bom_line_id, s.item_id, s.operation_id);
-        const work = t?.work ?? null;
-        const setup = work != null ? t.setup ?? 0 : t?.setup ?? null;
-        writes.push([s.id, setup, work, work == null ? null : r3(((setup ?? 0) + work) * Number(s.quantity))]);
-      }
-    }
-    for (let i = 0; i < writes.length; i += 500) {
-      const part = writes.slice(i, i + 500);
-      const cs = () => `CASE id ${part.map(() => 'WHEN ? THEN ?').join(' ')} END`;
-      const col = (k) => part.flatMap((w) => [w[0], w[k]]);
-      await db.query(
-        `UPDATE cf_production_steps SET est_setup_minutes = ${cs()}, est_work_minutes = ${cs()}, est_minutes = ${cs()},
-                mach_machine_id = NULL, mach_setup_minutes = NULL, mach_work_minutes = NULL, mach_minutes = NULL
-          WHERE company_id = ? AND id IN (?)`,
-        [...col(1), ...col(2), ...col(3), c.companyId, part.map((w) => w[0])],
-      );
-    }
-    retimed = writes.length;
-    // A step on a machine takes that machine's own time again (§58: the one writer of machine times).
-    const onMachine = steps.filter((s) => s.machine_id != null).map((s) => s.id);
-    if (onMachine.length) await estimateOnMachine(db, c, onMachine, undefined, { refuse: false, dropCannot: false });
+    retimed = await retimeOrderSteps(db, c, order.id);
   }
   return { orderId: order.id, timeOverrideSeconds: seconds, retimed };
+}
+
+/**
+ * Every step of the order that is not done, timed again by the estimator release uses: each line's formulas with its
+ * typed times (cf_time_overrides) laid over them — and the order's one-number override, when it is on (estimatorForLine
+ * reads it). Steps on a machine take that machine's own time again. Returns how many steps were re-timed.
+ * The "Override all times" clear and the per-operation order times sheet (timingSheetService) both end here.
+ */
+export async function retimeOrderSteps(db, c, orderId) {
+  // The formulas (and typed times) again, line by line — the estimator release itself uses.
+  const [steps] = await db.query(
+    `SELECT s.id, s.operation_id, s.quantity, s.machine_id, s.state, s.started_at, pi.item_id, pi.bom_line_id, r.order_line_id
+       FROM cf_production_steps s
+       JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
+       JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
+      WHERE s.company_id = ? AND r.order_id = ? AND s.deleted_at IS NULL AND s.state <> 'done'`,
+    [c.companyId, orderId],
+  );
+  const byLine = new Map();
+  for (const s of steps) { if (!byLine.has(s.order_line_id)) byLine.set(s.order_line_id, []); byLine.get(s.order_line_id).push(s); }
+  const writes = [];
+  for (const [lineId, list] of byLine) {
+    const est = await estimatorForLine(db, c.companyId, lineId, list.map((s) => ({ bomLineId: s.bom_line_id, itemId: s.item_id, operationId: s.operation_id })));
+    for (const s of list) {
+      const t = est(s.bom_line_id, s.item_id, s.operation_id);
+      const work = t?.work ?? null;
+      const setup = work != null ? t.setup ?? 0 : t?.setup ?? null;
+      writes.push([s.id, setup, work, work == null ? null : r3(((setup ?? 0) + work) * Number(s.quantity))]);
+    }
+  }
+  for (let i = 0; i < writes.length; i += 500) {
+    const part = writes.slice(i, i + 500);
+    const cs = () => `CASE id ${part.map(() => 'WHEN ? THEN ?').join(' ')} END`;
+    const col = (k) => part.flatMap((w) => [w[0], w[k]]);
+    await db.query(
+      `UPDATE cf_production_steps SET est_setup_minutes = ${cs()}, est_work_minutes = ${cs()}, est_minutes = ${cs()},
+              mach_machine_id = NULL, mach_setup_minutes = NULL, mach_work_minutes = NULL, mach_minutes = NULL
+        WHERE company_id = ? AND id IN (?)`,
+      [...col(1), ...col(2), ...col(3), c.companyId, part.map((w) => w[0])],
+    );
+  }
+  // A step on a machine takes that machine's own time again (§58: the one writer of machine times).
+  const onMachine = steps.filter((s) => s.machine_id != null).map((s) => s.id);
+  if (onMachine.length) await estimateOnMachine(db, c, onMachine, undefined, { refuse: false, dropCannot: false });
+  return writes.length;
 }

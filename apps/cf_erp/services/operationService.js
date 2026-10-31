@@ -210,6 +210,18 @@ export async function listTimingRules(db, companyId, operationId) {
   });
 }
 
+/** Every live rule of the company, shaped as listTimingRules shapes them (with `display`) — two reads. The timings sheet's download. */
+export async function listAllTimingRules(db, companyId) {
+  const [rows] = await db.query(`${RULE_SELECT} WHERE r.company_id = ? AND r.deleted_at IS NULL
+    ORDER BY r.operation_id, r.subject_type = 'machine', n.depth, r.effective_from, r.id`, [companyId]);
+  if (!rows.length) return [];
+  const bindings = await chartBindings(db, companyId);
+  return rows.map(shapeRule).map((r) => {
+    for (const t of [r.setup, r.work]) if (t?.expression != null) t.display = contractCharts(t.expression, bindings);
+    return r;
+  });
+}
+
 /**
  * The times a flow step card shows, for many operations at once: each one's MAIN rule (mainRuleOf),
  * its two times with the short `display` form, who the rule is for and how many rules there are.

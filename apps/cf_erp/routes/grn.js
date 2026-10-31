@@ -13,11 +13,15 @@
  *   GET  /grn-bills?supplierId=&purchaseOrderId=&flag=invoice_pending|no_money&from=&to=&search=&limit=   supplier bills (Accounts reads these)
  *   GET  /grn-bills/:id                     one bill with its lines
  *   PUT  /grn-bills/:id/invoice             { no, date } — the invoice that was "to follow" has come
+ *   GET  /purchase-orders/:id/grn-sheet     the PO's pending lines as a GRN workbook (.xlsx; services/grnSheetService.js)
+ *   POST /purchase-orders/:id/grn-sheet     { fileBase64, dryRun? } — rows matched by ITEM CODE (a file made for another PO
+ *                                           with the same items applies, with a note); books ONE GRN through receiveGrn
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam, contentDisposition } from '../lib/http.js';
 import { grnContext, receiveGrn, listBills, getBill, completeInvoice } from '../services/grnService.js';
+import { exportGrnSheet, importGrnSheet } from '../services/grnSheetService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -32,5 +36,16 @@ router.post('/purchase-orders/:id/grn', manage, handle((req) => (req.body?.dryRu
 router.get('/grn-bills', view, handle((req) => listBills(pool, ctx(req).companyId, req.query)));
 router.get('/grn-bills/:id', view, handle((req) => getBill(pool, ctx(req).companyId, id(req))));
 router.put('/grn-bills/:id/invoice', guardAny(PERM.inventory, PERM.accounts), handle((req) => tx(req, (db, c) => completeInvoice(db, c, id(req), req.body ?? {}))));
+
+router.get('/purchase-orders/:id/grn-sheet', view, handle(async (req, res) => {
+  const out = await exportGrnSheet(pool, ctx(req).companyId, id(req));
+  res.setHeader('Content-Type', out.contentType);
+  res.setHeader('Content-Disposition', contentDisposition(out.filename));
+  res.setHeader('Content-Length', String(out.buffer.length));
+  res.setHeader('X-CF-Sheet-Rows', String(out.rows));
+  res.send(out.buffer);
+}));
+// Always in a transaction: the dry run books the GRN inside a savepoint and rolls it back (grnSheetService).
+router.post('/purchase-orders/:id/grn-sheet', manage, handle((req) => tx(req, (db, c) => importGrnSheet(db, c, id(req), req.body ?? {}))));
 
 export default router;

@@ -19,6 +19,8 @@ import purchaseRoutes from './purchase.js';
 import purchaseFlowRoutes from './purchaseFlow.js';
 // Purchase flow v3 (§71): the MR screen, the PR with vendor columns, raise PO.
 import purchaseRequestRoutes from './purchaseRequests.js';
+// The buying chain as Excel: MR, PR quotes, PO — download / upload by item and supplier code (2026-10-31).
+import buyingSheetRoutes from './buyingSheets.js';
 import processRoutes from './process.js';
 import drawingRoutes from './drawings.js';
 import orderValuesRoutes from './orderValues.js';
@@ -59,6 +61,8 @@ import maintenanceRoutes from './maintenance.js';
 import storesRoutes from './stores.js';
 // Step 6: contractor work orders from a production order, in Accounts (init.sql §85).
 import contractorWorkOrderRoutes from './contractorWorkOrders.js';
+// Timings as Excel: standard times, an order's per-operation times, floor progress (2026-10-31).
+import timingSheetRoutes from './timingSheets.js';
 import { DRAWING_SOURCES, DRAWING_STATUSES, DRAWING_SUBJECT_TYPES } from '../services/drawingService.js';
 import { PURPOSES } from '../services/stockingAreaService.js';
 import { BATCH_STATUSES } from '../services/batchService.js';
@@ -142,6 +146,7 @@ router.use(trackerRoutes);
 router.use(purchaseRoutes);
 router.use(purchaseFlowRoutes);
 router.use(purchaseRequestRoutes);
+router.use(buyingSheetRoutes);
 router.use(processRoutes);
 router.use(drawingRoutes);
 router.use(orderValuesRoutes);
@@ -169,5 +174,6 @@ router.use(toolsResourcesRoutes);
 router.use(maintenanceRoutes);
 router.use(storesRoutes);
 router.use(contractorWorkOrderRoutes);
+router.use(timingSheetRoutes);
 
 export default router;
