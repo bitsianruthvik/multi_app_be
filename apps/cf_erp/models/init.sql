@@ -8215,3 +8215,31 @@ SELECT r.company_id, r.id AS role_id, r.name AS role_name,
 SELECT IF((SELECT COUNT(*) FROM features WHERE deleted_at IS NULL AND feature_tag = 'cf_erp_orders_delete') >= 1
       AND (SELECT COUNT(*) FROM features_capability WHERE deleted_at IS NULL AND name = 'cf_erp_orders_delete') >= 1,
       'SCHEMA-OK', 'SCHEMA-MISSING') AS result;
+
+-- ============================================================================
+-- §95  AN ISSUE REMEMBERS ITS MR AND ITS MAINTENANCE ORDER (2026-10-31)
+-- ============================================================================
+-- Stores › MR › "Issue now" (purchaseRequestService.issueMr) posts ONE issue for what is earmarked for the MR and not
+-- issued yet; the movement names the MR it came from. An MR for a maintenance order puts the MO on the issue, so the
+-- MO's parts cost (maintenanceService.partsCost) and the Maintenance summary count the spares without typing.
+--   cf_stock_movements.requisition_id        the MR an issue was made from (NULL = any other movement). "Issued" per MR
+--                                            line = its issues of the line's item; Accounts › Order costing counts an
+--                                            issue from an MR raised BY HAND for the order as consumables.
+--   cf_stock_movements.maintenance_order_id  the maintenance order the issue is for (an open one when posted).
+-- Columns and indexes in separate statements (TiDB refuses an index on a column added in the same ALTER). No FK (the
+-- maintenance tables come with §82 and may be missing on an old schema). Idempotent; safe to run again.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND COLUMN_NAME = 'requisition_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_movements ADD COLUMN requisition_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND COLUMN_NAME = 'maintenance_order_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_movements ADD COLUMN maintenance_order_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND INDEX_NAME = 'idx_csm_requisition');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_stock_movements ADD INDEX idx_csm_requisition (company_id, requisition_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND INDEX_NAME = 'idx_csm_maint');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_stock_movements ADD INDEX idx_csm_maint (company_id, maintenance_order_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements'
+            AND COLUMN_NAME IN ('requisition_id', 'maintenance_order_id')) = 2, 'S95-OK', 'S95-MISSING') AS result;

@@ -330,6 +330,16 @@ try {
   ok('the Drawings screen finds every part row\'s file by its mark', view.summary.rows > 0 && view.drawings.length === 36 && view.drawings.every((d) => d.rows.length >= 1), JSON.stringify(view.summary));
   const stA = await STD.lineStandard(conn, COMPANY, lineA.id);
   ok('unedited: nothing to offer', stA.edited === false && stA.offer === null, JSON.stringify({ e: stA.edited, o: stA.offer }));
+  // Its gaps are said right after it is ADDED (2026-10-31) — read by the screen OUTSIDE the add's transaction, from
+  // the Freeze checklist itself (GET /order-lines/:id/lock without the piece tree), never inside the add.
+  eq('the add answer carries no readiness (it would hold the add’s transaction)', Object.keys(made.out.fromStandard).sort(), ['cutPieces', 'lineId', 'number', 'rows', 'standardId', 'versionNo']);
+  const LOCK = await imp('apps/cf_erp/services/lockService.js');
+  const lockRead = await roundTrips(conn, () => LOCK.lockPlan(conn, COMPANY, lineA.id));
+  const failing = lockRead.out.checks.filter((ch) => ch.applies !== false && !ch.ok && ch.key !== 'execution_plan');
+  says(`the read after the add: ${lockRead.n} round trips; line A needs: ${failing.map((ch) => `${ch.key}${ch.warning ? ' (warning)' : ''}`).join(', ') || 'nothing'}`);
+  ok('the GET after the add says what the new line needs before the freeze, in the checklist’s words', failing.length > 0 && failing.every((ch) => ch.title && ch.detail), JSON.stringify(failing.map((ch) => ch.key)));
+  eq('…without the piece tree', lockRead.out.nodes, []);
+  ok('…the standard’s gaps show: a value, a section part or a code still to settle', failing.some((ch) => ['values', 'section_parts', 'codes', 'structure'].includes(ch.key)), JSON.stringify(failing.map((ch) => ch.key)));
 
   /* ------------------------------------------------------------------------ */
   section('5. Edit a line made from the standard: update the standard (new version), or keep it');

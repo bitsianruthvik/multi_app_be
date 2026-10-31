@@ -167,11 +167,31 @@ export async function customerScrapLots(db, c, itemId, wants) {
   const [taken] = await db.query('SELECT code_active FROM cf_stock_batches WHERE company_id = ? AND code_active IN (?)', [c.companyId, want.map((w) => w.code.toLowerCase())]);
   const takenSet = new Set(taken.map((t) => t.code_active));
   for (const w of want) if (takenSet.has(w.code.toLowerCase())) w.code = `${w.code}-${w.partyId}`;
-  await insertRows(db, 'cf_stock_batches', ['company_id', 'item_id', 'code', 'received_on', 'owner_party_id', 'owner_order_id', 'unit_cost', 'notes', 'created_by'],
-    want.map((w) => [c.companyId, itemId, w.code, new Date().toISOString().slice(0, 10), w.partyId, w.orderId ?? null, null,
-      `The customer's scrap from ${w.orderCode ?? 'their material'} — theirs, to be given back.`, c.userId ?? null]));
+  const COLS = ['company_id', 'item_id', 'code', 'received_on', 'owner_party_id', 'owner_order_id', 'unit_cost', 'notes', 'created_by'];
+  const rowOf = (w) => [c.companyId, itemId, w.code, new Date().toISOString().slice(0, 10), w.partyId, w.orderId ?? null, null,
+    `The customer's scrap from ${w.orderCode ?? 'their material'} — theirs, to be given back.`, c.userId ?? null];
+  try {
+    await insertRows(db, 'cf_stock_batches', COLS, want.map(rowOf), Math.max(1, want.length));
+  } catch (e) {
+    // Two transactions making the same customer's scrap lot at once (2026-10-31): the later one hit uq_csb_code when the
+    // first committed (its insert alone was undone). The lot the other made is THE lot; anything still missing is
+    // made one by one under code-<party>, else with the time.
+    if (!(e?.errno === 1062 || e?.code === 'ER_DUP_ENTRY')) throw e;
+    const [now] = await db.query(
+      `SELECT id, owner_party_id, owner_order_id FROM cf_stock_batches
+        WHERE company_id = ? AND item_id = ? AND owner_party_id IN (?) AND production_item_id IS NULL AND deleted_at IS NULL ORDER BY id FOR UPDATE`,
+      [c.companyId, itemId, want.map((w) => w.partyId)],
+    );
+    for (const b of now) { const k = `${b.owner_party_id}:${b.owner_order_id ?? 0}`; if (!out.has(k)) out.set(k, b.id); }
+    for (const w of want.filter((x) => !out.has(`${x.partyId}:${x.orderId ?? 0}`))) {
+      const names = [...new Set([w.code, `${w.code}-${w.partyId}`, `${w.code}-${w.partyId}-${Date.now().toString(36)}`])];
+      for (const [i, code] of names.entries()) {
+        try { w.code = code; await insertRows(db, 'cf_stock_batches', COLS, [rowOf(w)]); break; } catch (e2) { if (!(e2?.errno === 1062 || e2?.code === 'ER_DUP_ENTRY') || i === names.length - 1) throw e2; }
+      }
+    }
+  }
   const [made] = await db.query('SELECT id, owner_party_id, owner_order_id FROM cf_stock_batches WHERE company_id = ? AND code_active IN (?)', [c.companyId, want.map((w) => w.code.toLowerCase())]);
-  for (const b of made) out.set(`${b.owner_party_id}:${b.owner_order_id ?? 0}`, b.id);
+  for (const b of made) { const k = `${b.owner_party_id}:${b.owner_order_id ?? 0}`; if (!out.has(k)) out.set(k, b.id); }
   return out;
 }
 

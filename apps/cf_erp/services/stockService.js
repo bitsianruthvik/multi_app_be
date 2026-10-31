@@ -26,6 +26,8 @@ import { unitKgOf } from './valuationService.js';
 import { hasV67, missingV67 } from '../lib/schemaV67.js';
 // Tools with a life (§81): each piece issued gets a tool-life row.
 import { trackIssuedTools, voidIssuedTools } from './toolLifeService.js';
+// §95: an issue may name the MR it was made from ("Issue now") and the maintenance order it is for.
+import { hasMovementLinks, MOVEMENT_LINKS_MISSING } from '../lib/movementLinks.js';
 
 export const MOVEMENT_TYPES = ['receipt', 'issue', 'transfer', 'adjustment', 'scrap', 'return'];
 const PREFIX = { receipt: 'GRN', issue: 'ISS', transfer: 'TRF', adjustment: 'ADJ', scrap: 'SCR', return: 'RET' };
@@ -399,6 +401,8 @@ async function movementCode(db, c, type, input, areaId) {
  *              customer supplied it for; return: the order it is returned against
  *   orderLineId?  issue / scrap: the line of that order (job cost is per line)
  *   usedFor?   issue (§74, REQUIRED): 'order' (with orderId) or 'general' (overhead) — an issue naming an orderId is for that order
+ *   maintenanceOrderId?  issue (§95): the maintenance order the spares are for — an OPEN one of the company (open,
+ *              in progress, waiting for parts). Its parts cost is read off these issues (maintenanceService.partsCost).
  *   ownerPartyId?, ownerOrderId?  receipt: whose it is — default for every line
  *   reference?, reason? (required for adjustment, scrap and return), notes?,
  *   returnKg?  return: scrap handed back by weight (ownershipService)
@@ -412,9 +416,12 @@ async function movementCode(db, c, type, input, areaId) {
  *
  * opts.allowEmpty — a return with no stock lines (only offcuts or scrap by
  * weight go back): the header is written alone. Only ownershipService sets it.
+ * opts.requisitionId — §95: the MR an issue is made from (purchaseRequestService.issueMr). Server-only, never a body field.
  */
 /** §74: what an issue is used for. */
 export const USED_FOR = ['order', 'general'];
+/** §95: a maintenance order spares may still be issued to (maintenanceService.ACTIVE_STATUSES). */
+const MO_OPEN = ['open', 'in_progress', 'waiting_parts'];
 export const USED_FOR_MISSING = 'Say what it is used for: a sales order, or General (overhead).';
 
 export async function postMovement(db, c, input = {}, opts = {}) {
@@ -497,6 +504,19 @@ export async function postMovement(db, c, input = {}, opts = {}) {
     else if (!asked && blank(input.orderId)) problems.push(USED_FOR_MISSING);
     usedFor = asked ?? (blank(input.orderId) ? null : 'order');
   }
+  // §95: the maintenance order an issue is for (spares costed to it), and the MR it was made from.
+  let maintenanceOrder = null;
+  const requisitionId = type === 'issue' && opts.requisitionId != null ? Number(opts.requisitionId) : null;
+  if (!blank(input.maintenanceOrderId)) {
+    const [[mo]] = type === 'issue'
+      ? await db.query('SELECT id, code, status FROM cf_maintenance_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(input.maintenanceOrderId)])
+      : [[null]];
+    if (type !== 'issue') problems.push('Only an issue is made for a maintenance order.');
+    else if (!mo) problems.push('That maintenance order does not exist.');
+    else if (!MO_OPEN.includes(mo.status)) problems.push(`${mo.code} is ${mo.status === 'done' ? 'done' : 'cancelled'} — nothing more is issued to it.`);
+    else maintenanceOrder = mo;
+  }
+  if ((maintenanceOrder || requisitionId) && !(await hasMovementLinks(db))) problems.push(MOVEMENT_LINKS_MISSING);
   const reason = blank(input.reason) ? null : String(input.reason).trim().slice(0, 255);
   if (type === 'adjustment' && !reason) problems.push('Say why the stock changes — a count, damage found, a correction.');
   if (type === 'scrap' && !reason) problems.push('Say why it is scrapped.');
@@ -579,11 +599,14 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   const receiptOrders = new Set(moving.map((p) => p.owner?.orderId).filter((x) => x != null));
   const movementOrder = order ?? (type === 'receipt' && receiptOrders.size === 1 ? { id: [...receiptOrders][0] } : null);
   const code = await movementCode(db, c, type, input, moving[0]?.legs[0]?.area?.id ?? null);
+  // §95's columns only when this movement carries them — a database without §95 still takes every other movement.
+  const links = maintenanceOrder || requisitionId ? ', requisition_id, maintenance_order_id' : '';
   const [r] = await db.query(
-    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, notes, return_kg, used_for, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, notes, return_kg, used_for, created_by${links})
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${links ? ', ?, ?' : ''})`,
     [c.companyId, code, type, date, party?.id ?? null, movementOrder?.id ?? null, orderLine?.id ?? null,
-      blank(input.reference) ? null : String(input.reference).trim().slice(0, 100), reason, blank(input.notes) ? null : String(input.notes), returnKg, usedFor, c.userId],
+      blank(input.reference) ? null : String(input.reference).trim().slice(0, 100), reason, blank(input.notes) ? null : String(input.notes), returnKg, usedFor, c.userId,
+      ...(links ? [requisitionId, maintenanceOrder?.id ?? null] : [])],
   );
   const movementId = r.insertId;
   if (!code) await db.query('UPDATE cf_stock_movements SET code = ? WHERE id = ?', [`${PREFIX[type]}-${String(movementId).padStart(6, '0')}`, movementId]);
@@ -867,13 +890,17 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
       else poolOut(pools.get(l.item.id), -l.delta, l.value);
     }
   }
+  // §95: the reversal keeps the MR and the maintenance order of what it undoes (the cost sheets net the two out).
+  const links = m.requisition_id != null || m.maintenance_order_id != null ? ', requisition_id, maintenance_order_id' : '';
   const [r] = await db.query(
-    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, reversal_of_id, used_for, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, party_id, order_id, order_line_id, reference, reason, reversal_of_id, used_for, created_by${links})
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${links ? ', ?, ?' : ''})`,
     [c.companyId, `REV-${m.code}`.slice(0, 60), m.movement_type, todayText(), m.party_id, m.order_id, m.order_line_id ?? null, m.reference,
-      String(reason).trim().slice(0, 255), m.id, m.used_for ?? null, c.userId],
+      String(reason).trim().slice(0, 255), m.id, m.used_for ?? null, c.userId, ...(links ? [m.requisition_id ?? null, m.maintenance_order_id ?? null] : [])],
   );
   const revId = r.insertId;
+  // §95: an issue made from an MR ("Issue now") put back — the stock is earmarked to that MR line again, as it was.
+  if (m.movement_type === 'issue' && m.requisition_id != null) await reholdForMr(db, c, m.requisition_id, legs);
   for (const l of legs) {
     await writeLeg(db, c, { movementId: revId, lineNo: l.row.line_no, area: l.area, item: l.item, batch: l.batch, delta: l.delta, notes: l.row.notes, unitCost: l.unitCost, value: l.value });
   }
@@ -901,6 +928,25 @@ export async function reverseMovement(db, c, id, { reason } = {}) {
   return { ...out, purchase: { ...unreceived, plannedUnits: { orderIds, ...(await plannedUnitsOfOrders(db, c.companyId, orderIds)) } } };
 }
 
+
+/** §95: the stock an MR issue took, held again for the MR's line of each item (set-based: 1 read, 1 insert). */
+async function reholdForMr(db, c, requisitionId, legs) {
+  const back = legs.filter((l) => l.delta > EPS);
+  if (!back.length) return;
+  const [lines] = await db.query(
+    `SELECT pl.id, pl.item_id, r.order_line_id, r.order_id FROM cf_requisition_lines pl JOIN cf_requisitions r ON r.id = pl.requisition_id
+      WHERE pl.company_id = ? AND pl.requisition_id = ? AND pl.deleted_at IS NULL AND pl.item_id IN (?)`,
+    [c.companyId, Number(requisitionId), [...new Set(back.map((l) => l.item.id))]],
+  );
+  const lineOf = new Map(lines.map((l) => [Number(l.item_id), l]));
+  // An MR raised by hand holds for itself (no order); an order's own MR for its order (as purchaseRequestService.saveMr).
+  const rows = back.filter((l) => lineOf.has(Number(l.item.id))).map((l) => {
+    const pl = lineOf.get(Number(l.item.id));
+    return [c.companyId, pl.order_line_id == null ? null : pl.order_id, pl.id, l.item.id, l.batch?.id ?? null, round6(l.delta), c.userId ?? null];
+  });
+  if (!rows.length) return;
+  await db.query(`INSERT INTO cf_stock_reservations (company_id, held_for_order_id, pr_line_id, item_id, batch_id, quantity, created_by) VALUES ${rows.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')}`, rows.flat());
+}
 
 // --- reading ------------------------------------------------------------------------
 
@@ -932,6 +978,9 @@ function shapeMovement(m) {
     orderLine: m.order_line_id ? { id: m.order_line_id, lineNo: m.order_line_no ?? null } : null,
     // §74: an issue's "Used for": 'order' | 'general' (null before §74 and on other movements).
     usedFor: m.used_for ?? null,
+    // §95: the MR it was issued from ("Issue now") and the maintenance order it is for (null when none, or before §95).
+    requisitionId: m.requisition_id ?? null,
+    maintenanceOrderId: m.maintenance_order_id ?? null,
     // What it moved, at cost (a transfer's two legs counted once). null = nothing
     // in it is costed; `uncostedRows` says how many ledger rows have no cost.
     value: m.abs_value == null ? null : round2(Number(m.abs_value) / (m.movement_type === 'transfer' ? 2 : 1)),

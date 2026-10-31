@@ -200,7 +200,7 @@ const optionText = (o) => o.label || o.value;
  *     input      the record's own typed value as the server takes it ('' when none; an option's id)
  *     missing    required and still empty — the amber cell
  *     why        why it is not typed, when it is not
- *     options    [{ id, text }] for a pick-list, as this row may choose
+ *     options    [{ id, text, value, label }] for a pick-list, as this row may choose
  */
 export function orderSheetLayout({ root, view, codes = null }) {
   const rows = visibleRows(root);
@@ -249,7 +249,7 @@ export function orderSheetLayout({ root, view, codes = null }) {
       code, name: col.name, unit: col.unit ?? null, dataType: col.dataType, rule: c.rule, required: c.required,
       state, input: c.input, missing: missingOf(node, code), from: c.from, calculated: c.calculated, noCalc: c.noCalc,
       why: c.editable ? null : (info.row.readOnly ?? c.why ?? (node.kind !== 'temporary' ? 'It is not one of this order’s own rows.' : !open ? (view.lock?.message ?? 'This line no longer changes.') : null)),
-      options: col.dataType === 'option' ? (c.options ?? []).map((o) => ({ id: o.id, text: optionText(o) })) : null,
+      options: col.dataType === 'option' ? (c.options ?? []).map((o) => ({ id: o.id, text: optionText(o), value: o.value ?? null, label: o.label ?? null })) : null,
     };
   };
 

@@ -1765,6 +1765,9 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const customPlates = [];
   const sizeAdvice = [];
   const notes = [];
+  // 2026-10-31: the steels no catalog plate is — the problems below, as data, so the screen can offer
+  // "Add this plate to the catalog" (POST …/nesting/plates { plates: [{ thickness, material, grade, impactClass }] }).
+  const missingPlates = [];
   /*
    * TRUE SHAPES, AND THE PLATES ALREADY SAVED (init.sql §55).
    *
@@ -1823,7 +1826,9 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       const have = [...new Set(g.steelPlates.map((p) => norm(p.steel.impactClass) ?? 'no stated class'))].join(', ');
       const needs = [...new Set(g.cutPlates.map((cp) => needWords(cp.steel)))].join(', ');
       const why = `no catalog plate of ${fmt(g.thickness)} mm ${g.material} is ${needs}${gradeRule === 'exact' ? '' : ' or better'} (the ${fmt(g.thickness)} mm ${g.grade} plates are ${have})`;
-      problems.push(`${g.cutPlates.length === 1 ? nameOf(g.cutPlates[0]) : `${g.cutPlates.length} cut plates`} cannot be nested: ${why}. Add a plate of that grade and impact class to the catalog, or correct the pieces' impact class (${IMPACT_ORDER_WORDS}).`);
+      const said = `${g.cutPlates.length === 1 ? nameOf(g.cutPlates[0]) : `${g.cutPlates.length} cut plates`} cannot be nested: ${why}. Add a plate of that grade and impact class to the catalog, or correct the pieces' impact class (${IMPACT_ORDER_WORDS}).`;
+      problems.push(said);
+      missingPlates.push(...missingSteelsOf(g, said, 'impact_class'));
       groups.push(emptyGroup(g, settings, guillotine, `no plate of its grade and impact class: ${why}`));
       continue;
     }
@@ -1836,7 +1841,10 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       continue;
     }
     if (!candidates.length) {
-      problems.push(`No catalog plate is ${fmt(g.thickness)} mm ${g.material} ${g.grade}, so ${g.cutPlates.length === 1 ? nameOf(g.cutPlates[0]) : `${g.cutPlates.length} cut plates`} have nothing to be cut from. Add the plate to the catalog, or correct the cut plate's steel.`);
+      const said = `No catalog plate is ${fmt(g.thickness)} mm ${g.material} ${g.grade}, so ${g.cutPlates.length === 1 ? nameOf(g.cutPlates[0]) : `${g.cutPlates.length} cut plates`} have nothing to be cut from. Add the plate to the catalog, or correct the cut plate's steel.`;
+      problems.push(said);
+      // Only when no plate of the steel exists at all (every one excluded in Step B is a choice, not a missing plate).
+      if (!sheetsFor(everyPlate, g).length) missingPlates.push(...missingSteelsOf(g, said, 'no_plate'));
       groups.push(emptyGroup(g, settings, guillotine, 'no candidate plate'));
       continue;
     }
@@ -2300,6 +2308,9 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     // §90: one entry per steel whose plates moved to a custom size — "custom size, not in the catalog yet".
     ...(customPlates.length ? { customPlates } : {}),
     problems,
+    // One entry per steel (thickness, material, grade, impact class) no catalog plate is; `problem` is the sentence of
+    // `problems` it belongs to. Empty when every steel has a plate.
+    missingPlates: dedupeMissing(missingPlates),
     // Things the reader should know that block nothing (2026-10-13): a steel whose drawings should have decided its layout and did not.
     notes,
     // Which seeds were tried and which won, so a plan can say how it was reached
@@ -2455,6 +2466,34 @@ const groupHead = (g, settings, guillotine) => ({
   offcutMinAreaMm2: settings.offcutMinAreaMm2, offcutMinSideMm: settings.offcutMinSideMm,
   guillotine, settingsBasis: settings.basis,
 });
+
+/**
+ * The steels a group's pieces ask that no catalog plate is — one per impact class they state (none stated = one,
+ * with none), so each can be added to the catalog as it is (nestPlateCatalogService.createNestPlates sizes it).
+ */
+function missingSteelsOf(g, problem, reason) {
+  const byClass = new Map();
+  for (const cp of g.cutPlates) {
+    const ic = blank(cp.steel.impactClass) ? null : String(cp.steel.impactClass).trim();
+    const k = norm(ic) ?? '';
+    if (!byClass.has(k)) byClass.set(k, { impactClass: ic, cutPlates: 0, pieces: 0 });
+    const e = byClass.get(k); e.cutPlates += 1; e.pieces += Number(cp.pieces) || 0;
+  }
+  return [...byClass.values()].map((e) => ({
+    key: [fmt(g.thickness), norm(g.material) ?? '', norm(g.grade) ?? '', norm(e.impactClass) ?? ''].join('|'),
+    thickness: g.thickness, material: g.material ?? null, grade: g.grade ?? null, impactClass: e.impactClass,
+    cutPlates: e.cutPlates, pieces: round3(e.pieces), reason, problem,
+  }));
+}
+/** The same steel named by two groups (a split group) is offered once. */
+export function dedupeMissing(list) {
+  const out = new Map();
+  for (const m of list) {
+    const had = out.get(m.key);
+    if (had) { had.cutPlates += m.cutPlates; had.pieces = round3(had.pieces + m.pieces); } else out.set(m.key, { ...m });
+  }
+  return [...out.values()];
+}
 
 const emptyGroup = (g, settings, guillotine, why) => ({
   ...groupHead(g, settings, guillotine),

@@ -23,7 +23,9 @@
  *   GET    /orders/:orderId/lines/:lineId/nesting/files/:lotId   the file one plate was read from
  *   DELETE /orders/:orderId/lines/:lineId/nesting/lots/:lotId    one plate off the line
  *   POST   /orders/:orderId/lines/:lineId/nesting/plates         { plates: [{ key, kind, code?, name? }], dryRun } — plates the files use
- *                                                                that the catalog does not have, added to it (orders manage AND catalog manage)
+ *                                                                that the catalog does not have, added to it (orders manage AND catalog manage);
+ *                                                                also a plan's `missingPlates` steel { thickness, material, grade, impactClass }
+ *                                                                with no size — sized by the company's plates (2026-10-31)
  *   GET    /orders/:orderId/lines/:lineId/nesting/untracked      what is left over, what is marked as cut from untracked offcuts, kg and cost (init.sql §61)
  *   POST   /orders/:orderId/lines/:lineId/nesting/untracked      { pieces?: [{ cutPlateId, quantity? }], all?, dryRun? } — mark left-over pieces
  *   DELETE /orders/:orderId/lines/:lineId/nesting/untracked      { cutPlateIds? } — undo (none = every mark)

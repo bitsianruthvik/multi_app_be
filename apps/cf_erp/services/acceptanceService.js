@@ -601,6 +601,46 @@ async function prefill(db, companyId) {
   return { charges: ch.charges ?? [], material: ch.material ?? null, lumpSums: ch.lumpSums ?? [], milestones: ms.milestones ?? [], stages: st.stages ?? [] };
 }
 
+/**
+ * The operation a pro-rata charge left without one is prefilled with, for a NEW acceptance (demo, 2026-10-31): the
+ * LAST operation of the order's top-level row flow — the flow of the first line (by line no.) whose item has one, read
+ * through the line's frozen copy once it is locked. Generic: whatever that flow ends with (for a girder span, Dispatch).
+ * Null when no line has a flow with a step. One read.
+ */
+export async function suggestedChargeOperation(db, companyId, orderId) {
+  const [rows] = await db.query(
+    `SELECT l.line_no, m.name AS item_name, f.id AS flow_id, f.code AS flow_code, f.name AS flow_name,
+            (SELECT s.operation_id FROM cf_operation_flow_steps s
+              WHERE s.company_id = l.company_id AND s.flow_id = f.id AND s.deleted_at IS NULL
+              ORDER BY s.sequence DESC, s.id DESC LIMIT 1) AS operation_id
+       FROM cf_sales_order_lines l
+       JOIN cf_master_records m ON m.company_id = l.company_id AND m.id = l.item_id
+       LEFT JOIN cf_operation_flows fc ON l.locked_at IS NOT NULL AND fc.company_id = l.company_id
+            AND fc.owner_order_line_id = l.id AND fc.source_flow_id = m.default_flow_id AND fc.deleted_at IS NULL
+       JOIN cf_operation_flows f ON f.company_id = l.company_id AND f.id = COALESCE(fc.id, m.default_flow_id)
+      WHERE l.company_id = ? AND l.order_id = ? AND l.deleted_at IS NULL AND m.default_flow_id IS NOT NULL
+      ORDER BY l.line_no, l.id`,
+    [companyId, Number(orderId)],
+  );
+  const hit = rows.find((r) => r.operation_id != null);
+  if (!hit) return null;
+  return {
+    operationId: Number(hit.operation_id), lineNo: hit.line_no,
+    why: `The last operation of line ${hit.line_no}${hit.item_name ? ` (${hit.item_name})` : ''}’s flow ${hit.flow_code ?? hit.flow_name ?? ''}`.trim() + '.',
+  };
+}
+
+/** Charges billed pro-rata that have no operation get the suggested one; the rest are left as they are. Pure. */
+export function prefillChargeOperations(charges, suggested) {
+  if (!suggested) return { charges, at: [] };
+  const at = [];
+  const out = (charges ?? []).map((ch, i) => {
+    if (ch?.billing === 'pro_rata' && blank(ch.operationId)) { at.push(i); return { ...ch, operationId: suggested.operationId }; }
+    return ch;
+  });
+  return { charges: out, at };
+}
+
 // ── the acceptance of an order ──────────────────────────────────────────────────────────────────
 
 const shapeVersion = (v) => (v ? {
@@ -692,14 +732,20 @@ async function mrsOf(db, companyId, orderId) {
 export async function getAcceptance(db, companyId, orderId) {
   // Side by side (speed, 2026-10-19): the order's facts and everything else read for it, the default terms
   // too (one small read, used when the order has no terms of its own) — one wave where there were three more.
-  const [facts, ctx, versions, mrs, stagesBy, templates, values, defaults] = await Promise.all([
+  const [facts, ctx, versions, mrs, stagesBy, templates, values, defaults, suggestedRaw] = await Promise.all([
     orderFacts(db, companyId, orderId),
     termContext(db, companyId), versionsOf(db, companyId, orderId), mrsOf(db, companyId, orderId), postStagesOf(db, companyId, [orderId]),
     listTemplates(db, companyId), orderValuesFor(db, companyId, [Number(orderId)]), prefill(db, companyId),
+    suggestedChargeOperation(db, companyId, orderId),
   ]);
   const { approved, pending, sentBack } = standing(versions);
   const shown = pending ?? sentBack ?? approved;
-  const terms = shown?.terms ?? defaults;
+  // A new acceptance: a pro-rata charge with no operation starts at the last operation of the order's top-level
+  // flow (suggestedChargeOperation) — a suggestion the person can change; never on terms already saved.
+  const sugOp = suggestedRaw ? ctx.opById.get(suggestedRaw.operationId) : null;
+  const suggested = sugOp ? { ...suggestedRaw, code: sugOp.code ?? null, name: sugOp.name ?? null } : null;
+  const filled = shown ? { charges: null, at: [] } : prefillChargeOperations(defaults.charges, suggested);
+  const terms = shown?.terms ?? { ...defaults, charges: filled.charges };
   const anyWeBuy = facts.lines.some((l) => l.supply === 'we_buy');
   const anyCustomer = facts.lines.some((l) => l.supply === 'customer');
   const full = { ...ctx, anyWeBuy, anyCustomer, stageKeys: new Set((terms.stages ?? []).map((s) => s.key)) };
@@ -725,6 +771,10 @@ export async function getAcceptance(db, companyId, orderId) {
     supplyEditable: editable && !approved && !mrs.some((m) => !m.held),
     terms: read,
     fromTemplates: !shown,
+    // The operation a pro-rata charge with none starts at (also for a charges template filled in on the screen), and
+    // the charges prefilled with it here — the screen says so beside them.
+    suggestedOperation: suggested,
+    prefilledCharges: filled.at.map((i) => read.charges[i]?.key).filter(Boolean),
     estimate,
     // ONE order value (orderValueService): what the order header shows, and the estimate from the line rates beside it.
     orderValue: values.get(Number(o.id)) ?? null,

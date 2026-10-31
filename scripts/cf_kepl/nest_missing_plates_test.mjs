@@ -374,6 +374,42 @@ try {
     const mix = await create([plate(31), { thickness: 32, length: 6000, width: 2000, grade: fx.GB, impactClass: fx.BR, kind: 'standard' }, plate(20)], {}, tm.db);
     ok(`a request that creates, makes one standard and skips one costs the same again (${tm.tally.n})`, mix.created.length === 2 && mix.skipped.length === 1 && tm.tally.n === trips.one && mix.message.includes('as a custom size, and') && mix.message.includes('as a standard size.'), mix.message);
   }
+
+  /* ───────────── 8. nesting's "no catalog plate is …": the steel as data, added from the plan ───────────── */
+  section('8. A plan\'s missing steel, added to the catalog from Nesting (2026-10-31)');
+  {
+    const plan = () => N.planNesting(conn, COMPANY, fx.lineId, { effort: 'quick', seed: 1 });
+    const find = (p, grade, impact) => p.missingPlates.find((m) => m.thickness === 12 && m.grade === grade && m.impactClass === impact);
+    let p = await plan();
+    const a = find(p, fx.GA, fx.BR);
+    ok('the plan carries the missing steel as data: thickness, material, grade, impact class', !!a && a.material === fx.MS && a.reason === 'no_plate' && a.cutPlates === 1 && a.pieces === 4, J(p.missingPlates));
+    ok('…with the sentence of `problems` it belongs to', !!a && p.problems.includes(a.problem) && /No catalog plate is 12 mm/.test(a.problem), J(p.problems));
+    ok('one entry per steel (two grades of 12 mm: two entries)', !!find(p, fx.GB, fx.BR) && p.missingPlates.filter((m) => m.thickness === 12).length === 2, J(p.missingPlates));
+    // No 12 mm plate in the catalog: the size most used by any plate (every plate of the fixture is 6000 × 2000).
+    const steel = (m) => ({ thickness: m.thickness, material: m.material, grade: m.grade, impactClass: m.impactClass });
+    const dryA = await create([steel(a)], { dryRun: true });
+    ok('a dry run says what it would add, and at which size', dryA.dryRun === true && dryA.created.length === 1 && dryA.created[0].sizedFrom === 'catalog' && dryA.created[0].length === 6000 && dryA.created[0].width === 2000, J(dryA));
+    const addA = await create([steel(a)]);
+    const itemA = await itemOf(addA.created[0].itemId);
+    ok('added at the size most catalog plates are, coded and named by the company\'s rules', addA.created.length === 1 && addA.created[0].code === `${fx.SHORT}-12X2000X6000-${fx.GA}${fx.BR}`
+      && itemA.m.code === addA.created[0].code && itemA.v.GRADE?.opt === fx.GA && itemA.v.IMPACT_CLASS?.opt === fx.BR && Number(itemA.v.THICKNESS.value_number) === 12
+      && Math.abs(Number(itemA.v.WEIGHT.value_number) - (6000 * 2000 * 12 * DENSITY) / 1e9) < 1e-6, J([addA, itemA.m.code]));
+    ok('asked again, it is not made twice', (await create([steel(a)])).skipped.length === 1);
+    p = await plan();
+    ok('the plan run again no longer misses it', !find(p, fx.GA, fx.BR) && !p.problems.some((x) => x.includes(`12 mm ${fx.MS} ${fx.GA},`)), J(p.missingPlates));
+
+    // The other grade gets a 12 mm plate of ANOTHER impact class and size: then its pieces miss the impact class.
+    await create([{ thickness: 12, length: 8000, width: 2500, grade: fx.GB, impactClass: fx.BO }]);
+    p = await plan();
+    const b = find(p, fx.GB, fx.BR);
+    ok('a plate of the thickness and grade but not the impact class: the steel is still offered, reason impact_class', !!b && b.reason === 'impact_class' && p.problems.includes(b.problem), J(p.missingPlates));
+    const addB = await create([steel(b)]);
+    ok('the size is the one the plates of that THICKNESS use most (a tie: the larger)', addB.created[0]?.sizedFrom === 'thickness' && addB.created[0].length === 8000 && addB.created[0].width === 2500
+      && addB.created[0].code === `${fx.SHORT}-12X2500X8000-${fx.GB}${fx.BR}`, J(addB));
+    p = await plan();
+    ok('…and the plan then misses no 12 mm steel', !p.missingPlates.some((m) => m.thickness === 12), J(p.missingPlates));
+    ok('commonSize: none without a sized plate', P.commonSize([], 12) === null);
+  }
 } catch (err) {
   failed += 1;
   fails.push(`ERROR ${err?.message}`);

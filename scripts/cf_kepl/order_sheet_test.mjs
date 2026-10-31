@@ -442,6 +442,20 @@ try {
       ['E350 — high strength', 'Yes', 16, 'B', false, AMBER]);
   });
   await attempt(async (d) => {
+    // As the grid does: a pick-list cell may hold the option's short code (its value) as well as its label,
+    // trimmed and in any case.
+    d.byId.get(id(f.pa2)).field(label(GRD)).cell.value = ' e350 ';
+    const dry = await upload(d.wb);
+    eq('a pick-list cell given the option’s value (short code, any case) is accepted', [dry.ok, dry.problems, dry.changes.map((ch) => [ch.field, ch.rowId])], [true, [], [[label(GRD), id(f.pa2)]]]);
+    const applied = await upload(d.wb, false);
+    eq('and saves that option', [applied.applied, await stored(f.pa2.child_id, GRD)], [true, f.opt.E350]);
+  });
+  await attempt(async (d) => {
+    d.byId.get(id(f.pa2)).field(label(GRD)).cell.value = 'e350 — HIGH STRENGTH';
+    const dry = await upload(d.wb);
+    eq('the option’s label in another case is accepted too', [dry.ok, dry.problems, dry.summary.valuesChanged], [true, [], 1]);
+  });
+  await attempt(async (d) => {
     d.byId.get(id(f.pa1)).field('Thk (mm)').cell.value = '10.0';
     d.byId.get(id(f.pa1)).field(label(CLS)).cell.value = null; // the shown default wiped: the row has no own value to clear
     const dry = await upload(d.wb);

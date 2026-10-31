@@ -35,6 +35,7 @@ import {
 } from './requisitionService.js';
 import { getPurchaseOrder, poStage, PO_STAGE_LABEL, askPoApproval } from './purchaseService.js';
 import { CURRENCY } from './priceService.js';
+import { postMovement } from './stockService.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -95,12 +96,33 @@ function screenLine(l, { free, held, customer }) {
   const sentence = locked + EPS >= l.need && l.need > EPS ? `All ${fmt(l.need)}${u} is locked for this order.`
     : l.need <= EPS ? 'The line no longer needs this.'
       : `${fmt(locked)}${u} of ${fmt(l.need)} locked for this order${onOrder > EPS ? `, ${fmt(onOrder)} still coming on purchase orders` : ''}.`;
+  // §95: issued from this MR so far ("Issue now"; for an order's own MR: issued to its production order), and what is
+  // earmarked for it and still in the store — held from stock or received on its POs — which "Issue now" can take.
+  const issued = round6(l.cover.issued ?? 0);
+  const toIssue = round6((l.holds ?? []).reduce((t, h) => t + Number(h.quantity), 0));
   return {
     id: l.id, item: l.item, required: l.need, inStock: round6(free), takeFromStock, takeChosen: l.stockTake != null, proposedTake, heldFromStock, takeMax,
     toBuy, poRaised, received, onOrder, locked, open: l.cover.open, status: l.status, statusLabel: l.statusLabel, sentence,
+    issued, toIssue,
     purchase: l.purchase,
   };
 }
+
+/**
+ * §95: why "Issue now" is not offered on an MR (null = it is). An order's OWN MR (raised from the order's structure)
+ * is not issued from here: on release its earmark becomes the production order's reservation, issued from there.
+ */
+function issueRefusal(v) {
+  if (v.heldForAcceptance) return heldMessage(v.code);
+  if (!v.manual) {
+    return `${v.code} is the material of line ${v.lineNo ?? '?'} of ${v.orderCode ?? 'its order'}: once the line is released its earmark becomes the production order's reservation, and it is issued from the production order — not from here.`;
+  }
+  if (v.forType === 'stock') return 'An MR for stock refills stock — nothing is issued from it.';
+  return null;
+}
+
+/** §95: what an issue from this MR is used for — its sales order (For: sales order, or general naming one), else General. */
+const issueUsedFor = (forType, orderId) => (orderId != null && forType !== 'maintenance_order' ? 'order' : 'general');
 
 /** The PRs of some MRs, in short: Map requisitionId -> { id, code, status, statusLabel }. */
 async function prsOfRequisitions(db, companyId, reqIds) {
@@ -136,6 +158,7 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
   const open = v.manual || OPEN_ORDER_STATUSES.includes(v.order?.status);
   // §73: an MR raised before the customer accepted is shared, not released — nothing is taken or bought until approval.
   const heldMr = !!v.heldForAcceptance;
+  const issueReason = issueRefusal({ heldForAcceptance: heldMr, code: v.code, manual: v.manual, forType: v.forType, lineNo: v.line?.lineNo, orderCode: v.order?.code });
   return {
     id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel,
     forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes, raisedAt: v.raisedAt, raisedBy: v.raisedBy,
@@ -144,6 +167,10 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
     heldForAcceptance: heldMr,
     canEdit: open && !heldMr,
     reason: heldMr ? heldMessage(v.code) : open ? null : `${v.order?.code} is ${v.order?.status} — its material request no longer changes.`,
+    // §95: "Issue now" — one issue for what is earmarked and still in the store; used for the MR's sales order or General.
+    canIssue: !issueReason && lines.some((l) => l.toIssue > EPS),
+    issueReason,
+    issueUsedFor: issueUsedFor(v.forType, v.order?.id ?? null),
     lines,
     purchaseRequest: prOf.get(v.id) ?? null,
     purchaseOrders: [...pos.values()],
@@ -276,7 +303,7 @@ export async function saveMr(db, c, id, input = {}) {
       const mine = held.get(l.id) ?? [];
       const have = round6(mine.reduce((tt, h) => tt + h.quantity, 0));
       if (give > have + EPS) {
-        problems.push(`${nameOf(l.item)}: only ${fmt(have)}${u} is still held from stock — the rest is already reserved for production. Take at least ${fmt(round6(base - have))}.`);
+        problems.push(`${nameOf(l.item)}: only ${fmt(have)}${u} is still held from stock — ${l.issued > EPS ? `${fmt(l.issued)}${u} of it is already issued` : 'the rest is already reserved for production'}. Take at least ${fmt(round6(base - have))}.`);
         continue;
       }
       for (const h of mine) {
@@ -310,6 +337,156 @@ export async function saveMr(db, c, id, input = {}) {
   }
   const out = await mrScreen(db, c.companyId, head.id, manual ? { R: null } : {});
   return { ...out, saved: { held: holdRows.length, released: releaseAll.length + releasePart.length }, customerPurchaseOrders };
+}
+
+/**
+ * POST /material-requests/:id/issue { lines?: [{ lineId, quantity? }], movementDate?, notes?, dryRun? } — ISSUE NOW
+ * (init.sql §95, 2026-10-31). What is earmarked for the MR and still in the store (its holds: taken from stock, or
+ * received on its POs) leaves the store as ONE issue (stockService.postMovement — the one path that writes stock):
+ *   used for   the MR's sales order (For: sales order, or general naming one) — else General; an MR for a maintenance
+ *              order puts the MO on the issue (its parts cost), used for General
+ *   from       where the earmarked stock sits: storage areas first, then WIP, the most first (a lot stays its lot)
+ *   lines      none = everything earmarked; else per MR line, quantity blank = all of that line's earmark
+ * The holds fall by what is issued first (a hold used up is 'consumed'), so the issue never trips over its own earmark;
+ * the movement names the MR (requisition_id), and the MR screen shows it as Issued. dryRun: the plan, nothing written.
+ * Refused, every reason at once: an order's own MR (issued from its production order after release), a stock MR, an
+ * MR waiting for the customer's acceptance, more than is earmarked, stock not in a storage / WIP area or on a held lot.
+ * Fixed reads (head, lines, holds, balances) + ≤ 2 hold writes + the movement.
+ */
+export async function issueMr(db, c, id, input = {}) {
+  const [[head]] = await db.query(
+    `SELECT r.id, r.code, r.order_id, r.order_line_id, r.for_type, r.maintenance_order_id, r.held_for_acceptance, o.code AS order_code, sl.line_no
+       FROM cf_requisitions r LEFT JOIN cf_sales_orders o ON o.id = r.order_id LEFT JOIN cf_sales_order_lines sl ON sl.id = r.order_line_id
+      WHERE r.company_id = ? AND r.id = ? AND r.deleted_at IS NULL FOR UPDATE`,
+    [c.companyId, Number(id)],
+  );
+  if (!head) throw notFound('Material request');
+  const forType = forTypeOf(head.for_type);
+  const refused = issueRefusal({ heldForAcceptance: !!Number(head.held_for_acceptance), code: head.code, manual: head.order_line_id == null, forType, lineNo: head.line_no, orderCode: head.order_code });
+  if (refused) throw invalid('NOT_ISSUED_HERE', refused);
+  const [mrLines] = await db.query(
+    `SELECT pl.id, pl.item_id, m.code, m.name, COALESCE(pl.uom, i.uom) AS uom FROM cf_requisition_lines pl
+       JOIN cf_master_records m ON m.id = pl.item_id LEFT JOIN cf_item_details i ON i.master_id = pl.item_id AND i.deleted_at IS NULL
+      WHERE pl.company_id = ? AND pl.requisition_id = ? AND pl.deleted_at IS NULL ORDER BY pl.id`,
+    [c.companyId, head.id],
+  );
+  const lineById = new Map(mrLines.map((l) => [Number(l.id), { ...l, item: { id: Number(l.item_id), code: l.code, name: l.name, uom: l.uom ?? null } }]));
+  const itemIds = [...new Set(mrLines.map((l) => Number(l.item_id)))].sort((a, b) => a - b);
+  // The same lock order as saving the MR (the MR, its items, its holds) — and as postMovement's own check.
+  if (itemIds.length) await db.query('SELECT master_id FROM cf_item_details WHERE company_id = ? AND master_id IN (?) ORDER BY master_id FOR UPDATE', [c.companyId, itemIds]);
+  const [holdRows] = mrLines.length ? await db.query(
+    `SELECT v.id, v.pr_line_id, v.item_id, v.batch_id, v.quantity, b.code AS batch_code, b.status AS batch_status
+       FROM cf_stock_reservations v
+       JOIN cf_requisition_lines pl ON pl.id = v.pr_line_id AND pl.item_id = v.item_id AND pl.deleted_at IS NULL
+       LEFT JOIN cf_stock_batches b ON b.id = v.batch_id
+      WHERE v.company_id = ? AND pl.requisition_id = ? AND v.status = 'active' AND v.deleted_at IS NULL
+      ORDER BY v.id FOR UPDATE`,
+    [c.companyId, head.id],
+  ) : [[]];
+  const holdsOf = new Map();
+  for (const h of holdRows) { if (!holdsOf.has(Number(h.pr_line_id))) holdsOf.set(Number(h.pr_line_id), []); holdsOf.get(Number(h.pr_line_id)).push(h); }
+  const earmarked = (lineId) => round6((holdsOf.get(lineId) ?? []).reduce((t, h) => t + Number(h.quantity), 0));
+
+  // What to issue, per MR line.
+  const problems = [];
+  const want = new Map();
+  if (Array.isArray(input.lines) && input.lines.length) {
+    for (const [k, r] of input.lines.entries()) {
+      const l = lineById.get(Number(r?.lineId));
+      if (!l) { problems.push(`Row ${k + 1}: that line is not on ${head.code}.`); continue; }
+      const have = earmarked(Number(l.id));
+      const q = blank(r?.quantity) ? have : Number(r.quantity);
+      const u = unitOf(l.item);
+      if (!Number.isFinite(q) || q < 0) { problems.push(`${nameOf(l.item)}: the quantity to issue is a number above zero.`); continue; }
+      if (q <= EPS) continue;
+      if (q > have + EPS) { problems.push(`${nameOf(l.item)}: ${fmt(have)}${u} is earmarked for ${head.code} and not issued yet — issue at most that.`); continue; }
+      want.set(Number(l.id), round6((want.get(Number(l.id)) ?? 0) + q));
+    }
+  } else {
+    for (const l of mrLines) if (earmarked(Number(l.id)) > EPS) want.set(Number(l.id), earmarked(Number(l.id)));
+  }
+  assertNoProblems(problems, `${head.code} cannot be issued.`);
+  if (!want.size) throw invalid('NOTHING_TO_ISSUE', `Nothing on ${head.code} is earmarked and waiting in the store — take it from stock (and save), or wait for its purchase order to arrive.`);
+
+  // Where the earmarked stock sits: storage first, then WIP, the most first. One read for every item.
+  const wantItems = [...new Set([...want.keys()].map((lid) => Number(lineById.get(lid).item_id)))];
+  const [bal] = await db.query(
+    `SELECT k.stocking_area_id, a.code AS area_code, a.purpose, k.item_id, k.batch_key, k.quantity
+       FROM cf_stock_balances k JOIN cf_stocking_areas a ON a.id = k.stocking_area_id AND a.purpose IN ('storage', 'wip')
+      WHERE k.company_id = ? AND k.item_id IN (?) AND k.quantity > 0
+      ORDER BY (a.purpose = 'storage') DESC, k.quantity DESC, a.code`,
+    [c.companyId, wantItems],
+  );
+  const left = new Map(bal.map((b) => [`${b.stocking_area_id}:${b.item_id}:${b.batch_key}`, Number(b.quantity)]));
+  const legs = new Map();                 // area:item:batch → { itemId, batchId, fromAreaId, quantity, area, batch }
+  const holdLeft = new Map();             // hold id → quantity it keeps
+  const plan = [];
+  for (const [lineId, q] of want) {
+    const l = lineById.get(lineId);
+    const u = unitOf(l.item);
+    let need = q;
+    const skipped = [];
+    for (const h of holdsOf.get(lineId) ?? []) {
+      if (need <= EPS) break;
+      if (h.batch_id && h.batch_status !== 'available') { skipped.push(`lot ${h.batch_code} is ${h.batch_status === 'on_hold' ? 'on hold' : 'rejected'}`); continue; }
+      let take = round6(Math.min(need, Number(h.quantity)));
+      let got = 0;
+      for (const b of bal) {
+        if (take <= EPS) break;
+        if (Number(b.item_id) !== Number(l.item_id) || Number(b.batch_key) !== Number(h.batch_id ?? 0)) continue;
+        const key = `${b.stocking_area_id}:${b.item_id}:${b.batch_key}`;
+        const t = round6(Math.min(take, left.get(key)));
+        if (t <= EPS) continue;
+        left.set(key, round6(left.get(key) - t));
+        const lk = `${b.stocking_area_id}:${l.item_id}:${h.batch_id ?? 0}`;
+        const leg = legs.get(lk) ?? { itemId: Number(l.item_id), batchId: h.batch_id ?? null, fromAreaId: b.stocking_area_id, quantity: 0, area: b.area_code, batch: h.batch_code ?? null, lineId };
+        leg.quantity = round6(leg.quantity + t);
+        legs.set(lk, leg);
+        take = round6(take - t);
+        got = round6(got + t);
+      }
+      if (got > EPS) holdLeft.set(h.id, round6(Number(h.quantity) - got));
+      need = round6(need - got);
+    }
+    if (need > EPS) {
+      problems.push(`${nameOf(l.item)}: ${fmt(need)}${u} of the ${fmt(q)} to issue is not in a storage or WIP area${skipped.length ? ` (${skipped.join('; ')})` : ''} — issue ${fmt(round6(q - need))} at most.`);
+    }
+    plan.push({ lineId, item: l.item, quantity: round6(q - need) });
+  }
+  assertNoProblems(problems, `${head.code} cannot be issued.`);
+  const usedFor = issueUsedFor(forType, head.order_id);
+  const maintenanceOrderId = forType === 'maintenance_order' ? head.maintenance_order_id ?? null : null;
+  const lines = [...legs.values()];
+  const words = {
+    usedFor, order: usedFor === 'order' ? { id: head.order_id, code: head.order_code } : null, maintenanceOrderId,
+    lines: plan.map((p) => ({ ...p, from: lines.filter((x) => x.lineId === p.lineId).map((x) => ({ area: x.area, batch: x.batch, quantity: x.quantity })) })),
+  };
+  if (input.dryRun === true || input.dryRun === 'true') return { dryRun: true, ...words };
+
+  // The holds fall first (so the issue does not trip over its own earmark); a refusal by postMovement undoes them.
+  await db.query('SAVEPOINT mr_issue');
+  try {
+    const used = [...holdLeft].filter(([, q]) => q <= EPS).map(([hid]) => hid);
+    const part = [...holdLeft].filter(([, q]) => q > EPS);
+    if (used.length) await db.query("UPDATE cf_stock_reservations SET quantity = 0, status = 'consumed', closed_at = NOW() WHERE company_id = ? AND id IN (?)", [c.companyId, used]);
+    if (part.length) {
+      await db.query(`UPDATE cf_stock_reservations SET quantity = CASE id ${part.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
+        [...part.flat(), c.companyId, part.map((x) => x[0])]);
+    }
+    const movement = await postMovement(db, c, {
+      movementType: 'issue', movementDate: input.movementDate, usedFor,
+      ...(usedFor === 'order' ? { orderId: head.order_id } : {}),
+      ...(maintenanceOrderId != null ? { maintenanceOrderId } : {}),
+      reference: head.code, notes: blank(input.notes) ? `Issued against ${head.code}` : String(input.notes),
+      lines: lines.map((x) => ({ itemId: x.itemId, quantity: x.quantity, fromAreaId: x.fromAreaId, ...(x.batchId != null ? { batchId: x.batchId } : {}) })),
+    }, { requisitionId: head.id });
+    await db.query('RELEASE SAVEPOINT mr_issue');
+    const materialRequest = await mrScreen(db, c.companyId, head.id, { R: null });
+    return { ...words, movement, materialRequest, message: `${movement.code} issued ${plan.length === 1 ? `${fmt(plan[0].quantity)}${unitOf(plan[0].item)} of ${nameOf(plan[0].item)}` : `${plan.length} materials`} from ${head.code}.` };
+  } catch (e) {
+    await db.query('ROLLBACK TO SAVEPOINT mr_issue');
+    throw e;
+  }
 }
 
 /**

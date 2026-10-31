@@ -8,6 +8,10 @@
  *   PUT    /material-requests/:id { lines: [{ lineId, takeFromStock }], customerDate? }
  *                                                              earmark what is taken, make / update the PR (we buy) or the
  *                                                              customer's ₹0 PO (customer supplies)
+ *   POST   /material-requests/:id/issue { lines?: [{ lineId, quantity? }], movementDate?, notes?, dryRun? }
+ *                                                              ISSUE NOW (§95): what is earmarked for the MR and still in the
+ *                                                              store leaves it as ONE issue (used for its sales order, else
+ *                                                              General; an MO's MR names the MO) — same permission as saving
  *   GET    /purchase-requests?status=open|all|<status>&search=&orderId=
  *   GET    /purchase-requests/:id                              the grid: lines × vendor columns, quotes, PO raised
  *   POST   /purchase-requests/:id/vendors { supplierId }       a vendor column
@@ -25,7 +29,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
-  listMrs, mrScreen, saveMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
+  listMrs, mrScreen, saveMr, issueMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
 } from '../services/purchaseRequestService.js';
 
 const router = Router();
@@ -42,6 +46,7 @@ const company = (req) => ctx(req).companyId;
 router.get('/material-requests', view, handle((req) => listMrs(pool, company(req), req.query)));
 router.get('/material-requests/:id', view, handle((req) => mrScreen(pool, company(req), id(req))));
 router.put('/material-requests/:id', mrManage, handle((req) => tx(req, (db, c) => saveMr(db, c, id(req), body(req)))));
+router.post('/material-requests/:id/issue', mrManage, handle((req) => tx(req, (db, c) => issueMr(db, c, id(req), body(req)))));
 
 router.get('/purchase-requests', view, handle((req) => listPrs(pool, company(req), req.query)));
 router.get('/purchase-requests/:id', view, handle((req) => getPr(pool, company(req), id(req))));

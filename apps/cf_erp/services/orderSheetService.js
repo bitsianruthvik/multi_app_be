@@ -75,7 +75,7 @@ import ExcelJS from 'exceljs';
 import { CfError, invalid, conflict, assertNoProblems } from '../lib/errors.js';
 import { requireMaster } from './records.js';
 import { explode, writeLineUpdate, assertEditable } from './bomService.js';
-import { refreshValues } from './valueService.js';
+import { refreshValues, findOption } from './valueService.js';
 import { dateText } from './resolutionService.js';
 import { readLineValues, writeLineValues, LINK_CHOICES } from './orderValuesService.js';
 import { readLinks, settleLine, linksBlock, correspondingLine } from './linkService.js';
@@ -300,8 +300,10 @@ function inputFor(f, text, problems, where) {
   const t = String(text ?? '').trim();
   if (t === '') return { input: '', value: null };
   if (f.dataType === 'option') {
-    const lower = t.toLowerCase();
-    const found = (f.options ?? []).find((o) => o.text === t) ?? (f.options ?? []).find((o) => o.text.toLowerCase() === lower);
+    // The grid's own matcher (valueService.findOption): the option's value (short code) or its
+    // label, trimmed, any case — then the text the download wrote for it.
+    const found = findOption(f.options, t, { byId: false })
+      ?? (f.options ?? []).find((o) => String(o.text ?? '').trim().toLowerCase() === t.toLowerCase());
     if (!found) {
       const choices = (f.options ?? []).map((o) => o.text);
       problems.push(`${where}: "${t}" is not one of the choices of ${f.label}${choices.length ? ` — ${choices.slice(0, 8).join(', ')}${choices.length > 8 ? '…' : ''}` : ''}.`);

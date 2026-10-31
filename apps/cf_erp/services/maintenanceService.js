@@ -492,16 +492,33 @@ export async function setStatus(db, c, id, input = {}) {
   return getOrder(db, c.companyId, id);
 }
 
-/** Parts issued against the MO — when the stores record it (S8: cf_stock_movements.maintenance_order_id). null = not recorded. */
+/** Parts issued against the MO — Stores' issues naming it (init.sql §95: cf_stock_movements.maintenance_order_id; the MR's
+ * "Issue now" puts it there). null = none recorded. */
 async function partsCost(db, companyId, id) {
+  return (await partsCosts(db, companyId, [id])).get(Number(id)) ?? null;
+}
+
+/** The parts cost of several MOs at once: Map moId → rupees (an MO with no issue is not in it). 1 read. */
+async function partsCosts(db, companyId, ids) {
+  const out = new Map();
+  if (!ids.length) return out;
   try {
-    const [[r]] = await db.query(
-      `SELECT -SUM(l.value) AS cost, COUNT(*) AS n FROM cf_stock_ledger l JOIN cf_stock_movements m ON m.id = l.movement_id
-        WHERE m.company_id = ? AND m.maintenance_order_id = ? AND m.reversal_of_id IS NULL AND m.reversed_by_id IS NULL`,
-      [companyId, id],
+    const [rows] = await db.query(
+      `SELECT m.maintenance_order_id AS mo, -SUM(l.value) AS cost, COUNT(*) AS n FROM cf_stock_ledger l JOIN cf_stock_movements m ON m.id = l.movement_id
+        WHERE m.company_id = ? AND m.maintenance_order_id IN (?) AND m.reversal_of_id IS NULL AND m.reversed_by_id IS NULL AND l.deleted_at IS NULL
+        GROUP BY m.maintenance_order_id`,
+      [companyId, ids.map(Number)],
     );
-    return Number(r?.n) ? Math.round(Number(r.cost ?? 0) * 100) / 100 : null;
-  } catch (e) { if (missingSchema(e)) return null; throw e; }
+    for (const r of rows) if (Number(r.n)) out.set(Number(r.mo), Math.round(Number(r.cost ?? 0) * 100) / 100);
+    return out;
+  } catch (e) { if (missingSchema(e)) return out; throw e; }
+}
+
+/** An open MO's money so far: the parts issued to it, read live (stored on the MO only when it is closed). */
+function withLiveParts(o, parts) {
+  if (!ACTIVE_STATUSES.includes(o.status)) return o;
+  const partsCost = parts ?? null;
+  return { ...o, partsCost, cost: partsCost == null && !o.otherCost ? null : Number(partsCost ?? 0) + Number(o.otherCost ?? 0) };
 }
 
 const readMoney = (raw, label) => {
@@ -619,8 +636,9 @@ export async function listOrders(db, companyId, q = {}) {
   try {
     [rows] = await db.query(`${MO_SELECT} WHERE ${where.join(' AND ')} ORDER BY mo.id DESC LIMIT 500`, args);
   } catch (e) { if (missingSchema(e)) return { now: wall, rows: [] }; throw e; }
-  const mrs = await requisitionsOf(db, companyId, rows.map((r) => r.id));
-  return { now: wall, rows: rows.map((r) => shapeOrder(r, wall, mrs)) };
+  const active = rows.filter((r) => ACTIVE_STATUSES.includes(r.status)).map((r) => r.id);
+  const [mrs, parts] = await Promise.all([requisitionsOf(db, companyId, rows.map((r) => r.id)), partsCosts(db, companyId, active)]);
+  return { now: wall, rows: rows.map((r) => withLiveParts(shapeOrder(r, wall, mrs), parts.get(Number(r.id)))) };
 }
 
 /** GET /maintenance/orders/:id — the MO with its history and MRs (and the parts cost so far). 4 reads. */
@@ -637,8 +655,7 @@ export async function getOrder(db, companyId, id) {
     partsCost(db, companyId, id),
   ]);
   if (!row) throw notFound('Maintenance order');
-  const out = shapeOrder(row, wall, mrs);
-  if (ACTIVE_STATUSES.includes(row.status)) out.partsCost = parts;
+  const out = withLiveParts(shapeOrder(row, wall, mrs), parts);
   out.events = events.map((e) => ({ id: e.id, event: e.event, from: e.from_status, to: e.to_status, note: e.note, by: e.user_name ?? null, at: e.created_at }));
   out.now = wall;
   return out;

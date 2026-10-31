@@ -271,7 +271,7 @@ const started = (s) => s.state === 'in_progress' || s.state === 'done' || (s.sta
  * Set-based: one read, and for new lots one insert, one read back, one read of
  * the codes already taken and one update naming them.
  */
-async function nodeLots(db, c, nodes) {
+export async function nodeLots(db, c, nodes) {
   const ids = nodes.map((n) => n.id);
   const out = new Map();
   if (!ids.length) return out;
@@ -294,12 +294,52 @@ async function nodeLots(db, c, nodes) {
       used.add(w.code.toLowerCase());
     }
     if (want.length) {
-      await db.query(`UPDATE cf_stock_batches SET code = CASE id ${want.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
-        [...want.flatMap((w) => [w.b.id, w.code]), c.companyId, want.map((w) => w.b.id)]);
+      try {
+        await db.query(`UPDATE cf_stock_batches SET code = CASE id ${want.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
+          [...want.flatMap((w) => [w.b.id, w.code]), c.companyId, want.map((w) => w.b.id)]);
+      } catch (e) {
+        // Two steps started at the same moment (2026-10-31): the "taken" read above cannot see a lot another
+        // transaction is naming right now, so both chose the same code and the later one hit uq_csb_code once the
+        // first committed. The statement alone was undone — settle the names now that the other's lots are visible.
+        if (!isDuplicate(e)) throw e;
+        await settleLotCodes(db, c, want);
+      }
     }
-    for (const w of want) out.set(w.n.id, { ...w.b, code: w.code });
+    for (const w of want) out.set(w.n.id, w.existing ?? { ...w.b, code: w.code });
   }
   return out;
+}
+
+const isDuplicate = (e) => e?.errno === 1062 || e?.code === 'ER_DUP_ENTRY';
+
+/**
+ * After a duplicate lot code (a race between two transactions — see nodeLots): a piece the other transaction made a lot
+ * for meanwhile takes THAT lot (ours is dropped: one lot per piece); every other lot is named one by one — its code,
+ * else code-<piece id>, else code-<piece id>-<lot id> (unique by construction). Locking reads see the other's
+ * committed rows. Sets w.existing (the other's lot) or w.code on each entry of `want`.
+ */
+async function settleLotCodes(db, c, want) {
+  const [theirs] = await db.query(
+    'SELECT * FROM cf_stock_batches WHERE company_id = ? AND production_item_id IN (?) AND id NOT IN (?) AND deleted_at IS NULL ORDER BY id FOR UPDATE',
+    [c.companyId, want.map((w) => w.n.id), want.map((w) => w.b.id)],
+  );
+  const firstOf = new Map();
+  for (const r of theirs) if (!firstOf.has(r.production_item_id)) firstOf.set(r.production_item_id, r);
+  const drop = want.filter((w) => firstOf.has(w.n.id));
+  if (drop.length) await db.query('UPDATE cf_stock_batches SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [c.companyId, drop.map((w) => w.b.id)]);
+  for (const w of drop) w.existing = firstOf.get(w.n.id);
+  for (const w of want.filter((x) => !x.existing)) {
+    const names = [...new Set([w.code, `${w.code}-${w.n.id}`, `${w.code}-${w.n.id}-${w.b.id}`])];
+    for (const [i, code] of names.entries()) {
+      try {
+        await db.query('UPDATE cf_stock_batches SET code = ? WHERE company_id = ? AND id = ?', [code, c.companyId, w.b.id]);
+        w.code = code;
+        break;
+      } catch (e) {
+        if (!isDuplicate(e) || i === names.length - 1) throw e;
+      }
+    }
+  }
 }
 
 /**
@@ -867,15 +907,34 @@ async function cutStep(db, c, ctx, area, { s, node, k, d }) {
       const [taken] = await db.query('SELECT code_active FROM cf_stock_batches WHERE company_id = ? AND code_active IN (?)', [c.companyId, want.map((w) => w.code.toLowerCase())]);
       const used = new Set(taken.map((t) => t.code_active));
       for (const w of want) { if (used.has(w.code.toLowerCase())) w.code = `${w.code}-${w.o.id}`; used.add(w.code.toLowerCase()); }
-      await insertRows(db, 'cf_stock_batches', ['company_id', 'item_id', 'code', 'received_on', 'supplier_ref', 'unit_cost', 'owner_party_id', 'owner_order_id', 'notes', 'created_by'],
-        want.map((w) => {
-          const o = w.o;
-          const v = plan.offcutValue.get(o.id);
-          const owner = plan.offcutOwner.get(o.id);
-          return [c.companyId, o._itemId, w.code, new Date().toISOString().slice(0, 10), o.offcut_no, v == null ? null : round4(v), owner, owner ? ctx.rel.order_id : null,
-            o.kind === 'bar' ? `Bar offcut ${o.offcut_no} of ${ctx.rel.order_code} — ${fmt(o.length_mm)} mm long (cf_offcuts #${o.id})` : `Offcut ${o.offcut_no} of ${ctx.rel.order_code} — outline in cf_offcuts #${o.id}`,
-            c.userId ?? null];
-        }));
+      const OFFCUT_COLUMNS = ['company_id', 'item_id', 'code', 'received_on', 'supplier_ref', 'unit_cost', 'owner_party_id', 'owner_order_id', 'notes', 'created_by'];
+      const rowOf = (w) => {
+        const o = w.o;
+        const v = plan.offcutValue.get(o.id);
+        const owner = plan.offcutOwner.get(o.id);
+        return [c.companyId, o._itemId, w.code, new Date().toISOString().slice(0, 10), o.offcut_no, v == null ? null : round4(v), owner, owner ? ctx.rel.order_id : null,
+          o.kind === 'bar' ? `Bar offcut ${o.offcut_no} of ${ctx.rel.order_code} — ${fmt(o.length_mm)} mm long (cf_offcuts #${o.id})` : `Offcut ${o.offcut_no} of ${ctx.rel.order_code} — outline in cf_offcuts #${o.id}`,
+          c.userId ?? null];
+      };
+      try {
+        await insertRows(db, 'cf_stock_batches', OFFCUT_COLUMNS, want.map(rowOf), Math.max(1, want.length));   // one statement: all or none
+      } catch (e) {
+        // Two cuts of the order at the same moment (2026-10-31): both chose the same offcut code before either was
+        // committed (the insert alone was undone). One by one now: the code, else code-<offcut id>, else with the time.
+        if (!isDuplicate(e)) throw e;
+        for (const w of want) {
+          const names = [...new Set([w.code, `${w.code}-${w.o.id}`, `${w.code}-${w.o.id}-${Date.now().toString(36)}`])];
+          for (const [i, code] of names.entries()) {
+            try {
+              w.code = code;
+              await insertRows(db, 'cf_stock_batches', OFFCUT_COLUMNS, [rowOf(w)]);
+              break;
+            } catch (e2) {
+              if (!isDuplicate(e2) || i === names.length - 1) throw e2;
+            }
+          }
+        }
+      }
       const [made] = await db.query('SELECT id, code_active FROM cf_stock_batches WHERE company_id = ? AND code_active IN (?)', [c.companyId, want.map((w) => w.code.toLowerCase())]);
       const idOf = new Map(made.map((b) => [b.code_active, b.id]));
       for (const w of want) w.o.batch_id = idOf.get(w.code.toLowerCase()) ?? null;

@@ -42,6 +42,7 @@
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
+import { hasMovementLinks } from '../lib/movementLinks.js';
 import { availability } from './rollOutService.js';
 import {
   lineReadiness, openLines, lineNeeds, today as clockToday, dateOnly, dayWords,
@@ -142,11 +143,12 @@ const RESOLVED = new Set(['from_stock', 'covered', 'skipped', 'not_needed']);
 const nameOfItem = (it) => it.code ?? it.name ?? `item ${it.id}`;
 
 /** One requisition line, from its stored row, its own holds and allocations, and the engine's answer for it. */
-function shapeLine(pl, { n, reason, holds, allocs, todayText, customer = false, forStock = false }) {
+function shapeLine(pl, { n, reason, holds, allocs, todayText, customer = false, forStock = false, mrIssued = 0 }) {
   const item = { id: pl.item_id, code: pl.item_code, name: pl.item_name, uom: pl.uom ?? null, trackedBy: pl.tracked_by ?? null };
   const known = !!n;
   const need = known ? round6(n.need) : round6(pl.quantity);
-  const issued = known ? n.issued : 0;
+  // Issued: the engine's (to the released line's requirements); an MR raised by hand — its own "Issue now" issues (§95).
+  const issued = known ? n.issued : round6(mrIssued);
   const reserved = known ? n.reserved : 0;
   const ownHeld = round6(holds.reduce((t, h) => t + Number(h.quantity), 0));
   const purchase = allocs.map((a) => {
@@ -312,7 +314,10 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
   // The engine only answers for MRs of an order line; MRs raised by hand alone skip it (its reads are the costly part).
   const R = given ?? (heads.some((h) => h.order_line_id != null) ? await lineReadiness(db, companyId, { full: true }) : { needs: new Map(), byLine: new Map(), today: clockToday() });
   const ids = heads.map((h) => h.id);
-  const [[lines], [holds], [allocs]] = await Promise.all([
+  // §95: what "Issue now" issued from MRs raised by hand, per MR line (issues of the line's item, not reversed).
+  const manualIds = heads.filter((h) => h.order_line_id == null).map((h) => h.id);
+  const links = manualIds.length ? await hasMovementLinks(db) : false;
+  const [[lines], [holds], [allocs], [issuedRows]] = await Promise.all([
     db.query(
       `SELECT pl.id, pl.requisition_id, pl.order_line_id, pl.item_id, pl.quantity, COALESCE(pl.uom, i.uom) AS uom, i.tracked_by,
               pl.skipped, pl.skipped_by, pl.skipped_at, pl.skip_note, pl.stock_take, su.name AS skipped_by_name, m.code AS item_code, m.name AS item_name
@@ -347,11 +352,22 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
         ORDER BY a.id`,
       [companyId, ids],
     ),
+    links ? db.query(
+      `SELECT pl.id AS pr_line_id, SUM(-l.quantity) AS qty
+         FROM cf_stock_movements m
+         JOIN cf_stock_ledger l ON l.movement_id = m.id AND l.deleted_at IS NULL
+         JOIN cf_requisition_lines pl ON pl.requisition_id = m.requisition_id AND pl.item_id = l.item_id AND pl.deleted_at IS NULL
+        WHERE m.company_id = ? AND m.requisition_id IN (?) AND m.movement_type = 'issue' AND m.deleted_at IS NULL
+          AND m.reversal_of_id IS NULL AND m.reversed_by_id IS NULL
+        GROUP BY pl.id`,
+      [companyId, manualIds],
+    ) : [[]],
   ]);
   const group = (rows, key) => { const m = new Map(); for (const r of rows) { if (!m.has(r[key])) m.set(r[key], []); m.get(r[key]).push(r); } return m; };
   const linesOf = group(lines, 'requisition_id');
   const holdsOf = group(holds, 'pr_line_id');
   const allocsOf = group(allocs, 'pr_line_id');
+  const issuedOf = new Map(issuedRows.map((r) => [Number(r.pr_line_id), Number(r.qty)]));
   return heads.map((h) => {
     const manual = h.order_line_id == null;           // §79: raised by hand — no order line, its lines are typed
     const lineId = manual ? null : Number(h.order_line_id);
@@ -364,7 +380,7 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
       n: known ? needs.items.get(Number(pl.item_id)) ?? { need: 0, issued: 0, reserved: 0 } : null,
       reason: known ? reasonOf.get(Number(pl.item_id)) ?? null : null,
       holds: holdsOf.get(pl.id) ?? [], allocs: allocsOf.get(pl.id) ?? [], todayText: R.today, customer: supplyOf(h.supply) === 'customer',
-      forStock: manual && forType === 'stock',
+      forStock: manual && forType === 'stock', mrIssued: manual ? issuedOf.get(Number(pl.id)) ?? 0 : 0,
     }));
     // A material the line needs now that the requisition does not list yet (the design was frozen again).
     const listed = new Set(own.map((l) => Number(l.item.id)));

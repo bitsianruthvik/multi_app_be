@@ -101,7 +101,7 @@ import { levelName, LEAF_DEPTH } from './tree.js';
 import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH, parseJsonCol, isWorkedDefault, rollupNeeds, workOutFormulas, drawingFactsOf } from './resolutionService.js';
 import { childWordReader, valueWord } from './bomGraph.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
-import { coerce, refreshValues } from './valueService.js';
+import { coerce, refreshValues, findOption } from './valueService.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
 import { loadDesignExtras, linksOf, linksBlock, settleLine, designValueOf } from './linkService.js';
 import { orderDefaultOf, ownStands, defaultsForLine, missingSchema, notAllowedNote } from '../lib/orderDefaults.js';
@@ -1423,8 +1423,7 @@ async function coerceFor(db, ctx, s, value) {
   if (s.spec.dataType !== 'option') return coerce(db, ctx.companyId, spec, value, null);
   if (value === null || value === undefined || value === '') return { typed: null };
   const options = ctx.optionsBySpec.get(s.spec.id) ?? [];
-  const found = options.find((o) => o.id === Number(value))
-    ?? options.find((o) => o.value.toLowerCase() === String(value).trim().toLowerCase());
+  const found = findOption(options, value);
   if (!found) return { problem: `"${value}" is not an option of ${spec.code}.` };
   if (found.status !== 'active') return { problem: `Option ${found.value} of ${spec.code} is retired.` };
   const allowed = s.options ? new Set(s.options.map((o) => o.id)) : null;

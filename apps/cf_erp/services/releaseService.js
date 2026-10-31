@@ -2211,10 +2211,14 @@ async function requireStep(db, companyId, stepId) {
 }
 
 /** The step as its release sees it: status, blockers, label. */
-async function evaluatedStep(db, companyId, step) {
+async function evaluatedStep(db, companyId, step, given = null) {
   // The raw rows and evaluate() — the same status getRelease would give — without
   // shaping 11k steps into objects to look at one of them.
-  const data = await evaluatedTracker(db, companyId, [step.release_id]);
+  // `given` (stepBatchService): the batch's own evaluation of this release, read once per wave — used only while it
+  // still agrees with the row just locked (same state and count); anything else is read again here.
+  const known = given?.steps?.find((s) => s.id === step.id);
+  const fresh = known && known.state === step.state && Math.abs(Number(known.qty_good) - Number(step.qty_good)) <= EPS;
+  const data = fresh ? given : await evaluatedTracker(db, companyId, [step.release_id]);
   const raw = data?.steps.find((s) => s.id === step.id);
   if (!raw) throw notFound('Step');
   return { s: shapeStep(raw, data.itemById.get(raw.production_item_id)?._label ?? '') };
@@ -2261,10 +2265,14 @@ async function logEvent(db, c, stepId, event, {
  * waiting starts anyway and its start event is flagged before_ready. A step in
  * progress, done or on hold is refused either way.
  */
-export async function startStep(db, c, stepId, input = {}) {
+export async function startStep(db, c, stepId, input = {}, batch = {}) {
+  // `batch` is stepBatchService's, never a request body: { evaluated } its wave's evaluation of the release,
+  // { unplanned } the steps of the batch the plan has no ship week for (one read for all), { ledger: false } the
+  // ledger is posted by the recordProgress that follows in the same transaction (ledgerOnSteps posts what the step's
+  // state says, so once after both is the same as after each).
   const step = await requireStep(db, c.companyId, stepId);
   const at = readAt(input.at, step.release_epoch);
-  const { s } = await evaluatedStep(db, c.companyId, step);
+  const { s } = await evaluatedStep(db, c.companyId, step, batch.evaluated ?? null);
   // §76: never before its production order is released — not even the machine log's "it really was done".
   const poBlock = s.blockers.find((b) => b.kind === 'production_order');
   if (poBlock && s.status === 'not_ready') throw invalid('NOT_RELEASED', `${s.label} cannot start yet.`, { problems: [poBlock.text] });
@@ -2294,8 +2302,9 @@ export async function startStep(db, c, stepId, input = {}) {
   );
   await logEvent(db, c, step.id, 'start', { machineId, note: blank(input.note) ? null : String(input.note).slice(0, 500), at, beforeReady });
   // Not in the plan (2026-10-17): the start stands; its start event is flagged unplanned (§70).
-  if ((await unplannedOf(db, c.companyId, [step.id])).size) await flagUnplanned(db, c.companyId, { stepIds: [step.id] });
-  await ledgerOnSteps(db, c, [step.id]);
+  const unplanned = batch.unplanned ? batch.unplanned.has(step.id) : (await unplannedOf(db, c.companyId, [step.id])).size > 0;
+  if (unplanned) await flagUnplanned(db, c.companyId, { stepIds: [step.id] });
+  if (batch.ledger !== false) await ledgerOnSteps(db, c, [step.id]);
   return releaseAfterWrite(db, c.companyId, step.release_id, input.view);
 }
 

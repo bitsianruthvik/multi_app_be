@@ -35,6 +35,8 @@
  *   POST   /production-steps/:id/hold       { note }
  *   POST   /production-steps/:id/resume     { note? }
  *   GET    /production-steps/:id/history
+ *   POST   /production-steps/finish         { stepIds, note?, at? } — start (if not) and finish many steps, each in its
+ *                                           own transaction, in the order their waits allow (stepBatchService; at most 200)
  *   POST   /requirements/:id/reserve        { quantity?, batchId? }
  *   POST   /releases/:id/reserve            reserves what is free for every requirement
  *   POST   /requirements/:id/issue          issues the reserved stock to the order
@@ -55,6 +57,7 @@ import { shipLine, shipmentView } from '../services/dispatchService.js';
 import { trackerTree, trackerTreeChildren, trackerTreeNode, lineGrid, lineGridChildren } from '../services/trackerTreeService.js';
 import { listProductionOrders } from '../services/productionOrdersService.js';
 import { planCheck } from '../services/floorService.js';
+import { finishSteps } from '../services/stepBatchService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -105,6 +108,8 @@ router.post('/production-steps/:id/start', manage, handle((req) => tx(req, (db, 
 router.post('/production-steps/:id/progress', manage, handle((req) => tx(req, (db, c) => recordProgress(db, c, id(req), body(req)))));
 router.post('/production-steps/:id/hold', manage, handle((req) => tx(req, (db, c) => holdStep(db, c, id(req), body(req)))));
 router.post('/production-steps/:id/resume', manage, handle((req) => tx(req, (db, c) => resumeStep(db, c, id(req), body(req)))));
+// Catching up / go-live data entry (2026-10-31): one transaction PER STEP inside, so it is not wrapped in tx().
+router.post('/production-steps/finish', manage, handle((req) => finishSteps(ctx(req), req.body ?? {})));
 router.get('/production-steps/:id/history', view, handle((req) => stepHistory(pool, company(req), id(req))));
 
 router.post('/requirements/:id/reserve', stock, handle((req) => tx(req, (db, c) => reserveRequirement(db, c, id(req), body(req)))));

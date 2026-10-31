@@ -22,12 +22,16 @@ const __dirname = path.dirname(__filename);
 
 export async function loadApps(server) {
   const entries = fs.readdirSync(__dirname, { withFileTypes: true });
+  // LOAD_APPS=cf_erp,cf_hrms loads only those folders — for a local server pointed at another database, so other
+  // apps' timers (digests, alert runs, delivery sweepers) do not claim or send there. Unset = every app.
+  const only = String(process.env.LOAD_APPS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const loaded = [];
   const loadedAppManifests = [];
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     if (entry.name.startsWith("_")) continue; // skip _loader/etc.
+    if (only.length && !only.includes(entry.name)) continue;
 
     const manifestPath = path.join(__dirname, entry.name, "app.js");
     if (!fs.existsSync(manifestPath)) continue;

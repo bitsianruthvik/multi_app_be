@@ -388,7 +388,9 @@ export async function settleLineRows(db, c, lineId, newRoot, ids, names) {
  * POST /orders/:id/lines/from-standard — a new line made from a standard: { standardId | number, versionId?,
  * quantity, committedDate?, description?, lineNo?, notes?, rate?, rateBasis? }. The line sells the version's root
  * definition, with a deep copy of its BOM, values and part drawings, editable until lock. Needs a transaction.
- * Returns the order (getOrder) with `fromStandard` { lineId, standardId, versionNo, rows, cutPieces }.
+ * Returns the order (getOrder) with `fromStandard` { lineId, standardId, versionNo, rows, cutPieces }. What the new
+ * line still needs before it can be frozen is read by the screen right after, OUTSIDE this transaction
+ * (GET /order-lines/:id/lock) — it is ~140 round trips on a big line and must not hold this one's locks.
  */
 export async function addLineFromStandard(db, c, orderId, input = {}) {
   const { companyId } = c;

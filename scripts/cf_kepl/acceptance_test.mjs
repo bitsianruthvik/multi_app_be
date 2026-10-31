@@ -461,6 +461,39 @@ try {
   const Arev = await ACC.getAcceptance(db, COMPANY, rev.id);
   ok('the revision is confirmed and its acceptance came with it, locked', rev.status === 'confirmed' && Arev.locked && Arev.approved.version === 1 && Arev.postStages.length === 2, j([rev.status, Arev.state, Arev.postStages.length]));
 
+  section('14. A pro-rata charge with no operation starts at the last operation of the top-level flow');
+  const trial = await OPS.createOperation(db, c, { code: `${tag}-TRL`, name: `Trial assembly ${tag}` });
+  const disp = await OPS.createOperation(db, c, { code: `${tag}-DSP`, name: `Dispatch ${tag}` });
+  const flowId = await ins("INSERT INTO cf_operation_flows (company_id, code, name, status, created_by) VALUES (?, ?, ?, 'active', ?)", [COMPANY, `${tag}-SPAN`, `Span ${tag}`, c.userId]);
+  for (const [i, op] of [[10, trial], [20, paint], [30, disp]]) {
+    await db.query('INSERT INTO cf_operation_flow_steps (company_id, flow_id, sequence, operation_id, created_by) VALUES (?, ?, ?, ?, ?)', [COMPANY, flowId, i, op.id, c.userId]);
+  }
+  const tNoOp = await ACC.createTemplate(db, c, { kind: 'charges', name: `${tag} no op`, isDefault: true, rows: { charges: [
+    { key: 'fab', label: 'Fabrication', basis: { type: 'weight', weight: 'drawing' }, billing: 'pro_rata' },
+    { key: 'pnt', label: 'Painting', basis: { type: 'weight', weight: 'drawing' }, billing: 'on_completion' },
+  ] } });
+  ok('the default charges template leaves the operation empty', tNoOp.isDefault && tNoOp.rows.charges[0].operationId === null);
+  const O3 = await makeOrder('P', 1);
+  const [[o3line]] = await db.query('SELECT item_id FROM cf_sales_order_lines WHERE id = ?', [O3.lineId]);
+  const [[o3item]] = await db.query('SELECT default_flow_id FROM cf_master_records WHERE id = ?', [o3line.item_id]);
+  const A3fixture = await ACC.getAcceptance(db, COMPANY, O3.id);
+  ok('the fixture girder’s own flow is read through the frozen line too (its last step)', o3item.default_flow_id != null && A3fixture.suggestedOperation?.operationId != null && A3fixture.terms.charges[0].operationId === A3fixture.suggestedOperation.operationId, j(A3fixture.suggestedOperation));
+  await db.query('UPDATE cf_master_records SET default_flow_id = NULL WHERE id = ?', [o3line.item_id]);
+  const A3none = await ACC.getAcceptance(db, COMPANY, O3.id);
+  ok('no flow on the top row: nothing is suggested and the charge stays empty', A3none.suggestedOperation === null && A3none.terms.charges[0].operationId === null && A3none.prefilledCharges.length === 0, j([A3none.suggestedOperation, A3none.terms.charges[0]]));
+  await db.query('UPDATE cf_master_records SET default_flow_id = ? WHERE id = ?', [flowId, o3line.item_id]);
+  const A3 = await ACC.getAcceptance(db, COMPANY, O3.id);
+  eq('the pro-rata charge is prefilled with the flow’s LAST operation; the on-completion one is left alone',
+    [A3.terms.charges.map((x) => [x.key, x.operationId]), A3.prefilledCharges, A3.suggestedOperation?.operationId, A3.suggestedOperation?.name],
+    [[['fab', disp.id], ['pnt', null]], ['fab'], disp.id, disp.name]);
+  ok('it says where the suggestion comes from', /last operation of line 1/.test(A3.suggestedOperation?.why ?? '') && A3.suggestedOperation.why.includes(`${tag}-SPAN`), A3.suggestedOperation?.why);
+  ok('the estimate names that operation on the charge', A3.estimate.charges.find((x) => x.key === 'fab')?.operation === disp.name);
+  const dry3 = await ACC.saveAcceptance(db, c, O3.id, { ...JSON.parse(JSON.stringify(A3.terms)), dryRun: true });
+  ok('the prefilled terms no longer say "choose the operation the work passes" for that charge', !dry3.problems.some((p) => /Charge 1 .*choose the operation/.test(p)), j(dry3.problems));
+  const changed3 = JSON.parse(JSON.stringify(A3.terms)); changed3.charges[0].operationId = trial.id;
+  const dry3b = await ACC.saveAcceptance(db, c, O3.id, { ...changed3, dryRun: true });
+  ok('the person can still choose another operation', dry3b.terms.charges[0].operationId === trial.id, j(dry3b.terms.charges[0]));
+
   const [[l923b]] = await db.query('SELECT id, locked_at, (SELECT COUNT(*) FROM cf_production_releases r WHERE r.order_line_id = 923 AND r.deleted_at IS NULL) AS rel FROM cf_sales_order_lines WHERE id = 923');
   ok('line 923 untouched', JSON.stringify(l923 ?? null) === JSON.stringify(l923b ?? null));
 } catch (e) {

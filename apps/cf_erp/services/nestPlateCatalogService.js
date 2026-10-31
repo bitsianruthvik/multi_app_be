@@ -380,9 +380,38 @@ export async function missingPlatesOf(db, companyId, ctx, found, { alikeGrade = 
 }
 
 /**
+ * The size a new plate of a steel is given when only its steel is known: the size the catalog's plates of that
+ * thickness use most ('thickness'), else the size most used by any plate ('catalog'); a tie goes to the larger plate,
+ * then the longer. Its kind is the kind most plates of that size are (standard / custom; custom when they do not say).
+ * → { length, width, kind, from } | null (no plate with a size at all)
+ */
+export function commonSize(plates, thickness) {
+  const sized = (plates ?? []).filter((x) => x.steel?.length > 0 && x.steel?.width > 0);
+  const pick = (rows) => {
+    const bySize = new Map();
+    for (const x of rows) {
+      const L = r3(Math.max(x.steel.length, x.steel.width)); const W = r3(Math.min(x.steel.length, x.steel.width));
+      const k = `${L}x${W}`;
+      if (!bySize.has(k)) bySize.set(k, { length: L, width: W, n: 0, kinds: { STANDARD: 0, CUSTOM: 0 } });
+      const e = bySize.get(k); e.n += 1;
+      const kind = norm(x.kind); if (kind === 'STANDARD' || kind === 'CUSTOM') e.kinds[kind] += 1;
+    }
+    const best = [...bySize.values()].sort((a, b) => b.n - a.n || b.length * b.width - a.length * a.width || b.length - a.length)[0];
+    return best ? { length: best.length, width: best.width, kind: best.kinds.STANDARD > best.kinds.CUSTOM ? 'standard' : 'custom' } : null;
+  };
+  const t = Number(thickness);
+  const own = Number.isFinite(t) && t > 0 ? pick(sized.filter((x) => Math.abs(Number(x.steel.thickness) - t) <= THICKNESS_TOL)) : null;
+  if (own) return { ...own, from: 'thickness' };
+  const any = pick(sized);
+  return any ? { ...any, from: 'catalog' } : null;
+}
+
+/**
  * POST …/nesting/plates — adds plates to the catalog, all of them in a fixed number of round trips.
  *
  *   input.plates   [{ key | thickness, length, width, grade, impactClass, kind: 'custom' (default) | 'standard', code?, name? }]
+ *                  — or a STEEL alone { thickness, material?, grade, impactClass } (nesting's missingPlates): sized by
+ *                  commonSize (the thickness's most used size, else the catalog's), standard when the line nests on standard only
  *   input.dryRun   say what would be created, write nothing
  *
  * → { dryRun, created: [{ key, itemId, code, name, kind }], skipped: [{ key, why, itemId?, code? }], message }
@@ -393,7 +422,7 @@ export async function missingPlatesOf(db, companyId, ctx, found, { alikeGrade = 
  * already taken, no plate stock place, no plate to model on — every one said, and nothing written.
  */
 export async function createNestPlates(db, c, lineId, input = {}) {
-  await requireLine(db, c.companyId, lineId);
+  const line = await requireLine(db, c.companyId, lineId);
   const dryRun = input.dryRun === true || input.dryRun === 'true' || input.dryRun === 1 || input.dryRun === '1';
   const asked = Array.isArray(input.plates) ? input.plates : [];
   if (!asked.length) throw invalid('NO_PLATES', 'Say which plates to add (plates).');
@@ -408,7 +437,30 @@ export async function createNestPlates(db, c, lineId, input = {}) {
   });
   if (unread.length) throw invalid('PLATES_INVALID', 'Nothing was added to the catalog.', { problems: unread });
 
-  const plans = await planPlates(db, c.companyId, wanted);
+  // A STEEL WITHOUT A SIZE (2026-10-31: nesting's "no catalog plate is 8 mm MS E250" — { thickness, material, grade,
+  // impactClass }): it is given the size the company's plates of that thickness use most, else the size most used by
+  // any plate (the largest of them on a tie). The catalog is read once here and handed on, so it is not read twice.
+  let catalog = null;
+  const unsized = wanted.filter((w) => blank(w.length) && blank(w.width));
+  if (unsized.length) {
+    const places = (await cutPlaces(db, c.companyId)).plate;
+    if (places.stockNodeIds.length) {
+      catalog = await candidatePlates(db, c.companyId, [...places.stockIds]);
+      for (const w of unsized) {
+        const size = commonSize(catalog, w.thickness);
+        if (!size) continue;
+        w.length = size.length; w.width = size.width; w.sizedFrom = size.from;
+        // A line that nests on standard plates only would not use a custom one: the plate is made standard for it.
+        if (blank(w.kind)) w.kind = line.nest_plates === 'standard' ? 'standard' : size.kind;
+      }
+    }
+    const still = unsized.filter((w) => blank(w.length)).map((w) => `${fmt(w.thickness)} mm ${[w.material, w.grade, w.impactClass].filter((x) => !blank(x)).join(' ')}: ${places.stockNodeIds.length
+      ? 'the catalog has no plate yet to take a size from — give its length and width, or add the first plate in Items'
+      : 'no raw plate stock is set, so nothing says where a new plate is filed — choose it in Setup › Cutting'}.`);
+    if (still.length) throw invalid('PLATES_INVALID', 'Nothing was added to the catalog.', { problems: still });
+  }
+
+  const plans = await planPlates(db, c.companyId, wanted, catalog ? { plates: catalog } : {});
   const problems = [];
   const skipped = [];
   const make = [];
@@ -434,12 +486,12 @@ export async function createNestPlates(db, c, lineId, input = {}) {
     return [added, not].filter(Boolean).join(' ') || 'Nothing to add.';
   };
   if (dryRun || !make.length) {
-    const created = dryRun ? make.map((p) => ({ key: p.key, itemId: null, code: p.code, name: p.name, kind: p.kind })) : [];
+    const created = dryRun ? make.map((p) => ({ key: p.key, itemId: null, code: p.code, name: p.name, kind: p.kind, ...(p.input?.sizedFrom ? { sizedFrom: p.input.sizedFrom, length: p.length, width: p.width } : {}) })) : [];
     return { dryRun, created, skipped, message: say(created) };
   }
 
   await writeNewPlates(db, c, make);
-  const created = make.map((p) => ({ key: p.key, itemId: p.id, code: p.code, name: p.name, kind: p.kind }));
+  const created = make.map((p) => ({ key: p.key, itemId: p.id, code: p.code, name: p.name, kind: p.kind, ...(p.input?.sizedFrom ? { sizedFrom: p.input.sizedFrom, length: p.length, width: p.width } : {}) }));
   return { dryRun: false, created, skipped, message: say(created) };
 }
 

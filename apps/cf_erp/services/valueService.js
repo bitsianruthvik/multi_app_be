@@ -167,6 +167,27 @@ export function validateTableValue(spec, input) {
   return { typed: { ...EMPTY, value_json: { x: x.values, y: y.values, v } } };
 }
 
+/**
+ * The one matcher for a typed pick-list answer — coerce (every value write, the
+ * values grid included) and the order sheet import use it: by id (unless `byId`
+ * is false), then by the option's VALUE (its short code), then by its LABEL —
+ * each trimmed, ignoring case. A value beats a label.
+ */
+export function findOption(options, typed, { byId = true } = {}) {
+  if (typed === null || typed === undefined) return undefined;
+  const list = options ?? [];
+  const t = String(typed).trim();
+  if (t === '') return undefined;
+  if (byId && /^\d+$/.test(t)) {
+    const hit = list.find((o) => Number(o.id) === Number(t));
+    if (hit) return hit;
+  }
+  const lower = t.toLowerCase();
+  const norm = (x) => String(x).trim().toLowerCase();
+  return list.find((o) => o.value != null && norm(o.value) === lower)
+    ?? list.find((o) => o.label != null && o.label !== '' && norm(o.label) === lower);
+}
+
 async function loadSpecOptions(db, companyId, specId) {
   const [rows] = await db.query(
     'SELECT id, value, label, status FROM cf_spec_options WHERE company_id = ? AND specification_id = ? AND deleted_at IS NULL',
@@ -210,8 +231,7 @@ export async function coerce(db, companyId, spec, input, allowedOptionIds = null
     }
     case 'option': {
       const options = await loadSpecOptions(db, companyId, spec.id);
-      const found = options.find((o) => o.id === Number(input))
-        ?? options.find((o) => o.value.toLowerCase() === String(input).trim().toLowerCase());
+      const found = findOption(options, input);
       if (!found) return { problem: `"${input}" is not an option of ${spec.code}.` };
       if (found.status !== 'active') return { problem: `Option ${found.value} of ${spec.code} is retired.` };
       if (allowedOptionIds && allowedOptionIds.size && !allowedOptionIds.has(found.id)) {

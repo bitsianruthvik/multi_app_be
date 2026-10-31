@@ -23,6 +23,7 @@ import { listStock } from './stockService.js';
 import { lastPricesPaid, listPricesOf, perUnitPrice } from './priceService.js';
 import { untrackedOf } from '../lib/nestUntracked.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
+import { hasMovementLinks } from '../lib/movementLinks.js';
 
 const EPS = 1e-9;
 const round2 = (n) => Number(Number(n).toFixed(2));
@@ -544,8 +545,11 @@ export async function orderCosts(db, companyId, orderId) {
  *   material      what left stock for the order and did not come back: plates / sections / bought parts — taken by
  *                 the production ledger (cut, step start), issued against the order or written off. Net of returns
  *                 (a cut undone puts the plate back).
- *   consumables   ISSUES from stock "Used for" the order (§74) of items that are not on the order's MR and are not
- *                 plate or section stock: welding wire, gas, paint … (an issue of an MR item or a plate is material).
+ *   consumables   ISSUES from stock "Used for" the order (§74) that are not plate or section stock: welding wire, gas,
+ *                 paint … — an issue made from an MR raised BY HAND for the order (Stores › New MR, For: sales order;
+ *                 §95 "Issue now"), or with no MR of an item that is not on the order's OWN material MR(s) (the ones
+ *                 raised from the order's structure, one per line). An issue of an item on the order's own MR (not
+ *                 from a hand-raised MR), or of a plate, is material (user, 2026-10-31).
  *   customer      the customer's own material used: quantity only, ₹0 to us (their reference value shown apart).
  *   credits       scrap at the scrap rate (the value that went into the SCRAP area) + offcuts back to stock (the value
  *                 of the offcut pieces cut from the order's plates). Net of undo.
@@ -568,21 +572,26 @@ export async function orderCostSheets(db, companyId, orderIds) {
     if (asked && !ownerOf.has(Number(f.id))) ownerOf.set(Number(f.id), Number(asked.id));
   }
   const all = [...ownerOf.keys()];
+  // §95: whether an issue came from an MR raised by hand (no order line) — such an issue is consumables.
+  const links = await hasMovementLinks(db);
+  const handMr = links ? '(rq.id IS NOT NULL AND rq.order_line_id IS NULL)' : '0';
   const [[rows], [mrItems], places, [offcutRows]] = await Promise.all([
     db.query(
-      `SELECT m.order_id, m.movement_type, m.used_for, l.item_id, a.purpose, (COALESCE(b.owner_party_id, 0) <> 0) AS theirs,
+      `SELECT m.order_id, m.movement_type, m.used_for, l.item_id, a.purpose, (COALESCE(b.owner_party_id, 0) <> 0) AS theirs, ${handMr} AS hand_mr,
               SUM(l.quantity) AS qty, SUM(l.value) AS value, SUM(l.value IS NULL) AS uncosted, COUNT(*) AS n
          FROM cf_stock_ledger l
          JOIN cf_stock_movements m ON m.id = l.movement_id AND m.deleted_at IS NULL
          JOIN cf_stocking_areas a ON a.id = l.stocking_area_id
          LEFT JOIN cf_stock_batches b ON b.id = l.batch_id
+         ${links ? 'LEFT JOIN cf_requisitions rq ON rq.id = m.requisition_id' : ''}
         WHERE l.company_id = ? AND m.order_id IN (?) AND m.movement_type IN ('issue', 'transform', 'scrap')
           AND b.production_item_id IS NULL
-        GROUP BY m.order_id, m.movement_type, m.used_for, l.item_id, a.purpose, (COALESCE(b.owner_party_id, 0) <> 0)`,
+        GROUP BY m.order_id, m.movement_type, m.used_for, l.item_id, a.purpose, (COALESCE(b.owner_party_id, 0) <> 0), ${handMr}`,
       [companyId, all]),
+    // The order's OWN material MRs only (raised from its structure, one per order line) — not one raised by hand for it.
     db.query(
       `SELECT DISTINCT r.order_id, rl.item_id FROM cf_requisition_lines rl JOIN cf_requisitions r ON r.id = rl.requisition_id AND r.deleted_at IS NULL
-        WHERE rl.company_id = ? AND r.order_id IN (?) AND rl.deleted_at IS NULL`,
+        WHERE rl.company_id = ? AND r.order_id IN (?) AND r.order_line_id IS NOT NULL AND rl.deleted_at IS NULL`,
       [companyId, all]),
     cutPlaces(db, companyId),
     // The offcut LOTS cutting made from the order's plates (cf_offcuts with a stock piece): their kilograms — the
@@ -635,7 +644,7 @@ export async function orderCostSheets(db, companyId, orderIds) {
     if (purpose === 'scrap') { s.credits.scrap = round2(s.credits.scrap + value); s.credits.scrapKg = round6(s.credits.scrapKg + qty); addItem(s, r.item_id, 'scrap', qty, value, uncosted); s.uncostedRows += uncosted; continue; }
     if (isOffcut(r.item_id) && value > 0) { s.credits.offcuts = round2(s.credits.offcuts + value); addItem(s, r.item_id, 'offcut', qty, value, uncosted); continue; }
     const consumable = r.movement_type === 'issue' && r.used_for === 'order' && !isStockPlate(r.item_id) && !isOffcut(r.item_id)
-      && !onMr.has(`${ownerOf.get(Number(r.order_id))}:${r.item_id}`);
+      && (Number(r.hand_mr) === 1 || !onMr.has(`${ownerOf.get(Number(r.order_id))}:${r.item_id}`));
     s.uncostedRows += uncosted;
     if (consumable) { s.consumables = round2(s.consumables - value); addItem(s, r.item_id, 'consumable', -qty, -value, uncosted); }
     else { s.material = round2(s.material - value); addItem(s, r.item_id, 'material', -qty, -value, uncosted); }
