@@ -1705,6 +1705,15 @@ async function loadPacker(injected) {
  * Only the line-level impossibilities (no structure, nowhere to file a plate)
  * throw, because there is no proposal to show at all.
  */
+/** What a losing try keeps of its layout: the figures pickBest ranks by and the stats read — no placed outlines. */
+function lightLayout(out) {
+  if (!out) return out;
+  return {
+    light: true, packer: out.packer, deterministic: out.deterministic, unplaced: out.unplaced, sizeOver: out.sizeOver, score: out.score, areaBought: out.areaBought,
+    nests: (out.nests ?? []).map((n) => ({ sheetKey: n.sheetKey, pieces: { length: n.pieces?.length ?? 0 } })),
+  };
+}
+
 export async function planNesting(db, companyId, orderLineId, input = {}) {
   const planStartedAt = Date.now();   // the effort's budget runs from here
   // PROGRESS (2026-10-03, nestRunService): a background run listens here for its
@@ -2079,6 +2088,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
      */
     const ckOf = new Map();                            // steel key → { unplaced, areaBought } of the last checkpoint passed on
     const settledOf = new Map();                       // steel key → results settled so far
+    const keptOf = new Map();                          // steel key → { entry, result } of its best try so far (kept whole)
     const passCheckpoint = (key, c, extra = {}) => {
       if (!input.onCheckpoint || !c) return;
       const last = ckOf.get(key);
@@ -2101,7 +2111,22 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       say(`${name} — try ${job.round + 1}: ${what}`, { phase: 'packing', done, total });
       // Every job of this steel has settled: its final layout is its checkpoint, marked done.
       if (!settledOf.has(job.key)) settledOf.set(job.key, []);
-      settledOf.get(job.key).push({ ...result, seed: job.seed });
+      const entry = { ...result, seed: job.seed };
+      settledOf.get(job.key).push(entry);
+      // ONLY THE BEST LAYOUT OF EACH STEEL IS KEPT WHOLE (2026-11-01: an hour-long run of the 75 m truss held all 48 tries'
+      // layouts — every placed piece's outline — until the end and ran out of 11 GB). A try that loses to the steel's best
+      // so far keeps only what the final pick and the stats read; the same ranking (pickBest) decides, so the answer is the same.
+      if (result?.ok && result.out) {
+        const kept = keptOf.get(job.key);
+        if (!kept) keptOf.set(job.key, { entry, result });
+        else {
+          const won = pickBest([kept.entry, entry]);
+          const loser = won?.out === entry.out ? kept : { entry, result };
+          if (won?.out === entry.out) keptOf.set(job.key, { entry, result });
+          const light = lightLayout(loser.entry.out);
+          loser.entry.out = light; loser.result.out = light;
+        }
+      }
       if (input.onCheckpoint && settledOf.get(job.key).length === jobsOf.get(job.key)) {
         const won = pickBest(settledOf.get(job.key).filter((r) => !r.skipped));
         if (won?.out?.packer === 'shape') passCheckpoint(job.key, checkpointOf(won.out), { done: true, seed: won.seed });
