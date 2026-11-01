@@ -117,6 +117,14 @@ ok('a drawing is a row\'s only while it is the row\'s size (either way round), a
   return planFacts([row({})], d).get(7)?.TRUE_AREA === 5e6 && planFacts([row({ lengthMm: 500, widthMm: 12000 })], d).has(7) && !planFacts([row({ lengthMm: 11000 })], d).has(7)
     && planFacts([row({ lengthMm: null, widthMm: null })], d).has(7) && !planFacts([row({ isPlatePart: false })], d).has(7) && !planFacts([row({ markNorm: 'XX' })], d).has(7);
 })());
+ok('the drawing is the truth within 2 % (at least 25 mm): a web cut to camber (7534 × 1157 for 7525 × 1150) and a smoothed gusset (2998 × 2130 for 2995 × 2125) take their drawings, the difference said; a part re-sized past it does not', (() => {
+  const web = [{ id: 2, drawing_id: null, mark_norm: 'WEB-S1', lengthMm: 7533.9, widthMm: 1157.1, areaMm2: 8.65e6, holes: 90, holeDiameters: [23.5] }];
+  const gp = [{ id: 3, drawing_id: null, mark_norm: 'JL2A-GP', lengthMm: 2998, widthMm: 2130, areaMm2: 4.1e6, holes: 91, holeDiameters: [26.5] }];
+  const w = planFacts([{ id: 8, isPlatePart: true, markNorm: 'WEB-S1', drawingIds: [], lengthMm: 7525, widthMm: 1150 }], web).get(8);
+  const g = planFacts([{ id: 9, isPlatePart: true, markNorm: 'JL2A-GP', drawingIds: [], lengthMm: 2995, widthMm: 2125 }], gp).get(9);
+  const far = planFacts([{ id: 10, isPlatePart: true, markNorm: 'WEB-S1', drawingIds: [], lengthMm: 7000, widthMm: 1150 }], web);
+  return w?.TRUE_AREA === 8.65e6 && w.sizeDiffers?.row?.[0] === 7525 && g?.TRUE_AREA === 4.1e6 && !!g.sizeDiffers && !far.has(10);
+})());
 
 /* ===========================================================================
  * 2 + 3. On the database: the rule, and a fixture girder

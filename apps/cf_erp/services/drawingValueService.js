@@ -20,8 +20,8 @@
  * WHICH ROW TAKES WHICH DRAWING — partDrawingService's own rule: the file with the row's drawing
  * mark, else the file of a register drawing the row is linked to. Only for a row cut from PLATE
  * (its CUT_FROM, resolved as every value is — lib/cutFrom), and only while the drawing IS the row:
- * its rectangle must be the row's LENGTH × WIDTH within 1 mm, either way round (partGeometry.orientTo
- * — the check the Drawings dialog already words). A part re-sized away from its drawing loses the
+ * its overall size must be the row's LENGTH × WIDTH within SIZE_TOLERANCE (2 %, at least 25 mm), either way round
+ * (sizeFit; within it the drawing is the truth and any difference is said). A part re-sized away from its drawing loses the
  * facts and is weighed by its rectangle again, until the drawing of the new size arrives.
  *
  * NO STALE AREAS. The facts are worked out again, and the difference written, wherever the answer
@@ -43,7 +43,6 @@
 import { insertRows } from '../lib/db.js';
 import { cutFromOf } from '../lib/cutFrom.js';
 import { LOCKED_ORDER_STATUSES, DRAWING_FACT_SPECS } from './records.js';
-import { orientTo } from './partGeometry.js';
 import { normMark, NOT_ONE_PLATE } from './partDrawingService.js';
 
 const FACTS = [...DRAWING_FACT_SPECS];
@@ -73,6 +72,26 @@ export function factsOfShape(g) {
   };
 }
 
+/** How far a drawing's overall size may stand from the row's typed one and still be its drawing: 2 %, at least 25 mm. */
+export const SIZE_TOLERANCE = { pct: 0.02, minMm: 25 };
+
+/**
+ * Pure: does drawing `d` fit row `p`'s typed size? → { ok, differs: { drawing: [L, W], row: [L, W] } | null }.
+ * Either way round; a size not typed yet does not contradict the drawing.
+ */
+export function sizeFit(d, p) {
+  const dl = Number(d.lengthMm); const dw = Number(d.widthMm);
+  const rl = p.lengthMm == null ? null : Number(p.lengthMm); const rw = p.widthMm == null ? null : Number(p.widthMm);
+  if (!(dl > 0 && dw > 0) || rl == null || rw == null || !(rl > 0) || !(rw > 0)) return { ok: true, differs: null };
+  const tol = (v) => Math.max(SIZE_TOLERANCE.minMm, v * SIZE_TOLERANCE.pct);
+  const near = (a, b) => Math.abs(a - b) <= tol(Math.max(a, b));
+  const straight = near(dl, rl) && near(dw, rw); const turned = near(dl, rw) && near(dw, rl);
+  if (!straight && !turned) return { ok: false, differs: { drawing: [dl, dw], row: [rl, rw] } };
+  const [ml, mw] = straight ? [rl, rw] : [rw, rl];
+  const exact = Math.abs(dl - ml) <= 1 && Math.abs(dw - mw) <= 1;
+  return { ok: true, differs: exact ? null : { drawing: [dl, dw], row: [rl, rw] } };
+}
+
 /**
  * Pure: the facts every row should hold.
  *   rows      [{ id, isPlatePart, markNorm, drawingIds: [], lengthMm, widthMm }]
@@ -87,9 +106,15 @@ export function planFacts(rows, drawings) {
     const d = drawings.find((x) => p.markNorm && x.mark_norm === p.markNorm)
       ?? drawings.find((x) => x.drawing_id != null && (p.drawingIds ?? []).includes(Number(x.drawing_id)));
     if (!d) continue;
-    // Its rectangle must be the row's (either way round); a size not typed yet does not contradict it.
-    if (orientTo({ lengthMm: Number(d.lengthMm), widthMm: Number(d.widthMm) }, p.lengthMm ?? null, p.widthMm ?? null).sizeMatches === false) continue;
-    out.set(p.id, { ...factsOfShape(d), drawingId: Number(d.id) });
+    // THE DRAWING IS THE TRUTH (user, 2026-11-01: "fix the rule itself"). It used to have to match the row's typed
+    // rectangle within 1 mm, which turned away real drawings — a web cut to camber (7534 × 1157 for 7525 × 1150), a
+    // gusset whose curves were smoothed (2998 × 2130 for 2995 × 2125). Now a drawing that belongs to the row is the
+    // row's within SIZE_TOLERANCE of its typed size (either way round; a size not typed yet does not contradict it)
+    // and the difference is said; only a size changed past that — a part re-sized on purpose, its drawing not yet
+    // replaced — keeps the drawing out (no stale area).
+    const fit = sizeFit(d, p);
+    if (!fit.ok) continue;
+    out.set(p.id, { ...factsOfShape(d), drawingId: Number(d.id), ...(fit.differs ? { sizeDiffers: fit.differs } : {}) });
   }
   return out;
 }
