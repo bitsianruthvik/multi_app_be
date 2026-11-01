@@ -201,12 +201,12 @@ section('8. our own nestToDxf export reads back');
   const nest = readNestDxf(dxf, { filename: 'N-007.dxf' });
   const m = matchNest(nest, [flg, C.gusset, C.splice, C.web]);
   ok('the plate is 3000 × 1000 from its outline', nest.plate.found === 'outline' && nest.plate.length === 3000 && nest.plate.width === 1000);
-  ok('4 parts; the offcut is not a part and keeps its number', nest.parts.length === 4 && nest.offcuts.length === 1 && nest.offcuts[0].label === 'N-007-A', JSON.stringify([nest.parts.length, nest.offcuts]));
-  ok('all four matched by label', m.placements.length === 4 && m.placements.every((p) => p.by === 'label') && m.unmatched.length === 0, JSON.stringify([m.placements, m.unmatched]));
+  ok('4 parts; the offcut is not a part (no number written: no text in our files)', nest.parts.length === 4 && nest.offcuts.length === 1 && nest.offcuts[0].label == null, JSON.stringify([nest.parts.length, nest.offcuts]));
+  ok('all four matched (by shape / size — our files carry no labels)', m.placements.length === 4 && m.placements.every((p) => p.by === 'shape' || p.by === 'size') && m.unmatched.length === 0, JSON.stringify([m.placements, m.unmatched]));
   const got = (i) => m.placements.find((p) => Math.abs(p.x - pieces[i].x) <= 0.5 && Math.abs(p.y - pieces[i].y) <= 0.5);
   ok('positions and turns are the ones exported', got(0)?.rotationDeg === 0 && got(1)?.rotationDeg === 90 && got(2)?.candidateKey === 'cp-gusset' && got(2).rotationDeg === 0 && got(3)?.candidateKey === 'cp-splice' && got(3).rotationDeg === 90, JSON.stringify(m.placements));
   ok('counts: 2 of CP-0001, none of the web', m.counts['cp-flg'] === 2 && m.counts['cp-web'] === 0);
-  ok('hints from our title: nest N-007, 12 mm, E350, 3000 x 1000', nest.hints.nestNo === 'N-007' && nest.hints.thicknessMm === 12 && nest.hints.grade === 'E350' && nest.hints.plateSize?.length === 3000 && nest.hints.plateSize?.width === 1000, JSON.stringify(nest.hints));
+  ok('hints from our comment line (999, no text): nest N-007, 12 mm, E350, 3000 x 1000', nest.hints.nestNo === 'N-007' && nest.hints.thicknessMm === 12 && nest.hints.grade === 'E350' && nest.hints.plateSize?.length === 3000 && nest.hints.plateSize?.width === 1000, JSON.stringify(nest.hints));
 }
 
 /* 9. the awkward cases */

@@ -367,17 +367,18 @@ section('8. The DXF ProNest opens: layers, closed polylines, mm — and our own 
     const pairs = []; for (let i = 0; i + 1 < lines.length; i += 2) pairs.push([lines[i].trim(), lines[i + 1]]);
     const layerOf = []; for (let i = 0; i < pairs.length; i += 1) if (pairs[i][0] === '0' && pairs[i][1] === 'POLYLINE') { const ly = pairs.slice(i + 1, i + 3).find((p) => p[0] === '8')?.[1]; const fl = pairs.slice(i + 1, i + 8).find((p) => p[0] === '70')?.[1]; layerOf.push([ly, fl]); }
     const closedOn = (ly) => layerOf.filter(([l, f]) => l === ly && f === '1').length;
-    ok(`${tag}: R12, mm ($INSUNITS 4, $MEASUREMENT 1), layers PLATE / OUTLINES / HOLES / MARKING${variant.leads ? ' / LEADS / CUT_ORDER' : ''}`, dxf.includes('AC1009') && /\$INSUNITS\r\n 70\r\n4|\$INSUNITS\r\n70\r\n4/.test(dxf) && ['PLATE', 'OUTLINES', 'HOLES', 'MARKING', ...(variant.leads ? ['LEADS', 'CUT_ORDER'] : [])].every((l) => dxf.includes(`\r\n${l}\r\n`)));
+    ok(`${tag}: R12, mm ($INSUNITS 4, $MEASUREMENT 1), layers PLATE / OUTLINES / HOLES${variant.leads ? ' / LEADS' : ''}`, dxf.includes('AC1009') && /\$INSUNITS\r\n 70\r\n4|\$INSUNITS\r\n70\r\n4/.test(dxf) && ['PLATE', 'OUTLINES', 'HOLES', ...(variant.leads ? ['LEADS'] : [])].every((l) => dxf.includes(`\r\n${l}\r\n`)));
     ok(`${tag}: closed polylines — plate 1, outlines ${closedOn('OUTLINES')} (6 parts), holes ${closedOn('HOLES')} (the window + 2)`, closedOn('PLATE') === 1 && closedOn('OUTLINES') === 6 && closedOn('HOLES') === 3);
-    ok(`${tag}: the part codes as single-stroke TEXT (style SIMPLEX → simplex.shx) on MARKING`, dxf.includes('simplex.shx') && ['FR-1', 'PL-7', 'WEB-1', 'ST-1', 'ST-2', 'ST-3'].every((c) => dxf.includes(`\r\n${c}\r\n`)));
+    // NO TEXT (user, 2026-11-01: ProNest could not program the files with part codes / cut-order numbers in them).
+    ok(`${tag}: no text at all — no part codes, no cut-order numbers, no text style`, !/\r\nTEXT\r\n/.test(dxf) && !dxf.includes('simplex.shx') && !['FR-1', 'PL-7', 'WEB-1', 'ST-1'].some((c) => dxf.includes(`\r\n${c}\r\n`)));
     const back = readNestDxf(dxf, { filename: 'N-001.dxf' });
     ok(`${tag}: read back — plate ${back.plate.length} × ${back.plate.width}, ${back.parts.length} parts (6), no problems`, Math.abs(back.plate.length - 3000) < 1e-6 && Math.abs(back.plate.width - 1500) < 1e-6 && back.parts.length === 6 && !(back.problems ?? []).length, J({ w: back.warnings, p: back.problems }));
     const labels = back.parts.map((p) => p.labels.join('|')).sort();
     // (with CUT_ORDER on, a hole's step number is a word inside its part too — the code is still there)
-    ok(`${tag}: every part read back carries its own code (${labels.join(', ')})`, variant.order
-      ? ['FR-1', 'PL-7', 'ST-1', 'ST-2', 'ST-3', 'WEB-1'].every((c) => back.parts.filter((p) => p.labels.includes(c)).length === 1)
-      : J(labels) === J(['FR-1', 'PL-7', 'ST-1', 'ST-2', 'ST-3', 'WEB-1']));
-    const web = back.parts.find((p) => p.labels.includes('WEB-1')); const fr = back.parts.find((p) => p.labels.includes('FR-1'));
+    ok(`${tag}: read back, the parts carry no codes (they are matched by shape)`, labels.every((l) => l === ''), J(labels));
+    // No codes in the file: the web is the part with the two holes, the frame the one with the window.
+    const holesOf = (p) => (p.rings?.holes?.length ?? 0) + (p.rings?.cutouts?.length ?? 0);
+    const web = back.parts.find((p) => holesOf(p) === 2); const fr = back.parts.find((p) => holesOf(p) === 1 && (p.rings?.cutouts?.length ?? 0) + (p.rings?.holes?.length ?? 0) === 1 && Math.abs((p.bbox?.length ?? 0) - 900) < 1);
     ok(`${tag}: the web keeps its 2 holes, the frame its window, the plate in the window is a part of its own`, (web.rings.holes.length + web.rings.cutouts.length) === 2 && fr.rings.cutouts.length + fr.rings.holes.length === 1);
     const m = matchNest(back, [
       { key: 'FR', codes: ['FR-1'], rings: { outline: [[0, 0], [900, 0], [900, 600], [0, 600]], cutouts: [[[70, 70], [830, 70], [830, 530], [70, 530]]], holes: [] }, length: 900, width: 600 },

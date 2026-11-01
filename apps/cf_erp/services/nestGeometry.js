@@ -447,7 +447,6 @@ function labelSpot(rings) {
 const LAYERS = [
   { name: 'PLATE', color: 7 },
   { name: 'PARTS', color: 3 },
-  { name: 'LABELS', color: 2 },
   { name: 'OFFCUTS', color: 1 },
 ];
 
@@ -482,14 +481,18 @@ export function nestToDxf({ lot = {}, pieces = [], offcuts = [] } = {}) {
   const out = [];
   const g = (code, value) => { out.push(String(code), String(value)); };
 
-  const titleH = Math.max(10, Math.min(120, W / 40));
-  const titleY = -titleH * 2;
+  // NO TEXT (user, 2026-11-01: ProNest could not program the files with the part labels in them): geometry only —
+  // which part is which is in nests.csv beside the files.
 
+  // What the plate is, as a DXF COMMENT (999 — ignored by CAD / CAM programs; our reader takes the nest number,
+  // thickness and grade from it when the file comes back).
+  const about = [lotNo && `Nest ${lotNo}`, plateCode && `Plate ${plateCode}`, t != null && t !== '' && `${num(t)} mm`, grade, `${num(L)} x ${num(W)}`].filter(Boolean).join(' | ');
+  g(999, about.slice(0, 250));
   /* HEADER */
   g(0, 'SECTION'); g(2, 'HEADER');
   g(9, '$ACADVER'); g(1, 'AC1009');
   g(9, '$INSUNITS'); g(70, 4);
-  g(9, '$EXTMIN'); g(10, 0); g(20, num(titleY - titleH)); g(30, 0);
+  g(9, '$EXTMIN'); g(10, 0); g(20, 0); g(30, 0);
   g(9, '$EXTMAX'); g(10, num(L)); g(20, num(W)); g(30, 0);
   g(9, '$LIMMIN'); g(10, 0); g(20, 0);
   g(9, '$LIMMAX'); g(10, num(L)); g(20, num(W));
@@ -514,10 +517,6 @@ export function nestToDxf({ lot = {}, pieces = [], offcuts = [] } = {}) {
     for (const [x, y] of pts) { g(0, 'VERTEX'); g(8, layer); g(10, num(x)); g(20, num(y)); g(30, 0); }
     g(0, 'SEQEND'); g(8, layer);
   };
-  const text = (layer, x, y, h, s, centred) => {
-    g(0, 'TEXT'); g(8, layer); g(10, num(x)); g(20, num(y)); g(30, 0); g(40, num(h)); g(1, s);
-    if (centred) { g(72, 1); g(11, num(x)); g(21, num(y)); g(31, 0); g(73, 2); }
-  };
 
   poly('PLATE', [[0, 0], [L, 0], [L, W], [0, W]]);
   for (const p of pieces ?? []) {
@@ -530,33 +529,10 @@ export function nestToDxf({ lot = {}, pieces = [], offcuts = [] } = {}) {
     // BEFORE ITS OUTLINE — once the outline is cut the part is loose and nothing more can be cut in it.
     if (Array.isArray(p.outline) && p.outline.length) { for (const ring of [...p.outline.slice(1), p.outline[0]]) if (ring?.length >= 3) poly('PARTS', ring); }
     else poly('PARTS', [[x, y], [x + l, y], [x + l, y + w], [x, y + w]]);
-    const label = txt(p.code ?? p.cutPlateCode ?? p.cut_plate_code ?? '');
-    if (label) {
-      // A drawn part is labelled IN ITS STEEL (the middle of its box may be a window, or outside
-      // an angle altogether) so whatever reads the file back takes the label for the right part.
-      const spot = Array.isArray(p.outline) && p.outline.length ? labelSpot(p.outline) : null;
-      const room = spot ? Math.min(spot.w, l) : l;
-      const h = Math.max(2, Math.min(50, Math.min(l, w) * 0.25, (room * 0.9) / (label.length * 0.9)));
-      text('LABELS', spot ? spot.x : x + l / 2, spot ? spot.y : y + w / 2, h, label, true);
-    }
   }
   for (const o of offcuts ?? []) {
     for (const ring of o?.outline ?? []) if (ring?.length >= 3) poly('OFFCUTS', ring);
-    if (o?.offcutNo && o?.outline?.[0]?.length) {
-      const r = o.rect ?? null;
-      const [cxp, cyp] = r ? [r.x + r.length / 2, r.y + r.width / 2] : o.outline[0][0];
-      const h = r ? Math.max(5, Math.min(80, Math.min(r.length, r.width) * 0.2)) : 20;
-      text('OFFCUTS', cxp, cyp, h, txt(o.offcutNo), true);
-    }
   }
-  const title = [
-    lotNo && `Nest ${lotNo}`,
-    plateCode && `Plate ${plateCode}`,
-    t != null && t !== '' && `${num(t)} mm`,
-    grade,
-    `${num(L)} x ${num(W)}`,
-  ].filter(Boolean).join('  |  ');
-  text('LABELS', 0, titleY, titleH, title, false);
   g(0, 'ENDSEC');
   g(0, 'EOF');
   return `${out.join('\r\n')}\r\n`;

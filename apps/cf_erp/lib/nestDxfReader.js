@@ -1411,7 +1411,10 @@ export function readNestDxf(text, { filename, joinTolMm = JOIN_TOL, gapTolMm = G
    * WINS — somebody typed it to say what the plate is; a loose text is whatever was left on the
    * drawing (a title, but also a dimension). A text that disagrees with the name is a note.
    */
-  const wordHints = hintsFrom(loose.map((t) => t.text), null);
+  // …and the file's COMMENTS (group 999): our own exports carry no text since 2026-11-01 (ProNest could not program
+  // files with labels) and say the nest, plate, thickness and grade in a comment line instead.
+  const comments = [...String(text).matchAll(/(?:^|\n)[ \t]*999[ \t]*\r?\n([^\r\n]*)/g)].map((m) => m[1]);
+  const wordHints = hintsFrom([...loose.map((t) => t.text), ...comments], null);
   const sameSizeHint = (a, b) => Math.abs(a.length - b.length) <= 1 && Math.abs(a.width - b.width) <= 1;
   const hints = {
     thicknessMm: nameHints.thicknessMm ?? wordHints.thicknessMm,

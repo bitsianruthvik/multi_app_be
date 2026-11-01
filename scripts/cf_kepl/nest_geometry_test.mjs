@@ -240,7 +240,7 @@ function checkDxf(text, { plate = 1, parts = 0, offcutRings = 0 } = {}) {
     pairs.push([Number(code), lines[i + 1]]);
   }
   let depth = 0; let sections = 0;
-  const polys = { PLATE: 0, PARTS: 0, OFFCUTS: 0, LABELS: 0 };
+  const polys = { PLATE: 0, PARTS: 0, OFFCUTS: 0 };
   let texts = 0; let version = null; let insunits = null;
   const layersDefined = new Set();
   for (let i = 0; i < pairs.length; i += 1) {
@@ -279,7 +279,7 @@ function checkDxf(text, { plate = 1, parts = 0, offcutRings = 0 } = {}) {
   if (!(pairs.length && pairs[pairs.length - 1][0] === 0 && pairs[pairs.length - 1][1] === 'EOF')) problems.push('no EOF');
   if (version !== 'AC1009') problems.push(`version ${version}`);
   if (insunits !== '4') problems.push(`INSUNITS ${insunits}`);
-  for (const l of ['PLATE', 'PARTS', 'LABELS', 'OFFCUTS']) if (!layersDefined.has(l)) problems.push(`layer ${l} not defined`);
+  for (const l of ['PLATE', 'PARTS', 'OFFCUTS']) if (!layersDefined.has(l)) problems.push(`layer ${l} not defined`);
   if (polys.PLATE !== plate) problems.push(`PLATE polylines ${polys.PLATE}`);
   if (polys.PARTS !== parts) problems.push(`PARTS polylines ${polys.PARTS} (want ${parts})`);
   if (polys.OFFCUTS !== offcutRings) problems.push(`OFFCUTS polylines ${polys.OFFCUTS} (want ${offcutRings})`);
@@ -301,9 +301,8 @@ console.log('\n10. DXF structure');
   const c = checkDxf(dxf, { parts: 2, offcutRings: rings });
   ok('parses: balanced sections, closed polylines, right counts', c.problems.length === 0, c.problems.join('; '));
   ok('HEADER, TABLES, ENTITIES', c.sections === 3);
-  ok('labels + title + offcut names', c.texts === 2 + 1 + a.offcuts.length, `${c.texts}`);
-  ok('title carries lot, plate, thickness, grade', /Nest N-007/.test(dxf) && /12 mm/.test(dxf) && /E350/.test(dxf));
-  ok('title TEXT sits outside (below) the plate', /TEXT\r\n8\r\nLABELS\r\n10\r\n0\r\n20\r\n-/.test(dxf));
+  // NO TEXT (user, 2026-11-01: ProNest could not program the files with labels in them): no labels, title or offcut names.
+  ok('no text at all: no part labels, no title, no offcut names — the plate is said in a 999 comment line only', c.texts === 0 && !/\r\nTEXT\r\n/.test(dxf) && /^999\r\nNest N-007 \| /.test(dxf), `${c.texts}`);
   ok('true-size part corner', /VERTEX\r\n8\r\nPARTS\r\n10\r\n503\r\n20\r\n403/.test(dxf));
   const empty = G.nestToDxf({ lot: { lot_no: 'N-1', length_mm: '1000', width_mm: '500' }, pieces: [] });
   ok('an empty nest is still a valid drawing', checkDxf(empty).problems.length === 0);
@@ -374,7 +373,7 @@ if (process.env.CF_GEOM_NO_DB) {
         [COMPANY, LINE, big.id, `${big.lot_no}-TESTZ`, JSON.stringify([[[0, 0], [500, 0], [500, 500], [0, 500]]])]);
       const d1 = await X.lotDxf(conn, COMPANY, LINE, big.id);
       const s1 = d1.buffer.toString('latin1');
-      ok('stored offcut used (its name, one OFFCUTS ring)', s1.includes(`${big.lot_no}-TESTZ`) && (s1.match(/POLYLINE\r\n8\r\nOFFCUTS/g) ?? []).length === 1);
+      ok('stored offcut used (one OFFCUTS ring, no name written)', !s1.includes(`${big.lot_no}-TESTZ`) && (s1.match(/POLYLINE\r\n8\r\nOFFCUTS/g) ?? []).length === 1);
 
       const code = async (fn) => { try { await fn(); return null; } catch (e) { return e.code ?? e.message; } };
       ok('a lot on another line is not found', await code(() => X.lotDxf(conn, COMPANY, LINE + 999999, big.id)) === 'NOT_FOUND');
