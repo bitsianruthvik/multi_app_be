@@ -108,6 +108,8 @@ async function flowsOf(db, companyId, ids, { includeLocked = false } = {}) {
  * number of statements whatever the number of rows); a catalog item, which has no line, by itself.
  */
 async function settleValues(db, c, flows, recordIds) {
+  // A setup script putting the work off (valueService.rematerialize, c.deferRematerialize) does it once at the end.
+  if (c.deferRematerialize) { (c.deferred ??= []).push({ masterIds: [...new Set(recordIds)] }); return; }
   const byLine = new Map();
   const alone = [];
   for (const id of new Set(recordIds)) {

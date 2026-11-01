@@ -48,6 +48,7 @@
 import { ancestors, levelName } from './tree.js';
 import { loadMaster, frozenBy, LIVE_WHEN_FROZEN, DRAWING_FACT_SPECS, workedOutWhy } from './records.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
+import { listSummary, sameList } from '../lib/listSpec.js';
 import { placementOf, rollupChildren, storedValues } from './bomGraph.js';
 import { orderDefaultOf, ownStands, defaultsForLine, loadOrderDefaultRows, notAllowedNote } from '../lib/orderDefaults.js';
 
@@ -194,6 +195,7 @@ export function rawOf(row, dataType) {
     case 'date': return dateText(row.value_date);
     case 'option': return row.option_id ?? null;
     case 'table': return row.value_json === undefined ? null : parseJsonCol(row.value_json);
+    case 'list': return row.value_json === undefined ? null : parseJsonCol(row.value_json);
     default: return null;
   }
 }
@@ -212,6 +214,7 @@ export function displayOf(raw, spec, optionById) {
       return o ? (o.label || o.value) : `#${raw}`;
     }
     case 'table': return tableSummary(spec.tableConfig, raw);
+    case 'list': return listSummary(spec.tableConfig, raw);
     default: return String(raw);
   }
 }
@@ -236,12 +239,14 @@ export function sameAsCalculated(typed, calculated, decimals) {
   return Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(b));
 }
 
-/** What the drawing says about a record (records.DRAWING_FACT_SPECS), from its own value rows: Map code -> number. */
+/** What the drawing says about a record (records.DRAWING_FACT_SPECS), from its own value rows: Map code -> number (or rows, for a list fact). */
 export function drawingFactsOf(ownRows) {
   const out = new Map();
   for (const v of ownRows ?? []) {
     const code = String(v.spec_code ?? '').toUpperCase();
-    if (DRAWING_FACT_SPECS.has(code) && v.value_number != null) out.set(code, Number(v.value_number));
+    if (!DRAWING_FACT_SPECS.has(code)) continue;
+    if (v.value_number != null) out.set(code, Number(v.value_number));
+    else if (v.value_json != null && Array.isArray(parseJsonCol(v.value_json))) out.set(code, parseJsonCol(v.value_json));   // a list fact (DRAWN_HOLE_SET)
   }
   return out;
 }
@@ -300,12 +305,15 @@ export function workOutFormulas(specs, { parse, children = null, isMachine = fal
   for (const s of specs) if (s.value && s.spec.dataType === 'number') lookup.set(s.spec.code, s.value.raw);
   // The names a value "from the drawing" was fed by: the facts themselves, then whatever was worked out from them.
   const drawn = new Set();
-  for (const [code, n] of facts ?? []) { if (!lookup.has(code)) lookup.set(code, n); drawn.add(code); }
+  for (const [code, n] of facts ?? []) { if (!Array.isArray(n) && !lookup.has(code)) lookup.set(code, n); drawn.add(code); }
   // A calculated spec may read another table specification of the SAME
   // record through LOOKUP(TABLE_CODE, x) with no item./machine. prefix —
   // "any spec can be a table" is the point, not only machine rate charts.
   const tableLookup = new Map();
   for (const s of specs) if (s.value && s.spec.dataType === 'table') tableLookup.set(s.spec.code, { mode: s.spec.tableConfig?.mode, axes: s.spec.tableConfig?.axes, ...s.value.raw });
+  // A LIST (lib/listSpec) is read the same way, through EACH(list, …): the record's own, or a list fact of its drawing.
+  for (const s of specs) if (s.value && s.spec.dataType === 'list' && Array.isArray(s.value.raw)) tableLookup.set(s.spec.code, s.value.raw);
+  for (const [code, n] of facts ?? []) if (Array.isArray(n) && !tableLookup.has(code)) tableLookup.set(code, n);
   const calc = formulaSpecs(specs);
   const parsedOf = new Map();
   for (const s of calc) if (s.rule.formula) parsedOf.set(s, parse(s.rule.formula.expression));
@@ -332,8 +340,32 @@ export function workOutFormulas(specs, { parse, children = null, isMachine = fal
         none(s, 'no_bom', { note: isMachine ? 'A machine has no BOM.' : children ? 'Its BOM has no lines yet.' : 'It has no BOM to roll up.' });
         done.add(s); moved = true; continue;
       }
-      const waiting = parsed.references.some((code) => !lookup.has(code) && calc.some((o) => o.spec.code === code && !done.has(o)));
+      const waiting = [...parsed.references, ...(parsed.lookupRefs ?? []).filter((r) => r.list && r.role === 'plain').map((r) => r.code)]
+        .some((code) => !lookup.has(code) && !tableLookup.has(code) && calc.some((o) => o.spec.code === code && !done.has(o)));
       if (waiting) continue;
+      if (s.spec.dataType === 'list') {
+        // A list is worked out by naming another list — HOLE_SET's default is DRAWN_HOLE_SET, the drawing's holes —
+        // and a typed list stands over it, as a typed number does over its formula.
+        done.add(s); moved = true;
+        const named = parsed.ast.type === 'ref' && !parsed.ast.name.includes('.') ? parsed.ast.name.toUpperCase() : null;
+        const rows = named ? tableLookup.get(named) : null;
+        if (!named) { none(s, 'formula_error', { problem: 'A list is worked out by naming another list, e.g. DRAWN_HOLE_SET.' }); continue; }
+        if (!Array.isArray(rows)) { none(s, 'waiting_inputs', { missingInputs: [named] }); continue; }
+        const source = drawn.has(named) ? 'drawing' : 'calculated';
+        const from = `${source === 'drawing' ? 'drawing' : 'list'} ${named}`;
+        if (typedOver(s)) {
+          if (sameList(s.value.raw, rows)) { s.value = { ...s.value, source: 'defaulted', from }; s.status = 'default'; s.derived = { source, overridable: true, rollup: false, held: true, calculated: shown(s, rows) }; }
+          else s.derived = { source: 'typed', overridable: true, rollup: false, calculated: shown(s, rows), calculatedFrom: source };
+          continue;
+        }
+        s.value = { ...shown(s, rows), source: overridable ? 'defaulted' : 'calculated', from };
+        s.status = overridable ? 'default' : 'calculated';
+        s.derived = { source, overridable, rollup: false };
+        if (source === 'drawing') drawn.add(s.spec.code);
+        tableLookup.set(s.spec.code, rows);
+        effectiveRows.set(s.spec.id, { value_number: null, value_text: null, value_bool: null, value_date: null, option_id: null, value_json: rows });
+        continue;
+      }
       const out = evaluateFormula(parsed, (code) => (lookup.has(code) ? lookup.get(code) : null), isRollup ? children : null, null,
         (code) => tableLookup.get(code) ?? null);
       done.add(s);
@@ -343,7 +375,7 @@ export function workOutFormulas(specs, { parse, children = null, isMachine = fal
         continue;
       }
       const from = isRollup ? `BOM · ${children.length} line${children.length === 1 ? '' : 's'}` : `formula ${s.rule.formula.code}`;
-      const source = parsed.references.some((code) => drawn.has(code)) ? 'drawing' : 'calculated';
+      const source = [...parsed.references, ...(parsed.lookupRefs ?? []).filter((r) => r.list).map((r) => r.code)].some((code) => drawn.has(code)) ? 'drawing' : 'calculated';
       if (typedOver(s)) {
         // Typed by hand. Equal to the answer: it IS the answer, as far as anyone reading it can tell
         // (the typed row stays — nothing a person entered is taken away). Different: both are said.
@@ -450,7 +482,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   const effectiveRows = new Map();
   const fallbacks = new Map();
   for (const { rule: r, overridden } of merged.values()) {
-    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null };
+    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: (r.data_type === 'table' || r.data_type === 'list') ? parseJsonCol(r.table_config) : null };
     let allowed;
     if (r.data_type === 'option') {
       const narrowIds = new Set(narrowed.filter((n) => n.assignment_id === r.id).map((n) => n.option_id));
@@ -682,7 +714,7 @@ export async function resolveBatch(db, companyId, { item, batchId = null, draftV
   const specs = [];
   const calc = [];
   for (const { rule: r, overridden } of merged.values()) {
-    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null };
+    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: (r.data_type === 'table' || r.data_type === 'list') ? parseJsonCol(r.table_config) : null };
     let allowed;
     if (r.data_type === 'option') {
       const narrowIds = new Set(narrowed.filter((n) => n.assignment_id === r.id).map((n) => n.option_id));

@@ -26,6 +26,7 @@ import { invalid } from '../lib/errors.js';
 import { requireNode, subtreeIds } from './tree.js';
 import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS, DRAWING_FACT_SPECS, workedOutWhy } from './records.js';
 import { resolve, dateText, tableSummary, isWorkedDefault, sameAsCalculated } from './resolutionService.js';
+import { checkListValue, listSummary } from '../lib/listSpec.js';
 import { parentsOf, tempChildrenOf } from './bomGraph.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
 
@@ -204,7 +205,7 @@ export async function coerce(db, companyId, spec, input, allowedOptionIds = null
   if (input === null || input === undefined || input === '') return { typed: null };
   // Every OTHER type takes a plain value — an object here is a caller mistake
   // (e.g. a table value sent for a number spec), not a value to coerce into text.
-  if (spec.data_type !== 'table' && typeof input === 'object') return { problem: `${spec.code} needs a plain value, not a table.` };
+  if (spec.data_type !== 'table' && spec.data_type !== 'list' && typeof input === 'object') return { problem: `${spec.code} needs a plain value, not a table.` };
   switch (spec.data_type) {
     case 'number': {
       const n = typeof input === 'number' ? input : Number(String(input).trim());
@@ -241,6 +242,11 @@ export async function coerce(db, companyId, spec, input, allowedOptionIds = null
     }
     case 'table':
       return validateTableValue(spec, input);
+    case 'list': {
+      // Rows of named columns (lib/listSpec) — HOLE_SET: a diameter and its count kept together.
+      const out = checkListValue(spec.code, parseJsonCol(spec.table_config), input);
+      return out.problem ? out : { typed: { ...EMPTY, value_json: out.rows } };
+    }
     default:
       return { problem: `${spec.code} has an unknown data type.` };
   }
@@ -656,7 +662,7 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
         else if (own) touch(s, null, 'defaulted');
         break;
       case 'calculated':
-        if (s.status === 'calculated') touch(s, { ...EMPTY, value_number: s.value.raw }, 'calculated');
+        if (s.status === 'calculated') touch(s, { ...EMPTY, ...(Array.isArray(s.value.raw) ? { value_json: s.value.raw } : { value_number: s.value.raw }) }, 'calculated');
         else if (own) touch(s, null, 'calculated');
         break;
       case 'rollup':
@@ -790,6 +796,9 @@ export async function rematerialize(db, c, scope) {
       if (s.subject_type === 'machine') machines.add(s.subject_id);
       else if (s.subject_type === 'master' && s.record_kind === 'item') ids.add(s.subject_id);
       else {
+  // A setup script that changes many rules at once (scripts/cf_kepl/coats-holes-cleanup.mjs) works its open lines out
+  // ONCE at the end, a line at a time — record by record across the company would be hours of round trips on TiDB.
+  if (c.deferRematerialize) { (c.deferred ??= []).push(scope); return { records: 0, changes: 0, deferred: true }; }
         const reach = s.subject_type === 'classification' ? { classificationId: s.subject_id } : { definitionId: s.subject_id };
         (await affectedItems(db, c, reach)).forEach((id) => ids.add(id));
         if (s.subject_type === 'classification') (await affectedMachines(db, c, s.subject_id)).forEach((id) => machines.add(id));
@@ -836,7 +845,7 @@ export async function getHistory(db, companyId, subjectType, subjectId, limit = 
     if (j.number != null) return row.decimals == null ? String(j.number) : Number(j.number).toFixed(row.decimals);
     if (j.option_id != null) return optionText.get(j.option_id) ?? `#${j.option_id}`;
     if (j.bool != null) return j.bool ? 'Yes' : 'No';
-    if (j.json != null) return tableSummary(parseJsonCol(row.table_config), j.json);
+    if (j.json != null) return row.data_type === 'list' ? listSummary(parseJsonCol(row.table_config), parseJsonCol(j.json)) : tableSummary(parseJsonCol(row.table_config), j.json);
     return j.date ?? j.text ?? null;
   };
   return rows.map((row) => {

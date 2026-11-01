@@ -109,7 +109,7 @@ ok('the true area where the drawing gives one, else the rectangle', near(run(tex
   && near(run(text('PART_PLATE_WEIGHT'), { LENGTH: 12000, WIDTH: 500, THICKNESS: 25, DENSITY: 7850 }).value, 1177.5));
 ok('the same number is the same at the specification\'s decimals', sameAsCalculated(48, 48.0004, 3) && !sameAsCalculated(48, 48.0006, 3) && sameAsCalculated(1177.5, 1177.5, null) && !sameAsCalculated(0, null, 0));
 ok('one diameter for a part\'s holes: the commonest, the larger on a tie', holeDiameterOf([22, 22, 26]) === 22 && holeDiameterOf([22, 26]) === 26 && holeDiameterOf([]) === null);
-ok('what a shape says: its area, its holes, their diameter', JSON.stringify(factsOfShape({ areaMm2: 1234.5678, holes: 2, holeDiameters: [22, 22] })) === '{"TRUE_AREA":1234.568,"DRAWN_HOLES":2,"DRAWN_HOLE_DIA":22}'
+ok('what a shape says: its area, its holes, their diameter', JSON.stringify(factsOfShape({ areaMm2: 1234.5678, holes: 2, holeDiameters: [22, 22] })) === '{"TRUE_AREA":1234.568,"DRAWN_HOLES":2,"DRAWN_HOLE_DIA":22,"DRAWN_EDGE_LENGTH":null,"DRAWN_HOLE_SET":[{"DIA":22,"COUNT":2,"KIND":"drilled"}]}'
   && factsOfShape({ areaMm2: 10, holes: 0, holeDiameters: [] }).DRAWN_HOLE_DIA === null);
 ok('a drawing is a row\'s only while it is the row\'s size (either way round), and only for a plate part', (() => {
   const d = [{ id: 1, drawing_id: null, mark_norm: 'TF1', lengthMm: 12000, widthMm: 500, areaMm2: 5e6, holes: 0, holeDiameters: [] }];

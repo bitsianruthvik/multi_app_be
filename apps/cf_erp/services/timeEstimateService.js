@@ -305,7 +305,7 @@ export async function loadMachineSide(db, companyId, operations, date) {
   const specNames = new Map();   // CODE -> { name, dataType, tableConfig }
   for (const m of rulesAt.values()) {
     for (const r of m.values()) {
-      specNames.set(String(r.spec_code).toUpperCase(), { name: r.spec_name ?? r.spec_code, dataType: r.data_type, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null });
+      specNames.set(String(r.spec_code).toUpperCase(), { name: r.spec_name ?? r.spec_code, dataType: r.data_type, tableConfig: (r.data_type === 'table' || r.data_type === 'list') ? parseJsonCol(r.table_config) : null });
     }
   }
   const expressionsOf = (rule) => [rule?.work, rule?.setup].map((t) => t?.expression ?? t?.formula?.expression ?? '').join(' ');

@@ -10,6 +10,12 @@
  *   DRAWN_HOLES      the drilled holes the drawing shows (geometry.holes)
  *   DRAWN_HOLE_DIA   mm — their diameter; the commonest when they differ, the larger on a tie.
  *                    No holes, no value.
+ *   DRAWN_EDGE_LENGTH mm — every edge a coat has to cover: the outline, its cut-outs and the
+ *                    walls of its holes (cutLengthMm + π × Σ hole diameters). With TRUE_AREA it
+ *                    gives the part's WHOLE surface: 2 × area + edge × thickness (user, 2026-11-01:
+ *                    "when they do any coat, they will need entire surface area, not one side").
+ *   DRAWN_HOLE_SET   the holes as a LIST (lib/listSpec): one row per diameter, { DIA, COUNT, KIND }.
+ *                    HOLE_SET defaults to it; a person adds kinds and depths over it.
  *
  * Nothing here knows what they are used for. The tenant's FORMULAS read them
  * (FIRST(TRUE_AREA, LENGTH * WIDTH) * THICKNESS * DENSITY / 1e9 — the true shape where there is
@@ -42,7 +48,8 @@
  */
 import { insertRows } from '../lib/db.js';
 import { cutFromOf } from '../lib/cutFrom.js';
-import { LOCKED_ORDER_STATUSES, DRAWING_FACT_SPECS } from './records.js';
+import { LOCKED_ORDER_STATUSES, DRAWING_FACT_SPECS, LIST_FACT_SPECS } from './records.js';
+import { holeSetOf, sameList } from '../lib/listSpec.js';
 import { normMark, NOT_ONE_PLATE } from './partDrawingService.js';
 
 const FACTS = [...DRAWING_FACT_SPECS];
@@ -60,15 +67,19 @@ export function holeDiameterOf(diameters) {
 }
 
 /**
- * Pure: what a shape says. `g` needs areaMm2, holes and holeDiameters (a stored geometry, or the
- * lean columns of a drawing row). → { TRUE_AREA, DRAWN_HOLES, DRAWN_HOLE_DIA } (a null = no value).
+ * Pure: what a shape says. `g` needs areaMm2, cutLengthMm, holes and holeDiameters (a stored geometry, or the
+ * lean columns of a drawing row). → { TRUE_AREA, DRAWN_HOLES, DRAWN_HOLE_DIA, DRAWN_EDGE_LENGTH, DRAWN_HOLE_SET } (a null = no value).
  */
 export function factsOfShape(g) {
   const holes = g?.holes == null ? null : Number(g.holes);
+  const dias = (g?.holeDiameters ?? []).map(Number).filter((d) => Number.isFinite(d) && d > 0);
+  const cut = g?.cutLengthMm == null ? null : Number(g.cutLengthMm);
   return {
     TRUE_AREA: g?.areaMm2 != null && Number(g.areaMm2) > 0 ? r3(g.areaMm2) : null,
     DRAWN_HOLES: holes != null && Number.isFinite(holes) ? holes : null,
     DRAWN_HOLE_DIA: holes ? holeDiameterOf(g.holeDiameters) : null,
+    DRAWN_EDGE_LENGTH: cut != null && cut > 0 ? r3(cut + Math.PI * dias.reduce((t, d) => t + d, 0)) : null,
+    DRAWN_HOLE_SET: holes == null || !Number.isFinite(holes) ? null : holes === 0 ? [] : holeSetOf(dias),
   };
 }
 
@@ -148,7 +159,7 @@ export async function readFactInputs(db, companyId, lineId, specs = null) {
   const specIds = [...spec.values()].map((s) => s.id);
   const [[vals], [links], [files]] = await Promise.all([
     specIds.length ? db.query(
-      `SELECT v.subject_id, v.specification_id, v.value_number, v.value_text FROM cf_spec_values v
+      `SELECT v.subject_id, v.specification_id, v.value_number, v.value_text, v.value_json FROM cf_spec_values v
         WHERE v.company_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL AND v.subject_id IN (?) AND v.specification_id IN (?)`,
       [companyId, ids, specIds]) : [[]],
     db.query(
@@ -157,7 +168,7 @@ export async function readFactInputs(db, companyId, lineId, specs = null) {
         WHERE l.company_id = ? AND l.subject_type = 'master_record' AND l.deleted_at IS NULL AND l.subject_id IN (?)`,
       [companyId, ids]),
     db.query(
-      `SELECT id, drawing_id, mark_norm, length_mm, width_mm, area_mm2, holes,
+      `SELECT id, drawing_id, mark_norm, length_mm, width_mm, area_mm2, cut_length_mm, holes,
               JSON_EXTRACT(geometry_json, '$.holeDiameters') AS hole_dias, (geometry_json IS NOT NULL) AS shaped,
               (dxf_text IS NOT NULL) AS has_text, (warnings_json LIKE ?) AS not_one_plate
          FROM cf_part_drawings
@@ -173,6 +184,7 @@ export async function readFactInputs(db, companyId, lineId, specs = null) {
     const code = codeOf.get(Number(v.specification_id));
     if (!p || !code) continue;
     if (code === 'DRAWING_MARK') { const mark = v.value_text ?? (v.value_number != null ? String(Number(v.value_number)) : null); p.markNorm = mark ? normMark(mark) : null; }
+    else if (LIST_FACT_SPECS.has(code)) { const rows = parseJson(v.value_json); if (Array.isArray(rows)) p.held.set(code, rows); }
     else if (v.value_number == null) continue;
     else if (code === 'LENGTH') p.lengthMm = Number(v.value_number);
     else if (code === 'WIDTH') p.widthMm = Number(v.value_number);
@@ -183,7 +195,7 @@ export async function readFactInputs(db, companyId, lineId, specs = null) {
   const matches = (p, f) => (!!p.markNorm && p.markNorm === f.mark_norm) || (f.drawing_id != null && p.drawingIds.includes(Number(f.drawing_id)));
   const drawings = files.filter((f) => Number(f.shaped)).map((f) => ({
     id: Number(f.id), drawing_id: f.drawing_id, mark_norm: f.mark_norm, lengthMm: Number(f.length_mm), widthMm: Number(f.width_mm),
-    areaMm2: f.area_mm2 == null ? null : Number(f.area_mm2), holes: f.holes == null ? null : Number(f.holes), holeDiameters: parseJson(f.hole_dias) ?? [],
+    areaMm2: f.area_mm2 == null ? null : Number(f.area_mm2), cutLengthMm: f.cut_length_mm == null ? null : Number(f.cut_length_mm), holes: f.holes == null ? null : Number(f.holes), holeDiameters: parseJson(f.hole_dias) ?? [],
   }));
   const bare = files.filter((f) => !Number(f.shaped) && Number(f.has_text) && !Number(f.not_one_plate) && list.some((p) => p.isPlatePart && matches(p, f)));
   return { rows: list, drawings, bare };
@@ -232,7 +244,7 @@ export async function refreshDrawingValues(db, c, lineId, { force = false } = {}
       const now = p.held.has(code) ? p.held.get(code) : null;
       const next = w ? w[code] ?? null : null;
       if (now == null && next == null) continue;
-      if (now != null && next != null && Math.abs(now - next) < 1e-6) continue;
+      if (now != null && next != null && (Array.isArray(next) ? sameList(now, next) : Math.abs(now - next) < 1e-6)) continue;
       if (now != null) clears.push([p.id, spec.get(code).id]);
       if (next != null) sets.push([p.id, code, next]);
       moved.add(p.id);
@@ -251,8 +263,9 @@ export async function refreshDrawingValues(db, c, lineId, { force = false } = {}
     }
     if (sets.length) {
       // Stored like PIERCINGS: source 'entered' (records.DRAWING_FACT_SPECS says why).
-      await insertRows(db, 'cf_spec_values', ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'uom', 'source', 'created_by'],
-        sets.map(([id, code, value]) => [companyId, spec.get(code).id, 'master', id, value, spec.get(code).default_uom ?? null, 'entered', c.userId ?? null]));
+      await insertRows(db, 'cf_spec_values', ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_json', 'uom', 'source', 'created_by'],
+        sets.map(([id, code, value]) => [companyId, spec.get(code).id, 'master', id, Array.isArray(value) ? null : value, Array.isArray(value) ? JSON.stringify(value) : null,
+          spec.get(code).default_uom ?? null, 'entered', c.userId ?? null]));
     }
     const { materializeLineRecords } = await import('./orderValuesService.js');
     const settled = await materializeLineRecords(db, c, lineId, [...moved]);

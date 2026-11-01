@@ -37,3 +37,18 @@ export async function lineModel3d(db, companyId, orderId, lineId) {
   }
   return { fileId: Number(f.id), fileName: f.file_name, savedAt: f.created_at, model, codes };
 }
+
+/**
+ * GET /standard-drawings/:id/model3d → the standard's own 3D model, for its Drawings tab (user, 2026-11-01: "in drawings
+ * tab also same tool as SO"). A standard has no order, so no codes: the viewer labels by mark.
+ */
+export async function standardModel3d(db, companyId, standardId) {
+  const [[f]] = await db.query(
+    "SELECT id, file_name, file_text, created_at FROM cf_standard_drawing_files WHERE company_id = ? AND standard_id = ? AND kind = 'model' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+    [companyId, Number(standardId)],
+  );
+  if (!f) throw notFound('3D model');
+  let model;
+  try { model = JSON.parse(f.file_text); } catch { throw notFound('3D model'); }
+  return { fileId: Number(f.id), fileName: f.file_name, savedAt: f.created_at, model, codes: {} };
+}

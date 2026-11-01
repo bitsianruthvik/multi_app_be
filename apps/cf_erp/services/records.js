@@ -150,7 +150,9 @@ export const WORKED_OUT_WHY = 'Worked out by cutting and nesting — from the se
  * is reported as "from the drawing". Nobody types them — a typed write is refused. Stored with
  * source 'entered', like PIERCINGS, so no rule change ever sweeps them away.
  */
-export const DRAWING_FACT_SPECS = new Set(['TRUE_AREA', 'DRAWN_HOLES', 'DRAWN_HOLE_DIA']);
+export const DRAWING_FACT_SPECS = new Set(['TRUE_AREA', 'DRAWN_HOLES', 'DRAWN_HOLE_DIA', 'DRAWN_EDGE_LENGTH', 'DRAWN_HOLE_SET']);
+/** The facts that are a LIST (lib/listSpec), held in value_json — the rest are numbers. */
+export const LIST_FACT_SPECS = new Set(['DRAWN_HOLE_SET']);
 export const DRAWING_FACT_WHY = 'Read from the drawing of this part — it changes when the drawing does.';
 /** Why nobody types this value on an item, or null when it is typed like any other. */
 export const workedOutWhy = (code) => {

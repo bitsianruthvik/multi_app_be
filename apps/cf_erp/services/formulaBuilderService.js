@@ -235,7 +235,7 @@ async function typeValueMap(db, companyId, nodeId) {
     const raw = r.data_type === 'number' ? num(r.value_number) : r.data_type === 'table' ? parseJsonCol(r.value_json)
       : r.data_type === 'option' ? (r.option_value ?? null) : (blank(r.value_text) ? null : String(r.value_text));
     if (raw == null) continue;
-    out.set(r.code, { raw, dataType: r.data_type, optionValue: r.data_type === 'option' ? raw : null, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null });
+    out.set(r.code, { raw, dataType: r.data_type, optionValue: r.data_type === 'option' ? raw : null, tableConfig: (r.data_type === 'table' || r.data_type === 'list') ? parseJsonCol(r.table_config) : null });
   }
   return out;
 }

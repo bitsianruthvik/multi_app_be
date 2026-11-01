@@ -14,8 +14,9 @@ import { findSegmentsUsingToken } from '../modules/codegen/index.js';
 import { resolve } from './resolutionService.js';
 import { requireNode } from './tree.js';
 import { workedOutWhy, LOCKED_ORDER_STATUSES } from './records.js';
+import { checkListConfig } from '../lib/listSpec.js';
 
-export const DATA_TYPES = ['number', 'text', 'boolean', 'date', 'option', 'table'];
+export const DATA_TYPES = ['number', 'text', 'boolean', 'date', 'option', 'table', 'list'];
 export const MEASUREMENT_TYPES = ['LENGTH', 'AREA', 'VOLUME', 'MASS', 'DENSITY', 'COUNT', 'TIME', 'SPEED', 'FORCE', 'PRESSURE', 'TEMPERATURE', 'ANGLE', 'RATIO'];
 export const TABLE_MODES = ['step_up', 'linear'];
 const CODE_RE = /^[A-Z][A-Z0-9_]*$/;
@@ -34,7 +35,7 @@ function shapeSpec(s, options = [], usage = {}) {
     id: s.id, code: s.code, name: s.name, dataType: s.data_type, measurementType: s.measurement_type,
     defaultUom: s.default_uom, decimals: s.decimals, description: s.description, status: s.status,
     options: s.data_type === 'option' ? options.map((o) => ({ id: o.id, value: o.value, label: o.label, sortOrder: o.sort_order, status: o.status })) : undefined,
-    tableConfig: s.data_type === 'table' ? parseJson(s.table_config) : undefined,
+    tableConfig: s.data_type === 'table' || s.data_type === 'list' ? parseJson(s.table_config) : undefined,
     // Can be set for a whole order (init.sql §65): an order and its lines may carry a value every row takes.
     orderLevel: !!Number(s.order_level ?? 0),
     ruleCount: Number(usage.rules ?? 0),
@@ -141,11 +142,15 @@ export async function createSpec(db, c, input = {}) {
   let tableConfig = null;
   if (dataType === 'table') {
     tableConfig = readTableConfig(input.tableConfig, problems);
+  } else if (dataType === 'list') {
+    // A list's columns (lib/listSpec): HOLE_SET = diameter, count, kind, depth.
+    const checked = checkListConfig(input.tableConfig);
+    if (checked.problem) problems.push(checked.problem); else tableConfig = checked.config;
   } else if (input.tableConfig != null) {
     problems.push('Axes apply to table specifications only.');
   }
-  if (fields.order_level === 1 && (dataType === 'table' || workedOutWhy(code))) {
-    problems.push(`${code} cannot be set for a whole order — ${dataType === 'table' ? 'a table is never set on an order' : 'it is worked out, never typed'}.`);
+  if (fields.order_level === 1 && (dataType === 'table' || dataType === 'list' || workedOutWhy(code))) {
+    problems.push(`${code} cannot be set for a whole order — ${dataType === 'table' || dataType === 'list' ? `a ${dataType} is never set on an order` : 'it is worked out, never typed'}.`);
   }
   assertNoProblems(problems);
 
@@ -182,7 +187,11 @@ export async function updateSpec(db, c, id, input = {}) {
     fields.data_type = input.dataType;
     dataType = input.dataType;
   }
-  if (input.tableConfig !== undefined) {
+  if (input.tableConfig !== undefined && dataType === 'list') {
+    // A list's columns (lib/listSpec). Rows already stored keep their cells; a column taken away is no longer read.
+    const checked = checkListConfig(input.tableConfig);
+    if (checked.problem) problems.push(checked.problem); else fields.table_config = JSON.stringify(checked.config);
+  } else if (input.tableConfig !== undefined) {
     if (dataType !== 'table') {
       if (input.tableConfig != null) problems.push('Axes apply to table specifications only.');
     } else {

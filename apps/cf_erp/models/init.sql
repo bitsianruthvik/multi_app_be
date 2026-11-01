@@ -8305,3 +8305,19 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
             AND ((TABLE_NAME = 'cf_standard_drawings' AND COLUMN_NAME = 'curve_json')
               OR (TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'curve_deg'))) = 2, 'S98-OK', 'S98-MISSING') AS result;
+
+-- ============================================================================
+-- §99  LIST SPECIFICATIONS — rows of named columns on one piece (2026-11-01)
+-- ============================================================================
+-- User: "a linked array store … have the two specifications linked". A LIST holds rows of named columns, kept
+-- together: HOLE_SET = [{ DIA, COUNT, KIND, DEPTH }] — one row per kind of hole, so a diameter and its count never
+-- come apart (lib/listSpec.js). Its columns are in table_config ({ columns: [...] }), a value in cf_spec_values.value_json;
+-- formulas read it with EACH(list, row.X …) (formulaEngine). One value added to the enum; existing values are untouched.
+-- Idempotent.
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_specifications'
+             AND COLUMN_NAME = 'data_type' AND COLUMN_TYPE LIKE '%''list''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_specifications MODIFY COLUMN data_type ENUM('number','text','boolean','date','option','table','list') NOT NULL DEFAULT 'number'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_specifications'
+            AND COLUMN_NAME = 'data_type' AND COLUMN_TYPE LIKE '%''list''%') = 1, 'S99-OK', 'S99-MISSING') AS result;

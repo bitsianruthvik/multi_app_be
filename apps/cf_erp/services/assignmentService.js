@@ -76,7 +76,7 @@ async function checkRuleBody(db, companyId, spec, body, subject, problems) {
     problems.push('A machine has no BOM — nothing to roll up or inherit.');
   }
   if (['calculated', 'rollup'].includes(valueRule)) {
-    if (spec.data_type !== 'number') problems.push(`${spec.code} is a ${spec.data_type}; only numbers are calculated.`);
+    if (spec.data_type !== 'number' && spec.data_type !== 'list') problems.push(`${spec.code} is a ${spec.data_type}; only numbers and lists are calculated.`);
     if (!formulaId) { problems.push(`A ${valueRule} rule needs a formula.`); return; }
     const [[f]] = await db.query('SELECT id, code, expression, status FROM cf_formulas WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, formulaId]);
     if (!f) { problems.push('That formula does not exist.'); return; }
@@ -89,13 +89,16 @@ async function checkRuleBody(db, companyId, spec, body, subject, problems) {
   } else if (valueRule === 'defaulted' && formulaId) {
     // A Defaulted rule may name a formula: the formula gives the default and a typed value replaces
     // it (resolutionService — "calculated, but a person may type over it"). Calculated or roll-up, by what it reads.
-    if (spec.data_type !== 'number') problems.push(`${spec.code} is a ${spec.data_type}; only numbers are calculated.`);
+    if (spec.data_type !== 'number' && spec.data_type !== 'list') problems.push(`${spec.code} is a ${spec.data_type}; only numbers and lists are calculated.`);
     if (captureAt !== 'item') problems.push('A default worked out by a formula is an item-level rule.');
     const [[f]] = await db.query('SELECT id, code, expression, status FROM cf_formulas WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, formulaId]);
     if (!f) { problems.push('That formula does not exist.'); return; }
     if (f.status !== 'active') problems.push(`Formula ${f.code} is inactive.`);
     const parsed = parseFormula(f.expression);
     if (parsed.usesContext) { problems.push(`${f.code} reads item. and machine. values — it is a timing formula for operations, not a specification rule.`); return; }
+    // A list is worked out by naming another list (resolutionService.workOutFormulas): HOLE_SET ← DRAWN_HOLE_SET.
+    if (spec.data_type === 'list' && !(parsed.ast.type === 'ref' && !parsed.ast.name.includes('.'))) problems.push(`${spec.code} is a list — its formula names another list, e.g. DRAWN_HOLE_SET.`);
+    if (spec.data_type !== 'list' && parsed.ast.type === 'ref' && await isListSpec(db, companyId, parsed.ast.name)) problems.push(`${f.code} names a list — a number cannot take it.`);
     if (parsed.usesRollup && subject.machine) problems.push('A machine has no BOM — nothing to roll up.');
     if (parsed.references.includes(spec.code)) problems.push(`${f.code} reads ${spec.code} itself.`);
   } else if (formulaId) {
@@ -135,6 +138,12 @@ function readBody(input, existing = {}) {
     formulaId: pick('formulaId', existing.formula_id ?? null) || null,
     sortOrder: Number(pick('sortOrder', existing.sort_order ?? 0)) || 0,
   };
+}
+
+/** Whether code names a LIST specification (lib/listSpec). */
+async function isListSpec(db, companyId, code) {
+  const [[r]] = await db.query("SELECT 1 AS y FROM cf_specifications WHERE company_id = ? AND code = ? AND data_type = 'list' AND deleted_at IS NULL", [companyId, String(code).toUpperCase()]);
+  return !!r;
 }
 
 export async function listRules(db, companyId, subjectType, subjectId) {

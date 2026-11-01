@@ -88,6 +88,9 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
     for (const n of [...parsed.references, ...parsed.rollupTerms, ...parsed.itemRefs, ...parsed.machineRefs]) {
       const meta = known.get(n);
       if (!meta) problems.push(`Unknown specification ${n}.`);
+      // A formula that is just one list's name is how a list is worked out (HOLE_SET ← DRAWN_HOLE_SET).
+      else if (meta.dataType === 'list' && parsed.ast.type === 'ref' && parsed.references.length === 1) continue;
+      else if (meta.dataType === 'list') problems.push(`${n} is a list — read its rows with EACH(${n}, row.…).`);
       else if (meta.dataType === 'table') problems.push(`${n} is a chart — write machine.${n} (it reads its columns from the piece), or LOOKUP(machine.${n}, …).`);
       // A piece's pick-list or text value is a word: fine to compare ("E350") or to feed a chart.
       else if (meta.dataType !== 'number' && !(words.has(n) && ['option', 'text'].includes(meta.dataType))) problems.push(`${n} is a ${meta.dataType}, not a number.`);
@@ -97,6 +100,10 @@ export async function checkFormula(db, companyId, expression, sample = null, rea
     for (const ref of lookupRefs) {
       const meta = known.get(ref.code);
       if (!meta) { problems.push(`Unknown specification ${ref.code}.`); continue; }
+      if (ref.list) {
+        if (meta.dataType !== 'list') problems.push(`EACH reads a list — ${ref.code} is a ${meta.dataType}.`);
+        continue;
+      }
       if (meta.dataType !== 'table') {
         problems.push(`LOOKUP's first argument must be a table specification — ${ref.code} is a ${meta.dataType}. Read it directly instead of through LOOKUP.`);
         continue;

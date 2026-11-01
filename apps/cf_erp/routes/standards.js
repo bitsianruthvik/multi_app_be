@@ -6,6 +6,7 @@
  *   POST   /standard-drawings                    { number, name?, description?, revision?, sourceUrl?, internal?, notes?, file?: { name, content } }
  *   PUT    /standard-drawings/:id                { name?, description?, revision?, sourceUrl?, internal?, notes? }
  *   GET    /standard-drawings/files/:fileId      one of its files (DXF / PDF)
+ *   GET    /standard-drawings/:id/model3d        its 3D model (model3dService), for the Drawings tab's 3D view
  *
  *   POST   /orders/:id/lines/from-standard       { standardId | number, versionId?, quantity, committedDate?, description?, rate?, rateBasis? }
  *                                                → the order, + fromStandard { lineId, standardId, number, versionNo, rows, cutPieces }
@@ -24,6 +25,7 @@ import {
   listStandards, getStandard, createStandard, updateStandard, standardFile,
   addLineFromStandard, lineStandard, saveLineToStandard, keepStandard,
 } from '../services/standardDrawingService.js';
+import { standardModel3d } from '../services/model3dService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -40,6 +42,7 @@ router.get('/standard-drawings/files/:fileId', view, handle(async (req, res) => 
   res.setHeader('Content-Length', String(out.buffer.length));
   res.send(out.buffer);
 }));
+router.get('/standard-drawings/:id/model3d', view, handle((req) => standardModel3d(pool, company(req), id(req))));
 router.get('/standard-drawings/:id', view, handle((req) => getStandard(pool, company(req), id(req), req.query)));
 router.post('/standard-drawings', manage, handle((req) => tx(req, (db, c) => createStandard(db, c, req.body ?? {}))));
 router.put('/standard-drawings/:id', manage, handle((req) => tx(req, (db, c) => updateStandard(db, c, id(req), req.body ?? {}))));

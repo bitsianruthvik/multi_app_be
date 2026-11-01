@@ -602,7 +602,7 @@ export function resolveRecord(ctx, rec) {
   const effectiveRows = new Map();
   const fallbacks = new Map();
   for (const { rule: r, overridden } of merged.values()) {
-    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: r.data_type === 'table' ? parseJsonCol(r.table_config) : null };
+    const spec = { id: r.specification_id, code: r.spec_code, name: r.spec_name, dataType: r.data_type, unit: r.default_uom, decimals: r.decimals, tableConfig: (r.data_type === 'table' || r.data_type === 'list') ? parseJsonCol(r.table_config) : null };
     let allowed;
     if (r.data_type === 'option') {
       const narrowIds = new Set(ctx.narrowedBy.get(r.id) ?? []);
@@ -858,7 +858,7 @@ function derivedWrites(r) {
         else if (own) touch(s, null, 'defaulted');
         break;
       case 'calculated':
-        if (s.status === 'calculated') touch(s, { ...EMPTY, value_number: s.value.raw }, 'calculated');
+        if (s.status === 'calculated') touch(s, { ...EMPTY, ...(Array.isArray(s.value.raw) ? { value_json: s.value.raw } : { value_number: s.value.raw }) }, 'calculated');
         else if (own) touch(s, null, 'calculated');
         break;
       case 'rollup':
@@ -1130,6 +1130,8 @@ function ownInput(s) {
   const raw = s.value.raw;
   if (raw === null || raw === undefined) return '';
   if (typeof raw === 'boolean') return raw ? 'true' : 'false';
+  // A LIST (HOLE_SET): its rows as JSON — the grid reads them back, and a save parses the same text.
+  if (Array.isArray(raw)) return JSON.stringify(raw);
   return String(raw);
 }
 
@@ -1750,7 +1752,7 @@ export async function compareLineValues(db, companyId, lineId, { thaw = false, f
     const own = ownStore(ctx, Number(recordId));
     for (const code of DRAWING_FACT_SPECS) {
       // Keyed apart from the stored rows: drawingFactsOf reads a fact by its code, the later one winning.
-      if (f?.[code] != null) own.set(`fact:${code}`, { specification_id: `fact:${code}`, spec_code: code, value_number: f[code], source: 'entered' });
+      if (f?.[code] != null) own.set(`fact:${code}`, { specification_id: `fact:${code}`, spec_code: code, ...(Array.isArray(f[code]) ? { value_number: null, value_json: f[code] } : { value_number: f[code] }), source: 'entered' });
       else for (const [k, row] of own) if (String(row.spec_code).toUpperCase() === code) own.delete(k);
     }
   }
@@ -1779,7 +1781,7 @@ export async function compareLineValues(db, companyId, lineId, { thaw = false, f
         recordId: rec.id, row: labelOf(rec, ctx), name: rec.name, depth: depthOf.get(rec.id) ?? 0,
         code: s.spec.code, spec: s.spec.name, unit: s.spec.unit ?? null, decimals: s.spec.decimals ?? null, formula: s.rule.formula?.code ?? null,
         state, typed, calculated,
-        difference: typed != null && calculated != null ? Number((typed - calculated).toFixed(6)) : null,
+        difference: typeof typed === 'number' && typeof calculated === 'number' ? Number((typed - calculated).toFixed(6)) : null,
         from: d?.source === 'typed' ? d.calculatedFrom ?? null : d?.source ?? null,
         waiting: (d?.source === 'typed' ? d.waiting : s.missingInputs) ?? null,
       });
@@ -1825,6 +1827,8 @@ export function cellStates(ctx, recordIds, codes) {
         optionValue: s.value?.optionValue ?? null,
         display: s.value?.display ?? null,
         dataType: s.spec.dataType,
+        // A LIST (HOLE_SET): its columns, so a cell can open the rows to edit.
+        columns: s.spec.dataType === 'list' ? (s.spec.tableConfig?.columns ?? []) : null,
         options: s.spec.dataType === 'option' ? (s.options ?? []) : null,
       });
     }
