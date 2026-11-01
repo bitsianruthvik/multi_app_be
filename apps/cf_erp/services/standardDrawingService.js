@@ -850,9 +850,10 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
     .filter(Boolean).join('\n');
   const drawingId = await registerDrawingFor(db, c, { number: s.registerNumber, revision: s.revision, title: s.description ?? s.name, url: s.sourceUrl, notes });
   const [insS] = await db.query(
-    `INSERT INTO cf_standard_drawings (company_id, number, name, description, revision, drawing_id, source_url, internal, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [companyId, s.number, s.name.slice(0, 255), s.description, s.revision, drawingId, s.sourceUrl, s.internal ? 1 : 0, notes || null, c.userId ?? null],
+    // §98: the series' curve rule (bom.json curve — girders on chords, eccentricity at its maximum degree), kept for the order lines made from it.
+    `INSERT INTO cf_standard_drawings (company_id, number, name, description, revision, drawing_id, source_url, internal, notes, curve_json, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [companyId, s.number, s.name.slice(0, 255), s.description, s.revision, drawingId, s.sourceUrl, s.internal ? 1 : 0, notes || null, bom?.curve ? JSON.stringify(bom.curve) : null, c.userId ?? null],
   );
   const standardId = insS.insertId;
 

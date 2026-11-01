@@ -154,7 +154,11 @@ try {
   says(`new: ${news.join(', ') || 'none'}`);
   ok('studs are the Shear stud selection, left to choose when no 25 x 200 stud is in the catalog',
     byWhat('TS').every((r) => r.kind === 'selection' && (r.chosen || /Choose the stud/.test(r.notes ?? ''))));
-  eq('bearings and HSFG bolts are bought out: listed, not rows', plan.bought.map((b) => b.mark), ['NB', 'NB-AB', 'GBRG', 'GBRG-AB', 'HSFG-M22']);
+  // Bearings are listed; bolts are listed too on a tenant with no "Bolt set" selection (with one they are Bolt set rows —
+  // import_bolts_test). The package carries its bolts per joint size since 2026-11-01 (drawing_bom src/rdso/applyBolts.mjs).
+  const boughtMarks = plan.bought.map((b) => b.mark);
+  ok('bearings and the bolts are bought out on this tenant: listed, not rows (bolts per size, M22)',
+    ['NB', 'NB-AB', 'GBRG', 'GBRG-AB'].every((m) => boughtMarks.includes(m)) && boughtMarks.filter((m) => /^HSFG-M22/.test(m)).length >= 1, JSON.stringify(boughtMarks));
   ok('a part with a drilling caution carries it as a note (BF1..BF6)', ['BF1', 'BF2', 'BF3', 'BF4', 'BF5', 'BF6'].every((m) => /drill/i.test(byWhat(m)[0]?.notes ?? '')));
   const tf1 = byWhat('TF1')[0];
   const v = (r, code) => r.values.find((x) => x.code === code);

@@ -36,6 +36,7 @@ import {
 import { registerFile } from '../services/partDrawingService.js';
 import { lineModel3d } from '../services/model3dService.js';
 import { lineRowProgress, productionOrderLines } from '../services/rowProgressService.js';
+import { lineCurve, setLineCurve } from '../services/curveService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -48,6 +49,9 @@ router.get('/orders/:orderId/lines/:lineId/model3d', guard(PERM.ordersView),
 router.get('/orders/:orderId/lines/:lineId/row-progress', guard(PERM.ordersView),
   handle((req) => lineRowProgress(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'),
     { productionOrderId: req.query.productionOrderId ? intParam(req.query.productionOrderId, 'productionOrderId') : null })));
+// TRACK CURVE (§98, curveService): the line's degree of curve, its series' rule and the layout; saving it is refused beyond the series.
+router.get('/order-lines/:id/curve', guard(PERM.ordersView), handle((req) => lineCurve(pool, ctx(req).companyId, intParam(req.params.id, 'id'))));
+router.put('/order-lines/:id/curve', guard(PERM.orders), handle((req) => withTransaction((db) => setLineCurve(db, ctx(req), intParam(req.params.id, 'id'), req.body ?? {}))));
 // The lines a production order covers (for its 3D progress view).
 router.get('/production-orders/:id/lines', guard(PERM.ordersView),
   handle((req) => productionOrderLines(pool, ctx(req).companyId, intParam(req.params.id, 'id'))));

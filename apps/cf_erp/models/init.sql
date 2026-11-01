@@ -8284,3 +8284,24 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
             AND ((TABLE_NAME = 'cf_order_execution_plans' AND COLUMN_NAME = 'groups_json')
               OR (TABLE_NAME = 'cf_production_orders' AND COLUMN_NAME = 'members_json'))) = 2, 'S97-OK', 'S97-MISSING') AS result;
+
+-- ============================================================================
+-- §98  TRACK CURVE — a standard's curve rule and an order line's curve (2026-11-01)
+-- ============================================================================
+-- RDSO "up to 4 deg curve" series (X-frame sheet, note 4): girders are laid on chords of the curved alignment, the
+-- design takes a maximum eccentricity for curvature at the series' maximum degree, 100 mm standard eccentricity on top;
+-- the steel is the same for any curve up to it (curveService.js works an order line out; drawing_bom src/rdso/curveMeta.mjs).
+--   cf_standard_drawings.curve_json   { maxDeg, eccentricityAtMaxMm, standardEccentricityMm, layout: 'chords',
+--                                      girderSpacingMm, overallMm, bearingsCcMm, source } | { maxDeg: 0, note } (straight
+--                                      only) | NULL (the standard does not say)
+--   cf_sales_order_lines.curve_deg    the site's degree of curve for this line (NULL = straight / not set). Idempotent.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_standard_drawings' AND COLUMN_NAME = 'curve_json');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_standard_drawings ADD COLUMN curve_json JSON NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'curve_deg');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN curve_deg DECIMAL(6,3) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+            AND ((TABLE_NAME = 'cf_standard_drawings' AND COLUMN_NAME = 'curve_json')
+              OR (TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'curve_deg'))) = 2, 'S98-OK', 'S98-MISSING') AS result;
