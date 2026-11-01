@@ -429,9 +429,9 @@ const shapeSettings = (r, basis) => ({
  *   sharedCuts  parts edge to edge one kerf apart (a whole equal edge) wherever that makes the layout no longer.
  * `discipline: false` leaves the cost rules out (steel bought alone).
  */
-export function shapeHabits(settings, thicknessMm, maxPlateSizes, discipline = true) {
+export function shapeHabits(settings, thicknessMm, maxPlateSizes, discipline = true, offcutValue = undefined) {
   return {
-    costRules: discipline ? costRulesFor(thicknessMm, { maxSizes: maxPlateSizes, offcutMinArea: settings.offcutMinAreaMm2, offcutMinSide: settings.offcutMinSideMm }) : null,
+    costRules: discipline ? costRulesFor(thicknessMm, { maxSizes: maxPlateSizes, offcutMinArea: settings.offcutMinAreaMm2, offcutMinSide: settings.offcutMinSideMm, ...(offcutValue !== undefined ? { offcutValue } : {}) }) : null,
     gap: settings.shopSpacing ? Math.max(Number(settings.kerfMm) || 0, Number(settings.groupGapMm) || 0) : Number(settings.kerfMm) || 0,
     sharedCuts: true,
   };
@@ -1705,6 +1705,27 @@ async function loadPacker(injected) {
  * Only the line-level impossibilities (no structure, nowhere to file a plate)
  * throw, because there is no proposal to show at all.
  */
+/** The what-if sizes (planNesting `plateSizes`) as plates in each steel the cut plates need: { id < 0, code, name, steel, kind }. */
+function sizesAsPlates(sizes, cutPlates) {
+  const steels = new Map();
+  for (const cp of cutPlates) {
+    const s = cp.steel ?? {};
+    const key = [s.thickness, s.grade, s.material, s.impactClass].join('|');
+    if (s.thickness > 0 && !steels.has(key)) steels.set(key, s);
+  }
+  const out = [];
+  let id = -1;
+  for (const s of steels.values()) {
+    for (const z of sizes) {
+      const L = Math.max(Number(z.length), Number(z.width)); const W = Math.min(Number(z.length), Number(z.width));
+      if (!(L > 0 && W > 0)) continue;
+      out.push({ id: id--, code: `STD-${s.thickness}X${W}X${L}-${s.grade ?? ''}`, name: `Standard plate ${s.thickness} x ${W} x ${L} ${s.grade ?? ''}`,
+        steel: { thickness: s.thickness, length: L, width: W, grade: s.grade ?? null, material: s.material ?? null, density: s.density ?? null, impactClass: s.impactClass ?? null }, kind: 'STANDARD' });
+    }
+  }
+  return out;
+}
+
 /** What a losing try keeps of its layout: the figures pickBest ranks by and the stats read — no placed outlines. */
 function lightLayout(out) {
   if (!out) return out;
@@ -1721,12 +1742,19 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const say = (text, extra = {}) => { if (input.onProgress) { try { input.onProgress({ text, ...extra }); } catch { /* progress only */ } } };
   say('Reading the line\'s cut pieces and the catalog plates', { phase: 'reading' });
   const budgetCut = new Map();         // group key -> the clock limited its search
-  const line = await requireLine(db, companyId, orderLineId);
+  const stored = await requireLine(db, companyId, orderLineId);
+  // `freeRange` (a what-if, like plateSizes): plan the line in free size within this range, whatever the line says.
+  const line = input.freeRange ? { ...stored, nest_plates: 'free', nest_free_range: input.freeRange } : stored;
   assertFrozen(line);
   const { where, cutPlates: needed } = await surveyLine(db, companyId, line);
   const pack = await loadPacker(input.pack);
   const settingRows = await cutSettingRows(db, companyId);
-  const everyPlate = await candidatePlates(db, companyId, where.plateIds);
+  // `plateSizes` (a what-if, 2026-11-01: "take these standard sizes … only these, and not from the items"): [{ length,
+  // width }] offered in every steel the line needs INSTEAD of the catalog plates — stand-ins with negative ids, so the
+  // answer can be read and compared but never accepted (no catalog plate to buy).
+  const everyPlate = Array.isArray(input.plateSizes) && input.plateSizes.length
+    ? sizesAsPlates(input.plateSizes, needed)
+    : await candidatePlates(db, companyId, where.plateIds);
   // Standard only: a custom plate (or one that does not say) is not offered at all.
   const plates = everyPlate.filter(allowedBy(line.nest_plates));
   const theirs = await customerPlates(db, companyId, line.order_id, plates.map((p) => p.id));
@@ -2016,7 +2044,8 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
       // A kerf between parts; at the plate edge the clearance the rectangle packer leaves (rimOf).
       kerf: settings.kerfMm, margin: rim.shapeMargin, rotations: rotationsOf(settings), partInPart: true,
       effort: input.effort ?? 'standard', seed: input.seed ?? 1,
-      ...shapeHabits(settings, g.thickness, settingRows.maxPlateSizes, discipline),
+      // What-if overrides (2026-11-01, "think through the nesting"): how many plate sizes a thickness may use, and what a kept remnant is worth.
+      ...shapeHabits(settings, g.thickness, input.maxPlateSizes !== undefined ? input.maxPlateSizes : settingRows.maxPlateSizes, discipline, input.offcutValue),
     } : null;
     // A saved plate is owned already: free, one of it, its parts fixed where they are. The job
     // fills these FIRST (packJob.js), then opens new plates for what is left.

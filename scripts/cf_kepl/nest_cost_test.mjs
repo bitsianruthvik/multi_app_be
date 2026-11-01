@@ -51,7 +51,7 @@ console.log('\n1. The cost rules (nestCost.js)');
   const pr = NC.plateCosts([{ length: 1000, width: 1000, kind: 'STANDARD', ratePerKg: 60 }, { length: 1000, width: 1000, kind: 'STANDARD', ratePerKg: 66 }, { length: 1000, width: 1000, kind: 'STANDARD', ratePerKg: 72 }, { length: 1000, width: 1000, kind: 'STANDARD' }]);
   ok('priced plates: area × rate ÷ the median rate; an unpriced one at the median', near(pr[0].areaCost, 1e6 * 60 / 66) && near(pr[1].areaCost, 1e6) && near(pr[2].areaCost, 1e6 * 72 / 66) && pr[3].areaCost === 1e6, J(pr));
   const R = NC.costRulesFor(20, { offcutMinArea: 90000, offcutMinSide: 100 });
-  ok('the rules at 20 mm: at most 2 sizes, 150 kg per extra size, 20 kg handling a plate, remnants at half', R.maxSizes === 2 && near(R.sizePenalty, NC.kgToArea(150, 20)) && near(R.platePenalty, NC.kgToArea(20, 20)) && R.offcutValue === 0.5);
+  ok('the rules at 20 mm: at most 2 sizes, 150 kg per extra size, 20 kg handling a plate, a remnant not credited (2026-11-01)', R.maxSizes === 2 && near(R.sizePenalty, NC.kgToArea(150, 20)) && near(R.platePenalty, NC.kgToArea(20, 20)) && R.offcutValue === 0);
   ok('the company limit: 3 → 3, 0 → no limit', NC.costRulesFor(20, { maxSizes: 3 }).maxSizes === 3 && NC.costRulesFor(20, { maxSizes: 0 }).maxSizes === null);
   const rem = (maxX, maxY) => NC.remnantArea({ length: 12000, width: 2000, maxX, maxY, margin: 5, gap: 4, minArea: 90000, minSide: 100 });
   ok('a remnant: the clean strip at the plate end (full width) when it passes the offcut rule; 95 mm is scrap', near(rem(10000, 1995), (12000 - 10000 - 4 - 5) * 1990) && rem(11896, 1995) === 0, J([rem(10000, 1995), rem(11896, 1995)]));
@@ -61,7 +61,9 @@ console.log('\n1. The cost rules (nestCost.js)');
   ok('a layout\'s score: price + penalties + handling per plate bought + a penalty per extra size; the customer\'s plate is not bought and is no size',
     s1.cost === 51.2e6 && s1.plates === 3 && s1.sizes === 3 && s1.sizeOver === 1 && near(s1.score, 51.2e6 + 1e5 + 3 * R.platePenalty + 2 * R.sizePenalty), J(s1));
   const s2 = NC.layoutScore([{ sheetKey: 'a', extent: { maxX: 6000, maxY: 1995 } }], sheets, R);
-  ok('…less half the steel of a kept remnant at the plate end', near(s2.score, 24e6 + R.platePenalty - 0.5 * (12000 - 6000 - 0) * 2000), J(s2));
+  ok('…a kept remnant at the plate end earns nothing by default', near(s2.score, 24e6 + R.platePenalty), J(s2));
+  const Rhalf = NC.costRulesFor(20, { offcutMinArea: 90000, offcutMinSide: 100, offcutValue: 0.5 });
+  ok('…and less half its steel when a remnant is credited at half', near(NC.layoutScore([{ sheetKey: 'a', extent: { maxX: 6000, maxY: 1995 } }], sheets, Rhalf).score, 24e6 + Rhalf.platePenalty - 0.5 * (12000 - 6000 - 0) * 2000));
   ok('without rules the score is the steel bought, as before', NC.layoutScore([{ sheetKey: 'a' }, { sheetKey: 'b' }], sheets, null).score === 39.2e6);
   ok('ranking: pieces left off, then sizes over the limit, then the score', NC.compareScored({ off: 0, sizeOver: 1, score: 1 }, { off: 0, sizeOver: 0, score: 9 }) > 0 && NC.compareScored({ off: 0, sizeOver: 0, score: 9 }, { off: 1, sizeOver: 0, score: 1 }) < 0 && NC.compareScored({ off: 0, score: 2 }, { off: 0, score: 3 }) < 0);
 }

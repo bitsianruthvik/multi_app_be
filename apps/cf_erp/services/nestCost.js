@@ -33,7 +33,9 @@ export const COST_DEFAULTS = Object.freeze({
   customPct: 0.02,        // a CUSTOM plate (or one that does not say) costs 2 % more than a STANDARD one
   shortPct: 0.03,         // a short plate (under half the longest length offered) 3 % more
   shortRatio: 0.5,
-  offcutValue: 0.5,       // a usable remnant is worth half its steel
+  // A remnant is no longer credited (2026-11-01, SO260018: at 0.5 a plate with its last 4.7 m bare looked half free, so
+  // the search left 19 plates of 25 mm ~45 % empty instead of filling their tails; at 0 the same pieces bought 3 points less).
+  offcutValue: 0,         // what a usable remnant is worth, as a share of its steel
 });
 
 const DENSITY_KG_MM3 = 7.85e-6;
