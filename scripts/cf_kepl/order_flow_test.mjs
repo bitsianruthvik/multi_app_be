@@ -191,18 +191,18 @@ try {
   invalidateNodeCache(conn);
   proc = await PROC.orderProcess(conn, COMPANY, line.order_id);
   ok('a customer order offers no Confirm move — it is confirmed by its acceptance (§73)', !(await SO.getOrder(conn, COMPANY, line.order_id)).allowedTransitions.includes('confirmed'));
-  eq('nesting waits on the freeze', stageOf(proc, 'nesting')?.waitingOn?.stageKey, 'lock');
+  ok('nesting does not wait on the freeze (2026-11-01)', stageOf(proc, 'nesting')?.waitingOn?.stageKey !== 'lock', JSON.stringify(stageOf(proc, 'nesting')?.waitingOn));
   const lockStage = stageOf(proc, 'lock');
   ok('the freeze does not wait on nesting or say anything about plates', lockStage?.waitingOn?.stageKey !== 'nesting' && !(lockStage?.blockers ?? []).some((b) => /plate/i.test(b.message)),
     JSON.stringify(lockStage?.blockers));
   eq('un-frozen: still no stage waits on cut_pieces', badWaits(proc), []);
 
-  section('3. Nesting is refused before the freeze');
+  section('3. Nesting does not wait for the freeze (2026-11-01: a structure change voids it instead)');
   const planErr = await refusal(() => NEST.planNesting(conn, COMPANY, LINE, { effort: 'quick' }));
-  ok('planNesting: "Freeze the design first"', planErr?.code === 'NOT_FROZEN' && /Freeze the design first — nesting lays out the frozen pieces\./.test(planErr.message), planErr?.message);
-  eq('acceptNesting refuses it too', (await refusal(() => NEST.acceptNesting(conn, c, LINE, { groups: [] })))?.code, 'NOT_FROZEN');
-  eq('and an imported sheet cannot be saved', NEST.importBlocker((await NEST.importContext(conn, COMPANY, LINE)).line)?.code, 'NOT_FROZEN');
-  eq('the Nesting screen says the line is not frozen', (await NEST.getNesting(conn, COMPANY, LINE)).line?.frozen, false);
+  ok('planNesting is not refused for the freeze', planErr?.code !== 'NOT_FROZEN', planErr?.message);
+  ok('acceptNesting is not refused for the freeze', (await refusal(() => NEST.acceptNesting(conn, c, LINE, { groups: [] })))?.code !== 'NOT_FROZEN');
+  eq('an imported sheet is not held back by the freeze', NEST.importBlocker((await NEST.importContext(conn, COMPANY, LINE)).line)?.code ?? null, null);
+  eq('the Nesting screen says the line is open to nesting', (await NEST.getNesting(conn, COMPANY, LINE)).line?.frozen, true);
 
   await SO.setOrderStatus(conn, c, line.order_id, 'confirmed');
   const [[st]] = await conn.query('SELECT status FROM cf_sales_orders WHERE id = ?', [line.order_id]);

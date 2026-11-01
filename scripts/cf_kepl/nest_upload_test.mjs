@@ -414,7 +414,7 @@ try {
     await conn.query('DELETE FROM cf_production_releases WHERE company_id = ? AND order_line_id = ?', [COMPANY, fx.lineId]);
     await conn.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE id = ?', [fx.lineId]);
     out = await one(f);
-    ok('an unfrozen line', out.canSave === false && out.problemList.some((p) => p.code === 'NOT_FROZEN' && /Freeze the design first/.test(p.message)), J(out.problems));
+    ok('a line not frozen yet can take an upload (2026-11-01: a structure change voids the nesting instead)', !out.problemList.some((p) => p.code === 'NOT_FROZEN'), J(out.problems));
     await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE id = ?', [fx.lineId]);
     out = await one(f);
     ok('frozen again, the same file is clean', out.canSave === true && out.problems.length === 0);

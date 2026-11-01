@@ -1835,6 +1835,51 @@ export async function deleteNestLot(db, c, lineId, lotId) {
   };
 }
 
+/**
+ * A STRUCTURE CHANGE VOIDS THE NESTING (user, 2026-11-01: "Should we let nesting happen and if the structure changes,
+ * then throw a warning that the nesting will be void and void the nesting?"). A line is nested before it is locked now
+ * (nestingService.isFrozenForNesting), so a save can move what is to be cut under a saved nesting. After every structure
+ * save (cutPlateService.withCutPieces) the saved plates are held to the cut pieces as they are now; when they no longer
+ * agree, every saved plate of the line is taken off, as "take the plate off" does for one (plate lines back to the
+ * selection, cuts cleared), and the answer says so — the screen warned before the save.
+ *
+ * What counts as moved: a laid-out cut piece that is gone (deleted, or re-pooled after its parts changed size), one laid
+ * out a different number of times than it is needed, or a NEW cut piece (made after the newest saved plate) that is not
+ * laid out. A cut piece that was there before the nesting and is simply not laid out yet is not a change — that is a
+ * nesting of part of the line ("nest the rest"). Left-out and hand-laid (NEST_MANUAL) pieces are not held to a count.
+ * → null (nothing saved, nothing moved, or a frozen line) | { voided: true, plates, why, message }
+ */
+export async function voidNestingIfMoved(db, c, lineId) {
+  const [[n]] = await db.query(
+    "SELECT COUNT(*) AS lots, MAX(created_at) AS newest FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'plate'",
+    [c.companyId, lineId],
+  );
+  if (!Number(n?.lots)) return null;
+  const ctx = await uploadContext(db, c.companyId, lineId);
+  if (importBlocker(ctx.line) || !ctx.saved.length) return null;
+  const { coverage } = coverageOfLots(ctx.cutPlates, ctx.saved, ctx.excl, ctx.untracked);
+  const here = new Set(ctx.cutPlates.map((cp) => cp.id));
+  const gone = new Set();
+  for (const l of ctx.saved) for (const p of l.pieces) if (!here.has(p.cutPlateId)) gone.add(p.cutPlateId);
+  const [made] = ctx.cutPlates.length ? await db.query('SELECT id, created_at FROM cf_master_records WHERE company_id = ? AND id IN (?)', [c.companyId, ctx.cutPlates.map((cp) => cp.id)]) : [[]];
+  const newest = n.newest ? new Date(n.newest).getTime() : 0;
+  const isNew = new Set(made.filter((m) => m.created_at && new Date(m.created_at).getTime() > newest).map((m) => Number(m.id)));
+  const counted = coverage.filter((e) => !e.manual && !e.leftOut);
+  const count = counted.filter((e) => e.nested > 0 && e.nested + (e.untracked ?? 0) !== e.needed && !(e.nested < e.needed && e.nested + (e.untracked ?? 0) >= e.needed));
+  const fresh = counted.filter((e) => e.nested === 0 && e.needed > 0 && isNew.has(Number(e.cutPlateId)));
+  if (!gone.size && !count.length && !fresh.length) return null;
+  const why = [
+    gone.size ? `${plural(gone.size, 'laid-out cut piece is', 'laid-out cut pieces are')} no longer in the structure` : null,
+    count.length ? `${plural(count.length, 'cut piece needs', 'cut pieces need')} a different number of pieces` : null,
+    fresh.length ? `${plural(fresh.length, 'new cut piece', 'new cut pieces')} ${fresh.length === 1 ? 'is' : 'are'} not laid out` : null,
+  ].filter(Boolean).join(', ');
+  await applyChanges(db, c, lineId, ctx, { removeIds: ctx.saved.map((l) => l.id), keep: [] });
+  return {
+    voided: true, plates: ctx.saved.length, why,
+    message: `The structure changed (${why}), so the nesting of line ${ctx.line.line_no} is void: ${plural(ctx.saved.length, 'plate was', 'plates were')} taken off. Nest the line again.`,
+  };
+}
+
 /* ───────────────────────────── what is saved ───────────────────────────── */
 
 /** GET …/nesting/files — the plates saved on the line, the files they came from, and what is left over. */

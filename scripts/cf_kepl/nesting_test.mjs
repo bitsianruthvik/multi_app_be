@@ -355,10 +355,11 @@ try {
   await conn.query('UPDATE cf_sales_order_lines SET locked_at = NULL WHERE company_id = ? AND id = ?', [COMPANY, fixture.lineId]);
   let unfrozenPlan = null;
   try { await S.planNesting(conn, COMPANY, fixture.lineId, { pack: shelfPacker, effort: 'quick', seed: 7 }); } catch (e) { unfrozenPlan = e; }
-  ok('a line whose design is not frozen is not nested — planNesting says to freeze it first', unfrozenPlan?.code === 'NOT_FROZEN' && /Freeze the design first/.test(unfrozenPlan?.message ?? ''), unfrozenPlan?.message);
+  // 2026-11-01: nesting no longer waits for the freeze — a structure change voids it instead (nestDxfImportService.voidNestingIfMoved).
+  ok('a line not frozen yet is nested all the same', unfrozenPlan?.code !== 'NOT_FROZEN', unfrozenPlan?.message);
   let unfrozenAccept = null;
   try { await S.acceptNesting(conn, c, fixture.lineId, { groups: [] }); } catch (e) { unfrozenAccept = e; }
-  eq('…and acceptNesting refuses it the same way', unfrozenAccept?.code, 'NOT_FROZEN');
+  ok('…and acceptNesting does not refuse it for the freeze', unfrozenAccept?.code !== 'NOT_FROZEN', unfrozenAccept?.message);
   await conn.query('ROLLBACK TO SAVEPOINT unfrozen');
   const beforePlan = await counts(conn);
   const plan = await S.planNesting(conn, COMPANY, fixture.lineId, { pack: shelfPacker, effort: 'quick', seed: 7 });
@@ -470,6 +471,19 @@ try {
   near('and the plate count did not move', Number(stillA.quantity), 1.6 / 6, 1e-6);
 
   /* ---- 8. reading the saved plan back ----------------------------------- */
+  /* ---- 7b. a structure change voids the nesting (2026-11-01) ------------ */
+  section('7b. A structure change voids the saved nesting; no change keeps it');
+  const IMPORT = await imp('apps/cf_erp/services/nestDxfImportService.js');
+  eq('nothing moved: the nesting stays', await IMPORT.voidNestingIfMoved(conn, c, fixture.lineId), null);
+  await conn.query('SAVEPOINT void_check');
+  await conn.query('UPDATE cf_sales_order_lines SET quantity = ?, locked_at = NULL WHERE company_id = ? AND id = ?', [LINE_QTY + 1, COMPANY, fixture.lineId]);
+  const voided = await IMPORT.voidNestingIfMoved(conn, c, fixture.lineId);
+  ok('one more unit: the nesting is void, and the answer says why', voided?.voided === true && voided.plates === 2 && /different number of pieces/.test(voided.why) && /void/.test(voided.message), JSON.stringify(voided));
+  const [[leftLots]] = await conn.query("SELECT COUNT(*) AS n FROM cf_plate_lots WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND kind = 'plate'", [COMPANY, fixture.lineId]);
+  eq('every saved plate of the line is taken off', Number(leftLots.n), 0);
+  eq('and asked again, there is nothing left to void', await IMPORT.voidNestingIfMoved(conn, c, fixture.lineId), null);
+  await conn.query('ROLLBACK TO SAVEPOINT void_check');
+
   section('8. A look is a look — the saved plan reads back as the same layout');
   const saved = await S.getNesting(conn, COMPANY, fixture.lineId);
   eq('it says it is saved', saved.saved, true);

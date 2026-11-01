@@ -449,20 +449,22 @@ try {
     readNoSize.values?.complete === false && readNoSize.values.missing === noSize.out.summary.missing && readNoSize.cutPlates.length === 0 && readNoSize.upToDate === null,
     JSON.stringify({ values: readNoSize.values, upToDate: readNoSize.upToDate }));
 
-  // Sizes filled, but the run's own required mark left empty on one part: the
-  // plan WOULD make blanks now, and still nothing is made.
-  await OV.writeLineValues(conn, c, f.lineA.id, { writes: [...size(A, 10, 3000, 500), ...size(Bp, 10, 3000, 500), ...size(C, 12, 2000, 400), ...markAll([A, Bp]), ...steelAll([A, Bp, C])] });
+  // Sizes filled, but one part's GRADE left empty: the plan WOULD make blanks now, and still nothing is made.
+  // (2026-11-01: only the values a cut piece is made from hold it back — cutPlateService.CUT_PIECE_VALUES; a mark or
+  // a coat count does not, see section 9.)
+  await OV.writeLineValues(conn, c, f.lineA.id, { writes: [...size(A, 10, 3000, 500), ...size(Bp, 10, 3000, 500), ...size(C, 12, 2000, 400).filter((w) => w.specCode !== 'GRADE'), ...markAll([A, Bp, C]), ...steelAll([A, Bp, C])] });
   const noMark = await refresh(f.lineA.id);
   ok('with every size in but one other required value empty, it still says values_missing', noMark.out.reason === 'values_missing' && noMark.out.summary.missing === 1,
     JSON.stringify(noMark.out));
   eq('and writes nothing', noMark.writes, 0);
   const readNoMark = await CUT.getCutPlates(conn, COMPANY, f.lineA.id);
-  ok('the screen says one value is missing, and that the cut pieces are behind the parts', readNoMark.values?.missing === 1 && readNoMark.upToDate === false,
+  // A missing grade means the plan cannot be worked out yet, so "up to date" is unknown (null) rather than behind (false).
+  ok('the screen says one value is missing, and nothing claims the cut pieces are up to date', readNoMark.values?.missing === 1 && readNoMark.upToDate !== true,
     JSON.stringify({ values: readNoMark.values, upToDate: readNoMark.upToDate }));
 
   /* ---- made when complete ------------------------------------------------ */
   section('3. As soon as the values are complete, the cut pieces are made');
-  await OV.writeLineValues(conn, c, f.lineA.id, { writes: markAll([C]) });
+  await OV.writeLineValues(conn, c, f.lineA.id, { writes: [{ recordId: C, specCode: 'GRADE', value: 'E350' }] });
   invalidateNodeCache(conn);
   // The house's cut-plate flow (init.sql §33 — user, 2026-09-30: cutting
   // belongs to the cut plate). Set here, so a new cut plate is born with it.
@@ -694,12 +696,12 @@ try {
   await conn.query("UPDATE cf_master_records SET status = 'active' WHERE company_id = ? AND id = ?", [COMPANY, f.sel.id]);
   eq('restored, it catches up', (await refresh(f.lineA.id)).out.made, true);
 
-  section('9. The explicit derive does not wait for the values; the automatic one does');
+  section('9. A required value no cut piece is made from (the mark) does not hold the cut pieces back');
   await OV.writeLineValues(conn, c, f.lineA.id, { writes: [{ recordId: A, specCode: f.MARK.code, value: null }, { recordId: C, specCode: 'WIDTH', value: 450 }] });
   const waits = await refresh(f.lineA.id);
-  ok('the refresh waits for the missing mark', waits.out.reason === 'values_missing' && waits.writes === 0, JSON.stringify(waits.out));
+  ok('the refresh follows the new width though the mark is empty', waits.out.reason === 'made' && waits.out.summary.created === 1, JSON.stringify(waits.out));
   const now = await CUT.deriveCutPlates(conn, c, f.lineA.id, {});
-  ok('"Make them now" derives anyway — the sizes are all there', now.changed === true && now.created === 1, JSON.stringify({ changed: now.changed, created: now.created }));
+  ok('"Make them now" then has nothing left to change', now.changed === false, JSON.stringify({ changed: now.changed, created: now.created }));
   await OV.writeLineValues(conn, c, f.lineA.id, { writes: [{ recordId: A, specCode: f.MARK.code, value: 'M' }] });
   eq('with the mark back and nothing else changed, the refresh is up_to_date', (await refresh(f.lineA.id)).out.reason, 'up_to_date');
 

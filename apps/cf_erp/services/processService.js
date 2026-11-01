@@ -50,7 +50,7 @@
  */
 import { invalid, notFound, conflict, assertNoProblems } from '../lib/errors.js';
 import { explode } from './bomService.js';
-import { layoutDriftOfLines, driftSentence, FREEZE_FIRST } from './nestingService.js';
+import { layoutDriftOfLines, driftSentence } from './nestingService.js';
 import { plannedMaterialOfLines } from './releaseService.js';
 import { availability, madeRule } from './rollOutService.js';
 import { cutPieceGaps } from './lockService.js';
@@ -467,19 +467,7 @@ export const STAGE_CATALOGUE = [
       }
 
       const pieces = ctx.nesting.cutPieces ?? 0;
-      // Not frozen: nothing can be laid out yet, whatever else is missing — the
-      // freeze stage says what IT waits on.
-      if (ctx.line.line_type === 'custom' && !ctx.lock.lockedAt) {
-        return {
-          state: 'todo',
-          detail: pieces + secPieces ? `${n(pieces + secPieces, 'cut piece')} to lay out once the design is frozen` : 'Waiting for the design to be frozen',
-          blockers: [{
-            count: (pieces + secPieces) || 1,
-            message: `Line ${ctx.line.line_no}'s design is not frozen yet — nesting lays out the frozen pieces.`,
-          }],
-          waitingOn: { stageKey: 'lock', message: FREEZE_FIRST },
-        };
-      }
+      // Nesting no longer waits for the freeze (nestingService.isFrozenForNesting, 2026-11-01): a structure change voids it instead.
       // Only cut sections (no plate cut piece): their bars are the whole stage.
       if (!pieces && !items.length && secNeeded) {
         return sec.accepted

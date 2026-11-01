@@ -709,12 +709,14 @@ export function assertOpen(line) {
 }
 
 /**
- * NESTING COMES AFTER THE FREEZE (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30). It lays
- * out the frozen pieces and picks the plates for their blanks; before the
- * freeze the blanks can still change under it. A line built from a template is
- * frozen once it is locked; any other line has no design of its own to freeze.
+ * NESTING ONCE THE BOM AND DRAWINGS ARE THERE (user, 2026-11-01: "Once the BoM + diagrams are there, we should ideally
+ * be able to run nesting … if the structure changes, then throw a warning that the nesting will be void and void the
+ * nesting"). It used to wait for the freeze (CF_ERP_ORDER_FLOW_PLAN, 2026-09-30) because the blanks could still change
+ * under it; now a line is open to nesting before it is locked, and a save that changes what is to be cut VOIDS the saved
+ * nesting (nestDxfImportService.voidNestingIfMoved, run by cutPlateService.withCutPieces after every structure save).
+ * The order still decides: a closed order, a released line or one with production orders cannot be nested (assertOpen).
  */
-export const isFrozenForNesting = (line) => line.line_type !== 'custom' || !!line.locked_at;
+export const isFrozenForNesting = () => true;
 export const FREEZE_FIRST = 'Freeze the design first — nesting lays out the frozen pieces.';
 
 export function assertFrozen(line) {

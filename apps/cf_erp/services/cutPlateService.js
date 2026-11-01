@@ -801,10 +801,24 @@ async function planPlateFor(db, companyId, { line, st, selection, carried = null
  * no query of its own — survey read its lines and steel). `carried` — see
  * planPlateLines; for sections only the flow is carried.
  */
-async function planFor(db, companyId, { line, state, selection, places, carried = null }) {
+async function planFor(db, companyId, { line, state, selection, places, carried = null, sectionsMayWait = false }) {
   const plate = await planPlateFor(db, companyId, { line, st: state.plate, selection, carried });
-  const section = planSectionFor({ st: state.section, places, carried });
-  return combined(plate, section);
+  let section;
+  let sectionsWaiting = null;
+  try {
+    section = planSectionFor({ st: state.section, places, carried });
+  } catch (err) {
+    // Parts cut from a section with no bar chosen yet hold back only the SECTIONS (2026-11-01, nesting once the BOM and
+    // drawings are there): while the line has no cut section at all, its plates are made and the sections wait, said.
+    // A line that already has cut sections keeps refusing, so none of them is dropped by a part that lost its bar.
+    // Only the automatic refresh (sectionsMayWait); "Make them now" still refuses, naming the parts.
+    if (!sectionsMayWait || err?.code !== 'NO_SECTION' || state.section.cutPlates.length) throw err;
+    section = EMPTY_PLAN();
+    sectionsWaiting = err.message;
+  }
+  const plan = combined(plate, section);
+  if (sectionsWaiting) plan.sectionsWaiting = sectionsWaiting;
+  return plan;
 }
 
 // --- the section method ------------------------------------------------------------
@@ -1919,15 +1933,24 @@ export async function deriveCutPlates(db, c, orderLineId, input = {}) {
  * pieces being made again, or a blank missing a value would freeze every blank
  * on the line until somebody typed onto a row that is about to be replaced.
  */
+/**
+ * The values a cut piece is made from: a part's steel, its size and what it is cut from. Only these hold the cut pieces
+ * back (user, 2026-11-01: "once the BoM + diagrams are there, we should be able to run nesting") — a coat count or a weld
+ * size a flow asks for is required for the line, but no rectangle depends on it.
+ */
+export const CUT_PIECE_VALUES = new Set(['GRADE', 'IMPACT_CLASS', 'MATERIAL', 'DENSITY', 'THICKNESS', 'WIDTH', 'LENGTH', 'DEPTH', 'SECTION_AREA', 'CUT_FROM']);
+
 function missingValues(view, places) {
   const cut = places.blankIds;
   let missing = 0;
   let items = 0;
   for (const g of view.groups ?? []) {
     if (!g.own || cut.has(g.classification?.id)) continue;
+    const counted = (g.columns ?? []).filter((col) => CUT_PIECE_VALUES.has(String(col.code).toUpperCase())).map((col) => col.code);
     for (const r of g.rows) {
-      missing += Number(r.missing) || 0;
-      if (Number(r.missing)) items += 1;
+      const n = counted.filter((code) => r.cells?.[code]?.missing).length;
+      missing += n;
+      if (n) items += 1;
     }
   }
   return { missing, items, complete: missing === 0 };
@@ -2154,7 +2177,7 @@ export async function refreshCutPieces(db, c, lineId, opts = {}) {
     if (missingPlace) return stop('not_set_up', missingPlace.message);
     const selection = use.plate ? await plateSelection(db, companyId, places) : null;
     opened = { line, flowId: null, places, selection, state };
-    try { plan = await planFor(db, companyId, { line, state, selection, places, carried: opts.carry ?? null }); } catch (err) { if (!isRefusal(err)) throw err; planError = err; }
+    try { plan = await planFor(db, companyId, { line, state, selection, places, carried: opts.carry ?? null, sectionsMayWait: true }); } catch (err) { if (!isRefusal(err)) throw err; planError = err; }
   } catch (err) {
     if (!isRefusal(err)) throw err;
     return stop('cannot_derive', err.message, { problems: err.problems ?? [] });
@@ -2165,6 +2188,7 @@ export async function refreshCutPieces(db, c, lineId, opts = {}) {
     // Same pieces — but one may still lack steel its part has since been given.
     const methods = methodsOf(places, opened.selection);
     const filled = await fillBlankGaps(db, c, methods.plate, plan.plate) + await fillBlankGaps(db, c, methods.section, plan.section);
+    if (plan.sectionsWaiting) return stop('cannot_derive', `The cut plates of line ${line.line_no} match its parts; the sections wait: ${plan.sectionsWaiting}`, { cutPieces: plan.groups.length, filled, sectionsWaiting: plan.sectionsWaiting });
     return stop('up_to_date', `The ${plural(plan.groups.length, 'cut piece')} of line ${line.line_no} already match its parts.`, { cutPieces: plan.groups.length, filled });
   }
 
@@ -2196,8 +2220,8 @@ export async function refreshCutPieces(db, c, lineId, opts = {}) {
   return {
     made: true,
     reason: 'made',
-    message: `Cut pieces of line ${line.line_no} made from its values — ${plural(out.cutPlates.length, 'cut piece')}${bits.length ? ` (${bits.join(', ')})` : ''}.`,
-    summary: { cutPieces: out.cutPlates.length, created: out.created, updated: out.updated, removed: out.removed.length, unchanged: out.unchanged },
+    message: `Cut pieces of line ${line.line_no} made from its values — ${plural(out.cutPlates.length, 'cut piece')}${bits.length ? ` (${bits.join(', ')})` : ''}.${plan.sectionsWaiting ? ` The sections wait: ${plan.sectionsWaiting}` : ''}`,
+    summary: { cutPieces: out.cutPlates.length, created: out.created, updated: out.updated, removed: out.removed.length, unchanged: out.unchanged, ...(plan.sectionsWaiting ? { sectionsWaiting: plan.sectionsWaiting } : {}) },
   };
 }
 
@@ -2319,6 +2343,10 @@ export async function withCutPieces(db, c, lineId, out) {
   // Selection rows the system can answer on its own (a default, or one candidate) — before the cut pieces are worked out.
   await autofillLineSelections(db, c, lineId, { refresh: (ids) => refreshValues(db, c, ids) });
   const cutPieces = await refreshCutPieces(db, c, lineId);
+  // A line nested before it is locked: a save that moved what is to be cut voids its nesting (one count when it has none).
+  const { voidNestingIfMoved } = await import('./nestDxfImportService.js');
+  const nestingVoided = await voidNestingIfMoved(db, c, lineId);
+  if (nestingVoided && out && typeof out === 'object' && !Array.isArray(out)) out = { ...out, nestingVoided };
   // A size or a drawing mark may have changed without the cut pieces changing: the parts' values from
   // their drawings (true area, holes) follow the save too. A derive has already done it
   // (partDrawingService.shapesAfterCutPieces); one count when the line has no drawing; never fails the save.
