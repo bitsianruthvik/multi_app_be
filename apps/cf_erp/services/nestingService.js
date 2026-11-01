@@ -1934,9 +1934,18 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
         ownerPartyId: theirs.get(p.id).ownerPartyId,
       })),
     ]);
+    // A drawn part a few mm bigger than its typed size (a drawing within lib SIZE_TOLERANCE is the part's, 2026-11-01)
+    // takes the room its DRAWING needs: the rectangle laid out is never smaller than the outline the accept verifies.
+    const roomOf = (cp) => {
+      const L = cp.steel.length; const W = cp.steel.width;
+      const s = shapeOf(cp);
+      if (!s?.drawn || !(s.length > 0 && s.width > 0)) return [L, W];
+      const [a, b] = (s.length >= s.width) === (L >= W) ? [s.length, s.width] : [s.width, s.length];
+      return [Math.max(L, Math.ceil(a * 10) / 10), Math.max(W, Math.ceil(b * 10) / 10)];
+    };
     const pieces = sortPieces(g.cutPlates.map((cp) => ({
       id: cp.id, key: `cp${cp.id}`, cutPlate: cp,
-      length: cp.steel.length, width: cp.steel.width, qty: cp.pieces,
+      length: roomOf(cp)[0], width: roomOf(cp)[1], qty: cp.pieces,
       grain: 'any',                                        // a plate rectangle has no grain to respect
     })));
 
