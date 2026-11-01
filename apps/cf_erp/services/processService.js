@@ -437,6 +437,8 @@ export const STAGE_CATALOGUE = [
         const more = drift.length > 1 ? `, and ${n(drift.length - 1, 'more cut piece')}` : '';
         return {
           state: 'partial',
+          // The line has saved plates (the Structure step warns that a change voids them).
+          nested: { plates: saved.lots, pieces: saved.pieces ?? null },
           detail: `The nesting is out of date — ${driftSentence(drift)}`,
           blockers: [{
             count: drift.length,
@@ -447,6 +449,7 @@ export const STAGE_CATALOGUE = [
       if (saved?.lots > 0 && secPending) {
         return {
           state: 'partial',
+          nested: { plates: saved.lots, pieces: saved.pieces ?? null },
           detail: `${n(saved.lots, 'plate')} laid out · ${secPieces ? n(secPieces, 'cut section') : 'the cut sections'} still to lay out on bars`,
           blockers: [secBlocker],
         };
@@ -461,6 +464,7 @@ export const STAGE_CATALOGUE = [
         const loose = ctx.nesting.untracked?.pieces ? ` · ${n(ctx.nesting.untracked.pieces, 'piece')} cut from untracked offcuts` : '';
         return {
           state: 'done',
+          nested: { plates: saved.lots, pieces: saved.pieces ?? null },
           detail: `${n(saved.lots, 'plate')} laid out, ${n(saved.pieces, 'piece')} placed${byHand}${leftOut}${loose}`,
           blockers: [],
         };

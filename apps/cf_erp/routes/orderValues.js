@@ -81,11 +81,15 @@ router.put('/orders/:id/spec-defaults', protect, requireAny(VALUES_WRITE_PERMS),
     const out = await writeOrderDefaults(db, c, id(req), req.body ?? {});
     // Each line whose rows moved: its cut pieces (a grade or a size may have changed), as after a Values save.
     const cutPieces = [];
+    const nestingVoided = [];
     for (const lineId of out.linesWorked) {
       const r = await withCutPieces(db, c, lineId, {});
       cutPieces.push({ lineId, ...(r?.cutPieces ?? {}) });
+      // A nested line whose cut pieces moved: its nesting is void (cutPlateService.withCutPieces), said per line.
+      if (r?.nestingVoided) nestingVoided.push({ lineId, ...r.nestingVoided });
     }
-    return cutPieces.length ? { ...out, cutPieces } : out;
+    const said = nestingVoided.length ? { nestingVoided: nestingVoided.length === 1 ? nestingVoided[0] : { voided: true, message: nestingVoided.map((v) => v.message).join(' '), lines: nestingVoided } } : {};
+    return cutPieces.length ? { ...out, cutPieces, ...said } : out;
   })));
 
 export default router;
