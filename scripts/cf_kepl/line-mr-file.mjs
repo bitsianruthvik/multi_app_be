@@ -51,11 +51,11 @@ const nest = await getNesting(db, COMPANY, line.id);
 const plates = new Map();
 for (const g of nest.groups ?? []) {
   for (const n of g.nests ?? []) {
-    const pl = n.plate ?? {};
-    const key = `${pl.code ?? pl.id}|${g.thickness}|${n.length ?? pl.length}|${n.width ?? pl.width}`;
-    const L = Number(n.length ?? pl.length); const W = Number(n.width ?? pl.width);
-    if (!plates.has(key)) plates.set(key, { code: pl.code ?? '', name: pl.name ?? '', thickness: Number(g.thickness), length: L, width: W, grade: g.grade ?? '', qty: 0, kg: 0 });
-    const e = plates.get(key); e.qty += 1; e.kg += kgOf(g.thickness, L, W, g.density ?? 7850);
+    const code = n.plateCode ?? n.plate?.code ?? '';
+    const L = Number(n.length ?? n.plate?.length); const W = Number(n.width ?? n.plate?.width);
+    const key = `${code || n.plateItemId}|${g.thickness}|${L}|${W}`;
+    if (!plates.has(key)) plates.set(key, { code, name: n.plateName ?? '', thickness: Number(g.thickness), length: L, width: W, grade: n.grade ?? g.grade ?? '', qty: 0, kg: 0 });
+    const e = plates.get(key); e.qty += 1; e.kg += Number(n.weightKg) || kgOf(g.thickness, L, W, n.density ?? g.density ?? 7850);
   }
 }
 const plateRows = [...plates.values()].sort((a, b) => a.thickness - b.thickness || b.length - a.length || b.width - a.width);
