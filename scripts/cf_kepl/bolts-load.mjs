@@ -68,7 +68,8 @@ try {
   const markOf = async (r) => {
     if (MATCH === 'name') return BOLTS.byAssembly[r.name] ? r.name : null;
     const own = await q('SELECT d.number FROM cf_drawing_links k JOIN cf_drawings d ON d.id = k.drawing_id WHERE k.company_id = ? AND k.subject_id = ? AND k.deleted_at IS NULL', [COMPANY, r.id]);
-    for (const { number } of own) if (number.startsWith(so) && BOLTS.byAssembly[number.slice(so.length)]) return number.slice(so.length);
+    // The register numbers a line's level drawing '<SO>/L2/G1-S', and '-2' when that number was used before.
+    for (const { number } of own) { const m = number.slice(so.length).replace(/^L\d+\//, '').replace(/-\d+$/, ''); if (number.startsWith(so) && BOLTS.byAssembly[m]) return m; }
     // A row with no level drawing of its own: its parts' marks start with the assembly's.
     const kids = await q(`SELECT DISTINCT d.number FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL
                             JOIN cf_drawing_links k ON k.subject_id = l.child_id AND k.deleted_at IS NULL JOIN cf_drawings d ON d.id = k.drawing_id

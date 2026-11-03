@@ -41,7 +41,7 @@ export function customPlateSetting(v) {
   if (o == null) return null;
   if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
   if (!o || typeof o !== 'object' || !(o.on === true || o.on === 1 || o.on === '1')) return null;
-  return { on: true, maxLength: pos(o.maxLength), maxWidth: pos(o.maxWidth), minLength: pos(o.minLength), minWidth: pos(o.minWidth), step: pos(o.step) };
+  return { on: true, maxLength: pos(o.maxLength), maxWidth: pos(o.maxWidth), minLength: pos(o.minLength), minWidth: pos(o.minWidth), step: pos(o.step), ...lotOf(o) };
 }
 
 /** What a setting is saved as, checked: → { value (JSON text or null), problems }. */
@@ -56,11 +56,20 @@ export function customPlateInput(input) {
   }
   if (L.maxLength && L.minLength && L.minLength > L.maxLength) problems.push('The shortest length is more than the longest.');
   if (L.maxWidth && L.minWidth && L.minWidth > L.maxWidth) problems.push('The narrowest width is more than the widest.');
+  for (const [k, words] of [['minLotPieces', 'Least pieces of a size'], ['minLotTonnes', 'Least tonnes of a size']]) {
+    const raw = input[k];
+    if (raw != null && raw !== '' && !(Number(raw) > 0)) problems.push(`${words}: a number above 0, or blank.`);
+  }
   if (L.maxWidth && L.maxLength && L.maxWidth > L.maxLength) problems.push('The widest width is more than the longest length (a plate\'s length is its long side).');
   return { value: JSON.stringify({ on: true, ...L }), problems };
 }
 function limitsOf(o) {
-  return { maxLength: pos(o?.maxLength), maxWidth: pos(o?.maxWidth), minLength: pos(o?.minLength), minWidth: pos(o?.minWidth), step: pos(o?.step) };
+  return { maxLength: pos(o?.maxLength), maxWidth: pos(o?.maxWidth), minLength: pos(o?.minLength), minWidth: pos(o?.minWidth), step: pos(o?.step), ...lotOf(o) };
+}
+/** The mill's lot, only when one is stated. */
+function lotOf(o) {
+  const pieces = pos(o?.minLotPieces); const tonnes = pos(o?.minLotTonnes);
+  return { ...(pieces ? { minLotPieces: pieces } : {}), ...(tonnes ? { minLotTonnes: tonnes } : {}) };
 }
 
 /**
@@ -161,4 +170,91 @@ export function proposeCustomSize(nests, { limits, thickness, density = 7850, ma
     after: { plates: rows.length, kg: r3(areaAfter * kgPerMm2) },
     sizesBefore, sizesAfter: best.sizesAfter,
   };
+}
+
+/**
+ * THE MILL'S LOT RULE (user, 2026-11-02): a custom size is rolled only in a lot: "generally 5 pieces of each or 20 tonnes
+ * of weight at least". Standard sizes carry no such rule. A size passes on EITHER count, and it is counted over the whole
+ * sales order: the mill rolls for the order, not for one of its lines. null = the setting states no lot.
+ */
+export function lotRuleOf(setting) {
+  const pieces = pos(setting?.minLotPieces); const tonnes = pos(setting?.minLotTonnes);
+  return pieces || tonnes ? { pieces, tonnes } : null;
+}
+export const lotKey = (thickness, length, width) => `${fmtMm(thickness)}|${fmtMm(Math.max(length, width))}|${fmtMm(Math.min(length, width))}`;
+/** May a custom size be used: not dropped, and in `only` when the sizes are settled (an empty `only` = none). */
+export const lotSizeAllowed = (key, { removed = null, only = null } = {}) => !removed?.has(key) && (!only || only.has(key));
+export function lotPasses(rule, plates, kg) {
+  return (rule.pieces != null && plates >= rule.pieces) || (rule.tonnes != null && kg >= rule.tonnes * 1000);
+}
+
+/** One plate laid in lanes along its length, best fit, to judge a size. → the plates those pieces fill. */
+function laneFill(pieces, L, W, gap, rim) {
+  const UL = L - 2 * rim; const UW = W - 2 * rim;
+  const lanes = [];
+  for (const p of [...pieces].sort((a, b) => b.width - a.width || b.length - a.length)) {
+    for (let k = 0; k < p.qty; k++) {
+      let best = null;
+      for (const ln of lanes) if (p.width <= ln.w && ln.w - p.width <= 60 && ln.free >= p.length) { if (!best || ln.free < best.free) best = ln; }
+      if (best) { best.free -= p.length + gap; best.area += p.length * p.width; best.items.push(p); } else lanes.push({ w: p.width, free: UL - p.length - gap, area: p.length * p.width, items: [p] });
+    }
+  }
+  // Lanes across the width, fullest first.
+  const plates = [];
+  for (const ln of lanes.sort((a, b) => b.area / (UL * b.w) - a.area / (UL * a.w) || b.w - a.w)) {
+    const pl = plates.find((q) => q.free >= ln.w);
+    if (pl) { pl.free -= ln.w + gap; pl.area += ln.area; pl.lanes.push(ln); } else plates.push({ free: UW - ln.w - gap, area: ln.area, lanes: [ln] });
+  }
+  return plates;
+}
+
+/**
+ * The custom sizes worth offering a steel's pieces, within the limits and not already refused: sizes that carry its long
+ * strips side by side and end to end, chosen greedily by how full they run. The packer decides which it uses, standard
+ * sizes beside them; the lot rule then drops what the order does not use enough of (nestingService.planNesting).
+ *   pieces  [{ length, width, qty }] long side first
+ * → [{ length, width }]. PURE.
+ */
+export function lotCandidates(pieces, { limits, kerf = 5, rim = 10, step = 50, thickness = 0, removed = new Set(), maxSizes = 6 } = {}) {
+  const fits = (l, w) => l >= (limits.minLength ?? 0) && l <= limits.maxLength && w >= (limits.minWidth ?? 0) && w <= limits.maxWidth && w <= l;
+  const all = pieces.filter((p) => p.qty > 0 && p.length <= limits.maxLength - 2 * rim && p.width <= limits.maxWidth - 2 * rim);
+  if (!all.length) return [];
+  const strips = all.filter((p) => p.length >= 1500);
+  const base = strips.length ? strips : all;
+  const widthsOf = [...new Set(base.map((p) => Math.round(p.width)))];
+  const lengthsOf = [...new Set(base.map((p) => Math.round(p.length)))];
+  const Ws = new Set(); const Ls = new Set();
+  const round = (v) => up(v, step);
+  for (const a of widthsOf) {
+    Ws.add(round(a + 2 * rim));
+    for (const b of widthsOf) { Ws.add(round(a + b + kerf + 2 * rim)); for (const c of widthsOf) Ws.add(round(a + b + c + 2 * kerf + 2 * rim)); }
+  }
+  for (const a of lengthsOf) { Ls.add(round(a + 2 * rim)); for (const b of lengthsOf) Ls.add(round(a + b + kerf + 2 * rim)); }
+  if (limits.minWidth) Ws.add(round(limits.minWidth));
+  if (limits.minLength) Ls.add(round(limits.minLength));
+  const Wlist = [...Ws].filter((w) => w >= (limits.minWidth ?? 0) && w <= limits.maxWidth);
+  const Llist = [...Ls].filter((l) => l >= (limits.minLength ?? 0) && l <= limits.maxLength);
+  const left = all.map((p) => ({ ...p }));
+  const out = [];
+  while (out.length < maxSizes && left.some((p) => p.qty > 0)) {
+    let best = null;
+    const total = left.reduce((a, p) => a + p.length * p.width * p.qty, 0);
+    for (const L of Llist) for (const W of Wlist) {
+      if (!fits(L, W) || removed.has(lotKey(thickness, L, W)) || out.some((o) => o.length === L && o.width === W)) continue;
+      const sure = left.filter((p) => p.qty > 0 && p.length <= L - 2 * rim && p.width <= W - 2 * rim);
+      if (!sure.length) continue;
+      const plates = laneFill(sure, L, W, kerf, rim);
+      const area = plates.reduce((a, q) => a + q.area, 0);
+      const fill = area / (plates.length * L * W);
+      const score = fill * fill * fill * Math.sqrt(area / total);
+      if (!best || score > best.score) best = { L, W, score, plates };
+    }
+    if (!best) break;
+    out.push({ length: best.L, width: best.W });
+    // What it holds well is taken off; what is left asks for another size.
+    const done = best.plates.filter((q) => q.area / (best.L * best.W) >= 0.8);
+    if (!done.length) break;
+    for (const q of done) for (const ln of q.lanes) for (const it of ln.items) { const m = left.find((p) => p.length === it.length && p.width === it.width); if (m) m.qty -= 1; }
+  }
+  return out;
 }

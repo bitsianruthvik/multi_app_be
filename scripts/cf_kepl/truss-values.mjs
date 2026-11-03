@@ -19,7 +19,8 @@ const imp = (p) => import(pathToFileURL(path.join(__dir, '..', '..', p)).href);
 const { pool } = await imp('db.js');
 await imp('apps/cf_erp/services/codegenProvider.js');
 const { readLineValues, writeLineValues } = await imp('apps/cf_erp/services/orderValuesService.js');
-const FILL = { IMPACT_CLASS: 'BO', HOLE_DIA: 26.5, MIG_WELD_SIZE: 10, MIG_WELD_LENGTH: 3.2, SURFACE_AREA: 10.99 };
+// --hole / --only-steel: another drawing set (the Khajaguda tub girders: M24 in 26 holes, no pipes to weld).
+const FILL = { IMPACT_CLASS: 'BO', HOLE_DIA: Number(arg('hole') ?? 26.5), ...(process.argv.includes('--only-steel') ? {} : { MIG_WELD_SIZE: 10, MIG_WELD_LENGTH: 3.2, SURFACE_AREA: 10.99 }) };
 const missing = async () => {
   const v = await readLineValues(pool, COMPANY, LINE); const m = {}; const writes = [];
   for (const g of v.groups ?? []) { if (!g.own) continue; for (const r of g.rows) for (const [spec, cell] of Object.entries(r.cells ?? {})) if (cell.missing) {

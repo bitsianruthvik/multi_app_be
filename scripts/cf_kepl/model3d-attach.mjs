@@ -1,5 +1,5 @@
 /**
- * model3d-attach.mjs — keep a 3D model (`cf-erp-model3d/1` JSON, e.g. TM/drawing_bom/out/TCPL_TRUSS_75M/model3d.json) with a
+ * model3d-attach.mjs — keep a structure's model (`cf-erp-model3d` JSON, e.g. TM/drawing_bom/out/TCPL_TRUSS_75M/model.json) with a
  * standard drawing, so every order line made from it shows it in the drawing tool's 3D view (services/model3dService.js).
  * DRY RUN BY DEFAULT; --apply writes one cf_standard_drawing_files row (kind 'model'; a newer one wins). --remove takes
  * the standard's models off (soft delete).
@@ -36,7 +36,7 @@ try {
   } else {
     const text = fs.readFileSync(path.resolve(arg('file')), 'utf8');
     const m = JSON.parse(text);
-    if (m.schema !== 'cf-erp-model3d/1' || !Array.isArray(m.elements)) throw new Error('Not a cf-erp-model3d/1 model.');
+    if (!['cf-erp-model3d/1', 'cf-erp-model3d/2'].includes(m.schema) || !Array.isArray(m.elements)) throw new Error('Not a cf-erp-model3d model.');
     console.log(`${s.number}: model "${m.title ?? ''}", ${m.elements.length} elements, ${(text.length / 1e3).toFixed(0)} kB — ${APPLY ? 'saved' : 'dry run'}`);
     if (APPLY) {
       await pool.query(

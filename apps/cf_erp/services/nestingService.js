@@ -118,7 +118,7 @@ import { measurePlates } from './nestMeasure.js';
 import { shopRuleRows, withShopSpacing, shopRimOf, rotationsOf } from './shopRules.js';
 import { plateCosts, ratePerKg, costRulesFor, layoutScore, extentOf, COST_DEFAULTS } from './nestCost.js';
 import { ruleOf, fits as gradeFits, platesForAll, needWords, gradeRelation, gradeCheck, impactRank as impactRankOf, blocks as blocksGrade, IMPACT_ORDER_WORDS, DEFAULT_GRADE_RULE } from '../lib/plateGrade.js';
-import { customPlateSetting, customLimits, proposeCustomSize } from './nestCustomPlate.js';
+import { customPlateSetting, customLimits, proposeCustomSize, lotCandidates, lotKey, lotSizeAllowed, lotPasses, lotRuleOf } from './nestCustomPlate.js';
 // Exact outline checks for two parts whose BOXES conflict (pairVerdict): one rule for the proposal and the accept.
 import { toPolygon, polygonsOverlap, polygonsDistance } from '../lib/polyGeom.js';
 
@@ -1735,7 +1735,77 @@ function lightLayout(out) {
   };
 }
 
+/**
+ * STANDARD, OR STANDARD + CUSTOM UNDER THE MILL'S RULES (user, 2026-11-02). A line on 'any', when the company's custom
+ * setting states a lot (nestCustomPlate.lotRuleOf): the packer is offered the standard sizes and custom sizes made for the
+ * pieces, within the limits; a custom size the ORDER does not take in a full lot (this plan + what its other lines have
+ * saved) is dropped and the line planned again, until every custom size left holds. Standard sizes are never dropped.
+ * Those searches are short; the last plan gets the effort asked for. Anything else goes straight to one plan.
+ */
 export async function planNesting(db, companyId, orderLineId, input = {}) {
+  if (input.lotPass || input.plateSizes || input.freeRange || input.only || input.customPlates === false || input.customPlates) return planNestingOnce(db, companyId, orderLineId, input);
+  const stored = await requireLine(db, companyId, orderLineId);
+  const rows = await cutSettingRows(db, companyId);
+  const rule = stored.nest_plates === 'any' ? lotRuleOf(rows.customPlates) : null;
+  if (!rule) return planNestingOnce(db, companyId, orderLineId, input);
+  const pool = await savedLotsOfOrder(db, companyId, stored, orderLineId);
+  const removed = new Set();
+  for (let pass = 1; pass <= 10; pass++) {
+    const plan = await planNestingOnce(db, companyId, orderLineId, { ...input, lotPass: true, lotRemoved: removed, effort: 'quick', budgetMs: Math.min(input.budgetMs ?? 120000, 120000) });
+    const bad = failingLots(plan, pool, rule);
+    if (!bad.length) break;
+    for (const k of bad) removed.add(k);
+    if (input.onProgress) { try { input.onProgress({ text: `Custom sizes that miss the mill's lot left out: ${bad.length} (pass ${pass})`, phase: 'lots' }); } catch { /* progress only */ } }
+  }
+  for (let pass = 1; pass <= 4; pass++) {
+    const plan = await planNestingOnce(db, companyId, orderLineId, { ...input, lotPass: true, lotRemoved: removed });
+    const bad = failingLots(plan, pool, rule);
+    if (!bad.length) { plan.customLots = lotSummary(plan, pool, rule); return plan; }
+    for (const k of bad) removed.add(k);
+  }
+  // Still short after four long searches: standard sizes and the catalog's own only.
+  return planNestingOnce(db, companyId, orderLineId, { ...input, lotPass: true, lotRemoved: removed, lotNoNew: true });
+}
+
+/** The custom-size plates of a plan by size: lotKey → { thickness, length, width, plates, kg }. */
+export function customLotsOf(plan, into = new Map()) {
+  for (const g of plan.groups ?? []) for (const n of g.nests ?? []) {
+    if (!n.lotCustom && !n.customPlate) continue;
+    const k = lotKey(g.thickness, n.length, n.width);
+    const e = into.get(k) ?? { key: k, thickness: g.thickness, length: Math.max(n.length, n.width), width: Math.min(n.length, n.width), plates: 0, kg: 0 };
+    e.plates += 1; e.kg += Number(n.weightKg) || 0;
+    into.set(k, e);
+  }
+  return into;
+}
+function failingLots(plan, pool, rule) {
+  const out = [];
+  for (const [k, e] of customLotsOf(plan)) { const o = pool.get(k); if (!lotPasses(rule, e.plates + (o?.plates ?? 0), e.kg + (o?.kg ?? 0))) out.push(k); }
+  return out;
+}
+function lotSummary(plan, pool, rule) {
+  return { rule, sizes: [...customLotsOf(plan).values()].map((e) => ({ ...e, kg: round3(e.kg), elsewhereInOrder: pool.get(e.key)?.plates ?? 0 })) };
+}
+/** Custom-size plates the order's OTHER lines have saved, by size. */
+async function savedLotsOfOrder(db, companyId, line, orderLineId) {
+  const m = new Map();
+  const [others] = await db.query('SELECT id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND id <> ? AND deleted_at IS NULL', [companyId, line.order_id, orderLineId]);
+  for (const o of others) {
+    const saved = await getNesting(db, companyId, Number(o.id)).catch(() => null);
+    for (const g of saved?.groups ?? []) for (const n of g.nests ?? []) {
+      if (n.plateKind && n.plateKind === 'STANDARD') continue;
+      const k = lotKey(g.thickness, n.length, n.width);
+      const plate = (await candidatePlates(db, companyId, [n.plateItemId]).catch(() => []))[0];
+      if (plate?.kind === 'STANDARD') continue;
+      const e = m.get(k) ?? { plates: 0, kg: 0 };
+      e.plates += 1; e.kg += Number(n.weightKg) || 0;
+      m.set(k, e);
+    }
+  }
+  return m;
+}
+
+async function planNestingOnce(db, companyId, orderLineId, input = {}) {
   const planStartedAt = Date.now();   // the effort's budget runs from here
   // PROGRESS (2026-10-03, nestRunService): a background run listens here for its
   // log and bar. Optional, and a listener that throws never breaks the plan.
@@ -1744,7 +1814,8 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const budgetCut = new Map();         // group key -> the clock limited its search
   const stored = await requireLine(db, companyId, orderLineId);
   // `freeRange` (a what-if, like plateSizes): plan the line in free size within this range, whatever the line says.
-  const line = input.freeRange ? { ...stored, nest_plates: 'free', nest_free_range: input.freeRange } : stored;
+  // `plateChoice` (a what-if): plan as if the line took these plates, to compare.
+  const line = input.freeRange ? { ...stored, nest_plates: 'free', nest_free_range: input.freeRange } : input.plateChoice ? { ...stored, nest_plates: input.plateChoice } : stored;
   assertFrozen(line);
   const { where, cutPlates: needed } = await surveyLine(db, companyId, line);
   const pack = await loadPacker(input.pack);
@@ -1843,6 +1914,8 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const customSetting = input.customPlates === false ? null
     : input.customPlates && typeof input.customPlates === 'object' ? customPlateSetting({ ...input.customPlates, on: true }) : settingRows.customPlates ?? null;
   const customPlates = [];
+  const lotMode = !!input.lotPass && line.nest_plates === 'any' && !!lotRuleOf(customSetting);
+  const lotRemoved = input.lotRemoved ?? new Set();
   const sizeAdvice = [];
   const notes = [];
   // 2026-10-31: the steels no catalog plate is — the problems below, as data, so the screen can offer
@@ -1901,6 +1974,26 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     const settings = pickCutSettings(settingRows, g.thickness);
     const guillotine = input.guillotine == null ? settings.guillotine : !!input.guillotine;
     let candidates = groupSheets(plates, g).filter((p) => !excl.plates.has(p.id));
+    if (lotMode) {
+      // STANDARD + CUSTOM UNDER THE LOT RULE: the catalog's custom sizes must lie within the limits and still hold their lot
+      // (input.lotRemoved); beside them, the sizes made for these pieces, with stand-in ids until the nesting is used.
+      const lim = customLimits(customSetting, everyPlate, g.thickness, settings);
+      // Dropping a size must not just let the catalog's next custom size in (SO260019: five long searches, a new 20 mm size each time):
+      // lotNoNew = no custom size at all; lotFrozen = only the sizes in lotSizes.
+      const lotOnly = input.lotNoNew ? new Set() : input.lotFrozen ? new Set((input.lotSizes?.[fmt(g.thickness)] ?? []).map((z) => lotKey(g.thickness, z.length, z.width))) : null;
+      candidates = candidates.filter((p) => isStandard(p) || (Math.max(p.steel.length, p.steel.width) <= lim.maxLength + 0.5 && Math.min(p.steel.length, p.steel.width) <= lim.maxWidth + 0.5
+        && Math.max(p.steel.length, p.steel.width) >= (lim.minLength ?? 0) - 0.5 && Math.min(p.steel.length, p.steel.width) >= (lim.minWidth ?? 0) - 0.5 && lotSizeAllowed(lotKey(g.thickness, p.steel.length, p.steel.width), { removed: lotRemoved, only: lotOnly })));
+      const asks = g.cutPlates.map((cp) => cp.steel.impactClass).filter((v) => !blank(v)).sort((a, b) => (impactRankOf(b) ?? -1) - (impactRankOf(a) ?? -1));
+      const density = g.cutPlates.find((cp) => cp.steel.density > 0)?.steel.density ?? FALLBACK_DENSITY;
+      const asked = input.lotSizes?.[fmt(g.thickness)];
+      const sizes = (input.lotNoNew ? [] : input.lotFrozen ? asked ?? [] : asked ?? lotCandidates(g.cutPlates.map((cp) => ({ length: Math.max(cp.steel.length, cp.steel.width), width: Math.min(cp.steel.length, cp.steel.width), qty: cp.pieces })), { limits: lim, kerf: settings.kerfMm, step: lim.step, thickness: g.thickness, removed: lotRemoved }))
+        .filter((z) => !lotRemoved.has(lotKey(g.thickness, z.length, z.width)));
+      const have = (z) => candidates.some((p) => lotKey(g.thickness, p.steel.length, p.steel.width) === lotKey(g.thickness, z.length, z.width));
+      sizes.filter((z) => !have(z)).forEach((z, i) => candidates.push({
+        id: -((groups.length + 1) * 100 + i), code: customPlateCode(z.length, z.width), name: `Custom plate ${fmt(g.thickness)} x ${fmt(z.width)} x ${fmt(z.length)}`, kind: 'CUSTOM', lotStandIn: true,
+        steel: { thickness: g.thickness, length: z.length, width: z.width, grade: g.grade ?? null, material: g.material ?? null, impactClass: asks[0] ?? null, density },
+      }));
+    }
     if (line.nest_plates === 'free') {
       // FREE SIZE: one plate, the largest the range allows, of the pieces' own steel; each layout is cut down to size after.
       const lim = freeLimits(line, settingRows.customPlates ?? null, everyPlate, g.thickness, settings);
@@ -2309,6 +2402,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     const fromById = new Map(g.cutPlates.map((cp) => [cp.id, fromOf(cp).shapeFrom]));
     for (const n of nests) for (const p of n.pieces) p.shapeFrom = fromById.get(p.cutPlateId) ?? 'dimensions';
     if (line.nest_plates === 'free') sizeFreeNests(nests, { g, sheets, settings, everyPlate });
+    if (lotMode) markLotNests(nests, { sheets, everyPlate });
     /*
      * THE DRAWING SHOULD HAVE DECIDED AND DID NOT (packJob.js `rowsBecause`): this steel has a cut
      * plate whose drawing is not a rectangle, and its row layout stands all the same. Said in the
@@ -2326,7 +2420,7 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     }
     // ONE CUSTOM PLATE SIZE (§90, nestCustomPlate.js): the plates whose layouts stop short move to the size they need,
     // when that saves steel by the packers' own cost. Off unless the company switched it on (or the caller asks).
-    const custom = customSetting && line.nest_plates === 'any' && nests.length
+    const custom = customSetting && !lotMode && line.nest_plates === 'any' && nests.length
       ? customSizeFor(nests, { g, sheets, settings, everyPlate, customSetting, maxPlateSizes: settingRows.maxPlateSizes, discipline: input.plateDiscipline !== false })
       : null;
     if (custom) {
@@ -2836,6 +2930,25 @@ function sizeFreeNests(nests, { g, sheets, settings, everyPlate }) {
       sheetArea: round3(area), wasteArea: round3(area - n.usedArea), wastePct: area > 0 ? round3(((area - n.usedArea) / area) * 100) : 0,
       weightKg: kgOf(area, g.thickness, density), wasteTotalKg: kgOf(area - n.usedArea, g.thickness, density),
       customPlate: { ...steel, inCatalog: !!existing, itemId: existing?.id ?? null, code: existing?.code ?? null, free: true, replaces: null, ...(existing ? {} : { note: CUSTOM_NOT_IN_CATALOG }) },
+    });
+  }
+}
+
+/** Lot rule: the plates laid on a custom size. One made for the pieces is a custom plate until the nesting is used; a size the catalog has is that plate. Every one is counted for the lot. Mutates nests. */
+function markLotNests(nests, { sheets, everyPlate }) {
+  for (const n of nests) {
+    const sheet = sheets.find((s) => s.id === n.plateItemId);
+    const plate = sheet?.plate;
+    if (!plate || plate.kind === 'STANDARD') continue;
+    n.lotCustom = true;
+    if (!plate.lotStandIn) continue;
+    const steel = plate.steel;
+    const same = (p) => lotKey(p.steel.thickness, p.steel.length, p.steel.width) === lotKey(steel.thickness, steel.length, steel.width)
+      && norm(p.steel.grade) === norm(steel.grade) && norm(p.steel.impactClass) === norm(steel.impactClass) && agrees(p.steel.material, steel.material);
+    const existing = everyPlate.find(same) ?? null;
+    Object.assign(n, {
+      plateItemId: existing?.id ?? null, plateCode: existing?.code ?? customPlateCode(steel.length, steel.width), plateName: existing?.name ?? plate.name,
+      customPlate: { ...steel, inCatalog: !!existing, itemId: existing?.id ?? null, code: existing?.code ?? null, replaces: null, ...(existing ? {} : { note: CUSTOM_NOT_IN_CATALOG }) },
     });
   }
 }

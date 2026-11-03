@@ -13,6 +13,12 @@
  *                                                              | { type: 'pipe', d, t } } }
  *     | { id, mark, in, label, box: { c: [x,y,z], size: [sx,sy,sz] } } ] }
  * `mark` / `in` are the drawing marks of the line's rows, so the viewer can light up the level that is open.
+ *
+ * `cf-erp-model3d/2` (user, 2026-11-02: one JSON per structure, every level drawn from it on screen; docs/model_as_source.md)
+ * adds `parts` (each part's outline, holes, cut-outs and thickness, once), `levels` (name and quantity), `bolts`, and elements
+ * that name their part and where it sits: { id, mark, in, n: [copy of each level], part, o, u, v, w, rule? }, or
+ * { studs: { a, di, ni, dj, nj, d, h, up } }. This service only hands the file over; the screens expand it
+ * (multi_app_fe lib/modelDrawing.ts).
  */
 import { notFound } from '../lib/errors.js';
 import { rowsOfLine } from './partDrawingService.js';

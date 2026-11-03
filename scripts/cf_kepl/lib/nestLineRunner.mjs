@@ -23,7 +23,7 @@ import { planNesting, requireLine, assertNestable, runBudgetMs, effortOf } from 
 import { planSectionNesting } from '../../../apps/cf_erp/services/sectionNestingService.js';
 import { insertFinishedRun, STALE_MS } from '../../../apps/cf_erp/services/nestRunService.js';
 
-export async function nestLine({ db, companyId, orderCode, lineNo = null, effort = 'standard', workers = null, apply = false, whole = false, budgetMs = null, startedBy = 'offline runner', say = () => {} }) {
+export async function nestLine({ db, companyId, orderCode, lineNo = null, effort = 'standard', workers = null, apply = false, whole = false, budgetMs = null, planInput = null, startedBy = 'offline runner', say = () => {} }) {
   const level = effortOf(effort);
   const [lines] = await db.query(
     `SELECT l.id, l.line_no, o.id AS order_id, o.code
@@ -48,7 +48,7 @@ export async function nestLine({ db, companyId, orderCode, lineNo = null, effort
   ).catch((e) => { if (e?.errno === 1146 || e?.errno === 1054) return [[]]; throw e; });
   if (live.length) throw invalid('RUN_BUSY', `A nesting run is working on line ${picked.line_no} of ${orderCode} on the server right now (${live[0].purpose}). Wait for it, or stop it there, before nesting the line here.`);
 
-  const input = { effort: level, seed: 1, ...(whole ? { replaceImported: true } : {}) };
+  const input = { effort: level, seed: 1, ...(whole ? { replaceImported: true } : {}), ...(planInput ?? {}) };
   const budget = Number(budgetMs) > 0 ? Number(budgetMs) : runBudgetMs(level);
   const startedAt = Date.now();
   const log = [];
