@@ -776,6 +776,9 @@ async function affectedMachines(db, c, classificationId) {
  * { masterId } | { machineId } | { definitionId } | { classificationId } | { formulaId }.
  */
 export async function rematerialize(db, c, scope) {
+  // A setup script that changes many rules at once (scripts/cf_kepl/coats-holes-cleanup.mjs) works its open lines out
+  // ONCE at the end, a line at a time — record by record across the company would be hours of round trips on TiDB.
+  if (c.deferRematerialize) { (c.deferred ??= []).push(scope); return { records: 0, changes: 0, deferred: true }; }
   const ids = new Set();
   const machines = new Set();
   if (scope.masterId) ids.add(scope.masterId);
@@ -796,9 +799,6 @@ export async function rematerialize(db, c, scope) {
       if (s.subject_type === 'machine') machines.add(s.subject_id);
       else if (s.subject_type === 'master' && s.record_kind === 'item') ids.add(s.subject_id);
       else {
-  // A setup script that changes many rules at once (scripts/cf_kepl/coats-holes-cleanup.mjs) works its open lines out
-  // ONCE at the end, a line at a time — record by record across the company would be hours of round trips on TiDB.
-  if (c.deferRematerialize) { (c.deferred ??= []).push(scope); return { records: 0, changes: 0, deferred: true }; }
         const reach = s.subject_type === 'classification' ? { classificationId: s.subject_id } : { definitionId: s.subject_id };
         (await affectedItems(db, c, reach)).forEach((id) => ids.add(id));
         if (s.subject_type === 'classification') (await affectedMachines(db, c, s.subject_id)).forEach((id) => machines.add(id));

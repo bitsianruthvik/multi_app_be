@@ -29,7 +29,7 @@ const imp = (p) => import(pathToFileURL(path.join(BE, p)).href);
 const { pool } = await imp('db.js');
 await imp('apps/cf_erp/services/codegenProvider.js');
 const { createParty } = await imp('apps/cf_erp/modules/parties/service.js');
-const { createOrder } = await imp('apps/cf_erp/services/salesOrderService.js');
+const { createOrder, removeOrderLine } = await imp('apps/cf_erp/services/salesOrderService.js');
 const { addLineFromStandard } = await imp('apps/cf_erp/services/standardDrawingService.js');
 const { uploadDrawings, rowsOfLine } = await imp('apps/cf_erp/services/partDrawingService.js');
 const { saveExecutionPlan } = await imp('apps/cf_erp/services/executionPlanService.js');
@@ -83,12 +83,15 @@ try {
     await db.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id = ?", [COMPANY, lineId]);
     lines.push({ ...s, lineId, bom, std });
   }
+  // --remove <lineId,lineId>: the lines these replace, off in the same transaction (refused if released or locked).
+  for (const old of String(arg('remove') ?? '').split(',').map(Number).filter(Boolean)) { await removeOrderLine(db, c, old); console.log(`line removed: #${old}`); }
   // Both lines one production order. Made when the order is locked and confirmed; the plan says so from now.
   await saveExecutionPlan(db, c, orderId, { production: { level: 'order' } });
   console.log('execution plan: every line on the order level, so one production order');
   if (APPLY) { await db.commit(); console.log('order, lines and plan COMMITTED'); await db.beginTransaction(); }
 
-  for (const l of lines) {
+  // --no-levels: a level is drawn from the one JSON on screen (docs/model_as_source.md); no level file is stored.
+  for (const l of process.argv.includes('--no-levels') ? [] : lines) {
     const [[line]] = await db.query('SELECT * FROM cf_sales_order_lines WHERE company_id = ? AND id = ?', [COMPANY, l.lineId]);
     const rows = await rowsOfLine(db, COMPANY, { ...line, order_id: orderId });
     const byMark = new Map();

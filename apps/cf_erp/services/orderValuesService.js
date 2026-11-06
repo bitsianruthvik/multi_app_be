@@ -1827,9 +1827,9 @@ export function cellStates(ctx, recordIds, codes) {
         optionValue: s.value?.optionValue ?? null,
         display: s.value?.display ?? null,
         dataType: s.spec.dataType,
+        options: s.spec.dataType === 'option' ? (s.options ?? []) : null,
         // A LIST (HOLE_SET): its columns, so a cell can open the rows to edit.
         columns: s.spec.dataType === 'list' ? (s.spec.tableConfig?.columns ?? []) : null,
-        options: s.spec.dataType === 'option' ? (s.options ?? []) : null,
       });
     }
     out.set(Number(id), cells);

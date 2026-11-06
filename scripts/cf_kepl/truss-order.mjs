@@ -8,6 +8,9 @@
  *   node scripts/cf_kepl/truss-order.mjs ../drawing_bom/out/TCPL_TRUSS_75M --company 30005 --prod [--apply]
  *        [--quantity 3]   spans on the line (default 3: PL133–PL134, PL247–PL248, PR135–PR136)
  *        [--user <id>]    written as (default: the company's admin@ login, else its first user)
+ *        [--order <code>] a new line on that order, not a new order (a corrected BOM beside the line it replaces)
+ *        [--levels <dir>] the level drawings from another set's folder
+ *        [--like-line <id>] the new line nests on the plates that line nests on
  * Uses the app's own services (createParty, createOrder, addLineFromStandard, uploadDrawings), as the screens do.
  */
 import fs from 'fs';
@@ -43,7 +46,7 @@ const { uploadDrawings, rowsOfLine } = await imp('apps/cf_erp/services/partDrawi
 
 const bom = JSON.parse(fs.readFileSync(path.join(folder, 'bom.json'), 'utf8'));
 const meta = bom.order ?? {};
-const levelsDir = path.join(folder, 'levels');
+const levelsDir = arg('levels') ? path.resolve(arg('levels')) : path.join(folder, 'levels');
 const levels = fs.existsSync(levelsDir) ? fs.readdirSync(levelsDir).filter((f) => /\.dxf$/i.test(f)) : [];
 
 const db = await pool.getConnection();
@@ -63,8 +66,10 @@ try {
   else console.log(`customer found: #${party.id} ${party.name}`);
 
   // 2. The order.
-  const order = await createOrder(db, c, { orderType: 'customer', customerId: party.id, title: meta.title, customerReference: meta.customerReference, notes: meta.notes });
-  console.log(`order made: #${order.id ?? order.order?.id} ${order.code ?? order.order?.code}`);
+  const [[had]] = arg('order') ? await db.query('SELECT id, code FROM cf_sales_orders WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [COMPANY, arg('order')]) : [[null]];
+  if (arg('order') && !had) throw new Error(`No order ${arg('order')}.`);
+  const order = had ?? await createOrder(db, c, { orderType: 'customer', customerId: party.id, title: meta.title, customerReference: meta.customerReference, notes: meta.notes });
+  console.log(`order ${had ? 'found' : 'made'}: #${order.id ?? order.order?.id} ${order.code ?? order.order?.code}`);
   const orderId = Number(order.id ?? order.order?.id);
 
   // 3. The line from the standard.
@@ -73,6 +78,8 @@ try {
   const made = await addLineFromStandard(db, c, orderId, { standardId: std.id, quantity: QTY, description: meta.lineDescription });
   const lineId = made.fromStandard.lineId;
   console.log(`line made: #${lineId} — ${made.fromStandard.rows} rows from ${made.fromStandard.number} v${made.fromStandard.versionNo}, ×${QTY}`);
+  if (arg('nest-plates')) await db.query('UPDATE cf_sales_order_lines SET nest_plates = ? WHERE company_id = ? AND id = ?', [arg('nest-plates'), COMPANY, lineId]);
+  if (arg('like-line')) { const [u] = await db.query('UPDATE cf_sales_order_lines n JOIN cf_sales_order_lines o ON o.id = ? AND o.company_id = n.company_id SET n.nest_plates = o.nest_plates WHERE n.company_id = ? AND n.id = ?', [Number(arg('like-line')), COMPANY, lineId]); console.log(`nests like line ${arg('like-line')}: ${u.affectedRows} row`); }
 
   // 4. Each level's drawing onto the rows with its mark (aimed by row id, every copy of that design takes it).
   const [[line]] = await db.query('SELECT * FROM cf_sales_order_lines WHERE company_id = ? AND id = ?', [COMPANY, lineId]);
@@ -103,7 +110,14 @@ try {
   for (let i = 0; i < files.length; i += 6) {
     const batch = files.slice(i, i + 6);
     if (APPLY) await db.beginTransaction();
-    const up = await uploadDrawings(db, c, orderId, lineId, { files: batch, dryRun: false });
+    // Another job's locks on a shared production database: this batch again, never the whole line.
+    let up = null;
+    for (let attempt = 1; !up; attempt++) {
+      try { up = await uploadDrawings(db, c, orderId, lineId, { files: batch, dryRun: false }); } catch (e) {
+        if (!APPLY || attempt >= 8 || !/lock wait|deadlock|try restarting/i.test(e.message)) throw e;
+        console.log(`  batch at ${i}: ${e.message.slice(0, 80)}, again in 2 min`); await db.rollback(); await new Promise((r) => setTimeout(r, 120000)); await db.beginTransaction();
+      }
+    }
     for (const x of up.files ?? []) { st[x.status] = (st[x.status] ?? 0) + 1; if (!['new', 'replaces'].includes(x.status)) console.log(`  ${x.name}: ${x.status} ${(x.problems ?? x.warnings ?? []).join(' ')}`); }
     if (APPLY) await db.commit();
     console.log(`  level drawings ${i + batch.length}/${files.length} — ${JSON.stringify(st)}`);

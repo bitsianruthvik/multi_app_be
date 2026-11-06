@@ -574,6 +574,8 @@ export function valueReaders(map, levels = null) {
     // LOOKUP's own reader.
     table: (code) => {
       const v = map.get(code);
+      // A LIST (HOLE_SET) is read through EACH as its rows.
+      if (v?.dataType === 'list') return Array.isArray(v.raw) ? v.raw : null;
       if (!v || v.dataType !== 'table' || v.raw == null) return null;
       return { mode: v.tableConfig?.mode ?? 'step_up', axes: v.tableConfig?.axes ?? [], ...v.raw };
     },
@@ -586,8 +588,6 @@ function parsedOf(expression) {
   let p = parsedCache.get(expression);
   if (!p) {
     p = parseFormula(expression);
-      // A LIST (HOLE_SET) is read through EACH as its rows.
-      if (v?.dataType === 'list') return Array.isArray(v.raw) ? v.raw : null;
     if (parsedCache.size > 2000) parsedCache.clear();
     parsedCache.set(expression, p);
   }

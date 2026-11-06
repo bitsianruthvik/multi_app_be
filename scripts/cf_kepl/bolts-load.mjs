@@ -67,6 +67,10 @@ try {
   const so = `${line.code}/`;
   const markOf = async (r) => {
     if (MATCH === 'name') return BOLTS.byAssembly[r.name] ? r.name : null;
+    // The row's own DRAWING_MARK: with one JSON and no stored level files, this is what names the assembly.
+    const selfMark = await q(`SELECT v.value_text AS mark FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'DRAWING_MARK'
+                               WHERE v.company_id = ? AND v.subject_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL`, [COMPANY, r.id]);
+    for (const { mark } of selfMark) if (BOLTS.byAssembly[mark]) return mark;
     const own = await q('SELECT d.number FROM cf_drawing_links k JOIN cf_drawings d ON d.id = k.drawing_id WHERE k.company_id = ? AND k.subject_id = ? AND k.deleted_at IS NULL', [COMPANY, r.id]);
     // The register numbers a line's level drawing '<SO>/L2/G1-S', and '-2' when that number was used before.
     for (const { number } of own) { const m = number.slice(so.length).replace(/^L\d+\//, '').replace(/-\d+$/, ''); if (number.startsWith(so) && BOLTS.byAssembly[m]) return m; }
