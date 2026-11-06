@@ -368,12 +368,13 @@ const geometryView = (g) => (g ? {
 
 function viewOf(line, rows, drawings, refs = new Map(), levels = new Set()) {
   const covered = new Set();
+  const hasFile = new Set();   // rows with a saved file of their own (a waiting register sheet is not one)
   const measured = new Set();
   let rectArea = 0; let trueArea = 0; let rectKg = 0; let trueKg = 0;
   const views = drawings.map((d) => {
     const matched = rows.filter((p) => matches(p, d));
     for (const p of matched) {
-      covered.add(p.id);
+      covered.add(p.id); hasFile.add(p.id);
       const g = d.geometry;
       // A part is measured once, by the file it is read by.
       if (!g || !p.isPlatePart || measured.has(p.id) || fileFor(p, drawings) !== d) continue;
@@ -398,7 +399,8 @@ function viewOf(line, rows, drawings, refs = new Map(), levels = new Set()) {
     return { drawing: refs.get(id), rows: linked.map((p) => rowView(p, null)) };
   }).sort((a, b) => String(a.drawing.number).localeCompare(String(b.drawing.number)));
   // A level the line's ONE model draws has a drawing without a file (lib/modelLevels.js; user, 2026-11-06).
-  const modelRows = rows.filter((p) => !covered.has(p.id) && drawnByModel(levels, p.mark)).map((p) => p.id);
+  // A register sheet waiting for a file does not stop it: the model draws the level meanwhile.
+  const modelRows = rows.filter((p) => !hasFile.has(p.id) && drawnByModel(levels, p.mark)).map((p) => p.id);
   for (const id of modelRows) covered.add(id);
   const parts = rows.filter((p) => p.isPlatePart);
   const shaped = measured;
