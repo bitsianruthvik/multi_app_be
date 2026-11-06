@@ -42,7 +42,11 @@ const g = planImport(bomOf('Plate girder 60 m', [
   { kind: 'girder_segment', name: 'G1/Girder segment', qtyPerParent: 1, children: [{ item: 'p2', qtyPerParent: 2 }, { item: 'p3', qtyPerParent: 4 }, { item: 'p5', qtyPerParent: 2 }, { item: 'p6', qtyPerParent: 1 }] },
 ], [plate('p1', 'DW', 'diaphragm_web', 'Diaphragm web'), plate('p2', 'SPL', 'splice_plate', 'Splice plate, web 1 to web 2'), plate('p3', 'TIPK', 'top_packing_splice', 'SP1 top inner packing'),
   plate('p4', 'GSA-TOP', 'restrainer_plate', 'Girder seismic arrestor top plate'), plate('p5', 'CL', 'cleat_plate', 'Cleat plate'), plate('p6', 'WCP', 'cover_plate', 'Web side cover plate')]), catalog);
-ok('obsolete "Cover plate" → its successor the row\'s words point at (Web cover plate)', to(g, 'WCP') === 'Web cover plate' && g.mappings.some((m) => m.how === 'successor'), to(g, 'WCP'));
+ok('a web cover plate → Web cover plate', to(g, 'WCP') === 'Web cover plate', to(g, 'WCP'));
+// The successor route, through a role the list does not know (its name comes from the description: "Cover plate").
+const sc = planImport(bomOf('Plate girder', [{ kind: 'girder_segment', name: 'G1/Girder segment', qtyPerParent: 1, children: [{ item: 'w1', qtyPerParent: 1 }] }],
+  [plate('w1', 'WCP2', 'cover', 'Cover plate, web side')]), catalog);
+ok('obsolete "Cover plate" → its successor the row\'s words point at (Web cover plate)', to(sc, 'WCP2') === 'Web cover plate' && sc.mappings.some((m) => m.how === 'successor'), `${to(sc, 'WCP2')} ${JSON.stringify(sc.mappings.map((m) => m.how))}`);
 ok('"End cross girder diaphragm" → End diaphragm', to(g, 'ED/End cross girder diaphragm') === 'End diaphragm', to(g, 'ED/End cross girder diaphragm'));
 ok('"Intermediate cross girder diaphragm" → Intermediate diaphragm', to(g, 'ID/Intermediate cross girder diaphragm') === 'Intermediate diaphragm');
 ok('a seismic arrestor → Seismic stopper, with no second stopper inside it', to(g, 'GSA/Girder seismic arrestor') === 'Seismic stopper' && !g.rows.some((r) => r.node?.name === 'Seismic stopper'));
@@ -79,6 +83,50 @@ console.log('4. The family guard: a plate never lands on an assembly');
 const f = planImport(bomOf('Plate girder', [{ kind: 'girder_segment', name: 'G1/Girder segment', qtyPerParent: 1, children: [{ item: 'x1', qtyPerParent: 1 }] }],
   [plate('x1', 'X', 'arch_beam_plate', 'Arch beam plate')]), catalog);
 ok('"Arch beam plate" (a plate) is not taken as Arch box (an assembly)', to(f, 'X') !== 'Arch box', to(f, 'X'));
+
+console.log('5. A railway open web girder reuses the truss names (RDSO B-17186 / B-17081, 2026-11-06)');
+const trussDefs = defs.concat([
+  def('Steel truss span', 21), def('Main truss', 21), def('Top chord piece', 21), def('Bottom chord piece', 21), def('End raker piece', 21),
+  def('Truss vertical', 21), def('Truss diagonal', 21), def('Truss joint', 21), def('End cross girder', 21), def('Bottom cross girder', 21),
+  def('Stringer', 21), def('Bracing gusset set', 21), def('Top bracing system', 21), def('Batten plate', 11), def('Gusset plate', 11),
+  def('Top flange inner cover plate', 11), def('Flange cover plate', 11), def('Top lateral bracing member', 12),
+]);
+const tr = planImport({ ...bomOf('RDSO/B-17186: 30.50 m clear span open web girder, welded through type', [
+  { kind: 'truss', name: 'TRUSS/Main truss (T1, T2)', qtyPerParent: 2, children: [
+    { kind: 'member', name: 'TC1/Top chord U1–U2 (shipping marks 2 / 2X)', qtyPerParent: 2, children: [{ item: 't1', qtyPerParent: 1 }, { item: 't2', qtyPerParent: 2 }] },
+    { kind: 'member', name: 'V1/Vertical L1–U1', qtyPerParent: 2, children: [{ item: 't1', qtyPerParent: 1 }] },
+    { kind: 'joint', name: 'JU1/Joint U1 and U5 (marks 12, 13, 14)', qtyPerParent: 2, children: [{ item: 't3', qtyPerParent: 1 }, { item: 't4', qtyPerParent: 1 }, { item: 't5', qtyPerParent: 1 }] },
+  ] },
+  { kind: 'assembly', name: 'FLOOR/Floor system', qtyPerParent: 1, children: [
+    { kind: 'cross_girder', name: 'ICG/Intermediate cross girder', qtyPerParent: 5, children: [{ item: 't1', qtyPerParent: 2 }] },
+    { kind: 'assembly', name: 'LBX/Bottom lateral crossing: central gusset', qtyPerParent: 1, children: [{ item: 't3', qtyPerParent: 1 }] },
+  ] },
+  { kind: 'assembly', name: 'TLAT/Top lateral bracing', qtyPerParent: 1, children: [{ item: 't6', qtyPerParent: 2 }] },
+  { kind: 'assembly', name: 'PG/Portal girder PG', qtyPerParent: 2, children: [{ item: 't1', qtyPerParent: 2 }] },
+], [
+  plate('t1', 'TC1-FL', 'flange', 'Top chord U1–U2: flange strip 100 × 12 × 5325'),
+  plate('t2', 'TC-BT', 'batten', 'Top chord: end batten 550 × 470 × 12'),
+  plate('t3', 'P12', 'bent_plate', 'BLB BEND PLATE, 10 mm'),
+  plate('t4', 'P16', 'cover_plate', 'Top inner flange cover plate U2, U3, 490 × 10 × 882'),
+  plate('t5', 'P27', 'cover_plate', 'Top and bottom flange cover plate L1, 482 × 10 × 1130'),
+  { id: 't6', mark: 'A1', role: 'section', description: 'TLB, ISST 200x165 x 3813.5', category: 'section', profile: 'ISST 200x165', lengthMm: 3813.5 },
+]) }, { ...catalog, defs: trussDefs });
+const nodeTo = (p, name) => { const r = p.rows.find((x) => x.node?.name === name); return r?.def?.new ? `NEW ${r.def.new}` : (r?.def?.name ?? '(none)'); };
+ok('an open web girder span is a Steel truss span', tr.rows[0]?.def?.name === 'Steel truss span', tr.rows[0]?.def?.name ?? tr.rows[0]?.def?.new);
+ok('"Top chord U1–U2" → Top chord piece', nodeTo(tr, 'TC1/Top chord U1–U2 (shipping marks 2 / 2X)') === 'Top chord piece', nodeTo(tr, 'TC1/Top chord U1–U2 (shipping marks 2 / 2X)'));
+ok('"Vertical L1–U1" → Truss vertical', nodeTo(tr, 'V1/Vertical L1–U1') === 'Truss vertical');
+ok('"Joint U1 and U5" → Truss joint (never "Joint and")', nodeTo(tr, 'JU1/Joint U1 and U5 (marks 12, 13, 14)') === 'Truss joint', nodeTo(tr, 'JU1/Joint U1 and U5 (marks 12, 13, 14)'));
+ok('an intermediate cross girder of a through truss → Bottom cross girder', nodeTo(tr, 'ICG/Intermediate cross girder') === 'Bottom cross girder');
+ok('a lateral crossing gusset set → Bracing gusset set', nodeTo(tr, 'LBX/Bottom lateral crossing: central gusset') === 'Bracing gusset set');
+ok('top lateral bracing → Top bracing system (not Bottom lateral bracing)', nodeTo(tr, 'TLAT/Top lateral bracing') === 'Top bracing system', nodeTo(tr, 'TLAT/Top lateral bracing'));
+ok('"Portal girder PG" → a short new name, the mark dropped', nodeTo(tr, 'PG/Portal girder PG') === 'NEW Portal girder', nodeTo(tr, 'PG/Portal girder PG'));
+ok('a flange strip is named by its role, not by its member ("Top chord …:")', to(tr, 'TC1-FL') === 'NEW Member flange plate', to(tr, 'TC1-FL'));
+ok('a batten → Batten plate', to(tr, 'TC-BT') === 'Batten plate');
+ok('a bent plate → Gusset plate', to(tr, 'P12') === 'Gusset plate');
+ok('"Top inner flange cover plate" → Top flange inner cover plate', to(tr, 'P16') === 'Top flange inner cover plate', to(tr, 'P16'));
+ok('a flange cover plate on both faces → Flange cover plate', to(tr, 'P27') === 'Flange cover plate', to(tr, 'P27'));
+ok('a TLB tee → Top lateral bracing member', to(tr, 'A1') === 'Top lateral bracing member', to(tr, 'A1'));
+ok('a girder title without truss words is still a Bridge span', planImport(bomOf('Plate girder 36 m', [], []), catalog).rows[0]?.def?.name === 'Composite girder span');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

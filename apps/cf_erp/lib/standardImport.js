@@ -176,6 +176,54 @@ export function partCandidates(item, place = {}) {
       if (/BRACING|BRACE\b/.test(desc)) return ['Bracing'];
       // Any other angle (a jacking-bracket angle, an X-frame horizontal): its own short name, never "Bracing".
       return [plainName(item?.description ?? 'Angle')];
+    // Railway open web girder parts (RDSO B-17186, B-17081; 2026-11-06): the catalog's names where the kind exists. The
+    // descriptions start with the member ("Bottom chord L0–L1: flange strip …"), so the role decides, never that prefix.
+    case 'flange': return ['Member flange plate'];
+    case 'batten': return ['Batten plate'];
+    case 'packing': case 'washer': return ['Packing plate'];
+    case 'bent_plate': return ['Gusset plate'];
+    case 'stiffener_angle': return ['Stiffener angle'];
+    case 'end_plate': return ['End plate'];
+    case 'cleat': return ['Angle cleat'];
+    case 'lacing': return /\bANGLE\b|\bISA\b/.test(`${desc} ${String(item?.profile ?? '').toUpperCase()}`) ? ['Lacing angle'] : ['Lacing flat'];
+    case 'diaphragm': {
+      const prof = `${desc} ${String(item?.profile ?? '').toUpperCase()}`;
+      // A channel between the stringers is a cross frame, the bow strings' Cross frame channel.
+      if (/ISMC|CHANNEL/.test(prof)) return ['Cross frame channel'];
+      if (/\bANGLE\b|\bISA\b/.test(prof) || /^L\d/.test(String(item?.profile ?? '').toUpperCase())) return ['Diaphragm angle'];
+      return ['Diaphragm plate'];
+    }
+    case 'cover_plate': {
+      if (/\bWEB\b/.test(desc)) return ['Web cover plate'];
+      const face = /\bTOP\b/.test(desc) ? 'Top' : /\bBOTTOM\b/.test(desc) ? 'Bottom' : null;
+      const side = /\bINNER\b/.test(desc) ? 'inner' : /\bOUTER\b/.test(desc) ? 'outer' : null;
+      if (face && side) return [`${face} flange ${side} cover plate`];
+      if (/\bFLANGE\b/.test(desc)) return ['Flange cover plate'];
+      // No place said: the name as written, so an obsolete Cover plate finds its successor by the row's own words.
+      return [plainName(item?.description ?? 'Cover plate')];
+    }
+    case 'stiffener': return /CONNECTION\s+PLATE/.test(desc) ? ['Connection plate'] : ['Stiffener plate'];
+    case 'bracing':
+      if (/BOTTOM\s+LATERAL/.test(desc)) return ['Bottom lateral bracing member'];
+      if (/TOP\s+LATERAL/.test(desc)) return ['Top lateral bracing member'];
+      return ['Bracing'];
+    case 'section': {
+      if (/DIAPHRAGM/.test(desc)) return ['Diaphragm angle'];
+      if (/\bTLB\b|TOP\s+LATERAL/.test(desc)) return ['Top lateral bracing member'];
+      if (/\bBLB\b|BOTTOM\s+LATERAL/.test(desc)) return ['Bottom lateral bracing member'];
+      if (/T-BEAM|\bISHT\b|\bISST\b/.test(desc)) return ['Tee section'];
+      if (/CHANNEL|\bISMC\b/.test(desc)) return ['Cross frame channel'];
+      // An angle: a short one joins two parts (a cleat), a long one braces.
+      if (/\bANGLE\b|\bISA\b/.test(desc)) return Number(item?.lengthMm) > 0 && Number(item.lengthMm) <= 1000 ? ['Angle cleat'] : ['Bracing'];
+      return [plainName(item?.description ?? 'Section')];
+    }
+    case 'plate':
+      if (/\bPAD\b/.test(desc)) return ['Pad plate'];
+      if (/\bRIB\b/.test(desc)) return ['Stiffener plate'];
+      if (/\bEND\s+PLATE\b/.test(desc)) return ['End plate'];
+      if (/\bBASE\s+PLATE\b/.test(desc)) return ['Base plate'];
+      if (/\bSIDE\s+FLANGE\b/.test(desc)) return ['Member flange plate'];
+      return ['Joint plate'];
     // A role the list above does not know: a role of two words or more IS the generic name ("batten_plate" →
     // "Batten plate", "lifting_plate" → "Lifting plate"); else the description, cleaned.
     default: {
@@ -189,16 +237,49 @@ export function partCandidates(item, place = {}) {
   }
 }
 
+/**
+ * A truss's members, joints and floor by the catalog's truss names (the 75 m Thane truss, 2026-10-31), so a railway open
+ * web girder (RDSO B-17186, B-17081, 2026-11-06) reuses them: "Top chord TC1" → Top chord piece, "Joint U1 and U5" →
+ * Truss joint. The cross girders of a through truss are the truss's End cross girder and Bottom cross girder (not the
+ * bow string's cross beams). Kinds a road truss had none of (portal and sway girders, end brackets) get short names.
+ */
+export function trussNodeCandidates(name) {
+  const n = String(name ?? '').toUpperCase();
+  if (/\bMAIN\s+TRUSS\b/.test(n)) return ['Main truss'];
+  if (/\bTOP\s+CHORD\b/.test(n)) return ['Top chord piece'];
+  if (/\bBOTTOM\s+CHORD\b/.test(n)) return ['Bottom chord piece'];
+  if (/\bEND\s+RAKER\b/.test(n)) return ['End raker piece'];
+  if (/\bVERTICAL\b/.test(n)) return ['Truss vertical'];
+  if (/\bDIAGONAL\b/.test(n) && !/\bTIE\b/.test(n)) return ['Truss diagonal'];
+  if (/\bJOINT\b/.test(n)) return ['Truss joint'];
+  if (/\bEND\s+CROSS\s+GIRDER\b|^CROSS\s+GIRDER\b.*\(END\)/.test(n)) return ['End cross girder'];
+  if (/^(INTERMEDIATE\s+)?CROSS\s+GIRDER\b/.test(n)) return ['Bottom cross girder'];
+  if (/\bSTRINGER\s+BRACING\b/.test(n)) return ['Stringer bracing panel'];
+  if (/\bSTRINGER\s+PANEL\b/.test(n)) return ['Stringer panel'];
+  if (/\bSTRINGER\b/.test(n)) return ['Stringer'];
+  if (/\bLATERAL\s+CROSSING\b|\bCROSSING\s+GUSSET\b/.test(n)) return ['Bracing gusset set'];
+  if (/\bTOP\s+LATERAL\s+BRAC/.test(n)) return ['Top bracing system'];
+  if (/\bPORTAL\s+GIRDER\b/.test(n)) return ['Portal girder'];
+  if (/\bPORTAL\s+BRAC/.test(n)) return ['Portal bracing'];
+  if (/\bSWAY\s+GIRDER\b/.test(n)) return ['Sway girder'];
+  if (/\bSWAY\s+BRAC/.test(n)) return ['Sway bracing'];
+  if (/\bEND\s+BRACKET\b/.test(n)) return ['End bracket'];
+  if (/\bFLOOR\s+SYSTEM\b/.test(n)) return ['Floor system'];
+  return null;
+}
+const TRUSS_KINDS = new Set(['truss', 'member', 'joint', 'cross_girder', 'stringer', 'bracing']);
+
 /** The definition names an assembly node may take (IMPORT_FORMAT.md `assembly` kinds). */
 export function nodeCandidates(node, items = null) {
   const name = String(node?.name ?? '').toUpperCase();
   // A group holding ONE kind of part and nothing else ("Lifting plates for the 30.5 m span: …") is a set of that part.
   const kids = node?.children ?? [];
   const setOf = () => (items && kids.length === 1 && kids[0].item != null && items.get(kids[0].item) ? `${partCandidates(items.get(kids[0].item))[0]} set` : null);
+  if (TRUSS_KINDS.has(node?.kind)) { const t = trussNodeCandidates(nodeTitle(name)); if (t) return t; }
   switch (node?.kind) {
     // A launching / lifting tackle is not a bridge span: it gets its own name.
     // A truss span is its own kind of span (user, 2026-10-31: a 75 m through truss), never the girder span.
-    case 'span': return /LAUNCH|TACKLE|LIFTING\s+ARRANGEMENT/.test(name) ? [plainName(nodeTitle(name))] : /\bTRUSS\b/.test(name) ? ['Steel truss span'] : ['Bridge span'];
+    case 'span': return /LAUNCH|TACKLE|LIFTING\s+ARRANGEMENT/.test(name) ? [plainName(nodeTitle(name))] : /\bTRUSS\b|OPEN\s+WEB|THROUGH\s+TYPE|\bOWG\b/.test(name) ? ['Steel truss span'] : ['Bridge span'];
     case 'girder': return ['Girder line'];
     case 'girder_segment': return ['Girder segment'];
     case 'splice_set': return ['Splice set'];
@@ -225,6 +306,7 @@ export function nodeCandidates(node, items = null) {
       if (/END\s+DIAPHRAGM/.test(name)) return ['End diaphragm'];
       if (/END\s+X-?\s*FRAME/.test(name)) return ['End diaphragm frame', 'End diaphragm'];
       if (/X-?\s*FRAME|INTERMEDIATE\s+DIAPHRAGM|CROSS\s+FRAME/.test(name)) return ['Intermediate diaphragm frame', 'Intermediate diaphragm'];
+      { const t = trussNodeCandidates(nodeTitle(name)); if (t) return t; }
       if (/LATERAL\s+BRAC/.test(name)) return ['Bottom lateral bracing', 'Bracing'];
       if (/BED\s+PLATE|BEARING/.test(name)) return ['Bearing assembly'];
       return [setOf() ?? plainName(nodeTitle(name))];
