@@ -21,6 +21,7 @@ const cid = (req) => req.company.id;
 const report = (path, fn) => router.get(path, protect, wrap((req) => fn(cid(req), req.query)));
 
 report('/meta', reports.meta);
+report('/summary', reports.summary);
 report('/what-changed', reports.whatChanged);
 report('/actions', reports.actions);
 report('/problem-parts', reports.problemParts);

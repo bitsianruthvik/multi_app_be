@@ -26,8 +26,8 @@ async function load(companyId) {
 
 // ── Helpers ──
 const sum = (a, f) => a.reduce((t, x) => t + (f(x) || 0), 0);
-const median = (a) => { const v = a.filter((x) => x != null); if (!v.length) return null; const s = [...v].sort((x, y) => x - y); return s[Math.floor((s.length - 1) / 2)]; };
-const pctl = (a, p) => { const v = a.filter((x) => x != null).sort((x, y) => x - y); return v.length ? v[Math.floor((v.length - 1) * p)] : null; };
+const median = (a) => { const v = a.filter((x) => x != null && !Number.isNaN(x)); if (!v.length) return null; const s = [...v].sort((x, y) => x - y); return s[Math.floor((s.length - 1) / 2)]; };
+const pctl = (a, p) => { const v = a.filter((x) => x != null && !Number.isNaN(x)).sort((x, y) => x - y); return v.length ? v[Math.floor((v.length - 1) * p)] : null; };
 const pct = (a, b) => (b ? (a / b) * 100 : null);
 const days = (a, b) => (Date.parse(b) - Date.parse(a)) / 86400000;
 const round = (v, n = 1) => (v == null || !Number.isFinite(v) ? null : Math.round(v * 10 ** n) / 10 ** n);
@@ -442,4 +442,25 @@ export async function partDetail(companyId, id, q) {
   const open = d.lines.filter((l) => l.die === die && !l.sc && !l.full && f(l)).map((l) => openRow(d, l)).sort((a, b) => b.daysOverdue - a.daysOverdue).slice(0, 10);
   const p = sum(melt, (r) => r.kg); const rk = sum(rej, (r) => r.kg);
   return { die, name: d.partName.get(die), pouredT: tonnes(p), rejectedKg: Math.round(rk), pct: round(pct(rk, p)), reasons: reasonsNow, areas, months, open, asOf: d.m.asOf };
+}
+
+// ── Key metrics: one page, each figure taken from the report behind it ──
+// Every figure here is read from the same report its detail screen shows, with the same filters,
+// so the two never disagree.
+export async function summary(companyId, q) {
+  const d = await load(companyId);
+  const [cust, ord, qual, time, ready, rhythm, ven, mat, act] = await Promise.all([
+    customers(companyId, q), orders(companyId, q), quality(companyId, q), timeSpent(companyId, q), readyWaiting(companyId, q),
+    shippingRhythm(companyId, q), vendors(companyId, q), materialSuppliers(companyId, q), actions(companyId, q)]);
+  const disp = dispOf(d, q); const leg = (k) => time.legs.find((l) => l.key === k)?.days ?? null;
+  const months = [...groupBy(salesOf(d, q), (s) => s.dt.slice(0, 7)).entries()].map(([mo, a]) => ({ mo, sales: Math.round(sum(a, (s) => s.am)), dispatchedT: tonnes(sum(disp.filter((r) => r.dt.slice(0, 7) === mo), (r) => r.kg)) })).sort(byMonth);
+  return {
+    sales: { sales: cust.kpis.sales, pricePerKg: cust.kpis.pricePerKg, customers: cust.kpis.customers, topShare: cust.kpis.topShare, topName: cust.rows[0]?.name ?? null },
+    delivery: { onTimePct: ord.kpis.onTimePct, lines: ord.kpis.lines, medianDelay: ord.kpis.medianDelay, openTonnes: ord.kpis.openTonnes, openLines: ord.kpis.openLines, overdueTonnes: ord.kpis.overdueTonnes, overdueLines: ord.kpis.overdueLines },
+    actions: { pastDue: act.pastDue.lines, pastDueT: act.pastDue.tonnes, dueNotPoured: act.dueNotPoured.lines, waitingAfterPour: act.waitingAfterPour.lines, waitingAfterPourT: act.waitingAfterPour.tonnes, readyToShip: act.readyToShip.lines },
+    production: { pouredT: qual.kpis.pouredTonnes, rejectionPct: qual.kpis.pct, rejectedKg: qual.kpis.rejectedKg, orderToShip: time.legs.reduce((s, l) => s + (l.days || 0), 0), promised: time.promised, pourToPass: leg('pour2ins'), slowPourToPass: time.legs.find((l) => l.key === 'pour2ins')?.slow ?? null },
+    shipping: { dispatchedT: tonnes(sum(disp, (r) => r.kg)), shipments: new Set(disp.map((r) => `${r.dt}|${r.c}`)).size, readyT: ready.kpis.tonnes, readyPastDueT: ready.kpis.pastDue, pastUsualSlot: ready.kpis.overdueSlot, regularCustomers: rhythm.rows.length, missedWithStock: rhythm.skipCounts.find((s) => s.why === 'Castings were ready')?.slots ?? 0 },
+    vendors: { sentT: ven.kpis.tonnes, medianDays: ven.kpis.medianDays, notBackT: ven.kpis.openTonnes, oldNotBackT: ven.kpis.oldOpenTonnes, purchases: mat.kpis.value, suppliers: mat.kpis.suppliers },
+    months, asOf: d.m.asOf,
+  };
 }
