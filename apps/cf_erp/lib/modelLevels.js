@@ -62,25 +62,47 @@ export function levelMarkFor(model, row, rel = levelParents(model)) {
 }
 
 // One parse per model file: a model is up to a few MB and the drawing tree is read on every production screen.
-const cache = new Map();   // file id → Set of upper-case level marks
+const cache = new Map();   // file id → { levels, pieces } upper-case marks
 const CACHE_MAX = 24;
 
-/** The level marks (upper case) of a standard's ONE model; an empty Set when it has none. Two small queries when cached. */
-export async function modelLevelsOfStandard(db, companyId, standardId) {
-  if (!standardId) return new Set();
+/** PURE. The marks of the model's pieces (elements), upper case: a part or a bought section the screens can draw alone. */
+export function piecesOfModel(model) {
+  const out = new Set();
+  for (const e of model?.elements ?? []) if (e.mark != null && e.mark !== '') out.add(up(e.mark));
+  return out;
+}
+
+const EMPTY = { levels: new Set(), pieces: new Set() };
+/** { levels, pieces } (upper-case marks) of a standard's ONE model; empty when it has none. Two small queries when cached. */
+async function marksOfStandard(db, companyId, standardId) {
+  if (!standardId) return EMPTY;
   const [[f]] = await db.query(
     "SELECT id FROM cf_standard_drawing_files WHERE company_id = ? AND standard_id = ? AND kind = 'model' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
     [companyId, Number(standardId)],
   );
-  if (!f) return new Set();
+  if (!f) return EMPTY;
   const id = Number(f.id);
   if (cache.has(id)) return cache.get(id);
   const [[t]] = await db.query('SELECT file_text FROM cf_standard_drawing_files WHERE id = ?', [id]);
-  let levels = new Set();
-  try { levels = new Set(levelsOfModel(JSON.parse(t?.file_text ?? 'null')).keys()); } catch { /* not a model: nothing drawn from it */ }
+  let marks = EMPTY;
+  try { const model = JSON.parse(t?.file_text ?? 'null'); marks = { levels: new Set(levelsOfModel(model).keys()), pieces: piecesOfModel(model) }; } catch { /* not a model: nothing drawn from it */ }
   if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);
-  cache.set(id, levels);
-  return levels;
+  cache.set(id, marks);
+  return marks;
+}
+
+/** The level marks of a standard's model (the standard's own viewer draws levels from it). */
+export async function modelLevelsOfStandard(db, companyId, standardId) {
+  return (await marksOfStandard(db, companyId, standardId)).levels;
+}
+
+/**
+ * Every mark an order line's screens can draw from its standard's model: its levels, and its pieces (a bracing angle, a
+ * bolt, a plate with no DXF), each drawn alone (user, 2026-11-07: "do it" — the 4 bracing angles had no drawing).
+ */
+export async function modelDrawsOfStandard(db, companyId, standardId) {
+  const m = await marksOfStandard(db, companyId, standardId);
+  return new Set([...m.levels, ...m.pieces]);
 }
 
 /** Does the model draw this row? Its mark is one of the model's levels. */

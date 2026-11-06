@@ -77,7 +77,7 @@ import { createDrawing, reviseDrawing } from './drawingService.js';
 import { nextRevision } from '../lib/revision.js';
 import { parseDrawingName, matchCodePattern, codeWithNumbers } from '../lib/drawingName.js';
 import { dxfTextHints } from '../lib/nestDxfReader.js';
-import { modelLevelsOfStandard, drawnByModel } from '../lib/modelLevels.js';
+import { modelDrawsOfStandard, drawnByModel } from '../lib/modelLevels.js';
 
 const FALLBACK_DENSITY = 7850;
 // A row is one TiDB entry (6 MB at most): a 4 MB file is 5.3 MB as base64.
@@ -432,7 +432,7 @@ export async function drawingTree(db, companyId, orderId, lineId) {
   const rows = await rowsOfLine(db, companyId, line);
   const drawings = await liveDrawings(db, companyId, line.id);
   const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
-  const levels = await modelLevelsOfStandard(db, companyId, line.standard_id);
+  const levels = await modelDrawsOfStandard(db, companyId, line.standard_id);
   // A row with no file on the line may still be covered by a register drawing: one whose file a standard holds (it
   // opens with GET /drawings/:id/file), else one kept elsewhere (its link — an RDSO series sheet). Its file first.
   const sheetOf = (p) => {
@@ -466,7 +466,7 @@ export async function getDrawings(db, companyId, orderId, lineId) {
   // The safety net: a plate part's drawing saved without a shape is read now, shown, and kept.
   await readMissingShapes(db, companyId, rows, drawings);
   const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
-  return viewOf(line, rows, drawings, refs, await modelLevelsOfStandard(db, companyId, line.standard_id));
+  return viewOf(line, rows, drawings, refs, await modelDrawsOfStandard(db, companyId, line.standard_id));
 }
 
 /** A number no other shop drawing has: "SO-20260930-0001/TF1", else with the line, else numbered on. */
