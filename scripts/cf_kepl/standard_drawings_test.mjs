@@ -263,7 +263,7 @@ try {
   // Where the setup step already ran on this DB the first try simply applies: a savepoint takes it back, so the import
   // below is the one made after the setup step, as on a fresh DB.
   await conn.query('SAVEPOINT before_1623');
-  const noSetup = await refusal(() => STD.importStandard(conn, c, { ...readSet('RDSO_1623', true), apply: true }));
+  const noSetup = await refusal(() => STD.importStandard(conn, c, { ...readSet('RDSO_1623', true), apply: true, allowNew: true }));
   await conn.query('ROLLBACK TO SAVEPOINT before_1623');
   const [[aOpt]] = await conn.query("SELECT COUNT(*) AS n FROM cf_spec_options o JOIN cf_specifications s ON s.id = o.specification_id WHERE o.company_id = ? AND s.code = 'IMPACT_CLASS' AND o.value = 'A' AND o.deleted_at IS NULL", [COMPANY]);
   if (!Number(aOpt.n)) ok('an older set without the setup step is refused, and says to run it', noSetup?.code === 'OPTIONS_MISSING', noSetup?.message);
@@ -273,7 +273,7 @@ try {
   eq('the setup step is idempotent: a second run has nothing to do', setup2.actions.filter((a) => !a.problem).length, 0);
   const [[bo]] = await conn.query("SELECT o.label FROM cf_spec_options o JOIN cf_specifications s ON s.id = o.specification_id WHERE o.company_id = ? AND s.code = 'IMPACT_CLASS' AND o.value = 'BO' AND o.deleted_at IS NULL", [COMPANY]);
   eq('the BO impact class reads just "BO"', bo?.label, 'BO');
-  const t1623 = await STD.importStandard(conn, c, { ...readSet('RDSO_1623', true), apply: true });
+  const t1623 = await STD.importStandard(conn, c, { ...readSet('RDSO_1623', true), apply: true, allowNew: true });
   const [[v1623]] = await conn.query('SELECT * FROM cf_standard_drawing_versions WHERE id = ?', [t1623.report.written.versionId]);
   const r1623 = await rowsByMark(conn, [v1623.root_item_id]);
   ok('an older set applies too: its rows, its new definitions made once', r1623.ids.length === Number(v1623.rows_count) && t1623.report.written.newDefinitions.length === new Set(t1623.plan.newDefinitions.map((d) => d.name)).size, `${r1623.ids.length} rows, ${t1623.report.written.newDefinitions.length} new`);

@@ -22,7 +22,7 @@ export function normName(s) {
   t = t.replace(/\binter\.\s*/g, 'intermediate ').replace(/\bdiaph\.\s*/g, 'diaphragm ').replace(/\blong\.\s*/g, 'longitudinal ');
   t = t.replace(/\bg\s*&\s*a\b/g, 'girder arch').replace(/\bed\b/g, 'end diaphragm').replace(/\bid\b/g, 'intermediate diaphragm');
   t = t.replace(/\bcenter\b/g, 'centre').replace(/\bdigonal\b/g, 'diagonal').replace(/\bstiffner/g, 'stiffener');
-  t = t.replace(/[()&/.,_-]+/g, ' ');
+  t = t.replace(/[()&/.,_\-–—']+/g, ' ');
   t = t.replace(/\bhole\b/g, 'holed');
   const singular = { frames: 'frame', plates: 'plate', stiffeners: 'stiffener', bracings: 'bracing', cleats: 'cleat', supports: 'support', brackets: 'bracket', splices: 'splice', angles: 'angle' };
   return t.split(/\s+/).filter(Boolean).map((w) => singular[w] ?? w).join(' ');
@@ -36,10 +36,14 @@ export function normName(s) {
  *   "Lifting station under one girder end" → "Lifting station"     "Spacer/spreader beam channel" → "Spreader beam channel"
  */
 export function plainName(s) {
-  let t = ` ${String(s ?? '')} `.replace(/\([^)]*\)/g, ' ').replace(/[:;].*$/, ' ').replace(/\s-\s.*$/, ' ');
-  t = t.replace(/\s(for|at|under|on|per|in|to|from)\s.*$/i, ' ');
+  // What follows a comma is a note, never the name (user, 2026-11-06: "Stringer, end bay", "Girder shoe, high tub",
+  // "Hanger beam HB-4, two pieces, with its stiffeners and covers" made definitions of their own); so is "with its …",
+  // "welded", "true shape", "ends cut".
+  let t = ` ${String(s ?? '')} `.replace(/\([^)]*\)/g, ' ').replace(/[:;].*$/, ' ').replace(/\s-\s.*$/, ' ').replace(/,.*$/, ' ');
+  t = t.replace(/\s(for|at|under|on|per|in|to|from|with|between|joins)\s.*$/i, ' ');
+  t = t.replace(/\b(welded|true\s+shape|ends?\s+cut|two\s+pieces)\b/gi, ' ');
   t = t.replace(/\b(ISMC|ISLC|ISMB|ISJB|ISA|ISHB|ISMB|L)\b(?=\s*\d)/gi, ' ');
-  t = t.replace(/\S*\d\S*(\s*(mm|m|thk|th|dia|long|lg)\b\.?)?/gi, ' ');
+  t = t.replace(/\S*\d\S*(\s*(mm|m|thk|thick|th|dia|long|lg)\b\.?)?/gi, ' ');
   t = t.replace(/\b(\w+)\/(\w+)\b/g, '$2').replace(/\s[x×*]\s/gi, ' ').replace(/[,./\s-]+$/g, ' ');
   const singular = { plates: 'plate', stiffeners: 'stiffener', angles: 'angle', beams: 'beam', channels: 'channel', strips: 'strip', bolts: 'bolt', brackets: 'bracket', gussets: 'gusset', stations: 'station' };
   const words = t.split(/\s+/).filter(Boolean).map((w) => singular[w.toLowerCase()] ?? w);
@@ -132,7 +136,23 @@ export function partCandidates(item, place = {}) {
     case 'jacking_plate': return ['Jacking plate'];
     case 'diaphragm_plate': return ['Diaphragm plate'];
     case 'bracket_plate': return ['Bracket plate'];
-    case 'stiffener_plate': return ['Stiffener plate'];
+    // A stiffener plate whose description is a catalog name ("Inside support", "Box closing plate") takes that name.
+    case 'stiffener_plate': { const own = plainName(item?.description ?? ''); return place.has?.(own) && normName(own) !== 'stiffener plate' ? [own, 'Stiffener plate'] : ['Stiffener plate']; }
+    // User, 2026-11-06 (definition audit): a splice plate by its place — the catalog's girder / arch splice plates by
+    // face, the bow string's own splice plate on a bow string, a web's splice; "Splice plate" (obsolete) last.
+    case 'splice_plate': {
+      const out = [];
+      if (/\bWEB\b/.test(desc)) out.push('Web splice');
+      const face = /\bTOP\b/.test(desc) ? 'top' : /\bBOTTOM\b/.test(desc) ? 'bottom' : /\bSIDE\b/.test(desc) ? 'side' : null;
+      const at = /\bARCH\b/.test(desc) ? 'Arch' : /\b(BLB|BOTTOM\s+LONG|LONGITUDINAL|GIRDER)\b/.test(desc) ? 'Girder' : null;
+      if (at && face) out.push(`${at} ${face} splice plate`);
+      if (place.bowstring) out.push('Bow string splice plate');
+      return [...out, 'Splice plate'];
+    }
+    case 'cleat_plate':
+      if (/TIE\s+BEAM\s+(BRACKET|CLEAT)/.test(desc)) return ['Top tie beam cleat', 'Bracket plate'];
+      return ['Bracket plate', 'Cleat plate'];
+    case 'top_packing_splice': case 'bottom_packing_splice': case 'packing_splice': return ['Packing plate'];
     case 'bottom_lateral_bracing_member': return ['Bottom lateral bracing member'];
     case 'top_lateral_bracing_member': return ['Top lateral bracing member'];
     case 'pad_plate': return ['Pad plate'];
@@ -140,7 +160,9 @@ export function partCandidates(item, place = {}) {
     case 'shear_stud': return ['Shear stud'];
     case 'bolt': return ['Bolt set'];
     case 'angle':
-      if (/LATERAL\s+BRAC/.test(desc)) return ['Bottom lateral bracing member', 'Bottom bracings lateral', 'Bracing'];
+      // "BLB angle" is the bottom lateral bracing's angle on a girder span (on a bow string BLB is the bottom long beam).
+      if (/LATERAL\s+BRAC/.test(desc) || (!place.bowstring && /\bBLB\b/.test(desc))) return ['Bottom lateral bracing member', 'Bottom bracings lateral', 'Bracing'];
+      if (/CROSS\s+BEAM/.test(desc) && /\bANGLE\b|\bCLEAT\b/.test(desc)) return ['Intermediate cross beam angle cleat', 'Angle cleat'];
       if (/DIAGONAL|DIGONAL/.test(desc)) return ['X-frame diagonal angle'];
       if (/TOP\s*\/\s*BOTTOM/.test(desc)) return ['X-frame top angle'];
       if (/\bTOP\b/.test(desc)) return ['X-frame top angle'];
@@ -181,6 +203,25 @@ export function nodeCandidates(node, items = null) {
     case 'girder_segment': return ['Girder segment'];
     case 'splice_set': return ['Splice set'];
     case 'assembly':
+      // Bow string (the catalog's 2026-10-07 set) and tub girder (Khajaguda, 2026-11-02) assemblies by the catalog's names
+      // (user, 2026-11-06: fit what exists; a drawing's title is not a definition name).
+      if (/BOTTOM\s+LONG(ITUDINAL)?\s+BEAM/.test(name)) return ['Bottom longitudinal beam'];
+      if (/\bARCH\s+(BEAM|BOX)\b/.test(name)) return ['Arch box'];
+      if (/HANGER\s+BEAM/.test(name)) return ['Hanger beam'];
+      if (/INTERMEDIATE\s+(BOTTOM\s+)?CROSS\s+BEAM/.test(name)) return ['Intermediate cross beam'];
+      if (/\bEND\s+(BOTTOM\s+)?CROSS\s+BEAM|BOTTOM\s+END\s+CROSS\s+BEAM/.test(name)) return ['Bottom end cross beam'];
+      if (/TOP\s+TIE\s+DIAGONAL/.test(name)) return ['Top tie diagonal'];
+      if (/TOP\s+TIE\s+(CHORD\s+)?BEAM/.test(name)) return ['Top tie beam'];
+      if (/GIRDER\s+(AND|&)\s+ARCH\s+CONNECTION/.test(name)) return ['Girder and arch connection'];
+      if (/SEISMIC\s+(ARRESTOR|ARRESTER|STOPPER)/.test(name)) return ['Seismic stopper'];
+      if (/GIRDER\s+SHOE/.test(name)) return ['Girder shoe'];
+      if (/CONNECTING\s+GIRDER/.test(name)) return ['Connecting girder between the tubs', 'Connecting girder'];
+      if (/INTERNAL\s+CROSS\s+GIRDER/.test(name)) return ['Internal cross girder'];
+      if (/CROSS\s+GIRDER\s+PLATE/.test(name)) return ['Cross girder plate'];
+      if (/PLAN\s+BRACING/.test(name)) return ['Plan bracing panel'];
+      if (/DIAPHRAGM\s+IN\s+THE\s+TUB/.test(name)) return ['Diaphragm'];
+      if (/END\s+(CROSS\s+GIRDER\s+)?DIAPHRAGM/.test(name)) return ['End diaphragm'];
+      if (/INTERMEDIATE\s+CROSS\s+GIRDER\s+DIAPHRAGM/.test(name)) return ['Intermediate diaphragm'];
       if (/END\s+DIAPHRAGM/.test(name)) return ['End diaphragm'];
       if (/END\s+X-?\s*FRAME/.test(name)) return ['End diaphragm frame', 'End diaphragm'];
       if (/X-?\s*FRAME|INTERMEDIATE\s+DIAPHRAGM|CROSS\s+FRAME/.test(name)) return ['Intermediate diaphragm frame', 'Intermediate diaphragm'];
@@ -227,6 +268,62 @@ export function rowNote(item, decisions = []) {
 const roleText = (s) => sentence(String(s ?? '').replace(/\//g, ' ')).slice(0, 100);
 
 /**
+ * Names that mean a catalog definition (user, 2026-11-06, the definition audit: the 11-05 imports made 19 definitions that
+ * repeat one the catalog had). Tried after an exact name: { re } on the normalised name, { to } the catalog's names,
+ * first one there wins (and only in the same family of classes as the row: a plate never lands on an assembly).
+ * Not here on purpose — the engineer's calls: End cross girder / Bottom end cross beam, Bottom cross girder / Intermediate
+ * cross beam, Flange cover plate / the splices, Connection plate / Gusset plate, Jacking plate / Pad plate, Plan bracing panel.
+ */
+export const SYNONYMS = [
+  { re: /\bend cross girder diaphragm\b/, to: ['End diaphragm'] },
+  { re: /\bintermediate cross girder diaphragm\b/, to: ['Intermediate diaphragm'] },
+  { re: /\bsplice plate web\b|\bweb splice plate\b/, to: ['Web splice'] },
+  { re: /\bpacking splice\b|\binner packing\b/, to: ['Packing plate'] },
+  { re: /\bseismic arrest[oe]r\b/, to: ['Seismic stopper'] },
+  { re: /\bblb angle\b/, to: ['Bottom lateral bracing member'] },
+  { re: /\bbottom long beam\b/, to: ['Bottom longitudinal beam'] },
+  { re: /\barch beam\b/, to: ['Arch box'] },
+  { re: /\bintermediate bottom cross beam\b/, to: ['Intermediate cross beam'] },
+  { re: /\bend bottom cross beam\b/, to: ['Bottom end cross beam'] },
+  { re: /\btop tie chord beam\b/, to: ['Top tie beam'] },
+  { re: /\bcleat plate\b/, to: ['Bracket plate'] },
+  { re: /\bcross beam end angle\b/, to: ['Intermediate cross beam angle cleat', 'Angle cleat'] },
+  { re: /\bgirder shoe\b/, to: ['Girder shoe'] },
+];
+
+const STOPWORDS = new Set(['the', 'a', 'an', 'of', 'and', 'with', 'its', 'in', 'on', 'at', 'to', 'for', 'by']);
+/** Words most definition names share: a likeness on these alone does not say two parts are the same kind. */
+const GENERIC_WORDS = new Set(['plate', 'beam', 'girder', 'set', 'top', 'bottom', 'end', 'side', 'inner', 'outer', 'inside', 'outside', 'piece', 'member', 'assembly', 'part', 'cross', 'intermediate', 'left', 'right', 'cover', 'stiffener', 'splice']);
+const wordsOf = (s) => normName(s).split(' ').filter((w) => w && !STOPWORDS.has(w));
+/** How alike two names are: the share of words they have in common (Jaccard), and whether one's words are all in the other. */
+export function likeness(a, b) {
+  const A = new Set(wordsOf(a)); const B = new Set(wordsOf(b));
+  if (!A.size || !B.size) return { j: 0, subset: false, shared: [] };
+  const shared = [...A].filter((w) => B.has(w));
+  const [s, l] = A.size <= B.size ? [A, B] : [B, A];
+  return { j: shared.length / new Set([...A, ...B]).size, subset: [...s].every((w) => l.has(w)), shared };
+}
+
+/** The family of a definition: its class's parent (Parts, Assemblies, Structures …), from catalog.classes when given. */
+function familyTools(catalog) {
+  const parent = new Map((catalog.classes ?? []).map((c) => [Number(c.id), c.parent_id == null ? null : Number(c.parent_id)]));
+  const familyOf = (classId) => (parent.size ? parent.get(Number(classId)) ?? null : null);
+  const classOfName = (names) => {
+    for (const n of names) { const d = (catalog.defs ?? []).find((x) => x.status === 'active' && normName(x.name) === normName(n)); if (d) return Number(d.classification_id); }
+    return null;
+  };
+  const anchor = {
+    plate: classOfName(['Top flange', 'Web plate', 'Pad plate']),
+    profile: classOfName(['Bracing', 'X-frame top angle', 'Bottom lateral bracing member']),
+    assembly: classOfName(['Girder segment', 'End diaphragm', 'Splice set']),
+    structure: classOfName(['Composite girder span', 'Bridge span', 'Girder line']),
+  };
+  /** The family a row of this kind belongs to (null: not known, so no family test). */
+  const familyFor = (hint) => (anchor[hint] != null ? familyOf(anchor[hint]) : null);
+  return { familyOf, familyFor, anchor };
+}
+
+/**
  * THE PLAN. `catalog`:
  *   defs        [{ id, code, name, short_name, definition_type, status, classification_id, default_flow_id, bom_id }]
  *   specs       Map(CODE -> { id, data_type, default_uom })
@@ -253,13 +350,63 @@ export function planImport(bom, catalog) {
     if (!defsByNorm.has(k)) defsByNorm.set(k, []);
     defsByNorm.get(k).push(d);
   }
-  const pick = (names, type) => {
+  const fam = familyTools(catalog);
+  const active = (catalog.defs ?? []).filter((d) => d.status === 'active');
+  const inFamily = (d, hint) => { const f = fam.familyFor(hint); return f == null || fam.familyOf(d.classification_id) === f; };
+  const exact = (n, type) => (defsByNorm.get(normName(n)) ?? []).find((d) => d.definition_type === type) ?? null;
+  /**
+   * The definition a row takes (user, 2026-11-06: reuse what the catalog has; a new one only where nothing fits), tried
+   * in this order: 1 a name exactly; 2 an OBSOLETE definition of that name → its successor (an active one in the same
+   * class whose name holds every word of it, told apart by the row's own words); 3 a synonym (SYNONYMS); 4 a name
+   * alike within the row's family (every word of the shorter in the longer, and most words shared).
+   * → { def, asked, how: 'exact' | 'successor' | 'synonym' | 'similar', note? } | null
+   */
+  const pick = (names, type, { hint = null, hints = [] } = {}) => {
+    for (const n of names) { const d = exact(n, type); if (d) return { def: d, asked: n, how: 'exact' }; }
+    const rowWords = new Set(hints.flatMap(wordsOf));
     for (const n of names) {
-      const hit = (defsByNorm.get(normName(n)) ?? []).find((d) => d.definition_type === type);
-      if (hit) return { def: hit, asked: n };
+      const old = (catalog.defs ?? []).find((d) => d.status === 'obsolete' && d.definition_type === type && normName(d.name) === normName(n));
+      if (!old) continue;
+      const ow = wordsOf(old.name);
+      const next = active.filter((d) => d.definition_type === type && Number(d.classification_id) === Number(old.classification_id) && d.id !== old.id && ow.every((w) => wordsOf(d.name).includes(w)));
+      if (!next.length) continue;
+      // The row's own words must point at one successor ("web" → Web cover plate), never a lone successor by default.
+      const scored = next.map((d) => ({ d, s: wordsOf(d.name).filter((w) => !ow.includes(w) && rowWords.has(w)).length })).sort((a, b) => b.s - a.s);
+      if (scored[0].s > 0 && (scored.length === 1 || scored[0].s > scored[1].s)) return { def: scored[0].d, asked: n, how: 'successor', note: `${old.name} is obsolete` };
+    }
+    for (const n of names) {
+      const k = normName(n);
+      for (const rule of SYNONYMS) {
+        if (!rule.re.test(k)) continue;
+        for (const t of rule.to) { const d = exact(t, type); if (d && inFamily(d, hint)) return { def: d, asked: n, how: 'synonym' }; }
+      }
+    }
+    if (hint) {
+      for (const n of names) {
+        const best = active.filter((d) => d.definition_type === type && inFamily(d, hint)).map((d) => ({ d, l: likeness(n, d.name) }))
+          .filter((x) => x.l.subset && x.l.j >= 0.67).sort((a, b) => b.l.j - a.l.j);
+        if (best.length && (best.length === 1 || best[0].l.j > best[1].l.j)) return { def: best[0].d, asked: n, how: 'similar', note: `words ${best[0].l.shared.join(', ')}` };
+      }
     }
     return null;
   };
+  /**
+   * The nearest existing definition to a name nothing fits — proposed in the dry run, and (for an assembly) where a new
+   * one is filed. A word every kind shares ("beam", "plate", "girder") says little: a name sharing a word of its own
+   * ("hanger", "tie") comes first. `telling` says whether it does.
+   */
+  const nearestTo = (name, type, hint) => {
+    const scored = active.filter((d) => d.definition_type === type).map((d) => {
+      const l = likeness(name, d.name);
+      const telling = l.shared.some((w) => !GENERIC_WORDS.has(w));
+      return { d, l, telling, s: l.j + (inFamily(d, hint) ? 0.15 : 0) + (telling ? 0.25 : 0) };
+    }).filter((x) => x.l.shared.length).sort((a, b) => b.s - a.s || (a.d.bom_id ? -1 : 1));
+    const b = scored[0];
+    return b ? { id: b.d.id, code: b.d.code, name: b.d.name, classification_id: b.d.classification_id, score: Math.round(b.l.j * 100) / 100, telling: b.telling, why: `words ${b.l.shared.join(', ')}` } : null;
+  };
+  // A bow string span: its splice plates are the catalog's bow string ones; "BLB" is its bottom long beam.
+  const bowstring = /BOW\s*STRING|BOWSTRING|\bARCH\b/i.test(`${dw.title ?? ''} ${bom?.assembly?.name ?? ''}`);
+  const has = (n) => !!(defsByNorm.get(normName(n)) ?? []).length;
   const newDefs = new Map();   // name -> { name, classHint, roles }
   const mappings = [];
   const rows = [];
@@ -360,14 +507,17 @@ export function planImport(bom, catalog) {
     return best ? { def: best, asked: best.name } : null;
   };
 
-  function mapDef(names, type, what, classHint, { span = false } = {}) {
-    const hit = span ? pickSpan(names) : pick(names, type);
-    if (hit) { mappings.push({ what, asked: names, to: { id: hit.def.id, code: hit.def.code, name: hit.def.name }, fallback: hit.asked !== names[0] }); return { id: hit.def.id, code: hit.def.code, name: hit.def.name, classification_id: hit.def.classification_id, default_flow_id: hit.def.default_flow_id, bom_id: hit.def.bom_id ?? null }; }
+  function mapDef(names, type, what, classHint, { span = false, hints = [] } = {}) {
+    const hit = span ? pickSpan(names) : pick(names, type, { hint: classHint, hints: [what, ...hints] });
+    if (hit) {
+      mappings.push({ what, asked: names, to: { id: hit.def.id, code: hit.def.code, name: hit.def.name }, fallback: hit.asked !== names[0] && (hit.how ?? 'exact') === 'exact', how: hit.how ?? 'exact', note: hit.note ?? null });
+      return { id: hit.def.id, code: hit.def.code, name: hit.def.name, classification_id: hit.def.classification_id, default_flow_id: hit.def.default_flow_id, bom_id: hit.def.bom_id ?? null };
+    }
     const name = names[0];
     if (type === 'selection') { problems.push(`${what}: no selection definition named ${names.join(' / ')} — left out.`); return null; }
-    if (!newDefs.has(name)) newDefs.set(name, { name, classHint, used: [] });
+    if (!newDefs.has(name)) newDefs.set(name, { name, classHint, used: [], nearest: nearestTo(name, type, classHint) });
     if (!newDefs.get(name).used.includes(what)) newDefs.get(name).used.push(what);
-    mappings.push({ what, asked: names, to: { new: name }, fallback: false });
+    mappings.push({ what, asked: names, to: { new: name }, fallback: false, how: 'new' });
     return { new: name, name, classHint };
   }
 
@@ -384,7 +534,8 @@ export function planImport(bom, catalog) {
   const info = [];
   const withStopper = (node) => {
     const children = node.children ?? [];
-    if (/seismic\s+stopper/i.test(String(node.name ?? ''))) return children;
+    // A drawing's "seismic arrestor" IS the stopper (it maps to Seismic stopper): no second stopper inside it.
+    if (/seismic\s+(stopper|arrestor|arrester)/i.test(String(node.name ?? ''))) return children;
     const rp = children.filter((c) => c.item != null && items.get(c.item)?.role === 'restrainer_plate');
     const rsp = children.filter((c) => c.item != null && items.get(c.item)?.role === 'restrainer_stiffener');
     if (!rp.length) return children;
@@ -487,7 +638,7 @@ export function planImport(bom, catalog) {
       const splitNote = horizontal ? `Top or bottom is not told apart on the drawing: the ${q} split evenly (${top} top, ${q - top} bottom).` : null;
       const parts = split
         ? [{ names: ['X-frame top angle'], quantity: top, role: 'Top angle' }, { names: ['X-frame bottom angle'], quantity: q - top, role: 'Bottom angle' }]
-        : [{ names: partCandidates(it, { endDiaphragm, single: q === 1 }), quantity: q, role: roleText(it.description) }];
+        : [{ names: partCandidates(it, { endDiaphragm, single: q === 1, bowstring, has }), quantity: q, role: roleText(it.description) }];
       for (const [i, p] of parts.entries()) {
         const d = mapDef(p.names, 'template', split ? `${what2} (${p.role.toLowerCase()})` : what2, it.category === 'section' ? 'profile' : 'plate');
         const { values: pv, kg, gradeNote, bronze } = partValues(it, it.mark);

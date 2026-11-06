@@ -628,11 +628,14 @@ export async function updateStandard(db, c, id, input = {}) {
 /** What planImport needs to know about the tenant. 5 queries. */
 export async function importCatalog(db, companyId) {
   const [[defs], [specs], [grades], [bought], [existing]] = await Promise.all([
+    // With each definition its class's parent: the family that keeps a plate from landing on an assembly (2026-11-06).
     db.query(
-      `SELECT m.id, m.code, m.name, m.short_name, m.status, m.classification_id, m.default_flow_id, d.definition_type, b.id AS bom_id, b.status AS bom_status
+      `SELECT m.id, m.code, m.name, m.short_name, m.status, m.classification_id, m.default_flow_id, d.definition_type, b.id AS bom_id, b.status AS bom_status,
+              cn.parent_id AS class_parent_id
          FROM cf_master_records m
          JOIN cf_definition_details d ON d.master_id = m.id AND d.deleted_at IS NULL
          LEFT JOIN cf_boms b ON b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL
+         LEFT JOIN cf_classification_nodes cn ON cn.id = m.classification_id
         WHERE m.company_id = ? AND m.record_kind = 'definition' AND m.deleted_at IS NULL`,
       [companyId],
     ),
@@ -649,6 +652,8 @@ export async function importCatalog(db, companyId) {
     ),
     db.query('SELECT id, number FROM cf_standard_drawings WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
   ]);
+  // The classes the definitions sit in, each with its parent (every family test asks about a definition's own class).
+  const classes = [...new Map(defs.map((d) => [Number(d.classification_id), { id: Number(d.classification_id), parent_id: d.class_parent_id == null ? null : Number(d.class_parent_id) }])).values()];
   // The studs the Shear stud selection takes, and the bolt sets the "Bolt set" selection chooses from (bolts-load.mjs makes them) — one read.
   const bolts = bought.filter((r) => /bolt set m/i.test(r.name));
   const studs = bought.filter((r) => !/bolt set m/i.test(r.name));
@@ -670,6 +675,7 @@ export async function importCatalog(db, companyId) {
     studs: studs.map((s) => ({ id: Number(s.id), code: s.code, name: s.name })),
     bolts: bolts.map((b) => ({ id: Number(b.id), code: b.code, name: b.name })),
     standards: new Map(existing.map((s) => [String(s.number).toLowerCase(), Number(s.id)])),
+    classes,
   };
 }
 
@@ -745,25 +751,63 @@ export async function importSetup(db, c, { apply = false } = {}) {
   return { actions };
 }
 
-/** Where a NEW definition is filed: beside the definitions its kind of row already uses. */
-function classFor(catalog, hint) {
+/**
+ * Where a NEW definition is filed (user, 2026-11-06): beside its nearest existing definition (the plan's `nearest`, when
+ * it shares enough words and is the same kind of row), else beside the definitions its kind of row already uses. A
+ * span is filed with the spans, never under "Girder line".
+ */
+function classFor(catalog, hint, nearest = null) {
+  const parent = new Map((catalog.classes ?? []).map((k) => [Number(k.id), k.parent_id]));
   const byName = (names) => {
     for (const n of names) { const d = catalog.defs.find((x) => normName(x.name) === normName(n) && x.status === 'active'); if (d) return Number(d.classification_id); }
     return null;
   };
-  if (hint === 'plate') return byName(['Top flange', 'Bottom flange', 'Web plate', 'Pad plate']);
-  if (hint === 'profile') return byName(['X-frame top angle', 'Bracing', 'Bottom lateral bracing member']);
-  if (hint === 'structure') return byName(['Girder line', 'Bridge span']);
-  return byName(['Girder segment', 'End diaphragm', 'Splice set']);
+  const fallback = hint === 'plate' ? byName(['Top flange', 'Bottom flange', 'Web plate', 'Pad plate'])
+    : hint === 'profile' ? byName(['X-frame top angle', 'Bracing', 'Bottom lateral bracing member'])
+      : hint === 'structure' ? byName(['Composite girder span', 'Bridge span', 'Girder line'])
+        : byName(['Girder segment', 'End diaphragm', 'Splice set']);
+  // An assembly goes beside its nearest one (a hanger beam with the hanger supports, a tie diagonal with the top tie
+  // beam), when they share a telling word and the same family. A part keeps its kind's class (plate or profile part).
+  if ((hint === 'assembly' || hint === 'structure') && nearest?.classification_id && nearest.telling && Number(nearest.score) >= 0.2) {
+    const same = !parent.size || fallback == null || parent.get(Number(nearest.classification_id)) === parent.get(fallback);
+    if (same) return Number(nearest.classification_id);
+  }
+  return fallback;
 }
 
-/** A short name for a new definition, free among the company's: its mark's letters, else its initials. */
-function shortNameFor(catalog, name, mark, taken) {
+/** A short name for a new definition, free among the company's: its name's initials (never a drawing's mark — one order's code on a generic definition). */
+function shortNameFor(catalog, name, taken) {
   const used = new Set([...catalog.defs.map((d) => String(d.short_name ?? '').toUpperCase()), ...taken]);
-  const fromMark = String(mark ?? '').replace(/[^A-Za-z]/g, '').toUpperCase();
-  const initials = String(name).split(/\s+/).map((w) => w[0]).join('').toUpperCase();
-  for (const cand of [fromMark, initials, `${initials}X`, `${fromMark}2`]) if (cand && cand.length <= 30 && !used.has(cand)) { taken.add(cand); return cand; }
+  const words = String(name).split(/[\s–-]+/).filter(Boolean);
+  const initials = words.map((w) => w[0]).join('').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const longer = words.map((w) => w.slice(0, 2)).join('').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  for (const cand of [initials, longer, `${initials}X`, `${initials}2`, `${initials}3`]) if (cand && cand.length <= 30 && !used.has(cand)) { taken.add(cand); return cand; }
   const n = `${initials}${Date.now() % 1000}`; taken.add(n); return n;
+}
+
+/** A definition's own specification rules (subject 'master') and their allowed-option lists, copied onto another. → rules copied. */
+async function copyMasterRules(db, companyId, fromId, toId, userId) {
+  const [rules] = await db.query(
+    `SELECT id, specification_id, capture_at, is_required, is_applicable, value_rule, formula_id, sort_order FROM cf_spec_assignments
+      WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND deleted_at IS NULL`, [companyId, fromId]);
+  if (!rules.length) return 0;
+  await insertRows(db, 'cf_spec_assignments', ['company_id', 'specification_id', 'subject_type', 'subject_id', 'capture_at', 'is_required', 'is_applicable', 'value_rule', 'formula_id', 'sort_order', 'created_by'],
+    rules.map((r) => [companyId, r.specification_id, 'master', toId, r.capture_at, r.is_required, r.is_applicable, r.value_rule, r.formula_id, r.sort_order, userId]));
+  const [opts] = await db.query('SELECT assignment_id, option_id FROM cf_spec_assignment_options WHERE company_id = ? AND assignment_id IN (?) AND deleted_at IS NULL', [companyId, rules.map((r) => r.id)]);
+  if (opts.length) {
+    const [mine] = await db.query("SELECT id, specification_id, capture_at FROM cf_spec_assignments WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND deleted_at IS NULL", [companyId, toId]);
+    const newOf = new Map(rules.map((r) => [Number(r.id), mine.find((m) => Number(m.specification_id) === Number(r.specification_id) && m.capture_at === r.capture_at)?.id]));
+    const rows = opts.map((o) => [companyId, newOf.get(Number(o.assignment_id)), o.option_id, userId]).filter((x) => x[1]);
+    if (rows.length) await insertRows(db, 'cf_spec_assignment_options', ['company_id', 'assignment_id', 'option_id', 'created_by'], rows);
+  }
+  return rules.length;
+}
+
+/** The names a person allowed to be made new (`allowNew`: an array of names, or true for any — tests, old scripts). */
+function notAllowedNew(plan, allowNew) {
+  if (allowNew === true) return [];
+  const ok = new Set((Array.isArray(allowNew) ? allowNew : []).map((n) => normName(n)));
+  return plan.newDefinitions.filter((nd) => !ok.has(normName(nd.name)));
 }
 
 /**
@@ -775,7 +819,7 @@ function shortNameFor(catalog, name, mark, taken) {
  *   a register drawing per part file (one INSERT), the links (one INSERT), the files (one INSERT a 2 MB batch).
  * `files` [{ name, text }] are the dxf/ folder's files. Returns { plan, report, standardId? }.
  */
-export async function importStandard(db, c, { bom, files = [], apply = false, sourceUrl = null, catalog: given = null } = {}) {
+export async function importStandard(db, c, { bom, files = [], apply = false, sourceUrl = null, catalog: given = null, allowNew = [] } = {}) {
   const { companyId } = c;
   const catalog = given ?? await importCatalog(db, companyId);
   const plan = planImport(bom, catalog);
@@ -791,8 +835,16 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
   for (const f of fileRows) if (!f.missing && !f.geometry) plan.problems.push(`${f.mark}: ${f.file} has no shape the app can read (${f.warnings.join(' ') || 'no outline'}).`);
   const existingId = catalog.standards.get(plan.standard.number.toLowerCase()) ?? null;
   const report = reportOf(plan, fileRows, existingId);
+  const refused = notAllowedNew(plan, allowNew);
+  report.newNotAllowed = refused.map((nd) => nd.name);
   if (!apply) return { plan, report, standardId: existingId };
   if (existingId) throw conflict('DUPLICATE', `Standard drawing ${plan.standard.number} is already there (id ${existingId}). Nothing was written.`, { standardId: existingId });
+  // A new definition is an exception a person agrees to (user, 2026-11-06: 19 of 24 made on 11-05 repeated one the
+  // catalog had): each must be named in allowNew, after the dry run showed its nearest existing definition.
+  if (refused.length) {
+    throw invalid('NEW_DEFINITIONS', `These new definitions are not allowed: ${refused.map((nd) => `"${nd.name}"${nd.nearest ? ` (nearest: ${nd.nearest.name})` : ''}`).join(', ')}. Map them to an existing definition, or allow them by name (standard-import.mjs --allow-new "A,B"). Nothing was written.`,
+      { newDefinitions: refused.map((nd) => ({ name: nd.name, nearest: nd.nearest ?? null, for: nd.used })) });
+  }
 
   // Options the setup step makes (IMPACT_CLASS A, MATERIAL PB) must exist before anything is written.
   const needed = new Set();
@@ -807,12 +859,15 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
   const made = new Map();
   const taken = new Set();
   for (const nd of plan.newDefinitions) {
-    const classificationId = classFor(catalog, nd.classHint);
+    const classificationId = classFor(catalog, nd.classHint, nd.nearest);
     if (!classificationId) throw invalid('NO_CLASS', `No place to file the new definition ${nd.name}: the catalog has none of the usual ${nd.classHint} definitions.`);
-    const mark = plan.rows.find((r) => r.def?.new === nd.name)?.mark ?? null;
-    const rec = await createDefinition(db, c, { definitionType: 'template', classificationId, name: nd.name, shortName: shortNameFor(catalog, nd.name, mark, taken) });
+    const rec = await createDefinition(db, c, { definitionType: 'template', classificationId, name: nd.name, shortName: shortNameFor(catalog, nd.name, taken) });
     const active = await setStatus(db, c, rec.id, 'active');
-    made.set(nd.name, { id: Number(rec.id), code: active.code ?? null, name: nd.name, classification_id: classificationId, default_flow_id: null, bom_id: null });
+    // Its nearest sibling's own specification rules (coats, surface area, welds …) come with it, so its rows ask for the
+    // same values the definitions beside it do. Only from a sibling filed in the same class.
+    const sib = nd.nearest?.telling && Number(nd.nearest.classification_id) === classificationId ? Number(nd.nearest.id) : null;
+    const copied = sib ? await copyMasterRules(db, companyId, sib, Number(rec.id), c.userId ?? null) : 0;
+    made.set(nd.name, { id: Number(rec.id), code: active.code ?? null, name: nd.name, classification_id: classificationId, default_flow_id: null, bom_id: null, rulesFrom: sib, rules: copied });
   }
   for (const r of plan.rows) if (r.def?.new) r.def = made.get(r.def.new);
   const unresolved = new Set();
@@ -959,7 +1014,7 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
     batch.push(row); bytes += f.text.length;
   }
   await flush();
-  return { plan, report: { ...report, written: { standardId, versionId, drawingId, rows: tempRows.length, files: okFiles.length, sheets: sheetsOut, newDefinitions: [...made.values()].map((d) => ({ id: d.id, code: d.code, name: d.name })) } }, standardId };
+  return { plan, report: { ...report, written: { standardId, versionId, drawingId, rows: tempRows.length, files: okFiles.length, sheets: sheetsOut, newDefinitions: [...made.values()].map((d) => ({ id: d.id, code: d.code, name: d.name, classificationId: d.classification_id, rulesFrom: d.rulesFrom ?? null, rules: d.rules ?? 0 })) } }, standardId };
 }
 
 /** The mapping report a person reads before --apply: every row → definition, the new ones, the notes, the files. */
@@ -974,8 +1029,11 @@ function reportOf(plan, fileRows, existingId) {
     standard: { number: plan.standard.number, name: plan.standard.name, sourceUrl: plan.standard.sourceUrl, internal: plan.standard.internal, alreadyThere: existingId },
     totals: plan.totals,
     rows,
-    newDefinitions: plan.newDefinitions.map((d) => ({ name: d.name, kind: d.classHint, for: d.used })),
+    newDefinitions: plan.newDefinitions.map((d) => ({ name: d.name, kind: d.classHint, for: d.used, nearest: d.nearest ?? null })),
     fallbacks: plan.mappings.filter((m) => m.fallback).map((m) => ({ what: m.what, asked: m.asked[0], took: m.to.name ?? m.to.new })),
+    // Rows that took a definition by a successor, a synonym or a like name (not their own name): a person reads them.
+    matchedBy: [...new Map(plan.mappings.filter((m) => ['successor', 'synonym', 'similar'].includes(m.how))
+      .map((m) => [`${m.asked[0]}→${m.to.id}`, { how: m.how, asked: m.asked[0], took: m.to.name, id: m.to.id, note: m.note ?? null, for: m.what }])).values()],
     bought: plan.bought,
     files: fileRows.map((f) => ({ mark: f.mark, file: f.file, read: !!f.geometry, sizeMm: f.geometry ? `${r3(f.geometry.lengthMm)} × ${r3(f.geometry.widthMm)}` : null, holes: f.geometry?.holes ?? null, missing: !!f.missing })),
     notes: rows.filter((r) => r.note).map((r) => ({ mark: r.mark, note: r.note })),

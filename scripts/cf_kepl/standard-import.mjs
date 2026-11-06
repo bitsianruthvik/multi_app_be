@@ -16,6 +16,7 @@
  *                               (segment lengths, girder type, segment holes / drilled thickness, assembly surface)
  *                               and flows by usage are filled either way (lib/standardGaps.js, 2026-10-18).
  *        [--no-gap-fill]        skip the gap fill (a set that carries its own values)
+ *        [--allow-new "A,B"]    the new definitions agreed to, by name; --apply refuses any other new one (2026-11-06)
  *        [--json]               the report as JSON
  *        [--prod]               the production database: DB_* from TM/.env.tidb (the same way the other cf_kepl scripts reach it)
  *
@@ -82,7 +83,10 @@ try {
   if (APPLY) await conn.beginTransaction();
   // The setup step (options the standards need, the BO label) — in this same transaction when applying.
   const setup = await STD.importSetup(conn, c, { apply: APPLY });
-  const out = await STD.importStandard(conn, c, { bom, files, apply: APPLY, sourceUrl: arg('source-url') });
+  // --allow-new "A,B": the new definitions a person agreed to, by name, after the dry run showed each one's nearest
+  // existing definition. Without it --apply refuses any new definition (user, 2026-11-06).
+  const allowNew = arg('allow-new') ? String(arg('allow-new')).split(',').map((s) => s.trim()).filter(Boolean) : [];
+  const out = await STD.importStandard(conn, c, { bom, files, apply: APPLY, sourceUrl: arg('source-url'), allowNew });
   // --no-gap-fill: a set that carries every value itself skips the fill (on TiDB a write in it went through another
   // connection and waited on this transaction's own locks — 50 s a time — 2026-10-31).
   if (APPLY && out.standardId && !process.argv.includes('--no-gap-fill')) {
@@ -119,9 +123,17 @@ function printReport(r, { host, co, trips }) {
     if (x.values) line(`${pad}    ${x.values}`);
     if (x.note) line(`${pad}    NOTE: ${x.note}`);
   }
+  if (r.matchedBy?.length) {
+    line('\nTaken by another name (check each):');
+    for (const m of r.matchedBy) line(`  ${m.how.padEnd(9)} "${m.asked}" → ${m.took} #${m.id}${m.note ? `  (${m.note})` : ''}`);
+  }
   line(`\nNew definitions (nothing in the catalog fits): ${r.newDefinitions.length ? '' : 'none'}`);
-  for (const d of r.newDefinitions) line(`  + ${d.name} (${d.kind}) — for ${d.for.join('; ')}`);
-  if (r.written?.newDefinitions?.length) for (const d of r.written.newDefinitions) line(`    created #${d.id} ${d.code ?? ''} ${d.name}`);
+  for (const d of r.newDefinitions) {
+    line(`  + ${d.name} (${d.kind}) — for ${d.for.slice(0, 3).join('; ')}${d.for.length > 3 ? ` … ${d.for.length} rows` : ''}`);
+    line(`      nearest existing: ${d.nearest ? `${d.nearest.name} #${d.nearest.id} (${d.nearest.why}, likeness ${d.nearest.score})` : 'none'}`);
+  }
+  if (r.newNotAllowed?.length && !APPLY) line(`  --apply refuses these unless allowed by name: --allow-new "${r.newNotAllowed.join(',')}"  (or map them in lib/standardImport.js)`);
+  if (r.written?.newDefinitions?.length) for (const d of r.written.newDefinitions) line(`    created #${d.id} ${d.code ?? ''} ${d.name}${d.rules ? ` — ${d.rules} spec rules from #${d.rulesFrom}` : ''}`);
   if (r.fallbacks.length) { line('\nMapped to a second choice (the first name is not in the catalog):'); for (const f of r.fallbacks) line(`  ${f.what}: wanted "${f.asked}", took "${f.took}"`); }
   line(`\nBought out, not in the BOM (listed on the standard's notes): ${r.bought.length ? '' : 'none'}`);
   for (const b of r.bought) line(`  ${b.quantity} × ${b.mark} ${b.description}${b.profile ? ` (${b.profile})` : ''}`);

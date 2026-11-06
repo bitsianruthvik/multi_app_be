@@ -65,30 +65,50 @@ try {
   const orderId = Number(order.id ?? order.order?.id); const orderCode = order.code ?? order.order?.code;
   console.log(`order made: #${orderId} ${orderCode}`);
 
-  await db.query(
-    `INSERT INTO cf_company_settings (company_id, nest_custom_plates, updated_by) VALUES (?, ?, ?)
-     ON DUPLICATE KEY UPDATE nest_custom_plates = VALUES(nest_custom_plates), updated_by = VALUES(updated_by)`,
-    [COMPANY, JSON.stringify(CUSTOM), c.userId],
-  );
-  console.log(`custom plate rules: ${JSON.stringify(CUSTOM)}`);
+  // Small chunks (user, 2026-11-06): each step commits on its own, and a re-run finds what is already there and goes on
+  // from it — a lost connection on TiDB redoes one step, never the whole job.
+  const step = async (what) => { if (APPLY) { await db.commit(); console.log(`  committed: ${what}`); await db.beginTransaction(); } };
+  const [[had0]] = await db.query('SELECT nest_custom_plates AS v FROM cf_company_settings WHERE company_id = ?', [COMPANY]);
+  const same = had0?.v && JSON.stringify(typeof had0.v === 'string' ? JSON.parse(had0.v) : had0.v) === JSON.stringify(CUSTOM);
+  if (!same) {
+    await db.query(
+      `INSERT INTO cf_company_settings (company_id, nest_custom_plates, updated_by) VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE nest_custom_plates = VALUES(nest_custom_plates), updated_by = VALUES(updated_by)`,
+      [COMPANY, JSON.stringify(CUSTOM), c.userId],
+    );
+    await step('custom plate rules');
+  }
+  console.log(`custom plate rules: ${JSON.stringify(CUSTOM)}${same ? ' (already set)' : ''}`);
+  if (!had) await step('order');
 
   const lines = [];
   for (const s of SETS) {
     const bom = JSON.parse(fs.readFileSync(path.join(OUT, s.dir, 'bom.json'), 'utf8'));
     const [[std]] = await db.query('SELECT id, number FROM cf_standard_drawings WHERE company_id = ? AND deleted_at IS NULL AND number IN (?, ?) ORDER BY id DESC LIMIT 1', [COMPANY, bom.drawing.number, `${bom.drawing.number}${bom.drawing.revision}`]);
     if (!std) throw new Error(`No standard ${bom.drawing.number}: import it first (standard-import.mjs).`);
-    const made = await addLineFromStandard(db, c, orderId, { standardId: std.id, quantity: 1, description: s.description });
-    const lineId = made.fromStandard.lineId;
-    console.log(`line made: #${lineId}, ${made.fromStandard.rows} rows from ${made.fromStandard.number} v${made.fromStandard.versionNo}`);
-    await db.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id = ?", [COMPANY, lineId]);
+    // Already on the order from an earlier run that stopped part way: keep it.
+    const [[kept]] = await db.query('SELECT id FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND standard_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1', [COMPANY, orderId, std.id]);
+    let lineId;
+    if (kept) { lineId = Number(kept.id); console.log(`line kept: #${lineId} from ${std.number} (made by an earlier run)`); } else {
+      const made = await addLineFromStandard(db, c, orderId, { standardId: std.id, quantity: 1, description: s.description });
+      lineId = made.fromStandard.lineId;
+      console.log(`line made: #${lineId}, ${made.fromStandard.rows} rows from ${made.fromStandard.number} v${made.fromStandard.versionNo}`);
+      await db.query("UPDATE cf_sales_order_lines SET nest_plates = 'any' WHERE company_id = ? AND id = ?", [COMPANY, lineId]);
+      await step(`line #${lineId}`);
+    }
     lines.push({ ...s, lineId, bom, std });
   }
-  // --remove <lineId,lineId>: the lines these replace, off in the same transaction (refused if released or locked).
-  for (const old of String(arg('remove') ?? '').split(',').map(Number).filter(Boolean)) { await removeOrderLine(db, c, old); console.log(`line removed: #${old}`); }
+  // --remove <lineId,lineId>: the lines these replace, each its own step (refused if released or locked); one already gone is skipped.
+  for (const old of String(arg('remove') ?? '').split(',').map(Number).filter(Boolean)) {
+    const [[o]] = await db.query('SELECT deleted_at FROM cf_sales_order_lines WHERE company_id = ? AND order_id = ? AND id = ?', [COMPANY, orderId, old]);
+    if (!o || o.deleted_at) { console.log(`line #${old}: already removed`); continue; }
+    await removeOrderLine(db, c, old); console.log(`line removed: #${old}`);
+    await step(`removed #${old}`);
+  }
   // Both lines one production order. Made when the order is locked and confirmed; the plan says so from now.
   await saveExecutionPlan(db, c, orderId, { production: { level: 'order' } });
   console.log('execution plan: every line on the order level, so one production order');
-  if (APPLY) { await db.commit(); console.log('order, lines and plan COMMITTED'); await db.beginTransaction(); }
+  await step('execution plan');
 
   // --no-levels: a level is drawn from the one JSON on screen (docs/model_as_source.md); no level file is stored.
   for (const l of process.argv.includes('--no-levels') ? [] : lines) {
