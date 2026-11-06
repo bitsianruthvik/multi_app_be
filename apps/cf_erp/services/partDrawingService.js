@@ -77,6 +77,7 @@ import { createDrawing, reviseDrawing } from './drawingService.js';
 import { nextRevision } from '../lib/revision.js';
 import { parseDrawingName, matchCodePattern, codeWithNumbers } from '../lib/drawingName.js';
 import { dxfTextHints } from '../lib/nestDxfReader.js';
+import { modelLevelsOfStandard, drawnByModel } from '../lib/modelLevels.js';
 
 const FALLBACK_DENSITY = 7850;
 // A row is one TiDB entry (6 MB at most): a 4 MB file is 5.3 MB as base64.
@@ -91,7 +92,7 @@ const parseJson = (v) => { if (v == null) return null; if (typeof v !== 'string'
 
 async function requireLine(db, companyId, orderId, lineId) {
   const [[l]] = await db.query(
-    `SELECT l.id, l.order_id, l.line_no, l.line_type, l.item_id, l.quantity, l.locked_at, o.code AS order_code,
+    `SELECT l.id, l.order_id, l.line_no, l.line_type, l.item_id, l.quantity, l.locked_at, l.standard_id, o.code AS order_code,
             EXISTS (SELECT 1 FROM cf_production_releases r WHERE r.company_id = l.company_id AND r.order_line_id = l.id AND r.deleted_at IS NULL) AS released
        FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id AND o.deleted_at IS NULL
       WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL${orderId != null ? ' AND l.order_id = ?' : ''}`,
@@ -365,7 +366,7 @@ const geometryView = (g) => (g ? {
   cutLengthMm: g.cutLengthMm, piercings: g.piercings, holes: g.holes, holeDiameters: g.holeDiameters, innerCuts: g.innerCuts, rings: g.rings,
 } : null);
 
-function viewOf(line, rows, drawings, refs = new Map()) {
+function viewOf(line, rows, drawings, refs = new Map(), levels = new Set()) {
   const covered = new Set();
   const measured = new Set();
   let rectArea = 0; let trueArea = 0; let rectKg = 0; let trueKg = 0;
@@ -396,12 +397,16 @@ function viewOf(line, rows, drawings, refs = new Map()) {
     for (const p of linked) covered.add(p.id);
     return { drawing: refs.get(id), rows: linked.map((p) => rowView(p, null)) };
   }).sort((a, b) => String(a.drawing.number).localeCompare(String(b.drawing.number)));
+  // A level the line's ONE model draws has a drawing without a file (lib/modelLevels.js; user, 2026-11-06).
+  const modelRows = rows.filter((p) => !covered.has(p.id) && drawnByModel(levels, p.mark)).map((p) => p.id);
+  for (const id of modelRows) covered.add(id);
   const parts = rows.filter((p) => p.isPlatePart);
   const shaped = measured;
   return {
     line: { id: line.id, lineNo: line.line_no, orderId: line.order_id, orderCode: line.order_code, released: !!Number(line.released) },
     drawings: views,
     waiting,
+    modelRows,
     rowsWithoutDrawing: rows.filter((p) => !covered.has(p.id)).map((p) => ({ id: p.id, code: p.code, name: p.name, level: p.level, mark: p.mark, pieces: p.pieces, isPlatePart: p.isPlatePart })),
     summary: {
       rows: rows.length, rowsWithDrawing: covered.size, waiting: waiting.length,
@@ -425,6 +430,7 @@ export async function drawingTree(db, companyId, orderId, lineId) {
   const rows = await rowsOfLine(db, companyId, line);
   const drawings = await liveDrawings(db, companyId, line.id);
   const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
+  const levels = await modelLevelsOfStandard(db, companyId, line.standard_id);
   // A row with no file on the line may still be covered by a register drawing: one whose file a standard holds (it
   // opens with GET /drawings/:id/file), else one kept elsewhere (its link — an RDSO series sheet). Its file first.
   const sheetOf = (p) => {
@@ -439,7 +445,9 @@ export async function drawingTree(db, companyId, orderId, lineId) {
       const ref = d?.drawing_id != null ? refs.get(Number(d.drawing_id)) : null;
       return {
         rowId: p.id, parentId: p.parentId, code: p.code, name: p.name, level: p.level, depth: p.depth, seq: p.seq, mark: p.mark,
-        hasDrawing: !!d, drawingId: d ? Number(d.id) : null, fileKind: d ? d.file_kind ?? 'dxf' : null, fileName: d?.file_name ?? null,
+        hasDrawing: !!d, drawingId: d ? Number(d.id) : null,
+        // The line's one model draws this level (no file needed: the screen draws it from the model).
+        inModel: drawnByModel(levels, p.mark), fileKind: d ? d.file_kind ?? 'dxf' : null, fileName: d?.file_name ?? null,
         number: ref?.number ?? null, revision: ref?.revision ?? null, status: ref?.status ?? null,
         // No file on the line: the register drawing that covers the row (opens by its file, or by its link), else null.
         sheet: d ? null : sheetOf(p),
@@ -456,7 +464,7 @@ export async function getDrawings(db, companyId, orderId, lineId) {
   // The safety net: a plate part's drawing saved without a shape is read now, shown, and kept.
   await readMissingShapes(db, companyId, rows, drawings);
   const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
-  return viewOf(line, rows, drawings, refs);
+  return viewOf(line, rows, drawings, refs, await modelLevelsOfStandard(db, companyId, line.standard_id));
 }
 
 /** A number no other shop drawing has: "SO-20260930-0001/TF1", else with the line, else numbered on. */

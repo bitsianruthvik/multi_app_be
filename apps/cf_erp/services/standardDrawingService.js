@@ -34,6 +34,7 @@ import { readPartDrawing } from './partGeometry.js';
 import { normMark } from './partDrawingService.js';
 import { WORKED_OUT_SPECS, DRAWING_FACT_SPECS, AFTER_LOCK_SPECS, LIVE_WHEN_FROZEN, LOCKED_ORDER_STATUSES } from './records.js';
 import { planImport, normName } from '../lib/standardImport.js';
+import { modelLevelsOfStandard } from '../lib/modelLevels.js';
 
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const COPY_CHUNK = 1000;
@@ -236,6 +237,8 @@ export async function getStandard(db, companyId, id, q = {}) {
   if (q.versionId != null && q.versionId !== '' && !version) throw notFound('Version of the standard drawing');
   const files = await filesOf(db, companyId, s.id, version?.id ?? null);
   const tree = version ? await versionTree(db, companyId, version, files) : [];
+  // The levels the standard's ONE model draws: those rows have a drawing without a file (lib/modelLevels.js).
+  const modelLevels = [...await modelLevelsOfStandard(db, companyId, s.id)];
   const noOf = new Map(versions.map((v) => [Number(v.id), Number(v.version_no)]));
   return {
     ...standardView(s),
@@ -244,6 +247,7 @@ export async function getStandard(db, companyId, id, q = {}) {
     version: versionView(version),
     report: version?.report_json ? parseJson(version.report_json) : null,
     tree,
+    modelLevels,
     files: files.map(fileView),
     lines: lines.map((l) => ({
       id: Number(l.id), lineNo: l.line_no, orderId: Number(l.order_id), orderCode: Number(l.order_revision) > 1 ? `${l.order_code} rev ${l.order_revision}` : l.order_code,

@@ -627,7 +627,7 @@ export function planImport(bom, catalog) {
     }
     const k = rp.length === 1 && [...rp, ...rsp].every((c) => Number(c.qtyPerParent) % Number(rp[0].qtyPerParent) === 0) ? Number(rp[0].qtyPerParent) : 1;
     const stopper = {
-      id: `${node.id ?? 'N'}-STP`, kind: 'assembly', name: 'Seismic stopper', qtyPerParent: k,
+      id: `${node.id ?? 'N'}-STP`, kind: 'assembly', name: 'Seismic stopper', qtyPerParent: k, madeHere: true,
       children: [...rp, ...rsp].map((c) => ({ ...c, qtyPerParent: Number(c.qtyPerParent) / k })),
     };
     const at = children.indexOf(rp[0]);
@@ -645,8 +645,11 @@ export function planImport(bom, catalog) {
       return;
     }
     const key = `n${++seq}`;
-    // A span or a girder line carries no drawing mark of its own; a segment or an assembly does ("GA/…").
-    const mark = node.kind === 'span' || node.kind === 'girder' ? null : nodeMark(node);
+    // EVERY level carries its drawing mark — the span and the girder line too — because the screens draw each level from the
+    // structure's ONE model by that mark (user, 2026-11-06: "the drawings are only available at parts level"). The mark is
+    // the one the model uses for the level: its name's "G1/…", else the node's id. A group made here (the seismic stopper)
+    // is not a level of the model, so it has none.
+    const mark = nodeMark(node) ?? (node.madeHere || node.id == null ? null : String(node.id).slice(0, 120));
     const what = `${node.kind} ${node.name}`;
     const asked = nodeCandidates(node, items);
     const def = mapDef(asked, 'template', what, node.kind === 'span' || node.kind === 'girder' ? 'structure' : 'assembly', { span: asked[0] === 'Bridge span' });

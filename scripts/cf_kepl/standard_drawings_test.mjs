@@ -242,7 +242,10 @@ try {
   eq('a standard\'s rows belong to no order line', Number(owners[0].n), 0);
   const vTf1 = vt.byMark.get('TF1')[0];
   ok('TF1 on the standard: 32 × 480 × 7925, typed values', numOf(vTf1, 'THICKNESS') === 32 && numOf(vTf1, 'WIDTH') === 480 && numOf(vTf1, 'LENGTH') === 7925 && vTf1.values.get('THICKNESS').source === 'entered');
-  near('the root holds the span\'s weight', numOf(vt.byMark.get(null).find((r) => r.id === Number(ver.root_item_id)), 'WEIGHT'), s11751.bom.totals.steelKg, 1);
+  const vRoot = [...vt.byMark.values()].flat().find((r) => r.id === Number(ver.root_item_id));
+  near('the root holds the span\'s weight', numOf(vRoot, 'WEIGHT'), s11751.bom.totals.steelKg, 1);
+  // 2026-11-06: every level carries its drawing mark, the span too, so the screens can draw it from the one model.
+  ok('the span carries its drawing mark', !!vRoot?.values.get('DRAWING_MARK')?.value_text);
   const [files] = await conn.query("SELECT mark, drawing_id, geometry_json IS NOT NULL AS shaped FROM cf_standard_drawing_files WHERE version_id = ? AND kind = 'part' AND deleted_at IS NULL", [ver.id]);
   ok('36 part files, every one with its shape and its own register revision', files.length === 36 && files.every((f) => Number(f.shaped) && f.drawing_id));
   const [notes] = await conn.query(
