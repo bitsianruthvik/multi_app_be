@@ -39,9 +39,17 @@ try {
     if (!['cf-erp-model3d/1', 'cf-erp-model3d/2'].includes(m.schema) || !Array.isArray(m.elements)) throw new Error('Not a cf-erp-model3d model.');
     console.log(`${s.number}: model "${m.title ?? ''}", ${m.elements.length} elements, ${(text.length / 1e3).toFixed(0)} kB — ${APPLY ? 'saved' : 'dry run'}`);
     if (APPLY) {
-      await pool.query(
-        "INSERT INTO cf_standard_drawing_files (company_id, version_id, standard_id, kind, drawing_id, mark, mark_norm, file_name, file_kind, file_text) VALUES (?, NULL, ?, 'model', NULL, NULL, NULL, ?, 'json', ?)",
-        [COMPANY, STD, path.basename(arg('file')), text]);
+      // ONE JSON per structure (user, 2026-11-02 / 11-06): the older model is retired in the same commit, never left beside it.
+      const db = await pool.getConnection();
+      try {
+        await db.beginTransaction();
+        const [old] = await db.query("UPDATE cf_standard_drawing_files SET deleted_at = NOW() WHERE company_id = ? AND standard_id = ? AND kind = 'model' AND deleted_at IS NULL", [COMPANY, STD]);
+        await db.query(
+          "INSERT INTO cf_standard_drawing_files (company_id, version_id, standard_id, kind, drawing_id, mark, mark_norm, file_name, file_kind, file_text) VALUES (?, NULL, ?, 'model', NULL, NULL, NULL, ?, 'json', ?)",
+          [COMPANY, STD, path.basename(arg('file')), text]);
+        await db.commit();
+        if (old.affectedRows) console.log(`  the older model (${old.affectedRows}) retired`);
+      } catch (e) { await db.rollback().catch(() => {}); throw e; } finally { db.release(); }
     }
   }
 } finally { await pool.end(); }
