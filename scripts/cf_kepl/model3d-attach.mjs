@@ -37,6 +37,10 @@ try {
     const text = fs.readFileSync(path.resolve(arg('file')), 'utf8');
     const m = JSON.parse(text);
     if (!['cf-erp-model3d/1', 'cf-erp-model3d/2'].includes(m.schema) || !Array.isArray(m.elements)) throw new Error('Not a cf-erp-model3d model.');
+    // Only when required (user, 2026-11-07): the same JSON already live is left as it is.
+    const [[live]] = await pool.query("SELECT file_text FROM cf_standard_drawing_files WHERE company_id = ? AND standard_id = ? AND kind = 'model' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", [COMPANY, STD]);
+    if (live && live.file_text === text) { console.log(`${s.number}: the same model is already live — nothing to do`); }
+    else {
     console.log(`${s.number}: model "${m.title ?? ''}", ${m.elements.length} elements, ${(text.length / 1e3).toFixed(0)} kB — ${APPLY ? 'saved' : 'dry run'}`);
     if (APPLY) {
       // ONE JSON per structure (user, 2026-11-02 / 11-06): the older model is retired in the same commit, never left beside it.
@@ -50,6 +54,7 @@ try {
         await db.commit();
         if (old.affectedRows) console.log(`  the older model (${old.affectedRows}) retired`);
       } catch (e) { await db.rollback().catch(() => {}); throw e; } finally { db.release(); }
+    }
     }
   }
 } finally { await pool.end(); }

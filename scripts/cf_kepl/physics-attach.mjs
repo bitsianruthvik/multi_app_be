@@ -9,7 +9,7 @@
  * retired). warnings_json keeps { set, generated, modelSha, summary }.
  *
  * DRY RUN BY DEFAULT (makes the pages, writes nothing). --apply commits one standard at a time; re-running skips a standard
- * whose stored physics was made from the same model, unless --force.
+ * whose stored physics was made from the same model AND the same physics code (its last commit), unless --force.
  *   node scripts/cf_kepl/physics-attach.mjs --company 30005 --prod [--standard <id>] [--live] [--apply] [--force]
  *   --live: only standards some live order line is made from.
  */
@@ -29,6 +29,10 @@ if (process.argv.includes('--prod')) {
 }
 const BOM = path.resolve(__dir, '..', '..', '..', 'drawing_bom'); const OUT = path.join(BOM, 'out');
 const sha = (s) => crypto.createHash('sha1').update(s, 'utf8').digest('hex');
+// Only when required (user, 2026-11-07): the physics code's version, so a page is rebuilt only when the model OR the physics changed.
+// The last commit touching what the screen runs on; uncommitted edits there make it 'dirty' (always rebuilt).
+const PHYS_PATHS = ['src/physics', 'src/model2', 'src/verify/plateRules.mjs'];
+const physicsVersion = (() => { try { const h = execFileSync('git', ['log', '-1', '--format=%H', '--', ...PHYS_PATHS], { cwd: BOM }).toString().trim(); const dirty = execFileSync('git', ['status', '--porcelain', '--', ...PHYS_PATHS], { cwd: BOM }).toString().trim(); return dirty ? `${h}-dirty` : h; } catch { return null; } })();
 const { pool } = await import(pathToFileURL(path.join(__dir, '..', '..', 'db.js')).href);
 
 // The packages, by their model's sha.
@@ -49,14 +53,15 @@ for (const s of stds) {
   if (!set) { console.log(`skip ${name}: no package in drawing_bom/out has this exact model`); skipped++; continue; }
   const [[have]] = await pool.query("SELECT id, warnings_json FROM cf_standard_drawing_files WHERE company_id = ? AND standard_id = ? AND kind = 'physics' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", [COMPANY, s.standard_id]);
   let haveSha = null; try { haveSha = JSON.parse(have?.warnings_json ?? 'null')?.modelSha ?? null; } catch { /* none */ }
-  if (have && haveSha === h && !FORCE) { console.log(`ok   ${name}: ${set}, physics already from this model`); continue; }
+  let haveVer = null; try { haveVer = JSON.parse(have?.warnings_json ?? 'null')?.physicsVersion ?? null; } catch { /* none */ }
+  if (have && haveSha === h && haveVer && haveVer === physicsVersion && !/dirty/.test(physicsVersion ?? '') && !FORCE) { console.log(`ok   ${name}: ${set}, physics already from this model and this physics code`); continue; }
   const t0 = Date.now();
   try { execFileSync(process.execPath, ['src/physics/viewData.mjs', `out/${set}`], { cwd: BOM, stdio: ['ignore', 'pipe', 'pipe'], timeout: 600000 }); }
   catch (e) { console.log(`FAIL ${name}: ${set}: the physics did not run — ${String(e.stderr ?? e.message).split('\n').filter(Boolean).slice(-2).join(' ')}`); skipped++; continue; }
   const html = fs.readFileSync(path.join(OUT, set, 'physics_view.html'), 'utf8');
   const data = JSON.parse(fs.readFileSync(path.join(OUT, set, 'physics_view.json'), 'utf8'));
   const counts = {}; for (const f of data.findings ?? []) counts[f.status] = (counts[f.status] ?? 0) + 1;
-  const meta = { set, generated: data.generated, modelSha: h, summary: { ...(data.summary ?? {}), findings: counts, type: data.type ?? null } };
+  const meta = { set, generated: data.generated, modelSha: h, physicsVersion, summary: { ...(data.summary ?? {}), findings: counts, type: data.type ?? null } };
   console.log(`${APPLY ? 'save' : 'would save'} ${name}: ${set}, ${(html.length / 1048576).toFixed(2)} MB, ${Math.round((Date.now() - t0) / 1000)} s${have ? ' (replaces the older one)' : ''}`);
   if (APPLY) {
     const db = await pool.getConnection();
