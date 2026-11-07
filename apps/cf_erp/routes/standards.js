@@ -26,6 +26,7 @@ import {
   addLineFromStandard, lineStandard, saveLineToStandard, keepStandard,
 } from '../services/standardDrawingService.js';
 import { standardModel3d } from '../services/model3dService.js';
+import { standardPhysicsInfo, standardPhysicsPage } from '../services/physicsService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -43,6 +44,12 @@ router.get('/standard-drawings/files/:fileId', view, handle(async (req, res) => 
   res.send(out.buffer);
 }));
 router.get('/standard-drawings/:id/model3d', view, handle((req) => standardModel3d(pool, company(req), id(req))));
+router.get('/standard-drawings/:id/physics', view, handle((req) => standardPhysicsInfo(pool, company(req), id(req))));
+router.get('/standard-drawings/:id/physics/page', view, handle(async (req, res) => {
+  const html = await standardPhysicsPage(pool, company(req), id(req));
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');   // shown only inside a sandboxed frame
+  res.send(html);
+}));
 router.get('/standard-drawings/:id', view, handle((req) => getStandard(pool, company(req), id(req), req.query)));
 router.post('/standard-drawings', manage, handle((req) => tx(req, (db, c) => createStandard(db, c, req.body ?? {}))));
 router.put('/standard-drawings/:id', manage, handle((req) => tx(req, (db, c) => updateStandard(db, c, id(req), req.body ?? {}))));
