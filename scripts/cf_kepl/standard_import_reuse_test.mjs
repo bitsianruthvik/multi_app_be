@@ -21,6 +21,7 @@ const defs = [
   def('Splice plate', 11, { status: 'obsolete' }), def('Cover plate', 11, { status: 'obsolete' }), def('Web cover plate', 11),
   def('Bracing', 12), def('Bottom lateral bracing member', 12), def('Angle cleat', 12),
   def('Bottom longitudinal beam', 23), def('Intermediate cross beam', 24),
+  def('Bow string girder span', 21), def('Tub girder span', 21),
 ];
 const catalog = { defs, classes, specs: new Map(), gradeOption: new Map(), impactOption: new Map(), materialOption: new Map(), studs: [], bolts: [], standards: new Map() };
 const plate = (id, mark, role, description) => ({ id, mark, role, description, category: 'plate', thicknessMm: 20, widthMm: 300, lengthMm: 1000 });
@@ -126,6 +127,22 @@ ok('a bent plate → Gusset plate', to(tr, 'P12') === 'Gusset plate');
 ok('"Top inner flange cover plate" → Top flange inner cover plate', to(tr, 'P16') === 'Top flange inner cover plate', to(tr, 'P16'));
 ok('a flange cover plate on both faces → Flange cover plate', to(tr, 'P27') === 'Flange cover plate', to(tr, 'P27'));
 ok('a TLB tee → Top lateral bracing member', to(tr, 'A1') === 'Top lateral bracing member', to(tr, 'A1'));
+console.log('6. Each structure takes the span of its own kind (2026-11-07: bow strings had been given the Composite girder span)');
+const rootOf = (p) => (p.rows[0]?.def?.new ? `NEW ${p.rows[0].def.new}` : (p.rows[0]?.def?.name ?? '(none)'));
+ok('a bow string span → Bow string girder span', rootOf(b) === 'Bow string girder span', rootOf(b));
+ok('…never the Composite girder span (SPAN-001)', b.rows[0]?.def?.code !== 'SPAN-001');
+const bsTitle = planImport({ ...bomOf('1 x 49.4 m clear span steel bow string girder', [], []), assembly: { kind: 'span', name: 'SPAN/Span 49.4 m clear', children: [] } }, catalog);
+ok('the drawing title says bow string when the span name does not', rootOf(bsTitle) === 'Bow string girder span', rootOf(bsTitle));
+const tub = planImport(bomOf('Khajaguda flyover P10–P13: 3 × 30 m continuous steel tub girder superstructure', [], []), catalog);
+ok('a continuous steel tub girder → Tub girder span', rootOf(tub) === 'Tub girder span', rootOf(tub));
+const owg = planImport(bomOf('RDSO/B-17186: 30.50 m clear span open web girder, welded through type', [], []), { ...catalog, defs: trussDefs });
+ok('a railway open web girder → Steel truss span', rootOf(owg) === 'Steel truss span', rootOf(owg));
+const noBs = { ...catalog, defs: defs.filter((d) => !/^(Bow string girder span|Tub girder span)$/.test(d.name)) };
+const bNew = planImport(bomOf('Bow string span 72 m', [], []), noBs);
+const nd = bNew.newDefinitions.find((d) => d.name === 'Bow string girder span');
+ok('a tenant without it: a NEW Bow string girder span (asked by name), never SPAN-001', rootOf(bNew) === 'NEW Bow string girder span', rootOf(bNew));
+ok('…filed as a structure, beside the Composite girder span (its nearest, a telling word)', nd?.classHint === 'structure' && nd?.nearest?.name === 'Composite girder span' && nd?.nearest?.telling, JSON.stringify(nd));
+ok('a launching tackle keeps its own name', rootOf(planImport({ ...bomOf('Launching tackle', [], []), assembly: { kind: 'span', name: 'LT/Launching tackle', children: [] } }, catalog)) === 'NEW Launching tackle');
 ok('a girder title without truss words is still a Bridge span', planImport(bomOf('Plate girder 36 m', [], []), catalog).rows[0]?.def?.name === 'Composite girder span');
 
 console.log(`\n${pass} passed, ${fail} failed`);

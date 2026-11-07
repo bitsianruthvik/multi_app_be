@@ -269,6 +269,24 @@ export function trussNodeCandidates(name) {
 }
 const TRUSS_KINDS = new Set(['truss', 'member', 'joint', 'cross_girder', 'stringer', 'bracing']);
 
+/**
+ * The span definition a structure's root takes, by its kind in the bom.json name (or the drawing's title):
+ * a launching tackle its own name; a truss / open web girder (road or railway, through type) "Steel truss span";
+ * a bow string (arch) girder "Bow string girder span"; a tub / box girder "Tub girder span"; anything else the
+ * catalog's girder span ("Bridge span" → SPAN-001, Composite girder span).
+ */
+export const SPAN_KINDS = [
+  { re: /\bTRUSS\b|OPEN\s+WEB|THROUGH\s+TYPE|\bOWG\b/, name: 'Steel truss span' },
+  { re: /BOW\s*STRING|\bARCH\b/, name: 'Bow string girder span' },
+  { re: /\bTUB\b|\bTUBS\b|\bBOX\s+GIRDER/, name: 'Tub girder span' },
+];
+export function spanCandidates(text) {
+  const name = String(text ?? '').toUpperCase();
+  if (/LAUNCH|TACKLE|LIFTING\s+ARRANGEMENT/.test(name)) return [plainName(nodeTitle(name))];
+  const k = SPAN_KINDS.find((x) => x.re.test(name));
+  return k ? [k.name] : ['Bridge span'];
+}
+
 /** The definition names an assembly node may take (IMPORT_FORMAT.md `assembly` kinds). */
 export function nodeCandidates(node, items = null) {
   const name = String(node?.name ?? '').toUpperCase();
@@ -279,7 +297,9 @@ export function nodeCandidates(node, items = null) {
   switch (node?.kind) {
     // A launching / lifting tackle is not a bridge span: it gets its own name.
     // A truss span is its own kind of span (user, 2026-10-31: a 75 m through truss), never the girder span.
-    case 'span': return /LAUNCH|TACKLE|LIFTING\s+ARRANGEMENT/.test(name) ? [plainName(nodeTitle(name))] : /\bTRUSS\b|OPEN\s+WEB|THROUGH\s+TYPE|\bOWG\b/.test(name) ? ['Steel truss span'] : ['Bridge span'];
+    // A bow string (arch) girder and a tub (box) girder are their own kinds of span too (user, 2026-11-07: "all the
+    // relevant spans like bowstring or other types of girders"); a plate girder span stays the catalog's girder span.
+    case 'span': return spanCandidates(name);
     case 'girder': return ['Girder line'];
     case 'girder_segment': return ['Girder segment'];
     case 'splice_set': return ['Splice set'];
@@ -651,7 +671,9 @@ export function planImport(bom, catalog) {
     // is not a level of the model, so it has none.
     const mark = nodeMark(node) ?? (node.madeHere || node.id == null ? null : String(node.id).slice(0, 120));
     const what = `${node.kind} ${node.name}`;
-    const asked = nodeCandidates(node, items);
+    // The root span: its own name first, else the drawing's title says what kind it is ("1 x 72 m … bow string girder").
+    let asked = nodeCandidates(node, items);
+    if (node.kind === 'span' && depth === 0 && asked[0] === 'Bridge span') asked = spanCandidates(dw.title ?? '');
     const def = mapDef(asked, 'template', what, node.kind === 'span' || node.kind === 'girder' ? 'structure' : 'assembly', { span: asked[0] === 'Bridge span' });
     // What a group's name says after ":" ("use only the variant of the span being launched") is a NOTE on its line.
     const nodeNote = /:\s*(.+)$/.exec(String(node.name ?? '').replace(/\([^)]*\)/g, ''))?.[1]?.trim() ?? null;

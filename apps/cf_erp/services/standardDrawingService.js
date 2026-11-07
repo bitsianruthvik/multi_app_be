@@ -807,6 +807,79 @@ async function copyMasterRules(db, companyId, fromId, toId, userId) {
   return rules.length;
 }
 
+/**
+ * A new SPAN beside a span (user, 2026-11-07: a bow string girder span beside the Composite girder span) takes what makes a
+ * span a span besides its rules: the sibling's flow (trial assembly, dismantling, dispatch), its HSN and GST, its own
+ * values (CUT_FROM NONE …) and every live wait rule that names the sibling as the ancestor to wait for ("blasting waits for
+ * the span's dismantling"), so the pieces below the new span wait as they did under the old one. → what was copied.
+ */
+async function copySpanSetup(db, companyId, fromId, toId, userId) {
+  const jsonText = (j) => (j == null ? null : typeof j === 'string' ? j : JSON.stringify(j));
+  const [[from]] = await db.query(
+    `SELECT m.default_flow_id, d.hsn_code, d.gst_rate FROM cf_master_records m JOIN cf_definition_details d ON d.master_id = m.id
+      WHERE m.company_id = ? AND m.id = ?`, [companyId, fromId]);
+  if (!from) return { flow: false, tax: false, values: 0, waits: 0 };
+  if (from.default_flow_id) await db.query('UPDATE cf_master_records SET default_flow_id = ? WHERE company_id = ? AND id = ? AND default_flow_id IS NULL', [from.default_flow_id, companyId, toId]);
+  if (from.hsn_code || from.gst_rate != null) await db.query('UPDATE cf_definition_details SET hsn_code = COALESCE(hsn_code, ?), gst_rate = COALESCE(gst_rate, ?) WHERE company_id = ? AND master_id = ?', [from.hsn_code, from.gst_rate, companyId, toId]);
+  const [vals] = await db.query(
+    `SELECT specification_id, value_number, value_text, value_bool, value_date, option_id, value_json, uom, source FROM cf_spec_values
+      WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND deleted_at IS NULL
+        AND (value_number IS NOT NULL OR value_text IS NOT NULL OR value_bool IS NOT NULL OR value_date IS NOT NULL OR option_id IS NOT NULL OR value_json IS NOT NULL)`, [companyId, fromId]);
+  const [held] = await db.query("SELECT specification_id FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND deleted_at IS NULL", [companyId, toId]);
+  const fresh = vals.filter((v) => !held.some((h) => Number(h.specification_id) === Number(v.specification_id)));
+  if (fresh.length) {
+    await insertRows(db, 'cf_spec_values', ['company_id', 'specification_id', 'subject_type', 'subject_id', 'value_number', 'value_text', 'value_bool', 'value_date', 'option_id', 'value_json', 'uom', 'source', 'created_by'],
+      fresh.map((v) => [companyId, v.specification_id, 'master', toId, v.value_number, v.value_text, v.value_bool, v.value_date, v.option_id, jsonText(v.value_json), v.uom, v.source ?? 'entered', userId]));
+    const [ids] = await db.query("SELECT id, specification_id FROM cf_spec_values WHERE company_id = ? AND subject_type = 'master' AND subject_id = ? AND deleted_at IS NULL", [companyId, toId]);
+    const idOf = new Map(ids.map((r) => [Number(r.specification_id), r.id]));
+    await insertRows(db, 'cf_spec_value_history', ['company_id', 'value_id', 'specification_id', 'subject_type', 'subject_id', 'change_type', 'old_value', 'new_value', 'changed_by'],
+      fresh.map((v) => [companyId, idOf.get(Number(v.specification_id)), v.specification_id, 'master', toId, 'create', null,
+        JSON.stringify({ number: v.value_number, text: v.value_text, bool: v.value_bool, date: v.value_date, option_id: v.option_id, json: v.value_json, uom: v.uom, source: v.source ?? 'entered' }), userId]));
+  }
+  // Wait rules on live flows only (an obsolete flow's steps are not changed).
+  const [waits] = await db.query(
+    `SELECT w.flow_step_id, w.relation, w.target_operation_id, w.required_status, w.notes FROM cf_step_wait_rules w
+       JOIN cf_operation_flow_steps fs ON fs.id = w.flow_step_id AND fs.company_id = w.company_id
+       JOIN cf_operation_flows f ON f.id = fs.flow_id AND f.company_id = w.company_id AND f.deleted_at IS NULL AND f.status <> 'obsolete'
+      WHERE w.company_id = ? AND w.target_definition_id = ? AND w.deleted_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM cf_step_wait_rules x WHERE x.company_id = w.company_id AND x.flow_step_id = w.flow_step_id AND x.relation = w.relation
+                          AND x.target_definition_id = ? AND x.deleted_at IS NULL AND IFNULL(x.target_operation_id, 0) = IFNULL(w.target_operation_id, 0))`,
+    [companyId, fromId, toId]);
+  if (waits.length) {
+    await insertRows(db, 'cf_step_wait_rules', ['company_id', 'flow_step_id', 'relation', 'target_definition_id', 'target_operation_id', 'required_status', 'notes', 'created_by'],
+      waits.map((w) => [companyId, w.flow_step_id, w.relation, toId, w.target_operation_id, w.required_status, w.notes, userId]));
+  }
+  return { flow: !!from.default_flow_id, tax: !!from.hsn_code, values: fresh.length, waits: waits.length };
+}
+
+/**
+ * The importer's new definitions, made: each filed beside its nearest (classFor), named, short-named from its name,
+ * activated, with its nearest sibling's rules — and, for a span beside a span, that span's setup (copySpanSetup).
+ * `newDefs` [{ name, classHint, nearest }] as planImport gives them. → Map(name → { id, code, name, classification_id, … }).
+ * Exported so a catalog fix (scripts/cf_kepl/span-definitions.mjs) makes a definition exactly as an import would.
+ */
+export async function createNewDefinitions(db, c, catalog, newDefs) {
+  const { companyId } = c;
+  const { createDefinition, setStatus } = await import('./masterRecordService.js');
+  const made = new Map();
+  const taken = new Set();
+  for (const nd of newDefs) {
+    const classificationId = classFor(catalog, nd.classHint, nd.nearest);
+    if (!classificationId) throw invalid('NO_CLASS', `No place to file the new definition ${nd.name}: the catalog has none of the usual ${nd.classHint} definitions.`);
+    const rec = await createDefinition(db, c, { definitionType: 'template', classificationId, name: nd.name, shortName: shortNameFor(catalog, nd.name, taken) });
+    const active = await setStatus(db, c, rec.id, 'active');
+    // Its nearest sibling's own specification rules (coats, surface area, welds …) come with it, so its rows ask for the
+    // same values the definitions beside it do. Only from a sibling filed in the same class.
+    const sib = nd.nearest?.telling && Number(nd.nearest.classification_id) === classificationId ? Number(nd.nearest.id) : null;
+    const copied = sib ? await copyMasterRules(db, companyId, sib, Number(rec.id), c.userId ?? null) : 0;
+    const spanBesideSpan = sib && nd.classHint === 'structure' && /\bspan\b/i.test(nd.name) && /\bspan\b/i.test(String(nd.nearest.name ?? ''));
+    const setup = spanBesideSpan ? await copySpanSetup(db, companyId, sib, Number(rec.id), c.userId ?? null) : null;
+    const [[fresh]] = await db.query('SELECT default_flow_id FROM cf_master_records WHERE id = ?', [rec.id]);
+    made.set(nd.name, { id: Number(rec.id), code: active.code ?? null, name: nd.name, classification_id: classificationId, default_flow_id: fresh?.default_flow_id ?? null, bom_id: null, rulesFrom: sib, rules: copied, setup });
+  }
+  return made;
+}
+
 /** The names a person allowed to be made new (`allowNew`: an array of names, or true for any — tests, old scripts). */
 function notAllowedNew(plan, allowNew) {
   if (allowNew === true) return [];
@@ -859,20 +932,7 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
   }
 
   // ---- 1. the new definitions (rare: only what nothing in the catalog fits) ----
-  const { createDefinition, setStatus } = await import('./masterRecordService.js');
-  const made = new Map();
-  const taken = new Set();
-  for (const nd of plan.newDefinitions) {
-    const classificationId = classFor(catalog, nd.classHint, nd.nearest);
-    if (!classificationId) throw invalid('NO_CLASS', `No place to file the new definition ${nd.name}: the catalog has none of the usual ${nd.classHint} definitions.`);
-    const rec = await createDefinition(db, c, { definitionType: 'template', classificationId, name: nd.name, shortName: shortNameFor(catalog, nd.name, taken) });
-    const active = await setStatus(db, c, rec.id, 'active');
-    // Its nearest sibling's own specification rules (coats, surface area, welds …) come with it, so its rows ask for the
-    // same values the definitions beside it do. Only from a sibling filed in the same class.
-    const sib = nd.nearest?.telling && Number(nd.nearest.classification_id) === classificationId ? Number(nd.nearest.id) : null;
-    const copied = sib ? await copyMasterRules(db, companyId, sib, Number(rec.id), c.userId ?? null) : 0;
-    made.set(nd.name, { id: Number(rec.id), code: active.code ?? null, name: nd.name, classification_id: classificationId, default_flow_id: null, bom_id: null, rulesFrom: sib, rules: copied });
-  }
+  const made = await createNewDefinitions(db, c, catalog, plan.newDefinitions);
   for (const r of plan.rows) if (r.def?.new) r.def = made.get(r.def.new);
   const unresolved = new Set();
 
