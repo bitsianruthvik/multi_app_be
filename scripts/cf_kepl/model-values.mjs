@@ -72,6 +72,10 @@ try {
       console.log(`  worked out after them: ${r.values} value rows over ${r.records} rows; open required values ${r.openRequired.before} → ${r.openRequired.after}`);
       if (r.cutPieces) console.log(`  cut pieces: ${JSON.stringify(r.cutPieces)}`);
       if (r.pieces.length) console.log(`  piece counts differ from the BOM (${r.pieces.length}): ${r.pieces.slice(0, 15).map((p) => `${p.mark} model ${p.model} / BOM ${p.bom}`).join('; ')}`);
+      const rep = r.replaced ?? []; const byRep = new Map(); for (const d of rep) byRep.set(d.code, (byRep.get(d.code) ?? 0) + 1);
+      if (rep.length) console.log(`  typed values replaced by the model (${rep.length}): ${[...byRep].map(([k, v]) => `${k} ${v}`).join(', ')}`);
+      for (const d of rep.slice(0, LIST ? 10000 : 12)) console.log(`    ${d.mark ?? '?'} ${d.code}: was ${d.wasText}, now ${d.modelText}`);
+      if (!LIST && rep.length > 12) console.log(`    … ${rep.length - 12} more (--list)`);
       const byCode = new Map(); for (const d of r.disagreements) byCode.set(d.code, (byCode.get(d.code) ?? 0) + 1);
       if (byCode.size) console.log(`  disagreements by value: ${[...byCode].map(([k, v]) => `${k} ${v}`).join(', ')}`);
       for (const d of r.disagreements.slice(0, LIST ? 10000 : 12)) console.log(`    ${d.mark ?? '?'} ${d.code}: ${d.by === 'drawing' ? 'drawing' : 'typed'} ${d.heldText}, model ${d.modelText}`);

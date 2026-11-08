@@ -16,8 +16,9 @@
  *   piece counts   the model's pieces per mark against the BOM's — REPORTED, never written
  *
  * RULES (decisions of 2026-11-08):
- *   1. A value a person typed (source 'entered') ALWAYS stays; where the model says otherwise it is listed as a
- *      disagreement ("model says 576, typed 1036.8") for a person to accept (accept = write the model's value as theirs).
+ *   1. The model's value wins (user, 2026-11-08: "I want the calculated one, not the typed one"): a typed value
+ *      (source 'entered') the model says otherwise is REPLACED and listed in `replaced` ("was 9135, model 9133.681").
+ *      Only a drawing fact (drawingValueService, from the part's own file) that differs is listed as a disagreement.
  *   2. Order choices (grade, impact class, coats) are never written — the model does not know them.
  *   3. Computed on the standard's VERSION when its model is attached; a line made or replaced from that version copies
  *      the values with the rows (treeCopyService keeps the source). A line can be computed on its own too.
@@ -282,6 +283,15 @@ export async function applyModel(db, c, opts = {}) {
         out.written += 1;
       } else if (row.source === 'entered') {
         if (same) { out.kept += 1; continue; }
+        // User, 2026-11-08: "I want the calculated one, not the typed one." The model's value replaces a typed one
+        // (a fact the drawing wrote stays the drawing's); every replacement is listed with what was there.
+        if (!isFact) {
+          writes.push({ recordId: id, spec, typed: Array.isArray(value) ? { value_json: value } : { value_number: value }, source: 'model' });
+          out.written += 1;
+          out.replaced = out.replaced ?? [];
+          out.replaced.push({ recordId: id, mark: markText, row: rec?.name ?? null, code, was: now, model: value, wasText: words(code, now, spec.default_uom), modelText: words(code, value, spec.default_uom) });
+          continue;
+        }
         out.disagreements.push({
           recordId: id, mark: markText, row: rec?.name ?? null, code, held: now, model: value, heldText: words(code, now, spec.default_uom), modelText: words(code, value, spec.default_uom),
           // A fact the drawing wrote (drawingValueService) is not a person's: its part file and the model differ — said, not accepted.
