@@ -11,11 +11,14 @@
  *   node scripts/cf_kepl/standard-import.mjs ../drawing_bom/out/RDSO_11751R3 --company 2 --apply    writes it, ONE transaction
  *        [--source-url <url>]   when bom.json records none
  *        [--user <id>]          who it is written by (default: the company's first user)
- *        [--section-class BR]   on --apply, section parts take the catalog bar of this impact class (the class is the
- *                               order's on these sets); without it they are left to choose. Values the drawing settles
- *                               (segment lengths, girder type, segment holes / drilled thickness, assembly surface)
- *                               and flows by usage are filled either way (lib/standardGaps.js, 2026-10-18).
- *        [--no-gap-fill]        skip the gap fill (a set that carries its own values)
+ *        [--gap-fill]           OLD SETS ONLY: fill the gaps the drawing settles (segment lengths, girder type, segment holes /
+ *                               drilled thickness, assembly surface) and flows by usage, row by row (lib/standardGaps.js,
+ *                               2026-10-18). OFF by default since 2026-11-08 (user: "only when we upload the 3D json can it
+ *                               infer most values … until then only manual fill"): the geometry comes from the 3D model
+ *                               (modelValueService.applyModel). --no-gap-fill is still accepted (it is the default).
+ *        [--section-class BR]   with --gap-fill: section parts take the catalog bar of this impact class
+ *        [--model-values]       with --into: compute the new version's values from the standard's 3D model before the
+ *                               line copy (ON by default when the standard has a model; --no-model-values skips it)
  *        [--allow-new "A,B"]    the new definitions agreed to, by name; --apply refuses any other new one (2026-11-06)
  *        [--json]               the report as JSON
  *        [--prod]               the production database: DB_* from TM/.env.tidb (the same way the other cf_kepl scripts reach it)
@@ -106,11 +109,17 @@ try {
   const out = await STD.importStandard(conn, c, { bom, files, apply: APPLY, sourceUrl: arg('source-url'), allowNew, intoStandardId: INTO });
   // --no-gap-fill: a set that carries every value itself skips the fill (on TiDB a write in it went through another
   // connection and waited on this transaction's own locks — 50 s a time — 2026-10-31).
-  if (APPLY && out.standardId && !process.argv.includes('--no-gap-fill')) {
+  if (APPLY && out.standardId && process.argv.includes('--gap-fill')) {
     const { fillImportedGaps } = await imp('apps/cf_erp/services/standardGapFixService.js');
     try { out.report.gapFill = await fillImportedGaps(conn, c, { standardId: out.standardId, bom, sectionClass: arg('section-class') ? String(arg('section-class')).toUpperCase() : null }); } catch (e) { out.report.gapFill = { error: e.message }; }
   }
   tick('import + gap fill');
+  // The new version's values from the standard's 3D model (one computation per drawing set), before the line copies it.
+  if (APPLY && INTO && out.report.written?.versionId && !process.argv.includes('--no-model-values')) {
+    const { applyModel } = await imp('apps/cf_erp/services/modelValueService.js');
+    out.report.modelValues = await applyModel(conn, c, { versionId: out.report.written.versionId, bom });
+    tick('values from the model');
+  }
   out.report.setup = setup.actions;
   if (APPLY && ONTO) {
     const versionId = out.report.written?.versionId; if (!versionId) throw new Error('The import wrote no version.');
@@ -189,6 +198,7 @@ function printReport(r, { host, co, trips }) {
   if (r.gapFill) line(r.gapFill.error ? `
 Gaps left to fill (the fill failed: ${r.gapFill.error})` : `
 Gaps filled from the drawing: ${r.gapFill.values} values, ${r.gapFill.sections} section bars, ${r.gapFill.flows} flows (of ${r.gapFill.before}); left for a person: ${r.gapFill.skipped.length}${r.gapFill.problems.length ? `; refused: ${r.gapFill.problems.join('; ')}` : ''}`);
+  if (r.modelValues) line(r.modelValues.skipped ? `\nValues from the 3D model: none (${r.modelValues.skipped})` : `\nValues from the 3D model: ${r.modelValues.written} written, ${r.modelValues.kept} typed kept, ${r.modelValues.disagreements.length} disagreements; open required ${r.modelValues.openRequired.before} → ${r.modelValues.openRequired.after}`);
   if (r.written) line(`\nWritten: standard #${r.written.standardId}, version #${r.written.versionId}, register drawing #${r.written.drawingId}, ${r.written.rows} rows, ${r.written.files} files.`);
   line(`\nRound trips: ${trips}${APPLY ? '' : ' (dry run reads)'}`);
   if (!APPLY) line('Nothing written. --apply writes it in one transaction.');

@@ -8321,3 +8321,40 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_specifications'
             AND COLUMN_NAME = 'data_type' AND COLUMN_TYPE LIKE '%''list''%') = 1, 'S99-OK', 'S99-MISSING') AS result;
+
+-- ============================================================================
+-- §100  VALUES FROM THE 3D MODEL — value source 'model' and the runs that wrote them (2026-11-08)
+-- ============================================================================
+-- User, 2026-11-08: "The values should compute when we upload the 3D json. Until then only manual fill."
+-- (TM/plans/values-from-model.md; services/modelValueService.js.) A value the structure's model (cf-erp-model3d/2 + its part
+-- files) works out — LENGTH, WIDTH, THICKNESS, HOLES, the drawing facts, HOLE_DRILL_THICKNESS, weld length and size — is
+-- stored with source 'model'. It is the row's OWN value for resolution (like 'entered'), but it is NOT typed by a person:
+-- a re-upload rewrites only 'model' rows, a person's 'entered' value is never touched (a disagreement is listed instead),
+-- and it is not part of a row's design signature.
+--   cf_model_value_runs   one row per applyModel: the version or line it ran on, the model file, and its report
+--                         { written, unchanged, kept, disagreements: [...], notDerivable: [...], pieces: [...] } — the Values
+--                         screen lists the disagreements of the line's latest run that still stand. Idempotent.
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_spec_values'
+             AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''model''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_spec_values MODIFY COLUMN source ENUM('entered','fixed','defaulted','calculated','rollup','inherited','model') NOT NULL DEFAULT 'entered'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_model_value_runs (
+  id              INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT          NOT NULL,
+  subject_type    ENUM('version','line') NOT NULL,
+  subject_id      INT          NOT NULL,
+  standard_id     INT          NULL,
+  model_file_id   INT          NULL,
+  applied         TINYINT(1)   NOT NULL DEFAULT 1,     -- 0: a frozen line, the differences only
+  report_json     JSON         NULL,
+  deleted_at      DATETIME     DEFAULT NULL,
+  created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  created_by      INT          NULL,
+  KEY idx_cmvr_subject (company_id, subject_type, subject_id, id),
+  CONSTRAINT fk_cmvr_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_spec_values'
+            AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''model''%')
+          + (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_model_value_runs') = 2, 'S100-OK', 'S100-MISSING') AS result;

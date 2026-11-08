@@ -15,6 +15,9 @@
  *                                                (the file also goes on the line's top row)
  *   POST   /order-lines/:id/standard/save        { note? } — the line's BOM and values become the standard's next version
  *   POST   /order-lines/:id/standard/keep        "Keep the standard as it is" for the BOM as it stands
+ *   POST   /standard-drawings/:id/model-values   the values the standard's 3D model gives, written on its CURRENT version
+ *                                                (modelValueService.applyModel) → its report
+ *   POST   /order-lines/:id/model-values         the same on one order line (a locked line: the differences only)
  *
  * Reads: the orders view or the catalog view grant. Writes: the orders manage grant — the people who add lines.
  */
@@ -26,6 +29,8 @@ import {
   addLineFromStandard, lineStandard, saveLineToStandard, keepStandard,
 } from '../services/standardDrawingService.js';
 import { standardModel3d } from '../services/model3dService.js';
+import { applyModel } from '../services/modelValueService.js';
+import { invalid } from '../lib/errors.js';
 import { standardPhysicsInfo, standardPhysicsPage } from '../services/physicsService.js';
 
 const router = Router();
@@ -59,5 +64,12 @@ router.get('/order-lines/:id/standard', view, handle((req) => lineStandard(pool,
 router.post('/order-lines/:id/standard', manage, handle((req) => tx(req, (db, c) => createStandard(db, c, req.body ?? {}, { lineId: id(req) }))));
 router.post('/order-lines/:id/standard/save', manage, handle((req) => tx(req, (db, c) => saveLineToStandard(db, c, id(req), req.body ?? {}))));
 router.post('/order-lines/:id/standard/keep', manage, handle((req) => tx(req, (db, c) => keepStandard(db, c, id(req)))));
+// Values from the 3D model (2026-11-08, init.sql §100).
+router.post('/standard-drawings/:id/model-values', manage, handle((req) => tx(req, async (db, c) => {
+  const [[s]] = await db.query('SELECT current_version_id FROM cf_standard_drawings WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, id(req)]);
+  if (!s?.current_version_id) throw invalid('NO_BOM', 'This standard has no version to compute on yet.');
+  return applyModel(db, c, { versionId: Number(s.current_version_id) });
+})));
+router.post('/order-lines/:id/model-values', manage, handle((req) => tx(req, (db, c) => applyModel(db, c, { lineId: id(req) }))));
 
 export default router;

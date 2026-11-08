@@ -88,7 +88,7 @@ const MAX_ROWS = 20000;
 const ID_CHUNK = 500;
 
 /** Values a person may type. The rest are worked out and the sheet may not write them. */
-const TYPEABLE_SOURCES = new Set(['entered', 'defaulted']);
+const TYPEABLE_SOURCES = new Set(['entered', 'defaulted', 'model']);   // 'model': from the 3D model, a person may type over it
 const TYPEABLE_RULES = new Set(['entered', 'defaulted']);
 
 /* ---------------------------------------------------------------------------

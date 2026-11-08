@@ -7,6 +7,11 @@
  *   cd multi_app_be
  *   node scripts/cf_kepl/model3d-attach.mjs --company 30005 --standard 6150003 --file ../drawing_bom/out/TCPL_TRUSS_75M/model3d.json --prod [--apply]
  *   node scripts/cf_kepl/model3d-attach.mjs --company 180005 --standard <id> --remove --prod --apply
+ *
+ * VALUES FROM THE MODEL (2026-11-08, services/modelValueService.js): when a model is saved, the values it gives (sizes,
+ * holes, drawing facts, drilled thickness, welds) are written on the standard's CURRENT version, in their own transaction
+ * (bom.json beside the model file gives the weld sizes). --values does it also when the same model is already live;
+ * --no-values skips it. Lines already made from the standard are computed with model-values.mjs --line.
  */
 import fs from 'fs';
 import path from 'path';
@@ -16,6 +21,7 @@ const __dir = path.dirname(fileURLToPath(import.meta.url));
 const arg = (k) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : null; };
 const COMPANY = Number(arg('company')); const STD = Number(arg('standard'));
 const APPLY = process.argv.includes('--apply'); const REMOVE = process.argv.includes('--remove');
+const VALUES = !process.argv.includes('--no-values'); const FORCE_VALUES = process.argv.includes('--values');
 if (!COMPANY || !STD || (!REMOVE && !arg('file'))) { console.error('Usage: --company <id> --standard <id> (--file <model.json> | --remove) [--prod] [--apply]'); process.exit(2); }
 if (process.argv.includes('--prod')) {
   const env = {};
@@ -39,6 +45,7 @@ try {
     if (!['cf-erp-model3d/1', 'cf-erp-model3d/2'].includes(m.schema) || !Array.isArray(m.elements)) throw new Error('Not a cf-erp-model3d model.');
     // Only when required (user, 2026-11-07): the same JSON already live is left as it is.
     const [[live]] = await pool.query("SELECT file_text FROM cf_standard_drawing_files WHERE company_id = ? AND standard_id = ? AND kind = 'model' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", [COMPANY, STD]);
+    let saved = false;
     if (live && live.file_text === text) { console.log(`${s.number}: the same model is already live — nothing to do`); }
     else {
     console.log(`${s.number}: model "${m.title ?? ''}", ${m.elements.length} elements, ${(text.length / 1e3).toFixed(0)} kB — ${APPLY ? 'saved' : 'dry run'}`);
@@ -52,9 +59,27 @@ try {
           "INSERT INTO cf_standard_drawing_files (company_id, version_id, standard_id, kind, drawing_id, mark, mark_norm, file_name, file_kind, file_text) VALUES (?, NULL, ?, 'model', NULL, NULL, NULL, ?, 'json', ?)",
           [COMPANY, STD, path.basename(arg('file')), text]);
         await db.commit();
+        saved = true;
         if (old.affectedRows) console.log(`  the older model (${old.affectedRows}) retired`);
       } catch (e) { await db.rollback().catch(() => {}); throw e; } finally { db.release(); }
     }
+    }
+    if (APPLY && VALUES && (saved || FORCE_VALUES)) {
+      const [[cur]] = await pool.query('SELECT current_version_id FROM cf_standard_drawings WHERE company_id = ? AND id = ?', [COMPANY, STD]);
+      if (!cur?.current_version_id) console.log('  no version yet — values come when a BOM is saved and model-values.mjs runs');
+      else {
+        const { applyModel } = await import(pathToFileURL(path.join(__dir, '..', '..', 'apps', 'cf_erp', 'services', 'modelValueService.js')).href);
+        const bomFile = path.join(path.dirname(path.resolve(arg('file'))), 'bom.json');
+        const bom = fs.existsSync(bomFile) ? JSON.parse(fs.readFileSync(bomFile, 'utf8')) : null;
+        const [[u]] = await pool.query('SELECT id FROM users WHERE company_id = ? ORDER BY id LIMIT 1', [COMPANY]);
+        const db = await pool.getConnection();
+        try {
+          await db.beginTransaction();
+          const r = await applyModel(db, { companyId: COMPANY, userId: u?.id ?? null }, { versionId: Number(cur.current_version_id), bom });
+          await db.commit();
+          console.log(`  values from the model on version #${cur.current_version_id}: ${r.written} written, ${r.cleared} cleared, ${r.unchanged} unchanged, ${r.kept} typed kept, ${r.disagreements.length} disagreements; open required ${r.openRequired?.before} → ${r.openRequired?.after}`);
+        } catch (e) { await db.rollback().catch(() => {}); throw e; } finally { db.release(); }
+      }
     }
   }
 } finally { await pool.end(); }

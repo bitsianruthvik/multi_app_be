@@ -54,7 +54,7 @@ export function defaultsForLine(rows, lineId) {
 /** A row value that stands over an order or line value. */
 export function ownStands(own, specCode) {
   if (!own) return false;
-  if (own.source === 'entered') return true;
+  if (own.source === 'entered' || own.source === 'model') return true;   // the row's own (typed, or from the 3D model)
   return own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(specCode ?? '').toUpperCase());
 }
 

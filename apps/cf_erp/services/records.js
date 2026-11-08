@@ -150,6 +150,14 @@ export const WORKED_OUT_WHY = 'Worked out by cutting and nesting — from the se
  * is reported as "from the drawing". Nobody types them — a typed write is refused. Stored with
  * source 'entered', like PIERCINGS, so no rule change ever sweeps them away.
  */
+/**
+ * VALUE SOURCES that are a row's OWN value (2026-11-08, init.sql §100): 'entered' (a person typed it, or the import wrote
+ * the drawing's figure) and 'model' (worked out from the structure's 3D model — services/modelValueService.js). Resolution
+ * treats both as the row's own; only 'entered' is "typed by a person" (a design signature, typed over a formula, the
+ * model never overwrites it).
+ */
+export const OWN_VALUE_SOURCES = new Set(['entered', 'model']);
+export const isOwnSource = (source) => OWN_VALUE_SOURCES.has(source);
 export const DRAWING_FACT_SPECS = new Set(['TRUE_AREA', 'DRAWN_HOLES', 'DRAWN_HOLE_DIA', 'DRAWN_EDGE_LENGTH', 'DRAWN_HOLE_SET']);
 /** The facts that are a LIST (lib/listSpec), held in value_json — the rest are numbers. */
 export const LIST_FACT_SPECS = new Set(['DRAWN_HOLE_SET']);

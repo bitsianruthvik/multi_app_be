@@ -46,7 +46,7 @@
  * delivered. `frozen` on the result names the order.
  */
 import { ancestors, levelName } from './tree.js';
-import { loadMaster, frozenBy, LIVE_WHEN_FROZEN, DRAWING_FACT_SPECS, workedOutWhy } from './records.js';
+import { loadMaster, frozenBy, LIVE_WHEN_FROZEN, DRAWING_FACT_SPECS, workedOutWhy, isOwnSource } from './records.js';
 import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { listSummary, sameList } from '../lib/listSpec.js';
 import { placementOf, rollupChildren, storedValues } from './bomGraph.js';
@@ -555,7 +555,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
         else if (own) { entry.value = view(own, own.source, 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
         break;
       case 'defaulted':
-        if (own && own.source === 'entered') { entry.value = view(own, 'entered', 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
+        if (own && isOwnSource(own.source)) { entry.value = view(own, own.source, 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
         else if (od?.allowed) fromOrder();
         // Its formula gives the default (second pass); the value above only stands in where it cannot.
         else if (isWorkedDefault(entry.rule)) {

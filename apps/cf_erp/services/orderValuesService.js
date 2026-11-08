@@ -96,7 +96,7 @@
  *           its usual per-record cost for them.
  */
 import { invalid, notFound, conflict, translateDbError } from '../lib/errors.js';
-import { LOCKED_ORDER_STATUSES, LIVE_WHEN_FROZEN, DRAWING_FACT_SPECS, workedOutWhy, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
+import { isOwnSource, LOCKED_ORDER_STATUSES, LIVE_WHEN_FROZEN, DRAWING_FACT_SPECS, workedOutWhy, frozenBy, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { levelName, LEAF_DEPTH } from './tree.js';
 import { rawOf, displayOf, dateText, CAPTURE_DEPTH, TRACK_DEPTH, parseJsonCol, isWorkedDefault, rollupNeeds, workOutFormulas, drawingFactsOf } from './resolutionService.js';
 import { childWordReader, valueWord } from './bomGraph.js';
@@ -104,6 +104,7 @@ import { parseFormula, evaluateFormula } from './formulaEngine.js';
 import { coerce, refreshValues, findOption } from './valueService.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
 import { loadDesignExtras, linksOf, linksBlock, settleLine, designValueOf } from './linkService.js';
+import { isModelCode, modelStateOfLine } from './modelValueService.js';
 import { orderDefaultOf, ownStands, defaultsForLine, missingSchema, notAllowedNote } from '../lib/orderDefaults.js';
 
 /** explode()'s depth cap, so this screen and the Structure tab stop at the same place. */
@@ -172,6 +173,15 @@ const ORDER_DEFAULTS_COLUMN = `,
                JOIN cf_specifications ds ON ds.company_id = d.company_id AND ds.id = d.specification_id AND ds.deleted_at IS NULL AND ds.order_level = 1
               WHERE d.company_id = ol.company_id AND d.order_id = o.id AND d.deleted_at IS NULL) AS order_defaults`;
 
+/**
+ * The 3D model's state, WITH the line too (init.sql §100, modelValueService.modelStateOfLine): whether its standard has a
+ * model, and its latest run's report — the Values screen's "from the 3D model" / disagreements cost no round trip.
+ */
+const MODEL_COLUMNS = `,
+            (SELECT COUNT(*) FROM cf_standard_drawing_files mf WHERE mf.company_id = ol.company_id AND mf.standard_id = ol.standard_id AND mf.kind = 'model' AND mf.deleted_at IS NULL) AS model_files,
+            (SELECT mr.report_json FROM cf_model_value_runs mr WHERE mr.company_id = ol.company_id AND mr.subject_type = 'line' AND mr.subject_id = ol.id AND mr.deleted_at IS NULL ORDER BY mr.id DESC LIMIT 1) AS model_report,
+            (SELECT mr.created_at FROM cf_model_value_runs mr WHERE mr.company_id = ol.company_id AND mr.subject_type = 'line' AND mr.subject_id = ol.id AND mr.deleted_at IS NULL ORDER BY mr.id DESC LIMIT 1) AS model_ran_at`;
+
 async function loadLine(db, companyId, lineId, { lock }) {
   const lineSql = (extra) => `SELECT ol.id, ol.line_no, ol.line_type, ol.item_id, ol.quantity, ol.locked_at,
             o.id AS order_id, o.code AS order_code, o.status AS order_status,
@@ -183,11 +193,17 @@ async function loadLine(db, companyId, lineId, { lock }) {
       WHERE ol.company_id = ? AND ol.id = ? AND ol.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`;
   let row;
   try {
-    [[row]] = await db.query(lineSql(ORDER_DEFAULTS_COLUMN), [companyId, lineId]);
-  } catch (err) {
-    // A database without §65 yet: the line as before, and no order values.
-    if (!missingSchema(err)) throw err;
-    [[row]] = await db.query(lineSql(''), [companyId, lineId]);
+    [[row]] = await db.query(lineSql(ORDER_DEFAULTS_COLUMN + MODEL_COLUMNS), [companyId, lineId]);
+  } catch (err0) {
+    if (!missingSchema(err0)) throw err0;
+    try {
+      // A database without §100 yet: no model state (modelStateOfLine reads it itself, or says none).
+      [[row]] = await db.query(lineSql(ORDER_DEFAULTS_COLUMN), [companyId, lineId]);
+    } catch (err) {
+      // A database without §65 yet: the line as before, and no order values.
+      if (!missingSchema(err)) throw err;
+      [[row]] = await db.query(lineSql(''), [companyId, lineId]);
+    }
   }
   if (!row) throw notFound('Order line');
   if (!row.item_id) throw invalid('NO_ITEM', 'This line has no item yet — there are no values to fill.');
@@ -205,6 +221,7 @@ async function loadLine(db, companyId, lineId, { lock }) {
     releaseId: row.release_id ?? null,
     lockedAt: row.locked_at ?? null,
     orderDefaultRows: (parseJsonCol(row.order_defaults) ?? []).filter(Boolean),
+    modelRow: 'model_files' in row ? { models: Number(row.model_files), report: row.model_report ?? null, ranAt: row.model_ran_at ?? null } : null,
   };
 }
 
@@ -300,8 +317,12 @@ const subjectKey = (type, id) => `${type}:${id}`;
  * take turns instead of each re-working roll-ups from what the other has not
  * committed yet.
  */
-export async function loadContext(db, companyId, lineId, { lock = false } = {}) {
-  const line = await loadLine(db, companyId, lineId, { lock });
+export async function loadContext(db, companyId, lineId, { lock = false, rootItemId = null } = {}) {
+  // rootItemId (2026-11-08, modelValueService): a STANDARD VERSION's tree — rows owned by no line, no order, nothing frozen.
+  const line = rootItemId != null
+    ? { id: null, lineNo: null, lineType: 'custom', itemId: Number(rootItemId), quantity: 1, orderId: null, orderCode: null, orderStatus: null,
+      orderRevision: 1, orderLatestRevision: null, releaseId: null, lockedAt: null, orderDefaultRows: [] }
+    : await loadLine(db, companyId, lineId, { lock });
 
   // ---- the structure ------------------------------------------------------
   const [lineRows] = await db.query(STRUCTURE_SQL, [companyId, line.itemId, companyId, MAX_DEPTH + 1]);
@@ -675,7 +696,7 @@ export function resolveRecord(ctx, rec) {
         else if (own) { entry.value = view(own, own.source, 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
         break;
       case 'defaulted':
-        if (own && own.source === 'entered') { entry.value = view(own, 'entered', 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
+        if (own && isOwnSource(own.source)) { entry.value = view(own, own.source, 'here'); entry.status = 'set'; effectiveRows.set(spec.id, own); }
         else if (od?.allowed) fromOrder();
         // Its formula gives the default (second pass); the value above only stands in where it cannot.
         else if (isWorkedDefault(entry.rule)) {
@@ -852,7 +873,7 @@ function derivedWrites(r) {
         else if (own && own.source === 'fixed') touch(s, null, 'fixed');
         break;
       case 'defaulted':
-        if (own && own.source === 'entered') break;
+        if (own && isOwnSource(own.source)) break;
         // A formula's answer is stored as what it is (calculated / rollup); a default from above as 'defaulted'.
         if (s.value) touch(s, typedOf(effectiveRows.get(s.spec.id)), s.derived ? (s.derived.rollup ? 'rollup' : 'calculated') : 'defaulted');
         else if (own) touch(s, null, 'defaulted');
@@ -874,14 +895,14 @@ function derivedWrites(r) {
         if (s.fromOrder && s.value) { touch(s, typedOf(effectiveRows.get(s.spec.id)), 'defaulted'); break; }
         // A section part's steel taken from its stock bar (lib/cutFrom STEEL_FROM_STOCK) is stored
         // 'inherited' under an entered rule; the cut-piece derive owns those rows (valueService too).
-        if (own && own.source !== 'entered' && !(own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(s.spec.code).toUpperCase()))) touch(s, null, own.source);
+        if (own && !isOwnSource(own.source) && !(own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(s.spec.code).toUpperCase()))) touch(s, null, own.source);
         break;
       default:
         break;
     }
   }
   for (const own of ownRows.values()) {
-    if (!produced.has(own.specification_id) && own.source !== 'entered') {
+    if (!produced.has(own.specification_id) && !isOwnSource(own.source)) {
       writes.push({ spec: { id: own.specification_id, code: own.spec_code, default_uom: own.uom }, typed: null, source: own.source });
     }
   }
@@ -986,6 +1007,47 @@ export async function materializeLineRecords(db, c, lineId, recordIds) {
   note(refreshInMemory(ctx, moved));
   const flushed = order.records.length ? await flush(db, c, ctx, initial, order) : { values: 0 };
   return { records: order.records.length, values: flushed.values };
+}
+
+/**
+ * A row's OWN values written from outside the screen (2026-11-08, modelValueService: values from the 3D model, source
+ * 'model'), then everything that reads them worked out — the rows themselves (a formula over their own values), their
+ * parents (roll-ups) and children (inherited) — and the NET difference flushed: a fixed number of statements whatever the
+ * number of rows. `ctx` is a loadContext() the caller already read (and decided the writes from); `writes`:
+ * [{ recordId, spec: { id, code, default_uom }, typed: { value_number | value_json | … } | null, source }].
+ * → { records, values }.
+ */
+export async function applyOwnWrites(db, c, ctx, writes) {
+  const initial = storeAsLoaded(ctx);
+  const { order, note } = changeLog();
+  const byRecord = new Map();
+  for (const w of writes) {
+    if (!byRecord.has(w.recordId)) byRecord.set(w.recordId, []);
+    byRecord.get(w.recordId).push({ spec: w.spec, typed: w.typed ? { ...EMPTY, ...w.typed } : null, source: w.source });
+  }
+  const depthOf = new Map([[ctx.line.itemId, 0], ...ctx.lines.map((l) => [l.childId, l.depth])]);
+  const ids = [...byRecord.keys()].sort((a, b) => (depthOf.get(b) ?? 0) - (depthOf.get(a) ?? 0));
+  const moved = [];
+  for (const id of ids) {
+    const ch = applyToStore(ctx, id, byRecord.get(id));
+    note(ch);
+    const own = materializeInMemory(ctx, id);
+    note(own);
+    if (ch.length || own.length) moved.push(id);
+  }
+  note(refreshInMemory(ctx, moved));
+  const flushed = order.records.length ? await flush(db, c, ctx, initial, order) : { values: 0 };
+  return { records: order.records.length, values: flushed.values };
+}
+
+/** resolveRecord for the line's own rows, exported for modelValueService (which rules ask for which value). */
+export function resolveOwnRows(ctx) {
+  const out = new Map();
+  for (const rec of ctx.records.values()) {
+    if (rec.is_deleted || !isOwn(ctx, rec)) continue;
+    out.set(rec.id, resolveRecord(ctx, rec));
+  }
+  return out;
 }
 
 /* ===========================================================================
@@ -1168,8 +1230,10 @@ function ownInput(s) {
  *                   rule is entered or defaulted, its row has no `readOnly`, and
  *                   the view is `editable` — the server refuses anything else.
  */
-function buildView(ctx) {
+function buildView(ctx, model = null) {
   const { line } = ctx;
+  // The 3D model (2026-11-08, modelValueService): while none is attached, a geometry value still empty says it waits for it.
+  const waitsForModel = model && !model.attached;
   const lock = LOCKED_ORDER_STATUSES.has(line.orderStatus)
     ? { reason: 'closed', message: line.orderStatus === 'revised' ? revisedOrderMessage(line.orderCode, line.orderRevision, line.orderLatestRevision)
       : `Order ${line.orderCode} is ${line.orderStatus}, so everything made for it is frozen — its values are kept as they were.` }
@@ -1247,7 +1311,8 @@ function buildView(ctx) {
         note: s.note ?? s.conflict ?? null,
         options: s.spec.dataType === 'option' && s.options ? optionsKey(s) : null,
         // Where a formula value comes from, and — typed over — the answer it replaced.
-        from: d?.source ?? null,
+        from: d?.source ?? (s.value?.source === 'model' ? 'model' : null),
+        waitingModel: !!(waitsForModel && !s.value && isModelCode(s.spec.code)),
         calculated: d?.source === 'typed' ? d.calculated?.display ?? null : null,
         noCalc: whyNoAnswer(s),
       };
@@ -1345,6 +1410,7 @@ function buildView(ctx) {
         if (cell.from !== col.from) out.from = cell.from;
         if (cell.calculated != null) out.calculated = cell.calculated;
         if (cell.noCalc) out.noCalc = cell.noCalc;
+        if (cell.waitingModel) out.waitingModel = true;
         if (cell.inherit) out.inherit = cell.inherit;
         if (cell.override) { out.override = cell.override; out.orderDisplay = cell.orderDisplay; }
         cells[code] = out;
@@ -1368,6 +1434,8 @@ function buildView(ctx) {
     root: { id: root.id, code: root.code, name: root.name },
     editable: !lock,
     lock,
+    // { attached, ranAt, disagreements: [{ recordId, mark, code, heldText, modelText, model, acceptable, by }] } — null when not read.
+    model,
     truncated: ctx.truncated,
     counts,
     optionLists,
@@ -1384,7 +1452,8 @@ function buildView(ctx) {
 
 /** GET /order-lines/:id/values */
 export async function readLineValues(db, companyId, lineId) {
-  return buildView(await loadContext(db, companyId, lineId));
+  const ctx = await loadContext(db, companyId, lineId);
+  return buildView(ctx, await modelStateOfLine(db, companyId, ctx));
 }
 
 /** What a save on a linked copy may say: `all` = every copy of the design, `one` = only the rows named (they stop being copies). */
@@ -1665,7 +1734,7 @@ export async function writeLineValues(db, c, lineId, input = {}) {
         const parents = rows.map((r) => r.parent_id).filter((id) => !inStructure.has(id));
         if (parents.length) {
           await refreshValues(db, c, parents);
-          view = buildView(await loadContext(db, c.companyId, lineId));
+          { const fresh = await loadContext(db, c.companyId, lineId); view = buildView(fresh, await modelStateOfLine(db, c.companyId, fresh)); }
         }
       }
       if (dryRun) await db.query(`ROLLBACK TO SAVEPOINT ${sp}`);
@@ -1687,7 +1756,7 @@ export async function writeLineValues(db, c, lineId, input = {}) {
       + (derived.length ? `; ${plural(derived.length, 'worked-out value')} ${dryRun ? 'would follow' : 'followed'}` : '')
       + ` across ${plural(records, 'item')}.`;
 
-  const finalView = view ?? buildView(ctx);
+  const finalView = view ?? buildView(ctx, await modelStateOfLine(db, c.companyId, ctx));
   const broke = new Set(breaks.map((b) => b.recordId));
   const touchedList = [...touched.values()].map(({ said, ...t }) => t);
   return {

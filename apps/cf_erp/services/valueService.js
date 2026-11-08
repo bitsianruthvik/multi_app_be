@@ -24,7 +24,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { invalid } from '../lib/errors.js';
 import { requireNode, subtreeIds } from './tree.js';
-import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS, DRAWING_FACT_SPECS, workedOutWhy } from './records.js';
+import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requireMachine, AFTER_LOCK_SPECS, DRAWING_FACT_SPECS, workedOutWhy, isOwnSource } from './records.js';
 import { resolve, dateText, tableSummary, isWorkedDefault, sameAsCalculated } from './resolutionService.js';
 import { checkListValue, listSummary } from '../lib/listSpec.js';
 import { parentsOf, tempChildrenOf } from './bomGraph.js';
@@ -656,7 +656,7 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
         else if (own && own.source === 'fixed') touch(s, null, 'fixed');
         break;
       case 'defaulted':
-        if (own && own.source === 'entered') break;
+        if (own && isOwnSource(own.source)) break;
         // A formula's answer is stored as what it is (calculated / rollup); a default from above as 'defaulted'.
         if (s.value) touch(s, typedOf(effectiveRows.get(s.spec.id)), s.derived ? (s.derived.rollup ? 'rollup' : 'calculated') : 'defaulted');
         else if (own) touch(s, null, 'defaulted');
@@ -678,7 +678,7 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
         if (s.fromOrder && s.value) { touch(s, typedOf(effectiveRows.get(s.spec.id)), 'defaulted'); break; }
         // A section part's steel taken from its stock bar (lib/cutFrom STEEL_FROM_STOCK) is stored
         // 'inherited' under an entered rule; the cut-piece derive owns those rows, not this.
-        if (own && own.source !== 'entered' && !(own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(s.spec.code).toUpperCase()))) touch(s, null, own.source);
+        if (own && !isOwnSource(own.source) && !(own.source === 'inherited' && STEEL_FROM_STOCK_SET.has(String(s.spec.code).toUpperCase()))) touch(s, null, own.source);
         break;
       default:
         break;
@@ -686,7 +686,7 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
   }
   // Derived values whose rule is gone. Entered values stay — they are a person's data.
   for (const own of ownRows.values()) {
-    if (!produced.has(own.specification_id) && own.source !== 'entered') {
+    if (!produced.has(own.specification_id) && !isOwnSource(own.source)) {
       writes.push({ spec: { id: own.specification_id, code: own.spec_code, default_uom: own.uom }, typed: null, source: own.source });
     }
   }

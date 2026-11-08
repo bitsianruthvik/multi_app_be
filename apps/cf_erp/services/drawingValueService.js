@@ -159,7 +159,7 @@ export async function readFactInputs(db, companyId, lineId, specs = null) {
   const specIds = [...spec.values()].map((s) => s.id);
   const [[vals], [links], [files]] = await Promise.all([
     specIds.length ? db.query(
-      `SELECT v.subject_id, v.specification_id, v.value_number, v.value_text, v.value_json FROM cf_spec_values v
+      `SELECT v.subject_id, v.specification_id, v.value_number, v.value_text, v.value_json, v.source FROM cf_spec_values v
         WHERE v.company_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL AND v.subject_id IN (?) AND v.specification_id IN (?)`,
       [companyId, ids, specIds]) : [[]],
     db.query(
@@ -177,12 +177,13 @@ export async function readFactInputs(db, companyId, lineId, specs = null) {
   ]);
   const codeOf = new Map([...spec].map(([code, s]) => [Number(s.id), code]));
   const rows = new Map(masters.map((m) => [Number(m.id), {
-    id: Number(m.id), isPlatePart: cutFrom.get(Number(m.id)) === 'PLATE', markNorm: null, drawingIds: [], lengthMm: null, widthMm: null, held: new Map(),
+    id: Number(m.id), isPlatePart: cutFrom.get(Number(m.id)) === 'PLATE', markNorm: null, drawingIds: [], lengthMm: null, widthMm: null, held: new Map(), fromModel: new Set(),
   }]));
   for (const v of vals) {
     const p = rows.get(Number(v.subject_id));
     const code = codeOf.get(Number(v.specification_id));
     if (!p || !code) continue;
+    if (v.source === 'model') p.fromModel.add(code);
     if (code === 'DRAWING_MARK') { const mark = v.value_text ?? (v.value_number != null ? String(Number(v.value_number)) : null); p.markNorm = mark ? normMark(mark) : null; }
     else if (LIST_FACT_SPECS.has(code)) { const rows = parseJson(v.value_json); if (Array.isArray(rows)) p.held.set(code, rows); }
     else if (v.value_number == null) continue;
@@ -244,6 +245,9 @@ export async function refreshDrawingValues(db, c, lineId, { force = false } = {}
       const now = p.held.has(code) ? p.held.get(code) : null;
       const next = w ? w[code] ?? null : null;
       if (now == null && next == null) continue;
+      // A fact the 3D model gave (modelValueService, source 'model') stays where this row has no drawing of its own to
+      // say otherwise — a section, a part with no DXF on the line (2026-11-08).
+      if (next == null && p.fromModel.has(code)) continue;
       if (now != null && next != null && (Array.isArray(next) ? sameList(now, next) : Math.abs(now - next) < 1e-6)) continue;
       if (now != null) clears.push([p.id, spec.get(code).id]);
       if (next != null) sets.push([p.id, code, next]);

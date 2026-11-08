@@ -10,6 +10,8 @@
  *                                                                            stops at the first failure
  *        [--sets RDSO_11751R3,RDSO_1623]   only these (default: the finished sets below)
  *        [--scan]                          every folder with a bom.json, not only the finished list
+ *        [--gap-fill]                      OLD SETS ONLY: the row-by-row gap fill (off by default since 2026-11-08 — the
+ *                                          geometry comes from the 3D model, modelValueService.applyModel)
  *        [--out <folder>]                  default ../drawing_bom/out
  *        [--user <id>] [--prod]            as standard-import.mjs (--prod: DB_* from TM/.env.tidb)
  *        [--section-class BR]              as standard-import.mjs: the impact class of the section bars filled on --apply
@@ -113,11 +115,15 @@ try {
       if (APPLY) {
         if (rep.standard.alreadyThere) { await conn.rollback(); r.applied = 'already there — not written'; continue; }
         const done = await STD.importStandard(conn, c, { bom: v.bom, files: v.files, apply: true, catalog });
-        // What the drawing settles but the mapping left empty (lengths, girder type, holes, surface, bars, flows).
-        const { fillImportedGaps } = await imp('apps/cf_erp/services/standardGapFixService.js');
-        done.report.gapFill = await fillImportedGaps(conn, c, { standardId: done.standardId, bom: v.bom, sectionClass: arg('section-class') ? String(arg('section-class')).toUpperCase() : null });
+        // --gap-fill, OLD SETS ONLY (off by default since 2026-11-08: the geometry comes from the 3D model —
+        // modelValueService.applyModel when the model is attached): what the drawing settles but the mapping left empty.
+        if (process.argv.includes('--gap-fill')) {
+          const { fillImportedGaps } = await imp('apps/cf_erp/services/standardGapFixService.js');
+          done.report.gapFill = await fillImportedGaps(conn, c, { standardId: done.standardId, bom: v.bom, sectionClass: arg('section-class') ? String(arg('section-class')).toUpperCase() : null });
+        }
         await conn.commit();
-        r.applied = `standard #${done.report.written.standardId}, version #${done.report.written.versionId}; filled from the drawing: ${done.report.gapFill.values} values, ${done.report.gapFill.sections} section bars, ${done.report.gapFill.flows} flows`;
+        const g = done.report.gapFill;
+        r.applied = `standard #${done.report.written.standardId}, version #${done.report.written.versionId}${g ? `; filled from the drawing: ${g.values} values, ${g.sections} section bars, ${g.flows} flows` : ''}`;
         r.created = done.report.written.newDefinitions.map((d) => `${d.name} (#${d.id} ${d.code ?? ''})`.trim());
       }
     } catch (err) {
