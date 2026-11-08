@@ -341,7 +341,7 @@ async function requireLine(db, companyId, lineId, { lock = false } = {}) {
  * line (cf_part_drawings, each on its register revision); then everything a line works out for itself — flow rules,
  * values in the line's context (order values included), names, cut lengths, the drawings' facts, cut pieces.
  */
-async function copyVersionToLine(db, c, version, lineId) {
+export async function copyVersionToLine(db, c, version, lineId) {
   const { companyId } = c;
   const rootId = Number(version.root_item_id);
   const snap = await snapshotSubtrees(db, companyId, [rootId], (l) => l.child_item_type === 'temporary');
@@ -896,7 +896,7 @@ function notAllowedNew(plan, allowNew) {
  *   a register drawing per part file (one INSERT), the links (one INSERT), the files (one INSERT a 2 MB batch).
  * `files` [{ name, text }] are the dxf/ folder's files. Returns { plan, report, standardId? }.
  */
-export async function importStandard(db, c, { bom, files = [], apply = false, sourceUrl = null, catalog: given = null, allowNew = [] } = {}) {
+export async function importStandard(db, c, { bom, files = [], apply = false, sourceUrl = null, catalog: given = null, allowNew = [], intoStandardId = null } = {}) {
   const { companyId } = c;
   const catalog = given ?? await importCatalog(db, companyId);
   const plan = planImport(bom, catalog);
@@ -915,7 +915,9 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
   const refused = notAllowedNew(plan, allowNew);
   report.newNotAllowed = refused.map((nd) => nd.name);
   if (!apply) return { plan, report, standardId: existingId };
-  if (existingId) throw conflict('DUPLICATE', `Standard drawing ${plan.standard.number} is already there (id ${existingId}). Nothing was written.`, { standardId: existingId });
+  // intoStandardId (2026-11-08, line-replace): the tree becomes the NEXT version of that existing standard, in the same bulk writes.
+  if (intoStandardId && existingId && Number(existingId) !== Number(intoStandardId)) throw conflict('OTHER_STANDARD', `bom.json is standard ${plan.standard.number} (id ${existingId}), not ${intoStandardId}. Nothing was written.`);
+  if (existingId && !intoStandardId) throw conflict('DUPLICATE', `Standard drawing ${plan.standard.number} is already there (id ${existingId}). Nothing was written.`, { standardId: existingId });
   // A new definition is an exception a person agrees to (user, 2026-11-06: 19 of 24 made on 11-05 repeated one the
   // catalog had): each must be named in allowNew, after the dry run showed its nearest existing definition.
   if (refused.length) {
@@ -967,14 +969,22 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
   const notes = [s.ownership, s.sheets?.length ? `Sheets: ${s.sheets.map((x) => `${x.number} ${x.title}`).join('; ')}` : null,
     plan.bought.length ? `Bought out, not in the BOM: ${plan.bought.map((b) => `${b.quantity} × ${b.description}${b.profile ? ` (${b.profile})` : ''}`).join('; ')}` : null]
     .filter(Boolean).join('\n');
-  const drawingId = await registerDrawingFor(db, c, { number: s.registerNumber, revision: s.revision, title: s.description ?? s.name, url: s.sourceUrl, notes });
+  let drawingId; let standardId;
+  if (intoStandardId) {
+    const [[ex]] = await db.query('SELECT id, drawing_id FROM cf_standard_drawings WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, intoStandardId]);
+    if (!ex) throw invalid('NO_STANDARD', `Standard ${intoStandardId} is not there. Nothing was written.`);
+    standardId = Number(ex.id);
+    drawingId = ex.drawing_id ?? await registerDrawingFor(db, c, { number: s.registerNumber, revision: s.revision, title: s.description ?? s.name, url: s.sourceUrl, notes });
+  } else {
+  drawingId = await registerDrawingFor(db, c, { number: s.registerNumber, revision: s.revision, title: s.description ?? s.name, url: s.sourceUrl, notes });
   const [insS] = await db.query(
     // §98: the series' curve rule (bom.json curve — girders on chords, eccentricity at its maximum degree), kept for the order lines made from it.
     `INSERT INTO cf_standard_drawings (company_id, number, name, description, revision, drawing_id, source_url, internal, notes, curve_json, created_by)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [companyId, s.number, s.name.slice(0, 255), s.description, s.revision, drawingId, s.sourceUrl, s.internal ? 1 : 0, notes || null, bom?.curve ? JSON.stringify(bom.curve) : null, c.userId ?? null],
   );
-  const standardId = insS.insertId;
+  standardId = insS.insertId;
+  }
 
   // ---- 3. the tree: a synthetic snapshot, written by the one copy machine ----
   const snap = { items: new Map(), linesByBom: new Map(), values: new Map(), rules: new Map(), ruleOptions: new Map() };
@@ -1022,10 +1032,11 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
 
   // ---- 4. the version ---------------------------------------------------------
   const tempRows = plan.rows.filter((r) => r.kind === 'temp');
+  const versionNoNext = intoStandardId ? (Number((await db.query('SELECT MAX(version_no) AS top FROM cf_standard_drawing_versions WHERE company_id = ? AND standard_id = ?', [companyId, standardId]))[0][0]?.top) || 0) + 1 : 1;
   const [insV] = await db.query(
     `INSERT INTO cf_standard_drawing_versions (company_id, standard_id, version_no, root_item_id, design_id, rows_count, parts_count, weight_kg, made_from, note, report_json, created_by)
-     VALUES (?, ?, 1, ?, ?, ?, ?, ?, 'import', ?, ?, ?)`,
-    [companyId, standardId, root, plan.rows[0].def.id, tempRows.length, plan.totals.parts, plan.totals.steelKg, `Imported from ${bom.set ?? 'bom.json'}`.slice(0, 500), JSON.stringify(report), c.userId ?? null],
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'import', ?, ?, ?)`,
+    [companyId, standardId, versionNoNext, root, plan.rows[0].def.id, tempRows.length, plan.totals.parts, plan.totals.steelKg, `Imported from ${bom.set ?? 'bom.json'}`.slice(0, 500), JSON.stringify(report), c.userId ?? null],
   );
   const versionId = insV.insertId;
   await db.query('UPDATE cf_standard_drawings SET current_version_id = ? WHERE company_id = ? AND id = ?', [versionId, companyId, standardId]);

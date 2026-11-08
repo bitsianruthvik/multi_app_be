@@ -33,7 +33,13 @@ const __dir = path.dirname(fileURLToPath(import.meta.url));
 const arg = (k) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : null; };
 const folder = process.argv[2] && !process.argv[2].startsWith('--') ? path.resolve(process.argv[2]) : null;
 const COMPANY = Number(arg('company'));
-const APPLY = process.argv.includes('--apply');
+// --into <standardId> --onto-line <lineId> (2026-11-08, user: "why not soft delete the previous BOM and add the new one fresh"):
+// the package becomes the next VERSION of that standard (bulk writes), the line's old tree is soft-deleted and the new version is
+// copied onto the line (bulk, as "line from standard" does). Only for a line nothing has started on (not locked, no nest/release).
+// --rehearse runs all of it in the transaction and rolls back.
+const INTO = arg('into') ? Number(arg('into')) : null; const ONTO = arg('onto-line') ? Number(arg('onto-line')) : null;
+const REHEARSE = process.argv.includes('--rehearse');
+const APPLY = process.argv.includes('--apply') || REHEARSE;
 const JSON_OUT = process.argv.includes('--json');
 if (!folder || !Number.isInteger(COMPANY) || COMPANY <= 0) {
   console.error('Usage: node scripts/cf_kepl/standard-import.mjs <folder with bom.json and dxf/> --company <id> [--apply] [--source-url <url>] [--user <id>] [--json] [--prod]');
@@ -86,15 +92,49 @@ try {
   // --allow-new "A,B": the new definitions a person agreed to, by name, after the dry run showed each one's nearest
   // existing definition. Without it --apply refuses any new definition (user, 2026-11-06).
   const allowNew = arg('allow-new') ? String(arg('allow-new')).split(',').map((s) => s.trim()).filter(Boolean) : [];
-  const out = await STD.importStandard(conn, c, { bom, files, apply: APPLY, sourceUrl: arg('source-url'), allowNew });
+  let lineBefore = null;
+  if (ONTO) {
+    const [[l]] = await conn.query(`SELECT l.id, l.item_id, l.locked_at, l.standard_id, l.line_type, o.status, o.code FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id
+                                     WHERE l.company_id = ? AND l.id = ? AND l.deleted_at IS NULL`, [COMPANY, ONTO]);
+    if (!l) throw new Error(`No line ${ONTO}.`);
+    if (l.locked_at) throw new Error(`Line ${ONTO} of ${l.code} is locked: its BOM is frozen.`);
+    if (!['inquiry', 'draft', 'quoted'].includes(String(l.status))) throw new Error(`${l.code} is ${l.status}: replace only an order nothing has started on.`);
+    if (INTO && Number(l.standard_id) !== INTO) throw new Error(`Line ${ONTO} is made from standard ${l.standard_id}, not ${INTO}.`);
+    lineBefore = l;
+  }
+  const T0 = Date.now(); const tick = (k) => { (globalThis.__t ??= []).push(`${k} ${Math.round((Date.now() - T0) / 1000)} s`); };
+  const out = await STD.importStandard(conn, c, { bom, files, apply: APPLY, sourceUrl: arg('source-url'), allowNew, intoStandardId: INTO });
   // --no-gap-fill: a set that carries every value itself skips the fill (on TiDB a write in it went through another
   // connection and waited on this transaction's own locks — 50 s a time — 2026-10-31).
   if (APPLY && out.standardId && !process.argv.includes('--no-gap-fill')) {
     const { fillImportedGaps } = await imp('apps/cf_erp/services/standardGapFixService.js');
     try { out.report.gapFill = await fillImportedGaps(conn, c, { standardId: out.standardId, bom, sectionClass: arg('section-class') ? String(arg('section-class')).toUpperCase() : null }); } catch (e) { out.report.gapFill = { error: e.message }; }
   }
+  tick('import + gap fill');
   out.report.setup = setup.actions;
-  if (APPLY) await conn.commit();
+  if (APPLY && ONTO) {
+    const versionId = out.report.written?.versionId; if (!versionId) throw new Error('The import wrote no version.');
+    const [[version]] = await conn.query('SELECT * FROM cf_standard_drawing_versions WHERE company_id = ? AND id = ?', [COMPANY, versionId]);
+    // The old tree: every row the line owns, its BOMs and lines, values, and the line's part files. Soft-deleted.
+    const [old] = await conn.query('SELECT m.id FROM cf_master_records m JOIN cf_item_details d ON d.company_id = m.company_id AND d.master_id = m.id WHERE m.company_id = ? AND d.owner_order_line_id = ? AND m.deleted_at IS NULL', [COMPANY, ONTO]);
+    const ids = old.map((r) => Number(r.id)); const gone = { records: ids.length, boms: 0, lines: 0, values: 0, files: 0 };
+    for (let i = 0; i < ids.length; i += 2000) {
+      const part = ids.slice(i, i + 2000);
+      const [bs] = await conn.query('SELECT id FROM cf_boms WHERE company_id = ? AND parent_id IN (?) AND deleted_at IS NULL', [COMPANY, part]);
+      if (bs.length) { const [r1] = await conn.query('UPDATE cf_bom_lines SET deleted_at = NOW() WHERE company_id = ? AND bom_id IN (?) AND deleted_at IS NULL', [COMPANY, bs.map((b) => b.id)]); gone.lines += r1.affectedRows;
+        const [r2] = await conn.query('UPDATE cf_boms SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [COMPANY, bs.map((b) => b.id)]); gone.boms += r2.affectedRows; }
+      const [r3] = await conn.query("UPDATE cf_spec_values SET deleted_at = NOW() WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND deleted_at IS NULL", [COMPANY, part]); gone.values += r3.affectedRows;
+      await conn.query('UPDATE cf_master_records SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [COMPANY, part]);
+    }
+    const [r4] = await conn.query('UPDATE cf_part_drawings SET deleted_at = NOW() WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [COMPANY, ONTO]); gone.files = r4.affectedRows;
+    tick('old tree soft-deleted');
+    const made = await STD.copyVersionToLine(conn, c, version, ONTO);
+    tick('copied onto the line');
+    out.report.replaced = { line: ONTO, order: lineBefore.code, oldRoot: Number(lineBefore.item_id), gone, newRoot: made.rootId, rows: made.rows, versionNo: Number(version.version_no), cutPieces: made.cutPieces };
+  }
+  if (REHEARSE) { await conn.rollback(); out.report.rehearsed = true; }
+  else if (APPLY) await conn.commit();
+  console.log('TIMES: ' + (globalThis.__t ?? []).join(', '));
   const trips = count.get();
   if (JSON_OUT) { console.log(JSON.stringify({ ...out.report, roundTrips: trips }, null, 1)); }
   else printReport(out.report, { host, co, trips });
@@ -111,7 +151,8 @@ process.exit(code);
 function printReport(r, { host, co, trips }) {
   const line = (s = '') => console.log(s);
   // DB_HOST, not @@hostname: TiDB Cloud answers "localhost" for that, which reads as the local database.
-  line(`${APPLY ? 'APPLIED' : 'DRY RUN (read-only)'} — database ${host.d} at ${process.env.DB_HOST ?? host.h}, company ${co.id} ${co.name}`);
+  if (r.replaced) line(`LINE REPLACED${r.rehearsed ? ' (REHEARSED, ROLLED BACK)' : ''}: ${r.replaced.order} line ${r.replaced.line} — old tree soft-deleted (${JSON.stringify(r.replaced.gone)}), new tree from version ${r.replaced.versionNo}: ${r.replaced.rows} rows, root ${r.replaced.newRoot}; cut pieces ${JSON.stringify(r.replaced.cutPieces)}`);
+  line(`${REHEARSE ? 'REHEARSED (rolled back)' : APPLY ? 'APPLIED' : 'DRY RUN (read-only)'} — database ${host.d} at ${process.env.DB_HOST ?? host.h}, company ${co.id} ${co.name}`);
   line(`\n${r.standard.number} — ${r.standard.name}`);
   line(`  source: ${r.standard.sourceUrl ?? '(no link recorded)'}${r.standard.internal ? '   · INTERNAL USE ONLY (RDSO property)' : ''}`);
   if (r.standard.alreadyThere) line(`  ALREADY THERE as standard #${r.standard.alreadyThere} — --apply would refuse.`);

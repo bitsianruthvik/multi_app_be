@@ -140,15 +140,15 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
     if (have.length && !REPLACE) { log(`  ${r.name} (${mark}): has bolt rows — left`); left.push(mark); continue; }
     if (have.length) {
       const now = have.map((h) => ({ item: Number(h.child_id), qty: Number(h.quantity), role: h.role }));
-      const next = groups.map((g) => ({ item: itemOf.get(g.name), qty: g.qty, role: `${g.where}`.slice(0, 120) }));
+      const next = groups.map((g) => ({ item: itemOf.get(g.name), qty: g.qty, role: `${g.where}`.slice(0, 100) }));
       if (sig(now) === sig(next)) { if (verbose) log(`  ${r.name} (${mark}): bolt rows match bolts.json — left`); left.push(mark); continue; }
       removed += await removeRows(have);
-      replaced.push({ row: r.name, mark, from: have.map((h) => ({ name: h.name, qty: Number(h.quantity), role: h.role })), to: groups.map((g) => ({ name: g.name, qty: g.qty, role: `${g.where}`.slice(0, 120) })) });
+      replaced.push({ row: r.name, mark, from: have.map((h) => ({ name: h.name, qty: Number(h.quantity), role: h.role })), to: groups.map((g) => ({ name: g.name, qty: g.qty, role: `${g.where}`.slice(0, 100) })) });
     }
     if (verbose) log(`  ${r.name} (${mark}) rec ${r.id}: ${groups.length} groups`);
-    if (PLAN) { if (!have.length) replaced.push({ row: r.name, mark, from: [], to: groups.map((g) => ({ name: g.name, qty: g.qty, role: `${g.where}`.slice(0, 120) })) }); added += groups.length; continue; }
+    if (PLAN) { if (!have.length) replaced.push({ row: r.name, mark, from: [], to: groups.map((g) => ({ name: g.name, qty: g.qty, role: `${g.where}`.slice(0, 100) })) }); added += groups.length; continue; }
     for (const g of groups) {
-      await addLine(db, c, r.id, { childId: sel.id, quantity: g.qty, role: `${g.where}`.slice(0, 120), notes: g.assumed ? `Assumed: ${g.assumed}. Grip ${g.grip}.` : `Grip ${g.grip}.` });
+      await addLine(db, c, r.id, { childId: sel.id, quantity: g.qty, role: `${g.where}`.slice(0, 100), notes: g.assumed ? `Assumed: ${g.assumed}. Grip ${g.grip}.` : `Grip ${g.grip}.` });
       const [nl] = await q(`SELECT l.id FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL WHERE b.parent_id = ? AND b.deleted_at IS NULL ORDER BY l.id DESC LIMIT 1`, [r.id]);
       await resolveLine(db, c, nl.id, { itemId: itemOf.get(g.name) });
       added++;
