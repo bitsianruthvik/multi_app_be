@@ -24,6 +24,7 @@
  * Every function takes the caller's connection and belongs in its transaction.
  */
 import { ALL_TAGS, OLD_TAGS, isKnownTag, tagName, orderTags } from '../lib/access.js';
+import { clearPermissionCache } from '../../../core/middleware/authmiddleware.js';
 
 export const APP_SLUG = 'cf_hrms';
 
@@ -58,11 +59,11 @@ export async function ensureCatalog(conn, { apply = true } = {}) {
     if (!apply) continue;
     if (f) {
       // The tag is unique whether or not the row is deleted, so a retired one is brought back.
-      await conn.query('UPDATE features SET deleted_at = NULL WHERE id = ?', [f.id]);
+      await conn.query('UPDATE features SET deleted_at = NULL WHERE id = ?', [f.id]); clearPermissionCache();
       featureOf.set(tag, { ...f, deleted_at: null });
     } else {
       // 'frontend': the platform copies only frontend tags into a login token from the company role.
-      const [res] = await conn.query("INSERT INTO features (feature_name, feature_tag, type) VALUES (?, ?, 'frontend')", [tagName(tag), tag]);
+      const [res] = await conn.query("INSERT INTO features (feature_name, feature_tag, type) VALUES (?, ?, 'frontend')", [tagName(tag), tag]); clearPermissionCache();
       featureOf.set(tag, { id: res.insertId, feature_tag: tag, deleted_at: null });
     }
   }
@@ -80,7 +81,7 @@ export async function ensureCatalog(conn, { apply = true } = {}) {
     if (!cap) {
       created.capabilities.push(tag);
       if (apply && featureId != null) {
-        const [res] = await conn.query('INSERT INTO features_capability (name, features_json) VALUES (?, ?)', [tag, JSON.stringify([featureId])]);
+        const [res] = await conn.query('INSERT INTO features_capability (name, features_json) VALUES (?, ?)', [tag, JSON.stringify([featureId])]); clearPermissionCache();
         cap = { capability_id: res.insertId, name: tag, features_json: [featureId] };
       }
     } else if (featureId != null) {
@@ -88,7 +89,7 @@ export async function ensureCatalog(conn, { apply = true } = {}) {
       const ids = jsonIds(cap.features_json);
       if (ids.length !== 1 || ids[0] !== featureId) {
         repaired.push(tag);
-        if (apply) await conn.query('UPDATE features_capability SET features_json = ? WHERE capability_id = ?', [JSON.stringify([featureId]), cap.capability_id]);
+        if (apply) await conn.query('UPDATE features_capability SET features_json = ? WHERE capability_id = ?', [JSON.stringify([featureId]), cap.capability_id]); clearPermissionCache();
       }
     }
     byTag.set(tag, { featureId, capabilityId: cap?.capability_id ?? null });
@@ -166,7 +167,7 @@ export async function setRoleTags(conn, { companyId, appId, roleId, tags, catalo
     have.set(tag, r.id);
     if (!want.has(tag) && !addOnly) { retire.push(r.id); removed.push(tag); }
   }
-  if (retire.length) await conn.query('UPDATE role_capability SET deleted_at = NOW() WHERE id IN (?) AND role_id = ? AND app_id = ?', [retire, roleId, appId]);
+  if (retire.length) await conn.query('UPDATE role_capability SET deleted_at = NOW() WHERE id IN (?) AND role_id = ? AND app_id = ?', [retire, roleId, appId]); clearPermissionCache();
 
   const added = ALL_TAGS.filter((t) => want.has(t) && !have.has(t));
   const missing = added.filter((t) => catalog.byTag.get(t)?.capabilityId == null);
@@ -175,7 +176,7 @@ export async function setRoleTags(conn, { companyId, appId, roleId, tags, catalo
     await conn.query(
       `INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id) VALUES ${added.map(() => '(?, NULL, ?, ?, ?)').join(', ')}`,
       added.flatMap((t) => [roleId, companyId, appId, catalog.byTag.get(t).capabilityId]),
-    );
+    ); clearPermissionCache();
   }
 
   let stuck = [];

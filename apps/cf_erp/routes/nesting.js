@@ -99,7 +99,7 @@ import { lotDxf, lineCncZip, lotAiPlan } from '../services/cncExportService.js';
 // Plate changes after a purchase order (init.sql §62): every plate write below goes through the gate.
 import { plateChangeGate } from '../services/plateChangeService.js';
 // Drawings on an order line's rows (init.sql §51): DXF or PDF, matched by drawing mark; a plate part's DXF is its shape.
-import { getDrawings, drawingTree, uploadDrawings, deleteDrawing, drawingFile, startDrawing } from '../services/partDrawingService.js';
+import { getDrawings, drawingTree, drawingShapes, uploadDrawings, deleteDrawing, drawingFile, startDrawing } from '../services/partDrawingService.js';
 
 const router = Router();
 const view = guard(PERM.ordersView);
@@ -226,6 +226,9 @@ router.get('/orders/:orderId/lines/:lineId/drawings', view,
 // THE TREE: every row of the line with its parent and whether it has a drawing (view permission) — the viewer's levels.
 router.get('/orders/:orderId/lines/:lineId/drawings/tree', view,
   handle((req) => read(req, (db, companyId, id) => drawingTree(db, companyId, null, id))));
+// THE OUTLINES, read when drawn (the list carries no rings): ?ids=1,2 for some files, none for all of the line's.
+router.get('/orders/:orderId/lines/:lineId/drawings/shapes', view,
+  handle((req) => read(req, (db, companyId, id) => drawingShapes(db, companyId, null, id, String(req.query.ids ?? '').split(',').filter(Boolean)))));
 router.post('/orders/:orderId/lines/:lineId/drawings', manage,
   handle((req) => write(req, (db, c, id) => uploadDrawings(db, c, null, id, req.body ?? {}))));
 // START a register drawing from rows before its file exists: { rowIds, number, revision?, title?, source?, status? }.

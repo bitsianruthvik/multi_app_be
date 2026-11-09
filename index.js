@@ -7,6 +7,7 @@ import cors from "cors";
 import jwt from "jsonwebtoken";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import pinoHttp from "pino-http";
+import compression from "compression";
 import { logger } from "./core/utils/logger.js";
 import authRoutes from "./core/auth/authRoute.js";
 import companyAuthRoutes from "./core/auth/companyAuthRoute.js";
@@ -56,6 +57,20 @@ app.use("/iclock", iclockRoutes);
 // router has its own 2 MB one, run after its rate limits and key check) and before appContext, which would
 // read "integrations" as a company (apps/cf_hrms/routes/integrations.js).
 app.use("/api/integrations", attendanceIntegrationRoutes);
+
+// Compress JSON and text answers (gzip, or brotli when the browser asks): an order line's structure is ~0.3 MB and a
+// 3D model 1.2 MB as plain JSON — on production nothing was compressed (2026-11-09). After the device routes above (an
+// attendance device never gets a body it did not ask for), before every API route. Below 1 KB it is not worth it; a
+// stream (text/event-stream) is never held back, and a response can opt out with the x-no-compression header.
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.headers["x-no-compression"]) return false;
+    const type = String(res.getHeader("Content-Type") ?? "");
+    if (type.startsWith("text/event-stream")) return false;
+    return compression.filter(req, res);
+  },
+}));
 
 // Increase payload size limit for audio uploads (50MB)
 app.use(express.json({ limit: "50mb" }));

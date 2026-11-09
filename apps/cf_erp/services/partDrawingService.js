@@ -366,6 +366,14 @@ const geometryView = (g) => (g ? {
   cutLengthMm: g.cutLengthMm, piercings: g.piercings, holes: g.holes, holeDiameters: g.holeDiameters, innerCuts: g.innerCuts, rings: g.rings,
 } : null);
 
+/** A drawing's geometry as the list carries it: every fact, no outline (rings), and whether there is one. */
+const listGeometry = (g) => {
+  const v = geometryView(g);
+  if (!v) return null;
+  const { rings, ...facts } = v;
+  return { ...facts, hasShape: Array.isArray(rings) && rings.length > 0 };
+};
+
 function viewOf(line, rows, drawings, refs = new Map(), levels = new Set()) {
   const covered = new Set();
   const hasFile = new Set();   // rows with a saved file of their own (a waiting register sheet is not one)
@@ -387,7 +395,9 @@ function viewOf(line, rows, drawings, refs = new Map(), levels = new Set()) {
       id: d.id, mark: d.mark, fileName: d.file_name, fileKind: d.file_kind ?? 'dxf', uploadedAt: d.created_at,
       drawing: d.drawing_id != null ? refs.get(Number(d.drawing_id)) ?? null : null,
       levels: [...new Set(matched.map((p) => p.level))],
-      geometry: geometryView(d.geometry), rows: matched.map((p) => rowView(p, d.geometry)), warnings: d.warnings,
+      // The facts only: the outline itself (rings, most of the bytes — 2.6 MB on a 187-file line) is read per file,
+      // when a screen draws it (GET …/drawings/shapes; 2026-11-09). hasShape says there is one to read.
+      geometry: listGeometry(d.geometry), rows: matched.map((p) => rowView(p, d.geometry)), warnings: d.warnings,
     };
   });
   // Register drawings linked to rows of the line that have no file here yet.
@@ -467,6 +477,22 @@ export async function getDrawings(db, companyId, orderId, lineId) {
   await readMissingShapes(db, companyId, rows, drawings);
   const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
   return viewOf(line, rows, drawings, refs, await modelDrawsOfStandard(db, companyId, line.standard_id));
+}
+
+/**
+ * THE OUTLINES of some of the line's saved drawings (all of them when ids is empty), read only when a screen draws
+ * them: the drawings list carries the facts, not the rings. { shapes: [{ id, rings }] } — rings as the list used to
+ * carry them (geometry.rings: outline, cut-outs, holes, mm from the rectangle's corner), null when a file has no shape.
+ */
+export async function drawingShapes(db, companyId, orderId, lineId, ids = []) {
+  const line = await requireLine(db, companyId, orderId, lineId);
+  const want = [...new Set((ids ?? []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  const [rows] = await db.query(
+    `SELECT id, geometry_json FROM cf_part_drawings
+      WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL${want.length ? ' AND id IN (?)' : ''} ORDER BY id`,
+    want.length ? [companyId, line.id, want] : [companyId, line.id],
+  );
+  return { shapes: rows.map((r) => ({ id: Number(r.id), rings: parseJson(r.geometry_json)?.rings ?? null })) };
 }
 
 /** A number no other shop drawing has: "SO-20260930-0001/TF1", else with the line, else numbered on. */

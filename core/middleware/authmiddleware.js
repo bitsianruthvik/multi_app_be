@@ -4,6 +4,41 @@ import { verifyToken } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import { pool } from "../../db.js";
 
+/**
+ * A role's feature tags in an app, kept 60 s per (role, app) in this process (2026-11-09: two queries ran on EVERY
+ * request, ~49 ms each on production). Whether the user still has the app (app_user_access) is NOT cached: it is one
+ * indexed row and is read on every request, so a user whose access is taken away loses it at once. What a role may do
+ * follows a change to its capabilities within PERMISSION_TTL_MS at most — at once in this process when the change is
+ * made through the admin screens or the HRMS access grants (they call clearPermissionCache).
+ */
+export const PERMISSION_TTL_MS = 60 * 1000;
+const permissionCache = new Map();          // "roleId:appId" -> { at, tags }
+export function clearPermissionCache() { permissionCache.clear(); }
+async function roleFeatureTags(roleId, appId) {
+  const key = `${roleId}:${appId}`;
+  const kept = permissionCache.get(key);
+  if (kept && Date.now() - kept.at < PERMISSION_TTL_MS) return kept.tags;
+  // JSON_CONTAINS instead of JSON_TABLE — JSON_TABLE isn't supported
+  // on TiDB (MySQL-compatible but not MySQL 8's JSON_TABLE), and this
+  // form works identically on both.
+  const [permRows] = await pool.query(
+    `SELECT DISTINCT f.feature_tag
+       FROM role_capability rc
+       JOIN features_capability fca ON fca.capability_id = rc.capability_id
+         AND fca.deleted_at IS NULL
+       JOIN features f ON JSON_CONTAINS(fca.features_json, CAST(f.id AS JSON))
+         AND f.deleted_at IS NULL
+      WHERE rc.role_id = ?
+        AND (rc.app_id = ? OR rc.app_id IS NULL)
+        AND rc.deleted_at IS NULL`,
+    [roleId, appId]
+  );
+  const tags = permRows.map(r => r.feature_tag);
+  if (permissionCache.size > 5000) permissionCache.clear();
+  permissionCache.set(key, { at: Date.now(), tags });
+  return tags;
+}
+
 export const protect = async (req, res, next) => {
   try {
     logger.debug({
@@ -94,23 +129,8 @@ export const protect = async (req, res, next) => {
 
         // Load feature_tags for this user's role in this app
         try {
-          const roleId = rows[0].role_id;
-          // JSON_CONTAINS instead of JSON_TABLE — JSON_TABLE isn't supported
-          // on TiDB (MySQL-compatible but not MySQL 8's JSON_TABLE), and this
-          // form works identically on both.
-          const [permRows] = await pool.query(
-            `SELECT DISTINCT f.feature_tag
-               FROM role_capability rc
-               JOIN features_capability fca ON fca.capability_id = rc.capability_id
-                 AND fca.deleted_at IS NULL
-               JOIN features f ON JSON_CONTAINS(fca.features_json, CAST(f.id AS JSON))
-                 AND f.deleted_at IS NULL
-              WHERE rc.role_id = ?
-                AND (rc.app_id = ? OR rc.app_id IS NULL)
-                AND rc.deleted_at IS NULL`,
-            [roleId, req.appCtx.id]
-          );
-          req.user.uiPermissions = permRows.map(r => r.feature_tag);
+          // Cached per (role, app) for PERMISSION_TTL_MS; a copy, so a handler that changes it changes nothing kept.
+          req.user.uiPermissions = [...await roleFeatureTags(rows[0].role_id, req.appCtx.id)];
         } catch (permErr) {
           logger.error({ permErr }, "authmiddleware: failed to load app permissions");
           // Non-fatal — uiPermissions stays as decoded JWT value (may be empty)

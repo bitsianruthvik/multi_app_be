@@ -998,7 +998,7 @@ export async function lineStructure(db, companyId, lineId, { c = null } = {}) {
   const line = await requireOrderLine(db, companyId, lineId);
   const o = await requireOrder(db, companyId, line.order_id);
   if (!line.item_id) throw invalid('NO_ITEM', 'This line has no item yet.');
-  if (c) await autofillLineSelections(db, c, line.id, { refresh: (ids) => refreshValues(db, c, ids) });
+  const filled = c ? await autofillLineSelections(db, c, line.id, { refresh: (ids) => refreshValues(db, c, ids) }) : null;
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity), withCut: true });
   const released = !!(await releaseOfLine(db, companyId, line.id));
   return {
@@ -1015,6 +1015,9 @@ export async function lineStructure(db, companyId, lineId, { c = null } = {}) {
       flowsFillOnly: !LOCKED.has(o.status) && !released && !!line.locked_at,
     },
     ...tree,
+    // How many selections this read chose (and values it refreshed): a screen that read the line's values beside the
+    // structure reads them again when this is above 0 (2026-11-09).
+    autofilled: Number(filled?.filled ?? 0),
   };
 }
 

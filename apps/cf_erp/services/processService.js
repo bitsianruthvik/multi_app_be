@@ -54,7 +54,7 @@ import { layoutDriftOfLines, driftSentence } from './nestingService.js';
 import { plannedMaterialOfLines } from './releaseService.js';
 import { availability, madeRule } from './rollOutService.js';
 import { cutPieceGaps } from './lockService.js';
-import { lineReadiness, dayWords, DATED_PO_STATUSES } from './materialReadyService.js';
+import { orderLineReadiness, dayWords, DATED_PO_STATUSES } from './materialReadyService.js';
 import { planRowsOf, linePlanStates, madeOf } from './executionPlanService.js';
 
 /**
@@ -1380,6 +1380,14 @@ async function loadOrderContext(db, companyId, order, lines) {
   // connection (inside a transaction) mysql2 queues them — same answers.
   const lineIds = lines.map((l) => l.id);
 
+  // 4 (started first: it needs only the order). The material-ready state of this order's lines, in claim order with
+  //    the rest — only the lines ranked up to this order's last are worked out (a later one cannot change its
+  //    answer). Its materials' supply is read too, for what is on order: they are handed over once the trees are read.
+  let giveItems;
+  const itemsKnown = new Promise((resolve) => { giveItems = resolve; });
+  const readyP = orderLineReadiness(db, companyId, order.id, { full: true, extraItemIds: itemsKnown });
+  readyP.catch(() => { /* awaited below */ });
+
   // 1. Each line's structure, exploded once — the lines side by side.
   const trees = new Map(await Promise.all(lines.map(async (line) => [
     line.id,
@@ -1404,6 +1412,7 @@ async function loadOrderContext(db, companyId, order, lines) {
     [companyId, [...itemIds]],
   ) : [[]];
   const detail = new Map(detailRows.map((r) => [r.master_id, r]));
+  giveItems([...itemIds]);
   const lockedLines = lines.filter((l) => l.locked_at).map((l) => l.id);
   const temporaryIds = [...itemIds].filter((id) => detail.get(id)?.item_type === 'temporary');
 
@@ -1510,8 +1519,8 @@ async function loadOrderContext(db, companyId, order, lines) {
   ] = await Promise.all([
     // 3. Free stock, once, for every item that could be drawn from it.
     itemIds.size ? availability(db, companyId, [...itemIds]) : new Map(),
-    // 4. The material-ready state of every open line (this order's among them, in claim order with the rest).
-    lineReadiness(db, companyId, { full: true }),
+    // 4. Started at the top.
+    readyP,
     releasesStage,
     lotsStage,
     specStage,
@@ -1556,9 +1565,8 @@ async function loadOrderContext(db, companyId, order, lines) {
   const { chains, nestSpec, nestingBy, values } = spec;
   const cutPiecesBy = new Map(blankRows.filter((r) => r.kind === 'plate').map((r) => [r.order_line_id, Number(r.blanks)]));
   const sectionPiecesBy = new Map(blankRows.filter((r) => r.kind === 'section').map((r) => [r.order_line_id, Number(r.blanks)]));
-  // Section nesting's own answer, for every line that has cut sections (one ask a line).
-  const sectionBy = new Map();
-  for (const [lineId] of sectionPiecesBy) sectionBy.set(lineId, await sectionNestingStateOf(db, companyId, lineId, { tree: trees.get(lineId) ?? undefined }));
+  // Section nesting's own answer, for every line that has cut sections (one ask a line, the lines side by side).
+  const sectionBy = new Map(await Promise.all([...sectionPiecesBy.keys()].map(async (lineId) => [lineId, await sectionNestingStateOf(db, companyId, lineId, { tree: trees.get(lineId) ?? undefined })])));
   const locksBy = new Map(lockedLines.map((id) => [id, { pieces: 0, bomLines: new Set() }]));
   for (const r of pieceRows) {
     const e = locksBy.get(r.order_line_id);
@@ -2006,16 +2014,23 @@ export async function orderProcess(db, companyId, orderId) {
     specIds.forEach((specId, i) => out.set(specId, values[i]));
     return out;
   })();
+  // §73: the order's acceptance standing and which lines have an MR — two reads, only for a process that asks. They
+  // need nothing of the context, so they are read beside it (one round trip less at the end; 2026-11-09).
+  const accP = stageRows.some((s) => s.stage_key === 'acceptance' || s.stage_key === 'buying')
+    ? (async () => {
+      const { acceptanceStates } = await import('./acceptanceService.js');
+      return Promise.all([
+        acceptanceStates(db, companyId, [order.id]),
+        db.query('SELECT id, code, order_line_id, held_for_acceptance FROM cf_requisitions WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [companyId, order.id]),
+      ]);
+    })()
+    : null;
+  accP?.catch(() => { /* awaited below */ });
   const [ctx, overrideValues] = await Promise.all([ctxP ?? loadOrderContext(db, companyId, order, lines), overrides]);
 
   const planStage = stageRows.some((s) => s.stage_key === 'execution_plan');
-  // §73: the order's acceptance standing and which lines have an MR — two reads, only for a process that asks.
-  if (stageRows.some((s) => s.stage_key === 'acceptance' || s.stage_key === 'buying')) {
-    const { acceptanceStates } = await import('./acceptanceService.js');
-    const [acc, [mrs]] = await Promise.all([
-      acceptanceStates(db, companyId, [order.id]),
-      db.query('SELECT id, code, order_line_id, held_for_acceptance FROM cf_requisitions WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [companyId, order.id]),
-    ]);
+  if (accP) {
+    const [acc, [mrs]] = await accP;
     ctx.acceptance = acc.get(Number(order.id)) ?? null;
     ctx.mrByLine = new Map(mrs.map((r) => [Number(r.order_line_id), { id: r.id, code: r.code, held: !!Number(r.held_for_acceptance) }]));
   }

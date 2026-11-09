@@ -615,6 +615,41 @@ export async function lineReadiness(db, companyId, { lines: given = null, full =
   return { today: todayText, lines, needs, supply, byLine };
 }
 
+/**
+ * THE SAME ANSWER FOR ONE ORDER'S LINES, without working out every open line of the company (2026-11-09: the order
+ * page's /process ran lineReadiness over every open line — every frozen line's planned material — on each open and
+ * after each edit). The engine serves lines one after another in claimOrderOfLines and a line only takes from what is
+ * left (evaluate), so a line ranked AFTER this order's last open line can never change what this order's lines get:
+ * only the lines up to it are worked out. Their byLine is the whole engine's, byte for byte.
+ * `extraItemIds`: items whose supply is read as well (the order's own materials, for the purchase lines on order); a
+ * consumer takes only what it needs, so reading more items changes no result. May be a promise (awaited just before
+ * the supply is read, so the lines and their needs are read meanwhile).
+ * Returns { today, lines (the ones worked out), needs, supply, byLine } like lineReadiness.
+ */
+export async function orderLineReadiness(db, companyId, orderId, { full = true, todayText = today(), extraItemIds = [] } = {}) {
+  const all = await openLines(db, companyId);
+  const claim = claimOrderOfLines(all);
+  let last = -1;
+  claim.forEach((l, i) => { if (Number(l.order_id) === Number(orderId)) last = i; });
+  const lines = claim.slice(0, last + 1);
+  const needs = lines.length ? await lineNeeds(db, companyId, lines) : new Map();
+  const itemIds = new Set((await extraItemIds).map(Number));
+  for (const n of needs.values()) for (const id of n.items.keys()) itemIds.add(id);
+  const supply = await loadSupply(db, companyId, [...itemIds], { needs, todayText });
+  const consumers = lines.map((l) => ({
+    key: Number(l.id), lineId: Number(l.id), orderKey: orderKeyOf(l.order_code), customerId: l.customer_id ?? null,
+    needs: [...(needs.get(Number(l.id))?.items ?? [])].map(([itemId, e]) => ({ itemId, qty: e.need })),
+  }));
+  const { results } = evaluate(supply, consumers, { full });
+  const byLine = new Map();
+  for (const l of lines) {
+    if (Number(l.order_id) !== Number(orderId)) continue;
+    const n = needs.get(Number(l.id));
+    byLine.set(Number(l.id), { ...results.get(Number(l.id)), known: !!n?.known, complete: !!n?.ready, why: n?.why ?? null, source: n?.source ?? null });
+  }
+  return { today: todayText, lines, needs, supply, byLine };
+}
+
 /** A line's state as the screens show it: { state, readyDate, soft, known, complete, why, text, materials: [reason…] }. */
 export function shapeLineReady(r) {
   if (!r) return { state: null, readyDate: null, soft: false, known: false, complete: false, why: 'This line is not on an open order.', text: 'This line is not on an open order.', materials: [] };

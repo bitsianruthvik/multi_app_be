@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 import { pool } from "../../db.js";
 import { signToken } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
+import { clearPermissionCache } from "../middleware/authmiddleware.js";
 
 // DEPRECATED: FE now creates users via /api/query/v1/base_resource (mutate). This handler is kept for backwards compat only.
 // Add new user (Admin only)
@@ -71,7 +72,7 @@ export const addFeature = async (req, res) => {
     await pool.query(
       "INSERT INTO features (feature_name, feature_tag, type) VALUES (?, ?, ?)",
       [feature_name, feature_tag, type]
-    );
+    ); clearPermissionCache();
     res.status(201).json({ message: "Feature added successfully" });
   } catch (err) {
     logger.error({ err }, "Error adding feature");
@@ -100,7 +101,7 @@ export const addFeatureCapability = async (req, res) => {
     const [result] = await pool.query(
       "INSERT INTO features_capability (features_json) VALUES (?)",
       [JSON.stringify(features_json || [])]
-    );
+    ); clearPermissionCache();
     res
       .status(201)
       .json({ message: "Capability added successfully", id: result.insertId });
@@ -312,7 +313,7 @@ export const addRoleCapability = async (req, res) => {
     await pool.query(
       "INSERT INTO role_capability (role_id, team_id, company_id, capability_id) VALUES (?, ?, ?, ?)",
       [roleId, teamId, companyId, capability_id]
-    );
+    ); clearPermissionCache();
     res
       .status(201)
       .json({ message: "Role-capability mapping added successfully" });
@@ -374,7 +375,7 @@ export const updateRoleCapability = async (req, res) => {
     await pool.query(
       "UPDATE role_capability SET role_id = ?, team_id = ?, company_id = ?, capability_id = ? WHERE id = ? AND company_id = ?",
       [roleId, teamId, companyId, capability_id, id, companyId]
-    );
+    ); clearPermissionCache();
     res
       .status(200)
       .json({ message: "Role-capability mapping updated successfully" });
