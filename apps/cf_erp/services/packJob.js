@@ -175,10 +175,14 @@ function runShapeJob(input, hooks = {}) {
     if (!pcs.length) return null;
     const usedBy = new Map();
     for (const n of shape.nests ?? []) usedBy.set(String(n.sheetKey), (usedBy.get(String(n.sheetKey)) ?? 0) + 1);
-    const keep = (shape.nests ?? []).map((n, i) => {
+    // Only the emptiest plates (by their parts' box area) are offered back — every plate offered is an obstacle set to
+    // build — and their parts go without bolt holes (an obstacle needs none).
+    const fill = (n) => (n.placements ?? []).reduce((a, q) => a + (q.bbox ? (q.bbox.x1 - q.bbox.x0) * (q.bbox.y1 - q.bbox.y0) : 0), 0) / Math.max(1, (Number(n.sheetLength) || 1) * (Number(n.sheetWidth) || 1));
+    const roomiest = new Set((shape.nests ?? []).map((n, i) => ({ i, f: fill(n) })).sort((a, b) => a.f - b.f).slice(0, 6).map((x) => x.i));
+    const keep = (shape.nests ?? []).map((n, i) => ({ n, i })).filter(({ i }) => roomiest.has(i)).map(({ n, i }) => {
       const s = sheetMap.get(String(n.sheetKey)) ?? { length: n.sheetLength, width: n.sheetWidth };
       return { key: `__keep${i}`, length: s.length, width: s.width, available: 1, preferred: true, areaCost: 0, penalty: 0,
-        fixed: (n.placements ?? []).map((q, j) => ({ key: `k${i}_${j}`, placed: true, rings: q.rings })) };
+        fixed: withoutBoltHoles((n.placements ?? []).map((q, j) => ({ key: `k${i}_${j}`, placed: true, rings: q.rings }))) };
     });
     const fresh = (input.shape.sheets ?? []).filter((s) => !s.preferred)
       .map((s) => ({ ...s, available: Math.max(0, (Number(s.available) || 0) - (usedBy.get(String(s.key)) ?? 0)) })).filter((s) => s.available > 0);
@@ -218,17 +222,14 @@ function runShapeJob(input, hooks = {}) {
     const demand = new Map(allShape.map((p) => [String(p.key), Number(p.qty) || 0]));
     const lean = withoutBoltHoles(allShape);
     const bought = (input.shape.sheets ?? []).filter((s) => !s.preferred);
-    const est = [];
-    for (const s of bought) {
-      if (stopNow() || room() < 1000) break;
-      const rs0 = (input.rect.sheets ?? []).find((x) => String(x.key) === String(s.key));
-      if (!rs0) continue;
-      try { const o = nest({ ...input.rect, effort: 'quick', restarts: undefined, sheets: [rs0], seed, budgetMs: Math.max(100, Math.min(1500, Math.floor(room() / 12))), deadlineAt: mixEnd }); if (!stranded(o)) est.push({ s, area: Number(o.areaBought) || Infinity }); } catch { /* an estimate only */ }
-    }
+    // WHICH SINGLE SIZES: the two the answer in hand uses most, else the largest (a row pass per size to rate them
+    // cannot be interrupted, and on a bridge-size steel six of them overran the budget).
+    const usedN = new Map(); for (const n of resOut.nests ?? []) usedN.set(String(n.sheetKey), (usedN.get(String(n.sheetKey)) ?? 0) + 1);
+    const est = bought.map((s) => ({ s, area: -((usedN.get(String(s.key)) ?? 0) * 1e12 + s.length * s.width) }));
     const layouts = [platesOf(resOut)];
     let det = true;
     est.sort((a, b) => a.area - b.area).slice(0, 2).forEach((e, i) => {
-      if (stopNow() || room() < 1500) return;
+      if (stopNow() || room() < Math.max(1500, 0.25 * total)) return;
       try {
         const o = SP.packShapes({ ...input.shape, ...coarser, pieces: lean, sheets: [e.s], seed, freeRegions: false, ...mclock(i === 0 ? 0.35 : 0.5), shouldStop: stopNow });
         if (o.deterministic === false) det = false;
@@ -238,7 +239,7 @@ function runShapeJob(input, hooks = {}) {
     const cs = covers(layouts, { demand, sheets: sheetMap, net, margin: Number(input.shape.margin) || 0, rules: R });
     const cands = cs.slice(0, 3).map((c) => c.plates);
     for (const c of cs.slice(0, 2)) {
-      if (stopNow() || c.plates.length < 3 || room() < 1000) continue;
+      if (stopNow() || c.plates.length < 3 || room() < Math.max(1000, 0.1 * total)) continue;
       const t = tailOf(c, net);
       const pcs = lean.filter((p) => (t.need.get(String(p.key)) ?? 0) > 0).map((p) => ({ ...p, qty: t.need.get(String(p.key)) }));
       const usedBy = new Map(); for (const p of t.keep) usedBy.set(p.buy, (usedBy.get(p.buy) ?? 0) + 1);
