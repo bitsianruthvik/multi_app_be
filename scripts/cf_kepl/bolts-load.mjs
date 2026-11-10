@@ -30,6 +30,10 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
   const { createItem, createDefinition, setStatus } = await imp('apps/cf_erp/services/masterRecordService.js');
   const { addLine, resolveLine } = await imp('apps/cf_erp/services/bomService.js');
   const { applyBomChanges } = await imp('apps/cf_erp/services/bomChangeService.js');
+  const { assertEditable } = await imp('apps/cf_erp/services/bomService.js');
+  const { requireMaster } = await imp('apps/cf_erp/services/records.js');
+  const { bomOfParent, nextLineNo, nextPosition } = await imp('apps/cf_erp/services/bomGraph.js');
+  const { refreshValues } = await imp('apps/cf_erp/services/valueService.js');
   const COMPANY = c.companyId;
   const q = async (sql, p = []) => (await db.query(sql, p))[0];
 
@@ -105,9 +109,35 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
   //    or, with --replace, has them replaced when they differ.
   // A row inside a row of the SAME mark (Thane's seismic stopper carries its end cross girder's mark EBCG) is one assembly
   // for the bolts: they go on the one of the two that has bolt rows already, else on the outer one — never on both.
-  const markById = new Map(); for (const r of rows) markById.set(r.id, await markOf(r));
+  // BULK READS (2026-11-10): one query per kind for ALL rows instead of 5–7 per row — Thane's 660 rows were several
+  // thousand round trips to prod (50+ minutes). markOfBulk follows markOf's order exactly.
+  const ids = rows.map((r) => r.id);
+  const group = (list, key) => { const m = new Map(); for (const x of list) { const k = Number(x[key]); if (!m.has(k)) m.set(k, []); m.get(k).push(x); } return m; };
+  const selfMarks = group(ids.length ? await q(`SELECT v.subject_id, v.value_text AS mark FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'DRAWING_MARK'
+                                   WHERE v.company_id = ? AND v.subject_id IN (?) AND v.subject_type = 'master' AND v.deleted_at IS NULL ORDER BY v.id`, [COMPANY, ids]) : [], 'subject_id');
+  const ownNums = group(ids.length ? await q('SELECT k.subject_id, d.number FROM cf_drawing_links k JOIN cf_drawings d ON d.id = k.drawing_id WHERE k.company_id = ? AND k.subject_id IN (?) AND k.deleted_at IS NULL ORDER BY k.id', [COMPANY, ids]) : [], 'subject_id');
+  const kidNums = group(ids.length ? await q(`SELECT DISTINCT b.parent_id, d.number FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL
+                                 JOIN cf_drawing_links k ON k.subject_id = l.child_id AND k.deleted_at IS NULL JOIN cf_drawings d ON d.id = k.drawing_id
+                                WHERE b.company_id = ? AND b.parent_id IN (?) AND b.deleted_at IS NULL`, [COMPANY, ids]) : [], 'parent_id');
+  const kidMarks = group(ids.length ? await q(`SELECT DISTINCT b.parent_id, v.value_text AS mark FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL
+                                 JOIN cf_spec_values v ON v.subject_id = l.child_id AND v.subject_type = 'master' AND v.deleted_at IS NULL
+                                 JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'DRAWING_MARK'
+                                WHERE b.company_id = ? AND b.parent_id IN (?) AND b.deleted_at IS NULL`, [COMPANY, ids]) : [], 'parent_id');
+  const boltRowsAll = group(ids.length && sel.id ? await q(`SELECT b.parent_id, l.id, l.child_id, l.quantity, l.role, m.name FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL AND l.selection_definition_id = ?
+                                     JOIN cf_master_records m ON m.id = l.child_id WHERE b.parent_id IN (?) AND b.deleted_at IS NULL ORDER BY l.line_no, l.id`, [sel.id, ids]) : [], 'parent_id');
+  const markOfBulk = (r) => {
+    if (MATCH === 'name') return BOLTS.byAssembly[r.name] ? r.name : null;
+    for (const { mark } of selfMarks.get(r.id) ?? []) if (BOLTS.byAssembly[mark]) return mark;
+    for (const { number } of ownNums.get(r.id) ?? []) { const m = number.slice(so.length).replace(/^L\d+\//, '').replace(/-\d+$/, ''); if (number.startsWith(so) && BOLTS.byAssembly[m]) return m; }
+    const pre = [...new Set((kidNums.get(r.id) ?? []).map((k) => k.number).filter((n) => n.startsWith(so)).map((n) => n.slice(so.length).split('-')[0]))];
+    if (pre.length === 1 && BOLTS.byAssembly[pre[0]]) return pre[0];
+    const pre2 = [...new Set((kidMarks.get(r.id) ?? []).map((v) => String(v.mark ?? '').split('-')[0]).filter(Boolean))];
+    return pre2.length === 1 && BOLTS.byAssembly[pre2[0]] ? pre2[0] : null;
+  };
+  const ownMarkBulk = (r) => (selfMarks.get(r.id) ?? [])[0]?.mark ?? null;
+  const markById = new Map(); for (const r of rows) markById.set(r.id, markOfBulk(r));
   const byId = new Map(rows.map((r) => [r.id, r]));
-  const hasBolts = new Map(); for (const r of rows) hasBolts.set(r.id, (await boltRowsOf(r.id)).length > 0);
+  const hasBolts = new Map(); for (const r of rows) hasBolts.set(r.id, (boltRowsAll.get(r.id) ?? []).length > 0);
   const twinOf = (r) => { for (let up = byId.get(r.parent); up; up = byId.get(up.parent)) if (markById.get(up.id) && markById.get(up.id) === markById.get(r.id)) return up; return null; };
   const skip = new Set();
   for (const r of rows) {
@@ -115,6 +145,7 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
     if (hasBolts.get(r.id) && !hasBolts.get(outer.id)) skip.add(outer.id); else skip.add(r.id);
     log(`  ${r.name} sits in ${outer.name}, both ${markById.get(r.id)}: bolts on the ${skip.has(r.id) ? 'outer' : 'inner'} row only`);
   }
+  const touched = [];
   let added = 0; let removed = 0; const seen = new Set(); const unmatched = []; const replaced = []; const left = [];
   for (const r of rows) {
     if (skip.has(r.id)) { seen.add(markById.get(r.id)); continue; }
@@ -123,9 +154,9 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
       if (r.name !== '(line)') unmatched.push(r.name);
       // --replace: an assembly bolts.json no longer lists keeps no bolt rows.
       if (REPLACE) {
-        const have = await boltRowsOf(r.id);
+        const have = boltRowsAll.get(r.id) ?? [];
         if (have.length) {
-          const own = await ownMarkOf(r);
+          const own = ownMarkBulk(r);
           removed += await removeRows(have);
           replaced.push({ row: r.name, mark: own, from: have.map((h) => ({ name: h.name, qty: Number(h.quantity), role: h.role })), to: [] });
           log(`  ${r.name} (${own ?? 'no mark'}): ${have.length} bolt rows removed — bolts.json has no bolts for it`);
@@ -136,7 +167,7 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
     }
     seen.add(mark);
     const groups = BOLTS.byAssembly[mark];
-    const have = await boltRowsOf(r.id);
+    const have = boltRowsAll.get(r.id) ?? [];
     if (have.length && !REPLACE) { log(`  ${r.name} (${mark}): has bolt rows — left`); left.push(mark); continue; }
     if (have.length) {
       const now = have.map((h) => ({ item: Number(h.child_id), qty: Number(h.quantity), role: h.role }));
@@ -147,14 +178,32 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
     }
     if (verbose) log(`  ${r.name} (${mark}) rec ${r.id}: ${groups.length} groups`);
     if (PLAN) { if (!have.length) replaced.push({ row: r.name, mark, from: [], to: groups.map((g) => ({ name: g.name, qty: g.qty, role: `${g.where}`.slice(0, 100) })) }); added += groups.length; continue; }
-    for (const g of groups) {
-      await addLine(db, c, r.id, { childId: sel.id, quantity: g.qty, role: `${g.where}`.slice(0, 100), notes: g.assumed ? `Assumed: ${g.assumed}. Grip ${g.grip}.` : `Grip ${g.grip}.` });
-      const [nl] = await q(`SELECT l.id FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL WHERE b.parent_id = ? AND b.deleted_at IS NULL ORDER BY l.id DESC LIMIT 1`, [r.id]);
-      await resolveLine(db, c, nl.id, { itemId: itemOf.get(g.name) });
-      added++;
+    // BULK WRITE (2026-11-10): the row's checks once, then ONE insert of all its bolt rows with the item already chosen
+    // (as resolveLine leaves it: child = the item, auto_chosen 0), and ONE value refresh for every touched row at the end.
+    // addLine + resolveLine per group refreshed the values up the whole tree twice per bolt group (~40 round trips each).
+    const bom = await bomOfParent(db, COMPANY, r.id);
+    if (!bom) {
+      for (const g of groups) {
+        await addLine(db, c, r.id, { childId: sel.id, quantity: g.qty, role: `${g.where}`.slice(0, 100), notes: g.assumed ? `Assumed: ${g.assumed}. Grip ${g.grip}.` : `Grip ${g.grip}.` });
+        const [nl] = await q(`SELECT l.id FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL WHERE b.parent_id = ? AND b.deleted_at IS NULL ORDER BY l.id DESC LIMIT 1`, [r.id]);
+        await resolveLine(db, c, nl.id, { itemId: itemOf.get(g.name) });
+        added++;
+      }
+    } else {
+      await assertEditable(db, COMPANY, await requireMaster(db, COMPANY, r.id));
+      await q('SELECT id FROM cf_boms WHERE id = ? FOR UPDATE', [bom.id]);
+      let lineNo = (await nextLineNo(db, COMPANY, bom.id)) - 10;
+      let pos = (await nextPosition(db, COMPANY, bom.id, sel.id)) - 1;
+      const vals = groups.map((g) => [COMPANY, bom.id, (lineNo += 10), itemOf.get(g.name), sel.id, ++pos, `${g.where}`.slice(0, 100), g.qty, sel.id, null, null,
+        g.assumed ? `Assumed: ${g.assumed}. Grip ${g.grip}.` : `Grip ${g.grip}.`, c.userId, 0]);
+      if (vals.length) await q(`INSERT INTO cf_bom_lines (company_id, bom_id, line_no, child_id, design_id, position, role, quantity, selection_definition_id, source_line_id, operation_flow_id, notes, created_by, auto_chosen) VALUES ?`, [vals]);
+      added += vals.length;
     }
+    touched.push(r.id);
     if (APPLY) { await db.commit(); await db.beginTransaction(); }
   }
+  // One value refresh for every row that took bolt rows (removals refreshed themselves through applyBomChanges).
+  if (touched.length && !PLAN) { await refreshValues(db, c, [...new Set(touched)]); if (APPLY) { await db.commit(); await db.beginTransaction(); } }
   const missing = Object.keys(BOLTS.byAssembly).filter((m) => !seen.has(m));
   return { added, removed, replaced, left, missing, unmatched: [...new Set(unmatched)], code: line.code };
 }
