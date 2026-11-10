@@ -30,7 +30,11 @@ export const COST_DEFAULTS = Object.freeze({
   maxSizes: 2,            // distinct plate sizes per thickness (0 / null = no limit)
   sizePenaltyKg: 150,     // per distinct size beyond the first
   plateHandlingKg: 20,    // per plate bought
-  customPct: 0.02,        // a CUSTOM plate (or one that does not say) costs 2 % more than a STANDARD one
+  // A CUSTOM plate (or one that does not say) costs this much more per kg than a STANDARD one. 10 % since 2026-11-10
+  // (nest benchmark SO260018: at 2 % the plan bought custom plates that saved steel but cost more); the company's own
+  // figure is `premiumPct` in the custom-plate setting (cf_company_settings.nest_custom_plates JSON; Setup › Cutting,
+  // shopRules.customPremiumOf), handed in as `customPct` by nestingService.pickCutSettings. TO BE CONFIRMED.
+  customPct: 0.10,
   shortPct: 0.03,         // a short plate (under half the longest length offered) 3 % more
   shortRatio: 0.5,
   // A remnant is no longer credited (2026-11-01, SO260018: at 0.5 a plate with its last 4.7 m bare looked half free, so

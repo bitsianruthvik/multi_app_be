@@ -46,8 +46,9 @@ console.log('\n1. The cost rules (nestCost.js)');
     { length: 12000, width: 2000, kind: 'CUSTOM', ratePerKg: null },
     { length: 2500, width: 2000, kind: 'STANDARD', ratePerKg: null },
   ]);
-  ok('no price set: a plate costs its area; CUSTOM +2 %; a short plate (under half the longest) +3 %',
-    pc[0].areaCost === 24e6 && pc[0].penalty === 0 && near(pc[1].penalty, 0.02 * 24e6) && near(pc[2].penalty, 0.03 * 5e6), J(pc));
+  // CUSTOM: +10 % since 2026-11-10 (nestCost.COST_DEFAULTS.customPct; a company figure overrides it — nest_plate_mix_test).
+  ok('no price set: a plate costs its area; CUSTOM +10 %; a short plate (under half the longest) +3 %',
+    pc[0].areaCost === 24e6 && pc[0].penalty === 0 && near(pc[1].penalty, 0.10 * 24e6) && near(pc[2].penalty, 0.03 * 5e6), J(pc));
   const pr = NC.plateCosts([{ length: 1000, width: 1000, kind: 'STANDARD', ratePerKg: 60 }, { length: 1000, width: 1000, kind: 'STANDARD', ratePerKg: 66 }, { length: 1000, width: 1000, kind: 'STANDARD', ratePerKg: 72 }, { length: 1000, width: 1000, kind: 'STANDARD' }]);
   ok('priced plates: area × rate ÷ the median rate; an unpriced one at the median', near(pr[0].areaCost, 1e6 * 60 / 66) && near(pr[1].areaCost, 1e6) && near(pr[2].areaCost, 1e6 * 72 / 66) && pr[3].areaCost === 1e6, J(pr));
   const R = NC.costRulesFor(20, { offcutMinArea: 90000, offcutMinSide: 100 });

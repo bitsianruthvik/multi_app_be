@@ -108,13 +108,14 @@ const up = (v, step) => Math.ceil((Number(v) - EPS) / step) * step;
  *   opts      { limits, thickness, density, maxSizes, rules: { customPct, sizePenaltyKg, offcutValue, offcutMinArea, offcutMinSide } }
  * → { length, width, moves: [index], savingArea, savingKg, before: { plates, areaMm2, kg }, after: { … }, sizesBefore, sizesAfter } | null
  */
-export function proposeCustomSize(nests, { limits, thickness, density = 7850, maxSizes = COST_DEFAULTS.maxSizes, rules = {} } = {}) {
+export function proposeCustomSize(nests, { limits, thickness, density = 7850, maxSizes = COST_DEFAULTS.maxSizes, rules = {}, lot = null } = {}) {
   const R = { ...COST_DEFAULTS, offcutMinArea: 90000, offcutMinSide: 100, ...rules };
   if (!limits?.maxLength || !limits?.maxWidth) return null;
   const step = Number(limits.step) > 0 ? Number(limits.step) : 50;
   const kgPerMm2 = (Number(thickness) || 0) * ((Number(density) > 0 ? Number(density) : 7850) * 1e-9);
   const sizeKey = (l, w) => `${Math.max(l, w)}x${Math.min(l, w)}`;
-  const bought = nests.map((n, i) => ({ n, i })).filter(({ n }) => !n.ownerPartyId && n.source !== 'offcut' && n.length > 0 && n.width > 0);
+  // A plate already on a custom LOT size stays there (moving it could leave that lot short — nestingService.markLotNests).
+  const bought = nests.map((n, i) => ({ n, i })).filter(({ n }) => !n.ownerPartyId && !n.lotCustom && n.source !== 'offcut' && n.length > 0 && n.width > 0);
   if (!bought.length) return null;
   const rows = bought.map(({ n, i }) => {
     const area = n.length * n.width;
@@ -125,8 +126,8 @@ export function proposeCustomSize(nests, { limits, thickness, density = 7850, ma
     let needL = Math.max(up(Number(n.requiredLength) + (limits.marginLength ?? 0), step), limits.minLength ?? 0);
     let needW = Math.max(up(Number(n.requiredWidth) + (limits.marginWidth ?? 0), step), limits.minWidth ?? 0);
     if (needL < needW) needL = needW;                            // the length is the long side: the layout runs along it
-    // A size never larger than the plate it would replace (it would only cost more), never past the mill's limits.
-    needL = Math.min(needL, Math.max(n.length, n.width)); needW = Math.min(needW, Math.min(n.length, n.width));
+    // Never past the mill's limits, and never without the ordering margin (2026-11-10: the old cap at the replaced
+    // plate's own size could leave a custom plate 5 mm of margin; whether a size pays is the cost test below).
     const fitsLimits = needL <= limits.maxLength + EPS && needW <= limits.maxWidth + EPS && needL + EPS >= Number(n.requiredLength) && needW + EPS >= Number(n.requiredWidth);
     return { i, n, area, unit, costOld, needL, needW, fitsLimits, key: sizeKey(n.length, n.width) };
   });
@@ -147,6 +148,19 @@ export function proposeCustomSize(nests, { limits, thickness, density = 7850, ma
         if (r.costOld - costNew > 0) { gain += r.costOld - costNew; moves.push(r); }
       }
       if (!moves.length) continue;
+      // THE MILL'S LOT (`lot` { pieces, tonnes }, 2026-11-10): a size is rolled only for a lot. Short of it, the plates
+      // that fit the size and lose least by moving are moved too (still cheaper than buying a plate nobody cuts); a size
+      // that cannot make its lot from this steel's plates is not proposed.
+      if (lot && (lot.pieces || lot.tonnes)) {
+        const enough = () => (lot.pieces && moves.length >= lot.pieces) || (lot.tonnes && moves.length * L * W * kgPerMm2 >= lot.tonnes * 1000);
+        if (!enough()) {
+          const more = rows.filter((r) => !moves.includes(r) && r.fitsLimits && r.needL <= L + EPS && r.needW <= W + EPS && Math.abs(L * W - r.area) > 1)
+            .map((r) => ({ r, loss: L * W * r.unit * (1 + R.customPct) - R.offcutValue * remnantArea({ length: L, width: W, maxX: r.n.requiredLength, maxY: r.n.requiredWidth, minArea: R.offcutMinArea, minSide: R.offcutMinSide }) * r.unit - r.costOld }))
+            .sort((a, b) => a.loss - b.loss);
+          for (const m of more) { if (enough()) break; moves.push(m.r); gain -= m.loss; }
+          if (!enough() || gain <= 0) continue;
+        }
+      }
       const kept = rows.filter((r) => !moves.includes(r));
       const sizesAfter = new Set([...kept.map((r) => r.key), sizeKey(L, W)]).size;
       if (maxSizes && sizesAfter > maxSizes && sizesAfter > sizesBefore) continue;

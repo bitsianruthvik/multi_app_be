@@ -200,6 +200,19 @@ export async function shopRuleRows(db, companyId) {
   return rows;
 }
 
+/**
+ * What a CUSTOM plate costs over a STANDARD one, % per kg (2026-11-10): `premiumPct` inside the §90 custom-plate JSON
+ * (cf_company_settings.nest_custom_plates), so it needs no new column and no extra statement. It holds whether or not
+ * custom sizes are switched on (customPlateSetting answers null when they are off; this does not). null = the default.
+ */
+export const CUSTOM_PREMIUM_PCT_DEFAULT = 10;
+export function customPremiumOf(v) {
+  let o = v;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
+  const n = o && typeof o === 'object' && o.premiumPct != null && o.premiumPct !== '' ? Number(o.premiumPct) : NaN;
+  return Number.isFinite(n) && n >= 0 && n <= 100 ? n : null;
+}
+
 /** The screen's view: the switch, the saved rows, and the rules worked out at the shop's thicknesses. */
 export async function getShopRules(db, companyId) {
   const s = await readShopRules(db, companyId);
@@ -219,6 +232,9 @@ export async function getShopRules(db, companyId) {
     gradeRules: GRADE_RULES,
     impactOrder: IMPACT_ORDER_WORDS,
     customPlates: customView(s.customPlates),
+    // % a custom plate costs over a standard one (null = the default, 10).
+    customPremiumPct: customPremiumOf(s.customPlates),
+    customPremiumPctDefault: CUSTOM_PREMIUM_PCT_DEFAULT,
     defaults: { ...SHOP_DEFAULTS, kerf: SHOP_KERF_POINTS },
     rows: s.rows.map((r) => ({ id: r.id, thicknessMm: Number(r.thickness_mm), ...Object.fromEntries(SHOP_RULE_FIELDS.map((f) => [f, num(r[COLS[f]])])), notes: r.notes ?? null })),
     resolved: thick.map((t) => shopRulesFor(t, s.rows)),
@@ -255,13 +271,22 @@ export async function saveShopRules(db, c, input = {}) {
       [companyId, v, c.userId ?? null],
     );
   }
-  // §90: the grade rule and the custom plate sizes (one statement for both, only when either is sent).
-  if (input.gradeRule !== undefined || input.customPlates !== undefined) {
+  // §90: the grade rule and the custom plate sizes (one statement for both, only when either is sent) — and the custom
+  // plate premium, kept in the same JSON (`customPremiumPct`, % per kg; blank = the default, 10).
+  if (input.gradeRule !== undefined || input.customPlates !== undefined || input.customPremiumPct !== undefined) {
     if (!s.plateSchema) throw conflict('SCHEMA_MISSING', 'The grade rule and custom plate sizes need init.sql §90 (TM/s90.sql) applied to this database first.');
     const rule = input.gradeRule == null || input.gradeRule === '' ? null : String(input.gradeRule).toLowerCase();
     if (rule != null && !GRADE_RULES.includes(rule)) throw bad(`Grade rule: one of ${GRADE_RULES.join(', ')}, or blank for the default (exact).`);
     const cp = input.customPlates === undefined ? { value: s.customPlates == null ? null : (typeof s.customPlates === 'string' ? s.customPlates : JSON.stringify(s.customPlates)), problems: [] } : customPlateInput(input.customPlates);
     if (cp.problems.length) throw bad(`Custom plate sizes: ${cp.problems.join(' ')}`);
+    const pv = input.customPremiumPct === undefined ? customPremiumOf(s.customPlates)
+      : input.customPremiumPct == null || input.customPremiumPct === '' ? null : Number(input.customPremiumPct);
+    if (pv != null && !(Number.isFinite(pv) && pv >= 0 && pv <= 100)) throw bad(`Custom plate premium: a percentage 0–100, or blank for the default (${CUSTOM_PREMIUM_PCT_DEFAULT}).`);
+    if (pv != null || cp.value != null) {
+      const o = cp.value == null ? { on: false } : JSON.parse(cp.value);
+      if (pv == null) delete o.premiumPct; else o.premiumPct = pv;
+      cp.value = JSON.stringify(o);
+    }
     await db.query(
       `INSERT INTO cf_company_settings (company_id, nest_grade_rule, nest_custom_plates, updated_by) VALUES (?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE nest_grade_rule = VALUES(nest_grade_rule), nest_custom_plates = VALUES(nest_custom_plates), updated_by = VALUES(updated_by)`,

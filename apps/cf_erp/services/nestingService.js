@@ -369,6 +369,15 @@ export function cutSettingRows(db, companyId) {
   return memoized(db, `cutSettings:${companyId}`, () => readCutSettingRows(db, companyId));
 }
 
+/** `premiumPct` of the §90 custom-plate JSON (text or object), % per kg, 0–100; null when not stated. Kept apart from
+ *  customPlateSetting: the premium holds whether or not custom sizes are switched on. (shopRules.customPremiumOf = the same.) */
+const premiumOf = (v) => {
+  let o = v;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
+  const n = o && typeof o === 'object' && o.premiumPct != null && o.premiumPct !== '' ? Number(o.premiumPct) : NaN;
+  return Number.isFinite(n) && n >= 0 && n <= 100 ? n : null;
+};
+
 async function readCutSettingRows(db, companyId) {
   const sql = (level) => `SELECT id, thickness_min_mm, thickness_max_mm, kerf_mm, seq_gap_min_mm, seq_gap_max_mm,
             order_margin_length_mm, order_margin_width_mm, order_step_mm, guillotine,
@@ -401,6 +410,9 @@ async function readCutSettingRows(db, companyId) {
   // propose (nestCustomPlate.js; NULL = off) ride on the same read. A database without §90 answers the older query.
   Object.defineProperty(rows, 'gradeRule', { value: ruleOf(rows.find((r) => r.grade_rule != null)?.grade_rule), enumerable: false });
   Object.defineProperty(rows, 'customPlates', { value: customPlateSetting(rows.find((r) => r.custom_plates != null)?.custom_plates), enumerable: false });
+  // 2026-11-10: what a CUSTOM plate costs over a STANDARD one, % per kg — `premiumPct` inside the same §90 JSON
+  // (premiumOf; no new column, no extra statement). Absent = nestCost's default (10 %).
+  Object.defineProperty(rows, 'customPremiumPct', { value: premiumOf(rows.find((r) => r.custom_plates != null)?.custom_plates) ?? undefined, enumerable: false });
   return rows;
 }
 
@@ -440,7 +452,10 @@ export function shapeHabits(settings, thicknessMm, maxPlateSizes, discipline = t
 export function pickCutSettings(rows, thicknessMm) {
   // With the company's shop spacing switched on (shopRules.withShopSpacing): the edge margin and the gap
   // between blocks laid over the band — the kerf stays the band's. Off (the default): the band as it is.
-  return withShopSpacing(pickCutBand(rows, thicknessMm), rows?.shop, thicknessMm);
+  const s = withShopSpacing(pickCutBand(rows, thicknessMm), rows?.shop, thicknessMm);
+  // The custom plate premium rides with the band, so every cost of this thickness (plateCosts, the custom size
+  // proposal) reads the same figure; absent = nestCost.COST_DEFAULTS.customPct.
+  return rows?.customPremiumPct != null ? { ...s, customPct: rows.customPremiumPct / 100 } : s;
 }
 
 function pickCutBand(rows, thicknessMm) {
@@ -2046,7 +2061,7 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
       const lp = listPrices.get(p.id);
       const kg = kgOf(p.steel.length * p.steel.width, g.thickness, p.steel.density);
       return { length: p.steel.length, width: p.steel.width, kind: p.kind, ratePerKg: lp ? ratePerKg(lp.listPrice, lp.priceBasis, kg) : null };
-    })) : null;
+    }), settings.customPct != null ? { customPct: settings.customPct } : {}) : null;
     const costById = new Map(candidates.map((p, i) => [p.id, costs ? costs[i] : { areaCost: p.steel.length * p.steel.width, penalty: 0 }]));
     const sheets = sortSheets([
       ...candidates.map((p) => ({
@@ -2963,13 +2978,17 @@ export const CUSTOM_NOT_IN_CATALOG = 'Custom size, not in the catalog yet — it
  * catalog already has (an earlier accepted nesting made it) is that catalog plate, never a new one.
  * Mutates the nests that move; → the group's `customPlate` summary, or null.
  */
-function customSizeFor(nests, { g, sheets, settings, everyPlate, customSetting, maxPlateSizes, discipline }) {
+export function customSizeFor(nests, { g, sheets, settings, everyPlate, customSetting, maxPlateSizes, discipline }) {
   const limits = customLimits(customSetting, everyPlate, g.thickness, settings);
   const density = nests.find((n) => n.density > 0)?.density ?? g.cutPlates.find((cp) => cp.steel.density > 0)?.steel.density ?? FALLBACK_DENSITY;
   const sheetOf = (n) => sheets.find((s) => s.id === n.plateItemId && !s.ownerPartyId);
   const priced = nests.map((n) => { const s = sheetOf(n); return { ...n, areaCost: discipline ? s?.areaCost : null, penalty: discipline ? s?.penalty ?? 0 : 0 }; });
   const ms = maxPlateSizes === undefined ? COST_DEFAULTS.maxSizes : (Number(maxPlateSizes) > 0 ? Number(maxPlateSizes) : null);
-  const prop = proposeCustomSize(priced, { limits, thickness: g.thickness, density, maxSizes: ms, rules: { offcutMinArea: settings.offcutMinAreaMm2, offcutMinSide: settings.offcutMinSideMm } });
+  // The mill's lot (minLotPieces / minLotTonnes on the setting, where the company states one) holds for the size proposed
+  // here too: it is proposed only for at least that many plates (nestCustomPlate.proposeCustomSize `lot`).
+  const lot = Number(customSetting?.minLotPieces) > 0 || Number(customSetting?.minLotTonnes) > 0
+    ? { pieces: Number(customSetting.minLotPieces) > 0 ? Number(customSetting.minLotPieces) : null, tonnes: Number(customSetting.minLotTonnes) > 0 ? Number(customSetting.minLotTonnes) : null } : null;
+  const prop = proposeCustomSize(priced, { limits, thickness: g.thickness, density, maxSizes: ms, lot, rules: { offcutMinArea: settings.offcutMinAreaMm2, offcutMinSide: settings.offcutMinSideMm, ...(settings.customPct != null ? { customPct: settings.customPct } : {}) } });
   if (!prop) return null;
   const replaced = everyPlate.find((p) => p.id === Number(nests[prop.moves[0]].plateItemId));
   const asks = g.cutPlates.map((cp) => cp.steel.impactClass).filter((v) => !blank(v))

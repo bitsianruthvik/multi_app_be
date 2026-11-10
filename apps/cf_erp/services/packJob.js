@@ -76,6 +76,7 @@
  */
 import { nest } from './nestingPacker.js';
 import { layoutScore, extentOf } from './nestCost.js';
+import { withoutBoltHoles, platesOf, covers, tailOf, nestsOf, pieceArea } from './nestPlateMix.js';
 
 let SP = null;
 try { SP = await import('./shapePacker.js'); } catch { SP = null; }
@@ -166,6 +167,103 @@ function runShapeJob(input, hooks = {}) {
   const slimLayout = (o) => (o?.nests ?? []).map((n) => ({ sheetKey: n.sheetKey, placements: (n.placements ?? []).map((q) => ({ key: q.key, x: q.x, y: q.y, rotationDeg: q.rotationDeg, mirrored: !!q.mirrored })) }));
   let fillSlim = null;                                // what went into the saved plates, as a checkpoint keeps it
 
+  /** The pieces a true-shape answer left off, placed again: onto its own plates (their parts fixed), else new plates. */
+  const rescue = (shape, shapePieces) => {
+    const left = new Map();
+    for (const u of shape.unplaced ?? []) left.set(String(u.key), (left.get(String(u.key)) ?? 0) + (Number(u.qty) || 0));
+    const pcs = shapePieces.filter((p) => (left.get(String(p.key)) ?? 0) > 0).map((p) => ({ ...p, qty: left.get(String(p.key)) }));
+    if (!pcs.length) return null;
+    const usedBy = new Map();
+    for (const n of shape.nests ?? []) usedBy.set(String(n.sheetKey), (usedBy.get(String(n.sheetKey)) ?? 0) + 1);
+    const keep = (shape.nests ?? []).map((n, i) => {
+      const s = sheetMap.get(String(n.sheetKey)) ?? { length: n.sheetLength, width: n.sheetWidth };
+      return { key: `__keep${i}`, length: s.length, width: s.width, available: 1, preferred: true, areaCost: 0, penalty: 0,
+        fixed: (n.placements ?? []).map((q, j) => ({ key: `k${i}_${j}`, placed: true, rings: q.rings })) };
+    });
+    const fresh = (input.shape.sheets ?? []).filter((s) => !s.preferred)
+      .map((s) => ({ ...s, available: Math.max(0, (Number(s.available) || 0) - (usedBy.get(String(s.key)) ?? 0)) })).filter((s) => s.available > 0);
+    let r;
+    try {
+      r = SP.packShapes({ ...input.shape, ...coarser, pieces: pcs, sheets: [...keep, ...fresh], seed, rectFloor: false, freeRegions: false, ...clock(0.2), shouldStop: stopNow });
+    } catch (e) { errors.push(e?.message ?? String(e)); return null; }
+    if (stranded(r) >= stranded(shape)) return null;
+    const add = new Map(); const extra = [];
+    for (const n of r.nests ?? []) { const m = String(n.sheetKey).match(/^__keep(\d+)$/); if (m) add.set(Number(m[1]), n.placements ?? []); else extra.push(n); }
+    const nests = (shape.nests ?? []).map((n, i) => (add.has(i) ? { ...n, placements: [...(n.placements ?? []), ...add.get(i)], metrics: null } : n));
+    return {
+      ...shape, nests: [...nests, ...extra], unplaced: r.unplaced ?? [], source: 'shape',
+      deterministic: shape.deterministic !== false && r.deterministic !== false,
+      totals: { ...(shape.totals ?? {}), sheets: nests.length + extra.length, areaBought: (Number(shape.totals?.areaBought) || 0) + (Number(r.totals?.areaBought) || 0) },
+      rescued: { pieces: pcs.reduce((a, p) => a + p.qty, 0) - stranded(r), ontoOwnPlates: add.size, newPlates: extra.length },
+    };
+  };
+
+  /**
+   * THE PLATE MIX OF THE WHOLE STEEL (2026-11-10, nestPlateMix.js): beside the answer in hand, the same pieces on the two
+   * single plate sizes a quick row pass rates best; then, per set of one or two sizes, the plates of all of them that
+   * cover every piece for the least price; then the least-used plates of the best covers packed again. Taken only when
+   * the job's own ranking (beats) says it is better than the answer in hand. Bolt holes are left out of these extra
+   * searches (they never take a part); the answer's placements get the full rings back.
+   */
+  const plateMix = (res) => {
+    const resOut = res.chosen === 'shape' ? res.shape : res.rect;
+    if (!resOut || stranded(resOut) > 0) return null;
+    // ITS OWN CLOCK: everything here ends by 92 % of the job's budget (and the plan's deadline), so the job still lands
+    // inside its share; a step with too little room left is not started.
+    const mixEnd = Math.min(t0 + Math.floor(total * 0.92), deadlineAt ?? Infinity);
+    const room = () => mixEnd - Date.now();
+    const mclock = (share) => ({ budgetMs: Math.max(0, Math.floor(room() * share)), deadlineAt: mixEnd });
+    if (room() < Math.max(2000, 0.1 * total)) return null;
+    const net = new Map(allShape.map((p) => [String(p.key), pieceArea(p)]));
+    const demand = new Map(allShape.map((p) => [String(p.key), Number(p.qty) || 0]));
+    const lean = withoutBoltHoles(allShape);
+    const bought = (input.shape.sheets ?? []).filter((s) => !s.preferred);
+    const est = [];
+    for (const s of bought) {
+      if (stopNow() || room() < 1000) break;
+      const rs0 = (input.rect.sheets ?? []).find((x) => String(x.key) === String(s.key));
+      if (!rs0) continue;
+      try { const o = nest({ ...input.rect, effort: 'quick', restarts: undefined, sheets: [rs0], seed, budgetMs: Math.max(100, Math.min(1500, Math.floor(room() / 12))), deadlineAt: mixEnd }); if (!stranded(o)) est.push({ s, area: Number(o.areaBought) || Infinity }); } catch { /* an estimate only */ }
+    }
+    const layouts = [platesOf(resOut)];
+    let det = true;
+    est.sort((a, b) => a.area - b.area).slice(0, 2).forEach((e, i) => {
+      if (stopNow() || room() < 1500) return;
+      try {
+        const o = SP.packShapes({ ...input.shape, ...coarser, pieces: lean, sheets: [e.s], seed, freeRegions: false, ...mclock(i === 0 ? 0.35 : 0.5), shouldStop: stopNow });
+        if (o.deterministic === false) det = false;
+        layouts.push(platesOf(o));
+      } catch (err) { errors.push(err?.message ?? String(err)); }
+    });
+    const cs = covers(layouts, { demand, sheets: sheetMap, net, margin: Number(input.shape.margin) || 0, rules: R });
+    const cands = cs.slice(0, 3).map((c) => c.plates);
+    for (const c of cs.slice(0, 2)) {
+      if (stopNow() || c.plates.length < 3 || room() < 1000) continue;
+      const t = tailOf(c, net);
+      const pcs = lean.filter((p) => (t.need.get(String(p.key)) ?? 0) > 0).map((p) => ({ ...p, qty: t.need.get(String(p.key)) }));
+      const usedBy = new Map(); for (const p of t.keep) usedBy.set(p.buy, (usedBy.get(p.buy) ?? 0) + 1);
+      const sh = c.sizes.map((k) => sheetMap.get(k)).filter(Boolean).map((s) => ({ ...s, available: Math.max(0, (Number(s.available) || 0) - (usedBy.get(String(s.key)) ?? 0)) })).filter((s) => s.available > 0);
+      if (!sh.length) continue;
+      try {
+        const o = SP.packShapes({ ...input.shape, ...coarser, pieces: pcs, sheets: sh, seed: seed + 17, freeRegions: false, ...mclock(0.5), shouldStop: stopNow });
+        if (o.deterministic === false) det = false;
+        if (!stranded(o)) cands.push([...t.keep, ...platesOf(o).map((p) => ({ ...p, buy: p.sheetKey }))]);
+      } catch (err) { errors.push(err?.message ?? String(err)); }
+    }
+    let best = null;
+    for (const plates of cands) {
+      const nests = nestsOf(plates, sheetMap);
+      const area = nests.reduce((a, n) => { const s = sheetMap.get(String(n.sheetKey)); return a + (Number(s?.areaCost ?? s?.length * s?.width) || 0); }, 0);
+      const sc0 = score({ nests, unplaced: [] }, nests.length, area);
+      if (!best || beats(sc0, best.sc)) best = { nests, sc: sc0, area };
+    }
+    if (!best || !beats(best.sc, res.score)) return null;
+    tell({ plates: best.sc.plates, areaBought: best.sc.area, score: best.sc.score ?? best.sc.area, sizeOver: best.sc.sizeOver ?? 0, unplaced: 0, source: 'mix', trials: 0 });
+    const ringsOf = new Map(allShape.map((p) => [String(p.key), p.rings ?? { outline: [[0, 0], [p.length, 0], [p.length, p.width], [0, p.width]], cutouts: [], holes: [] }]));
+    const nests = best.nests.map((n) => ({ ...n, placements: n.placements.map((q) => ({ ...q, rings: SP.placeRings(ringsOf.get(String(q.key)), { x: q.x, y: q.y, rotationDeg: q.rotationDeg, mirrored: q.mirrored }) })) }));
+    return { chosen: 'shape', rect: res.rect, shape: { nests, unplaced: [], source: 'mix', deterministic: det, totals: { sheets: nests.length, areaBought: best.area } }, score: best.sc, fill: null };
+  };
+
   /** Step 3 for some pieces: the rectangle layout, the true-shape one seeded with it, and which is taken. */
   const newPlates = (rectPieces, shapePieces, share) => {
     if (!rectPieces.length) return { chosen: 'rect', rect: { nests: [], unplaced: [], areaBought: 0, deterministic: true }, shape: null, score: { off: 0, area: 0, plates: 0 } };
@@ -194,10 +292,15 @@ function runShapeJob(input, hooks = {}) {
         shape = SP.packShapes({ ...input.shape, ...coarser, pieces: shapePieces, seed, start, rectFloor: start ? false : undefined, freeRegions: false, ...time, ...hooksFor({ plates: 0, area: 0 }) });
         // A kept layout the packer could not read (a drawing changed under it) is not an answer: search afresh.
         if (kept && shape?.source !== 'start' && shape?.source !== 'shape') shape = null;
+        // STRANDED PIECES (2026-11-10): the search left a few pieces off. Place just those — into the room left on its
+        // own plates first, then on new plates — rather than lose the whole true-shape layout to the rows for them
+        // (SO260018 32 mm: 1–2 pieces off cost 61 row plates against 45–47).
+        if (shape && stranded(shape) > 0 && !stopNow()) { const r = rescue(shape, shapePieces); if (r) shape = r; }
       } catch (e) { errors.push(e?.message ?? String(e)); }
     }
     if (shape) {
       const ss = score(shape, (shape.nests ?? []).length, Number(shape.totals?.areaBought ?? Infinity));
+      if (shape.rescued) tell({ plates: ss.plates, areaBought: ss.area, score: ss.score ?? ss.area, sizeOver: ss.sizeOver ?? 0, unplaced: ss.off, source: 'shape', trials: 0 });
       // A layout the search made is taken when it beats the rows. So is a KEPT layout handed back as it
       // was ('start' — a steel picked up again that found nothing better): it was a true-shape layout
       // that beat the rows when it was kept. (The row layout handed in as a start is never "taken".)
@@ -242,10 +345,17 @@ function runShapeJob(input, hooks = {}) {
     }
     if (!result) { fill = null; fillSlim = null; }
   }
+  // The plate mix needs a budget to share and at least two plate sizes to choose between.
+  const mixOn = !!SP?.packShapes && total != null && !input.fillSheets?.length && input.plateMix !== false && !resume?.done && !resume?.start?.length && coarse < 2
+    && new Set((input.shape?.sheets ?? []).filter((s) => !s.preferred).map((s) => `${s.length}x${s.width}`)).size >= 2;
   if (!result) {
-    const r = newPlates(allRect, allShape, 0.9);
+    const r = newPlates(allRect, allShape, mixOn ? 0.6 : 0.9);
     // The floor already worked out (a fill that did not pay) may still be the better rectangle layout.
     result = { ...r, fill: null };
+  }
+
+  if (mixOn && !result.fill && !stopNow()) {
+    try { const m = plateMix(result); if (m) result = m; } catch (e) { errors.push(e?.message ?? String(e)); }
   }
 
   const win = result.chosen === 'shape' ? result.shape : result.rect;
