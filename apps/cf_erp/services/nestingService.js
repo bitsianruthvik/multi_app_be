@@ -2435,7 +2435,9 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
     }
     // ONE CUSTOM PLATE SIZE (§90, nestCustomPlate.js): the plates whose layouts stop short move to the size they need,
     // when that saves steel by the packers' own cost. Off unless the company switched it on (or the caller asks).
-    const custom = customSetting && !lotMode && line.nest_plates === 'any' && nests.length
+    // Under the mill's lot too (2026-11-10): proposeCustomSize honours the lot and never moves a plate already on a lot
+    // size (lotCustom), so it only re-buys plates as a whole lot; planNesting's lot check counts those plates as well.
+    const custom = customSetting && line.nest_plates === 'any' && nests.length
       ? customSizeFor(nests, { g, sheets, settings, everyPlate, customSetting, maxPlateSizes: settingRows.maxPlateSizes, discipline: input.plateDiscipline !== false })
       : null;
     if (custom) {
