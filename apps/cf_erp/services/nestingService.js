@@ -2241,7 +2241,9 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
       // Not on a run picked up again: it starts every steel from its checkpoint (nest_resume_test).
       if (extras.pairs && pr.shapeInput && !kept && !input.resume) {
         const pj = pairJobFor(pr.g.key, baseOf.get(pr.g.key), { effort: effortAsked, deadlineAt, planBudgetMs });
-        if (pj) jobs.push({ key: pr.g.key, seed: mine[0], round: Math.max(1, mine.length), input: pj.input, pairsCache: pj.cacheKey });
+        // its OWN seed number (one above the steel's seeds): pickBest breaks ties by the lowest seed, and two tries with one
+        // seed could each be kept as the winner — one of them already lightened (a crash on the bench, 2026-11-11).
+        if (pj) jobs.push({ key: pr.g.key, seed: Math.max(...mine) + 1, round: Math.max(1, mine.length), input: pj.input, pairsCache: pj.cacheKey });
       }
     }
     /*
