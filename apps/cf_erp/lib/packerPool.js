@@ -362,13 +362,14 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
       const clearHard = () => { if (hard) { clearTimeout(hard); hard = null; } };
       const armHard = (i, input) => {
         clearHard();
-        const at = Number(input?.hardDeadlineAt);
+        // absolute (hardDeadlineAt) or from the moment it starts (hardMs)
+        const at = input?.hardDeadlineAt != null && Number.isFinite(Number(input.hardDeadlineAt)) ? Number(input.hardDeadlineAt) : Number(input?.hardMs) > 0 ? Date.now() + Number(input.hardMs) : NaN;
         if (!Number.isFinite(at)) return;
         hard = setTimeout(() => {
           hard = null;
           if (!doing || doing.i !== i) return;
           const dead = w;
-          results[i] = { ok: false, error: `stopped at its hard time limit (${Math.round((at - (Number(input.startedAt) || at)) / 1000)} s)`, killed: true };
+          results[i] = { ok: false, error: 'stopped at its hard time limit', killed: true };
           stats.killed = (stats.killed ?? 0) + 1;
           told(i);
           doing = null;

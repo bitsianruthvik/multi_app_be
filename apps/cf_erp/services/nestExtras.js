@@ -97,9 +97,10 @@ const strandedOf = (o) => (o?.unplaced ?? []).reduce((a, u) => a + (Number(u.qty
 export async function cutStockPhase(steels, outBy, { effort = 'standard', workers = null, stop = null, budgetMs = null, standIn, say = () => {} } = {}) {
   const E = csEffort(effort);
   const per = CUTSTOCK_EFFORT[E].totalMs;
-  const phaseMs = budgetMs ?? per + 15_000;
+  // Each job has its own clock (its effort's totalMs, killed 20 s past it) and the biggest steels go first: a shared
+  // deadline split in shares left the last, largest steel nothing (Thane 32 mm). `budgetMs` (tests) sets one deadline.
   const t0 = Date.now();
-  const deadlineAt = t0 + phaseMs;
+  const deadlineAt = budgetMs != null ? t0 + budgetMs : null;
   const report = [];
   const jobs = []; const meta = [];
   for (const st of steels) {
@@ -121,12 +122,12 @@ export async function cutStockPhase(steels, outBy, { effort = 'standard', worker
     }
     meta.push({ st, raw, engine, ck, job: jobs.length });
     jobs.push({ key: st.key, seed: st.seed, round: 0, input: {
-      ...st.base, packer: 'cutstock', budgetMs: undefined,
+      ...st.base, packer: 'cutstock', budgetMs: undefined, deadlineAt: undefined,
       cutstock: { effort: E, totalMs: per, custom: st.custom ?? null, engine },
-      hardDeadlineAt: deadlineAt + 20_000,
+      ...(deadlineAt != null ? { hardDeadlineAt: deadlineAt + 20_000 } : { hardMs: per + 20_000 }),
     } });
   }
-  if (jobs.length) say(`Length combiner: ${jobs.length} steel${jobs.length === 1 ? '' : 's'}, up to ${Math.round(phaseMs / 1000)} s`);
+  if (jobs.length) say(`Length combiner: ${jobs.length} steel${jobs.length === 1 ? '' : 's'}, up to ${Math.round(per / 1000)} s each`);
   const runs = jobs.length ? await runAll(jobs, { workers, deadlineAt, stop }) : [];
   for (const m of meta) {
     const r = m.cached ? { ok: true, out: m.cached } : runs[m.job];

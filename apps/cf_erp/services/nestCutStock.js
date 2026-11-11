@@ -570,7 +570,8 @@ export const CUTSTOCK_EFFORT = Object.freeze({
   standard: { totalMs: 300_000, cgMs: 90_000, ipMs: 15_000, cgSetMs: 20_000, ipSetMs: 8_000, diveMs: 30_000, enrich: 30, enrichMs: 15_000, restMs: 30_000 },
   deep: { totalMs: 900_000, cgMs: 300_000, ipMs: 120_000, cgSetMs: 30_000, ipSetMs: 15_000, diveMs: 30_000, enrich: 30, enrichMs: 30_000, restMs: 60_000 },
 });
-export const variantsFor = (custom) => (custom ? [{ rectThr: 0.97, minLong: 0 }, { rectThr: 0.97, minLong: 3000 }] : [{ rectThr: 0.97, minLong: 0 }, { rectThr: 0, minLong: 0 }, { rectThr: 0.97, minLong: 3000 }]);
+// Quick tries the two item selections that won on the benchmark (SO260018: 12 and 32 mm on 0:0, custom on 0.97:0).
+export const variantsFor = (custom, effort = 'standard') => (custom ? (effort === 'quick' ? [{ rectThr: 0.97, minLong: 0 }] : [{ rectThr: 0.97, minLong: 0 }, { rectThr: 0.97, minLong: 3000 }]) : effort === 'quick' ? [{ rectThr: 0, minLong: 0 }, { rectThr: 0.97, minLong: 0 }] : [{ rectThr: 0.97, minLong: 0 }, { rectThr: 0, minLong: 0 }, { rectThr: 0.97, minLong: 3000 }]);
 
 const stranded = (o) => (o?.unplaced ?? []).reduce((a, u) => a + (Number(u.qty) || 0), 0);
 
@@ -637,7 +638,7 @@ export async function runCutStockJob(input, hooks = {}) {
   };
 
   let best = null;
-  const variants = cs.variants ?? variantsFor(!!custom);
+  const variants = cs.variants ?? variantsFor(!!custom, cs.effort);
   for (const V of variants) {
     if (stopNow() || Date.now() > deadline - 2000) break;
     const tv = Date.now();
