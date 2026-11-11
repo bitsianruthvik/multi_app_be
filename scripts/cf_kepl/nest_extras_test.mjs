@@ -47,9 +47,9 @@ function jobOf(pieces, sizes, { effort = 'quick', budgetMs = 8000 } = {}) {
       costRules: NC.costRulesFor(T, {}), gap: KERF, sharedCuts: true },
   };
 }
-const verifyAll = (out, sheets) => (out.nests ?? []).every((n) => {
+const verifyAll = (out, sheets, ringsBy = new Map()) => (out.nests ?? []).every((n) => {
   const s = sheets.find((x) => x.key === n.sheetKey) ?? { length: n.sheetLength, width: n.sheetWidth };
-  return verifyLayout({ sheet: { length: s.length, width: s.width }, placements: n.placements.map((q) => ({ key: q.key, rings: q.rings ?? placeRings(rect(1, 1), q) })), kerf: KERF, margin: KERF }).ok;
+  return verifyLayout({ sheet: { length: s.length, width: s.width }, placements: n.placements.map((q) => ({ key: q.key, rings: q.rings ?? placeRings(ringsBy.get(String(q.key)), q) })), kerf: KERF, margin: KERF }).ok;
 });
 const counts = (out) => { const m = new Map(); for (const n of out.nests ?? []) for (const q of n.placements ?? []) m.set(String(q.key), (m.get(String(q.key)) ?? 0) + 1); return m; };
 const sameCounts = (out, pieces) => pieces.every((p) => (counts(out).get(p.key) ?? 0) === p.qty) && [...counts(out).keys()].every((k) => pieces.some((p) => p.key === k));
@@ -79,7 +79,7 @@ let csOut = null; let packed = null;
   ok('an answer', !csOut.none, csOut.none ?? '');
   if (!csOut.none) {
     ok('every piece exactly once', sameCounts(csOut, LONG));
-    ok('every plate verifies (kerf, rim, no overlap)', verifyAll(csOut, base.shape.sheets));
+    ok('every plate verifies (kerf, rim, no overlap)', verifyAll(csOut, base.shape.sheets, new Map(LONG.map((p) => [p.key, p.rings]))));
     ok('no more plate sizes than the limit (2)', new Set(csOut.nests.map((n) => n.sheetKey)).size <= 2 && csOut.sizeOver === 0);
     ok('scored by the plan\'s own rules', Number.isFinite(csOut.score) && csOut.score > 0);
     console.log(`     packers ${packed.nests.length} plates score ${Math.round(packed.score)}; combiner ${csOut.nests.length} plates score ${Math.round(csOut.score)}`);
@@ -149,7 +149,7 @@ console.log('\n5. pairs');
   const base = jobOf(pieces, [[3000, 1500], [2500, 1250]], { budgetMs: 8000 });
   const out = await runPackJob({ ...base, packer: 'pairs', pairs: { searchMs: 15_000 } });
   ok('a pairs job places every piece once, real parts only', sameCounts(out, pieces) && (out.unplaced ?? []).length === 0);
-  ok('its plates verify', verifyAll(out, base.shape.sheets));
+  ok('its plates verify', verifyAll(out, base.shape.sheets, new Map(pieces.map((p) => [p.key, p.rings]))));
   ok('it used clusters and exploded them all', out.pairs?.used > 0 && out.pairs?.explodeFailures === 0, JSON.stringify(out.pairs ?? {}).slice(0, 200));
   const again = await runPackJob({ ...base, packer: 'pairs', pairs: { clusters: out.pairs.clusters, searchMs: 15_000 } });
   ok('handed its clusters again, it skips the search', again.pairs?.cached === true && sameCounts(again, pieces));

@@ -18,6 +18,7 @@
 import crypto from 'crypto';
 import { runAll, pickBest } from '../lib/packerPool.js';
 import { CUTSTOCK_EFFORT } from './nestCutStock.js';
+import { NO_PAIRS } from './nestPairs.js';
 
 /** `combiner` / `pairs` of the §90 custom-plate JSON (text or object): false only when said so. */
 export function extrasOf(v) {
@@ -45,7 +46,7 @@ function lru(max) {
   return { get: (k) => { if (!m.has(k)) return undefined; const v = m.get(k); m.delete(k); m.set(k, v); return v; }, set: (k, v) => { m.delete(k); m.set(k, v); while (m.size > max) m.delete(m.keys().next().value); }, clear: () => m.clear(), get size() { return m.size; } };
 }
 const PAIR_CACHE = lru(64);
-const CUT_CACHE = lru(64);
+const CUT_CACHE = lru(12);          // whole layouts: a few lines' steels, not more (memory)
 export const clearExtrasCache = () => { PAIR_CACHE.clear(); CUT_CACHE.clear(); };
 
 const quarterTurns = (rot) => Array.isArray(rot) && [0, 90, 180, 270].every((r) => rot.includes(r));
@@ -72,6 +73,7 @@ export function pairJobFor(key, base, { effort = 'standard', deadlineAt = null, 
   if (irregular.length < 1 || n < 2) return null;
   const ck = sha(['pairs', S.kerf, S.margin, minGain, piecesKey(S.pieces)]);
   const cached = PAIR_CACHE.get(ck);
+  if (Array.isArray(cached) && !cached.length) return null;          // searched before: nothing worth pairing
   const grace = Math.min(30_000, Math.max(2_000, Math.round(planBudgetMs * 0.1)));   // a request's 20 s plan gets 2 s
   return {
     cacheKey: ck,
@@ -79,8 +81,9 @@ export function pairJobFor(key, base, { effort = 'standard', deadlineAt = null, 
       ...(deadlineAt ? { hardDeadlineAt: deadlineAt + grace } : {}) },
   };
 }
-/** Keep what a pairs job found, by its pieces. */
-export function rememberPairs(cacheKey, out) {
+/** Keep what a pairs job found, by its pieces (a complete search that found nothing: an empty list). */
+export function rememberPairs(cacheKey, out, error = null) {
+  if (cacheKey && error === NO_PAIRS) { PAIR_CACHE.set(cacheKey, []); return; }
   const p = out?.pairs;
   if (!cacheKey || !p || p.cached || !Array.isArray(p.clusters) || p.complete === false) return;
   PAIR_CACHE.set(cacheKey, p.clusters);

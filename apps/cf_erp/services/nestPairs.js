@@ -27,6 +27,8 @@ import { runPackJob } from './packJob.js';
 import { offsetPolygon, booleanRegions, orientRing, cleanRing, transformRing } from '../lib/polyGeom.js';
 import { bbox, boxOfRings, area, shift, setDist, pointIn, ringDist, dropSpikes, outlineOf } from './nestRingMath.js';
 
+export const NO_PAIRS = 'no pairs worth making';
+const PAIRS_NFP_MAX = 50_000;
 const CLEAR_EXTRA = 0.05;            // members kept a kerf + this apart
 const COARSE = 20; const FINE = 5;   // band heights, mm
 
@@ -283,11 +285,11 @@ export function runPairJob(input, hooks = {}) {
   const S = input.shape;
   const kerf = Number(S.kerf) || 0; const margin = Number(S.margin) || 0;
   const plain = { ...input, packer: 'shape' }; delete plain.pairs;
-  const quietHooks = { shouldStop: hooks.shouldStop, onProgress: hooks.onProgress };   // no checkpoints: a composite cannot be resumed
+  // Without clusters it is an ordinary shape job: its hooks as they are (checkpoints included).
   const rot = S.rotations;
   const quarter = Array.isArray(rot) && [0, 90, 180, 270].every((r) => rot.includes(r));
   const bought = (S.sheets ?? []).filter((s) => !s.preferred);
-  if (!quarter || !bought.length || input.fillSheets?.length) return { ...runPackJob(plain, quietHooks), pairs: { used: 0, why: 'not paired' } };
+  if (!quarter || !bought.length || input.fillSheets?.length) return { ...runPackJob(plain, hooks), pairs: { used: 0, why: 'not paired' } };
   const longest = Math.max(...bought.map((s) => Math.max(s.length, s.width))); const widest = Math.max(...bought.map((s) => Math.min(s.length, s.width)));
   const fit = { long: longest - 2 * margin - 2 * kerf, short: widest - 2 * margin - 2 * kerf };
   let found = P.clusters ? { clusters: P.clusters, complete: true, cached: true, ms: 0 } : null;
@@ -297,11 +299,13 @@ export function runPairJob(input, hooks = {}) {
   }
   const clusters = (found.clusters ?? []).filter((c) => c.qty > 0);
   const tell = { clusters: found.clusters, found: clusters.length, complete: found.complete !== false, cached: !!found.cached, searchMs: found.ms ?? Date.now() - t0 };
-  if (!clusters.length) return { ...runPackJob(plain, quietHooks), pairs: { ...tell, used: 0 } };
+  // No cluster worth having: the job would be the steel's own first seed again (same seed, same pieces) — it is not
+  // run (memory and a worker's time); the pool's ranking simply has nothing from it. Its search is still remembered.
+  if (!clusters.length) throw new Error(tell.complete ? NO_PAIRS : `${NO_PAIRS} (search cut short)`);
   // the pieces with the clusters in place of their members
   const take = new Map(); for (const c of clusters) for (const m of c.members) take.set(m.key, (take.get(m.key) ?? 0) + c.qty);
   const byKey = new Map((S.pieces ?? []).map((p) => [String(p.key), p]));
-  for (const [k, n] of take) if (!byKey.has(k) || (Number(byKey.get(k).qty) || 0) < n) return { ...runPackJob(plain, quietHooks), pairs: { ...tell, used: 0, why: 'stale clusters' } };
+  for (const [k, n] of take) if (!byKey.has(k) || (Number(byKey.get(k).qty) || 0) < n) return { ...runPackJob(plain, hooks), pairs: { ...tell, used: 0, why: 'stale clusters' } };
   const less = (p) => ({ ...p, qty: (Number(p.qty) || 0) - (take.get(String(p.key)) ?? 0) });
   const comp = clusters.map((c) => { const b = bbox(c.outline); return { key: c.key, qty: c.qty, length: b.x1 - b.x0, width: b.y1 - b.y0, rings: { outline: c.outline, cutouts: [], holes: [] } }; });
   const elapsed = Date.now() - t0;
@@ -309,12 +313,25 @@ export function runPairJob(input, hooks = {}) {
     ...plain,
     ...(input.budgetMs != null ? { budgetMs: Math.max(500, Number(input.budgetMs) - elapsed) } : {}),
     rect: { ...input.rect, pieces: [...(input.rect.pieces ?? []).map(less).filter((p) => p.qty > 0), ...comp.map((c) => ({ key: c.key, length: c.length, width: c.width, qty: c.qty, grain: 'any' }))] },
-    shape: { ...S, pieces: [...(S.pieces ?? []).map(less).filter((p) => p.qty > 0), ...comp.map((c) => ({ ...c, grain: 'any', allowMirror: false }))] },
+    // a smaller no-fit-polygon cache than a seed's (composites have long outlines; memory, measured on SO260018)
+    shape: { ...S, nfpMax: S.nfpMax ?? PAIRS_NFP_MAX, pieces: [...(S.pieces ?? []).map(less).filter((p) => p.qty > 0), ...comp.map((c) => ({ ...c, grain: 'any', allowMirror: false }))] },
   };
-  const res = runPackJob(job, quietHooks);
   const clusterBy = new Map(clusters.map((c) => [c.key, c]));
   const ringsOf = new Map([...byKey].map(([k, p]) => [k, ringsObj(p)]));
   for (const c of comp) ringsOf.set(c.key, c.rings);
+  /*
+   * CHECKPOINTS ON THE REAL PARTS (2026-11-11, nest_resume_test): the run's best-so-far figure takes this job's progress,
+   * so its layouts must be checkpointed too — or the figure a run is picked up with is one no checkpoint holds. A
+   * checkpoint is exploded like the answer (composites back to their parts); one that cannot be (rows standing,
+   * pieces left off, a part that does not land) is not passed on.
+   */
+  const ckHook = typeof hooks.onCheckpoint === 'function' ? (c) => {
+    if (!c?.start || (Number(c.unplaced) || 0) > 0 || c.fill) return;
+    const ex = explodeNests(c.start, clusterBy, ringsOf);
+    if (ex.failures) return;
+    hooks.onCheckpoint({ ...c, start: ex.nests.map((n) => ({ sheetKey: n.sheetKey, placements: n.placements.map((q) => ({ key: q.key, x: q.x, y: q.y, rotationDeg: q.rotationDeg ?? 0, mirrored: !!q.mirrored })) })) });
+  } : undefined;
+  const res = runPackJob(job, { shouldStop: hooks.shouldStop, onProgress: hooks.onProgress, ...(ckHook ? { onCheckpoint: ckHook } : {}) });
   // a row layout becomes a free one (a composite has no row form downstream)
   const win = res.chosen === 'shape' ? res.shape : res.rect;
   const asFree = (win?.nests ?? []).map((n) => (n.placements ? n : { sheetKey: n.sheetKey, sheetLength: n.sheetLength, sheetWidth: n.sheetWidth,
@@ -329,6 +346,11 @@ export function runPairJob(input, hooks = {}) {
   }
   const un = [...unplaced.values()];
   const used = asFree.reduce((a, n) => a + n.placements.filter((q) => clusterBy.has(String(q.key))).length, 0);
+  // the answer without the placed outlines: the plan places each part again from x, y and its turn, and a layout's rings
+  // are most of what crosses from the worker (main-thread memory, measured on SO260018)
+  ex.nests = ex.nests.map((n) => ({ ...n, placements: n.placements.map(({ rings, ...q }) => q) }));
   const shape = { nests: ex.nests, unplaced: un, source: 'pairs', deterministic: win?.deterministic !== false, totals: { sheets: ex.nests.length, areaBought: Number(res.areaBought) || 0 } };
-  return { ...res, chosen: 'shape', shape, nests: ex.nests, unplaced: un, rowsBecause: null, pairs: { ...tell, used, explodeFailures: 0 } };
+  // the row layout (composite keys) only as the figures the plan reports; its placements would only cost memory
+  const rect = res.rect ? { nests: (res.rect.nests ?? []).map((n) => ({ sheetKey: n.sheetKey })), unplaced: [], areaBought: res.rect.areaBought, deterministic: res.rect.deterministic } : null;
+  return { ...res, rect, chosen: 'shape', shape, nests: ex.nests, unplaced: un, rowsBecause: null, pairs: { ...tell, used, explodeFailures: 0 } };
 }

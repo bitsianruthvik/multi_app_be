@@ -121,6 +121,7 @@ import { ruleOf, fits as gradeFits, platesForAll, needWords, gradeRelation, grad
 import { customPlateSetting, customLimits, proposeCustomSize, lotCandidates, lotKey, lotSizeAllowed, lotPasses, lotRuleOf } from './nestCustomPlate.js';
 // 2026-11-11: the length combiner and the pairing of irregular shapes — candidates beside the packers' seeds (nestExtras.js).
 import { extrasOf, pairJobFor, rememberPairs, cutStockPhase } from './nestExtras.js';
+import { NO_PAIRS } from './nestPairs.js';
 /** The length combiner runs only on a plan with at least this budget (a background run; not a request's 20 s plan). */
 export const COMBINER_MIN_PLAN_MS = 60_000;
 // Exact outline checks for two parts whose BOXES conflict (pairVerdict): one rule for the proposal and the accept.
@@ -2270,7 +2271,7 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
         ? `skipped (${result.skipped === 'time' ? 'no time left' : 'already the best possible'})`
         : result?.ok
           ? `${(result.out?.nests ?? []).length} plate${(result.out?.nests ?? []).length === 1 ? '' : 's'}${(result.out?.unplaced ?? []).length ? `, ${(result.out.unplaced).reduce((a, u) => a + (Number(u.qty) || 0), 0)} pieces left over` : ''}`
-          : `failed (${result?.error ?? 'unknown error'})`;
+          : String(result?.error ?? '').startsWith(NO_PAIRS) ? 'no pairs of irregular parts worth making' : `failed (${result?.error ?? 'unknown error'})`;
       say(`${name} — try ${job.round + 1}: ${what}`, { phase: 'packing', done, total });
       // Every job of this steel has settled: its final layout is its checkpoint, marked done.
       if (!settledOf.has(job.key)) settledOf.set(job.key, []);
@@ -2403,7 +2404,7 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
     const pairsUsed = [];
     runs.forEach((r, i) => {
       if (!jobs[i].pairsCache) return;
-      if (r?.ok) rememberPairs(jobs[i].pairsCache, r.out);
+      rememberPairs(jobs[i].pairsCache, r?.ok ? r.out : null, r?.ok ? null : r?.error ?? null);
       const won = outByGroup.get(jobs[i].key) === r?.out && !!r?.out;
       pairsUsed.push({ key: jobs[i].key, ran: !!r?.ok, error: r?.ok ? null : (r?.error ?? r?.skipped ?? null), clusters: r?.out?.pairs?.found ?? 0, placed: r?.out?.pairs?.used ?? 0, cached: !!r?.out?.pairs?.cached, searchMs: r?.out?.pairs?.searchMs ?? null, taken: won });
     });

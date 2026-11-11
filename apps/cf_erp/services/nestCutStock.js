@@ -742,7 +742,8 @@ export async function runCutStockJob(input, hooks = {}) {
       const placedN = new Map(); for (const p of plates) for (const q of p.placed) placedN.set(q.key, (placedN.get(q.key) ?? 0) + 1);
       if ([...demandAll].some(([k, n]) => (placedN.get(k) ?? 0) !== n)) { rec.result = 'pieces do not add up'; continue; }
       const nests = plates.map((p) => ({ sheetKey: String(p.sheet.key), sheetLength: p.sheet.length, sheetWidth: p.sheet.width,
-        placements: p.placed.map((q) => { const b = bbox(q.rings.outline ?? q.rings[0]); return { key: q.key, x: q.x, y: q.y, rotationDeg: q.rot ?? 0, mirrored: !!q.mirrored, rings: q.rings, bbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 } }; }) }));
+      // (no rings in the answer: the plan places each part again from x, y and its turn — memory)
+        placements: p.placed.map((q) => { const b = bbox(q.rings.outline ?? q.rings[0]); return { key: q.key, x: q.x, y: q.y, rotationDeg: q.rot ?? 0, mirrored: !!q.mirrored, bbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 } }; }) }));
       const ls = layoutScore(nests.map((n) => { let maxX = 0; let maxY = 0; for (const q of n.placements) { maxX = Math.max(maxX, q.bbox.x1); maxY = Math.max(maxY, q.bbox.y1); } return { sheetKey: n.sheetKey, extent: { maxX, maxY } }; }), sheetMap, R, { margin, gap });
       const areaBought = nests.reduce((a, n) => a + (Number(sheetMap.get(n.sheetKey)?.areaCost) || 0), 0);
       const cand = { nests, score: R ? ls.score : ls.cost, sizeOver: ls.sizeOver, areaBought, variant: V };
