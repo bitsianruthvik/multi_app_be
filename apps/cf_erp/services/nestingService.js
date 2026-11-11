@@ -2432,7 +2432,8 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
               moqPieces: rule.pieces ?? null, moqTonnes: rule.tonnes ?? null, density, thickness: g.thickness, removed };
           }
         }
-        return { key: g.key, base: baseOf.get(g.key), sheets: pr.sheets, custom, seed: Number(pr.packInput.seed) || 1, g, density };
+        const sheetKeys = custom ? new Set(pr.sheets.filter((s) => !s.plate?.lotStandIn).map((s) => String(s.key))) : null;
+        return { key: g.key, base: baseOf.get(g.key), sheets: pr.sheets, sheetKeys, custom, seed: Number(pr.packInput.seed) || 1, g, density };
       });
       const asks = (g) => g.cutPlates.map((cp) => cp.steel.impactClass).filter((v) => !blank(v)).sort((a, b) => (impactRankOf(b) ?? -1) - (impactRankOf(a) ?? -1));
       const standIn = (st, s) => {

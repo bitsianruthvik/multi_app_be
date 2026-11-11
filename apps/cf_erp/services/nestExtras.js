@@ -103,7 +103,10 @@ export async function cutStockPhase(steels, outBy, { effort = 'standard', worker
   const deadlineAt = budgetMs != null ? t0 + budgetMs : null;
   const report = [];
   const jobs = []; const meta = [];
-  for (const st of steels) {
+  for (const st0 of steels) {
+    // `sheetKeys`: the sheets the combiner may buy (lot mode: the standard ones; it makes its own custom sizes) — the same
+    // input on every pass of the lot loop, so the passes after the first come from the cache.
+    const st = st0.sheetKeys && st0.base?.shape ? { ...st0, base: { ...st0.base, shape: { ...st0.base.shape, sheets: st0.base.shape.sheets.filter((x) => st0.sheetKeys.has(String(x.key))) }, rect: { ...st0.base.rect, sheets: (st0.base.rect?.sheets ?? []).filter((x) => st0.sheetKeys.has(String(x.key))) }, sheets: (st0.base.sheets ?? []).filter((x) => st0.sheetKeys.has(String(x.key))) } } : st0;
     const raw = outBy.get(st.key);
     const S = st.base?.shape;
     const why = !S ? 'not a shape job' : st.base.fillSheets?.length ? 'saved plates to fill' : st.base.resume ? 'picked up again'
