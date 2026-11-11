@@ -2237,7 +2237,8 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
       // PAIRS (nestExtras.js): one more job for a steel with irregular parts — its shape job with the best pairs of them
       // packed as composites and put back after. The pool's ranking keeps it only when it is cheaper.
       if (pr.shapeInput) baseOf.set(pr.g.key, jobs[jobs.length - mine.length]?.input ?? null);
-      if (extras.pairs && pr.shapeInput && !kept) {
+      // Not on a run picked up again: it starts every steel from its checkpoint (nest_resume_test).
+      if (extras.pairs && pr.shapeInput && !kept && !input.resume) {
         const pj = pairJobFor(pr.g.key, baseOf.get(pr.g.key), { effort: effortAsked, deadlineAt, planBudgetMs });
         if (pj) jobs.push({ key: pr.g.key, seed: mine[0], round: Math.max(1, mine.length), input: pj.input, pairsCache: pj.cacheKey });
       }
