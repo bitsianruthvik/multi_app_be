@@ -72,7 +72,7 @@ export function pairJobFor(key, base, { effort = 'standard', deadlineAt = null, 
   if (irregular.length < 1 || n < 2) return null;
   const ck = sha(['pairs', S.kerf, S.margin, minGain, piecesKey(S.pieces)]);
   const cached = PAIR_CACHE.get(ck);
-  const grace = Math.max(30_000, Math.round(planBudgetMs * 0.1));
+  const grace = Math.min(30_000, Math.max(2_000, Math.round(planBudgetMs * 0.1)));   // a request's 20 s plan gets 2 s
   return {
     cacheKey: ck,
     input: { ...base, packer: 'pairs', pairs: { clusters: cached ?? null, searchMs: PAIR_SEARCH_MS[effort] ?? PAIR_SEARCH_MS.standard, minGain, triples: true },
@@ -94,9 +94,9 @@ const strandedOf = (o) => (o?.unplaced ?? []).reduce((a, u) => a + (Number(u.qty
  * in place when the combiner wins). opts: { effort, workers, stop, budgetMs, standIn(steel, sheet) → a plan sheet, say }
  * → [{ key, ran, taken, why, engineScore, score, plates, enginePlates, ms, cached }]
  */
-export async function cutStockPhase(steels, outBy, { effort = 'standard', workers = null, stop = null, budgetMs = null, standIn, say = () => {} } = {}) {
+export async function cutStockPhase(steels, outBy, { effort = 'standard', workers = null, stop = null, budgetMs = null, perMs = null, standIn, say = () => {} } = {}) {
   const E = csEffort(effort);
-  const per = CUTSTOCK_EFFORT[E].totalMs;
+  const per = Math.min(CUTSTOCK_EFFORT[E].totalMs, perMs ?? Infinity);   // the plan may give each steel less (nestingService: half its budget)
   // Each job has its own clock (its effort's totalMs, killed 20 s past it) and the biggest steels go first: a shared
   // deadline split in shares left the last, largest steel nothing (Thane 32 mm). `budgetMs` (tests) sets one deadline.
   const t0 = Date.now();

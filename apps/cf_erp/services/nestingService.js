@@ -121,6 +121,8 @@ import { ruleOf, fits as gradeFits, platesForAll, needWords, gradeRelation, grad
 import { customPlateSetting, customLimits, proposeCustomSize, lotCandidates, lotKey, lotSizeAllowed, lotPasses, lotRuleOf } from './nestCustomPlate.js';
 // 2026-11-11: the length combiner and the pairing of irregular shapes — candidates beside the packers' seeds (nestExtras.js).
 import { extrasOf, pairJobFor, rememberPairs, cutStockPhase } from './nestExtras.js';
+/** The length combiner runs only on a plan with at least this budget (a background run; not a request's 20 s plan). */
+export const COMBINER_MIN_PLAN_MS = 60_000;
 // Exact outline checks for two parts whose BOXES conflict (pairVerdict): one rule for the proposal and the accept.
 import { toPolygon, polygonsOverlap, polygonsDistance } from '../lib/polyGeom.js';
 
@@ -2199,6 +2201,7 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
   if (input.combiner === false || input.lotProbe || input.pack || !useShapes) extras.combiner = false;
   if (input.pairs === false || input.lotProbe || input.pack || !useShapes) extras.pairs = false;
   let extrasReport = null;
+  let extrasSkipped = null;
   if (input.pack) {
     // A caller injected its own packer (the tests do). Run it here, in order.
     for (const pr of prepared) outByGroup.set(pr.g.key, (await pack(pr.packInput)) ?? {});
@@ -2409,7 +2412,9 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
      * (lot mode) become stand-in sheets like the lot candidates'.
      */
     let combinerReport = [];
-    if (extras.combiner && !(input.control?.stop && Atomics.load(input.control.stop, 0) !== 0)) {
+    // Not on a plan held to a short budget (a request's 20 s plan, nest_v2_scale_test): it needs a minute a steel at least.
+    if (extras.combiner && planBudgetMs < COMBINER_MIN_PLAN_MS) extrasSkipped = `the plan's ${Math.round(planBudgetMs / 1000)} s budget is too short for the length combiner`;
+    if (extras.combiner && planBudgetMs >= COMBINER_MIN_PLAN_MS && !(input.control?.stop && Atomics.load(input.control.stop, 0) !== 0)) {
       let standInNo = 0;
       const steels = prepared.filter((pr) => pr.shapeInput && baseOf.get(pr.g.key)).map((pr) => {
         const g = pr.g;
@@ -2438,11 +2443,11 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
       };
       say('Length combiner: the long plates laid together, steel by steel', { phase: 'combiner' });
       try {
-        combinerReport = await cutStockPhase(steels, outByGroup, { effort: effortAsked, workers: input.workers ?? null, stop: input.control?.stop ?? null, standIn, say: (t) => say(t, { phase: 'combiner' }) });
+        combinerReport = await cutStockPhase(steels, outByGroup, { effort: effortAsked, perMs: Math.round(planBudgetMs / 2), workers: input.workers ?? null, stop: input.control?.stop ?? null, standIn, say: (t) => say(t, { phase: 'combiner' }) });
       } catch (e) { combinerReport = [{ error: e?.message ?? String(e) }]; }
       for (const c of combinerReport) if (c.taken) notes.push(`${steelName.get(c.key) ?? c.key}: the length combiner laid the long plates together — ${c.plates} plate${c.plates === 1 ? '' : 's'} for the packers' ${c.enginePlates}, a lower cost by the plan's own rules.`);
     }
-    extrasReport = { pairs: pairsUsed, combiner: combinerReport };
+    extrasReport = { pairs: pairsUsed, combiner: combinerReport, ...(extrasSkipped ? { combinerSkipped: extrasSkipped } : {}) };
     budget.extrasMs = Date.now() - planStartedAt - budget.packMs;
   }
 
