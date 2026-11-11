@@ -119,6 +119,8 @@ import { shopRuleRows, withShopSpacing, shopRimOf, rotationsOf } from './shopRul
 import { plateCosts, ratePerKg, costRulesFor, layoutScore, extentOf, COST_DEFAULTS } from './nestCost.js';
 import { ruleOf, fits as gradeFits, platesForAll, needWords, gradeRelation, gradeCheck, impactRank as impactRankOf, blocks as blocksGrade, IMPACT_ORDER_WORDS, DEFAULT_GRADE_RULE } from '../lib/plateGrade.js';
 import { customPlateSetting, customLimits, proposeCustomSize, lotCandidates, lotKey, lotSizeAllowed, lotPasses, lotRuleOf } from './nestCustomPlate.js';
+// 2026-11-11: the length combiner and the pairing of irregular shapes — candidates beside the packers' seeds (nestExtras.js).
+import { extrasOf, pairJobFor, rememberPairs, cutStockPhase } from './nestExtras.js';
 // Exact outline checks for two parts whose BOXES conflict (pairVerdict): one rule for the proposal and the accept.
 import { toPolygon, polygonsOverlap, polygonsDistance } from '../lib/polyGeom.js';
 
@@ -413,6 +415,9 @@ async function readCutSettingRows(db, companyId) {
   // 2026-11-10: what a CUSTOM plate costs over a STANDARD one, % per kg — `premiumPct` inside the same §90 JSON
   // (premiumOf; no new column, no extra statement). Absent = nestCost's default (10 %).
   Object.defineProperty(rows, 'customPremiumPct', { value: premiumOf(rows.find((r) => r.custom_plates != null)?.custom_plates) ?? undefined, enumerable: false });
+  // 2026-11-11: the length combiner and the pairing of irregular shapes (nestExtras.js) — `combiner` / `pairs` in the same
+  // §90 JSON, ON unless set false (no new column, no extra statement).
+  Object.defineProperty(rows, 'nestExtras', { value: extrasOf(rows.find((r) => r.custom_plates != null)?.custom_plates), enumerable: false });
   return rows;
 }
 
@@ -1746,6 +1751,8 @@ function lightLayout(out) {
   if (!out) return out;
   return {
     light: true, packer: out.packer, deterministic: out.deterministic, unplaced: out.unplaced, sizeOver: out.sizeOver, score: out.score, areaBought: out.areaBought,
+    // a pairs job's clusters (nestExtras.js keeps them for the next run of the same pieces)
+    ...(out.pairs ? { pairs: out.pairs } : {}),
     nests: (out.nests ?? []).map((n) => ({ sheetKey: n.sheetKey, pieces: { length: n.pieces?.length ?? 0 } })),
   };
 }
@@ -1766,7 +1773,8 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   const pool = await savedLotsOfOrder(db, companyId, stored, orderLineId);
   const removed = new Set();
   for (let pass = 1; pass <= 10; pass++) {
-    const plan = await planNestingOnce(db, companyId, orderLineId, { ...input, lotPass: true, lotRemoved: removed, effort: 'quick', budgetMs: Math.min(input.budgetMs ?? 120000, 120000) });
+    // A PROBE pass (which custom sizes hold their lot): no length combiner, no pairing (nestExtras.js) — the passes below do.
+    const plan = await planNestingOnce(db, companyId, orderLineId, { ...input, lotPass: true, lotProbe: true, lotRemoved: removed, effort: 'quick', budgetMs: Math.min(input.budgetMs ?? 120000, 120000) });
     const bad = failingLots(plan, pool, rule);
     if (!bad.length) break;
     for (const k of bad) removed.add(k);
@@ -2185,12 +2193,19 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
   const deadlineAt = planStartedAt + planBudgetMs - reserveMs;
   const outByGroup = new Map();
   let budget = null;
+  // THE EXTRAS (2026-11-11, nestExtras.js): the company's switches (ON unless set off), the caller's what-if, never on a
+  // lot PROBE pass nor with an injected packer.
+  const extras = { ...(settingRows.nestExtras ?? { combiner: true, pairs: true }) };
+  if (input.combiner === false || input.lotProbe || input.pack || !useShapes) extras.combiner = false;
+  if (input.pairs === false || input.lotProbe || input.pack || !useShapes) extras.pairs = false;
+  let extrasReport = null;
   if (input.pack) {
     // A caller injected its own packer (the tests do). Run it here, in order.
     for (const pr of prepared) outByGroup.set(pr.g.key, (await pack(pr.packInput)) ?? {});
   } else {
     const jobs = [];
     let seedsDropped = 0;
+    const baseOf = new Map();                          // steel key → its round-0 shape-job input (the extras start from it)
     for (const pr of prepared) {
       // Seeds worked out ONCE and checked against the real generator: two seeds
       // whose streams start in the same place would do identical work twice.
@@ -2216,6 +2231,13 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
           }
           : { ...pr.packInput, seed },
       }));
+      // PAIRS (nestExtras.js): one more job for a steel with irregular parts — its shape job with the best pairs of them
+      // packed as composites and put back after. The pool's ranking keeps it only when it is cheaper.
+      if (pr.shapeInput) baseOf.set(pr.g.key, jobs[jobs.length - mine.length]?.input ?? null);
+      if (extras.pairs && pr.shapeInput && !kept) {
+        const pj = pairJobFor(pr.g.key, baseOf.get(pr.g.key), { effort: effortAsked, deadlineAt, planBudgetMs });
+        if (pj) jobs.push({ key: pr.g.key, seed: mine[0], round: Math.max(1, mine.length), input: pj.input, pairsCache: pj.cacheKey });
+      }
     }
     /*
      * CHECKPOINTS (`input.onCheckpoint(key, c)`): the best layout of each steel so far, as the pool's
@@ -2373,6 +2395,55 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
       stopped: st.stopped === true,
       packMs: Date.now() - planStartedAt,
     };
+    // What the pairs jobs found is kept by the pieces' outlines: the next run of the same pieces skips the search.
+    const pairsUsed = [];
+    runs.forEach((r, i) => {
+      if (!jobs[i].pairsCache) return;
+      if (r?.ok) rememberPairs(jobs[i].pairsCache, r.out);
+      const won = outByGroup.get(jobs[i].key) === r?.out && !!r?.out;
+      pairsUsed.push({ key: jobs[i].key, ran: !!r?.ok, error: r?.ok ? null : (r?.error ?? r?.skipped ?? null), clusters: r?.out?.pairs?.found ?? 0, placed: r?.out?.pairs?.used ?? 0, cached: !!r?.out?.pairs?.cached, searchMs: r?.out?.pairs?.searchMs ?? null, taken: won });
+    });
+    /*
+     * THE LENGTH COMBINER (nestCutStock.js), a phase of its own once the packers are done: per steel, the packers' answer
+     * to beat; the combiner's answer replaces it only when the pool's ranking says it is better. Custom sizes it buys
+     * (lot mode) become stand-in sheets like the lot candidates'.
+     */
+    let combinerReport = [];
+    if (extras.combiner && !(input.control?.stop && Atomics.load(input.control.stop, 0) !== 0)) {
+      let standInNo = 0;
+      const steels = prepared.filter((pr) => pr.shapeInput && baseOf.get(pr.g.key)).map((pr) => {
+        const g = pr.g;
+        const density = g.cutPlates.find((cp) => cp.steel.density > 0)?.steel.density ?? FALLBACK_DENSITY;
+        let custom = null;
+        if (lotMode && !input.lotNoNew && !input.lotFrozen) {
+          const lim = customLimits(customSetting, everyPlate, g.thickness, pr.settings);
+          const rule = lotRuleOf(customSetting);
+          const t = lotKey(g.thickness, 1, 1).split('|')[0];
+          const removed = [...lotRemoved].map((k) => String(k).split('|')).filter((p) => p[0] === t).map((p) => `${Number(p[1])}x${Number(p[2])}`);
+          if (rule && lim?.maxLength > 0 && lim?.maxWidth > 0 && lim?.minLength > 0 && lim?.minWidth > 0) {
+            custom = { minLength: lim.minLength, maxLength: lim.maxLength, minWidth: lim.minWidth, maxWidth: lim.maxWidth, step: lim.step ?? 50,
+              customPct: pr.settings.customPct ?? COST_DEFAULTS.customPct, shortPct: COST_DEFAULTS.shortPct, shortRatio: COST_DEFAULTS.shortRatio,
+              moqPieces: rule.pieces ?? null, moqTonnes: rule.tonnes ?? null, density, thickness: g.thickness, removed };
+          }
+        }
+        return { key: g.key, base: baseOf.get(g.key), sheets: pr.sheets, custom, seed: Number(pr.packInput.seed) || 1, g, density };
+      });
+      const asks = (g) => g.cutPlates.map((cp) => cp.steel.impactClass).filter((v) => !blank(v)).sort((a, b) => (impactRankOf(b) ?? -1) - (impactRankOf(a) ?? -1));
+      const standIn = (st, s) => {
+        const id = -(900000 + (++standInNo));
+        const L = Math.max(s.length, s.width); const W = Math.min(s.length, s.width);
+        return { id, key: String(s.key), length: s.length, width: s.width, areaCost: s.areaCost, penalty: s.penalty ?? 0, preferred: false, available: 1000,
+          plate: { id, code: customPlateCode(L, W), name: `Custom plate ${fmt(st.g.thickness)} x ${fmt(W)} x ${fmt(L)}`, kind: 'CUSTOM', lotStandIn: true,
+            steel: { thickness: st.g.thickness, length: s.length, width: s.width, grade: st.g.grade ?? null, material: st.g.material ?? null, impactClass: asks(st.g)[0] ?? null, density: st.density } } };
+      };
+      say('Length combiner: the long plates laid together, steel by steel', { phase: 'combiner' });
+      try {
+        combinerReport = await cutStockPhase(steels, outByGroup, { effort: effortAsked, workers: input.workers ?? null, stop: input.control?.stop ?? null, standIn, say: (t) => say(t, { phase: 'combiner' }) });
+      } catch (e) { combinerReport = [{ error: e?.message ?? String(e) }]; }
+      for (const c of combinerReport) if (c.taken) notes.push(`${steelName.get(c.key) ?? c.key}: the length combiner laid the long plates together — ${c.plates} plate${c.plates === 1 ? '' : 's'} for the packers' ${c.enginePlates}, a lower cost by the plan's own rules.`);
+    }
+    extrasReport = { pairs: pairsUsed, combiner: combinerReport };
+    budget.extrasMs = Date.now() - planStartedAt - budget.packMs;
   }
 
   // ---- shape the winners ---------------------------------------------------
@@ -2552,6 +2623,8 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
     // How the effort's time budget was spent across the plan; `capped` says the
     // clock cut the search. Null when an injected packer ran the plan.
     budget: budget ? { ...budget, elapsedMs: Date.now() - planStartedAt } : null,
+    // 2026-11-11 (nestExtras.js): what the pairing and the length combiner did, steel by steel. Null when neither ran.
+    extras: extrasReport,
     totals: totalsOf(groups),
   };
 }

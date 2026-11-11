@@ -400,7 +400,15 @@ export function checkpointOf(out) {
   };
 }
 
+/**
+ * Two more kinds (2026-11-11), each answering in a shape job's words and run like one by the pool:
+ *   'cutstock'  the length combiner (nestCutStock.js) — ASYNC (its solver is WebAssembly, loaded once per worker);
+ *   'pairs'     the shape job with irregular parts paired into composites and put back after (nestPairs.js).
+ * Loaded only when asked for, so a plain job loads neither.
+ */
 export function runPackJob(input, hooks = {}) {
   if (input?.packer === 'measure') return runMeasure(input);
+  if (input?.packer === 'cutstock') return import('./nestCutStock.js').then((m) => m.runCutStockJob(input, hooks));
+  if (input?.packer === 'pairs') return import('./nestPairs.js').then((m) => m.runPairJob(input, hooks));
   return input?.packer === 'shape' ? runShapeJob(input, hooks) : nest(input);
 }

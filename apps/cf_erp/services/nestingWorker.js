@@ -17,13 +17,14 @@ import { runPackJob } from './packJob.js';
 
 if (!parentPort) throw new Error('nestingWorker must be started as a worker thread');
 
-parentPort.on('message', (job) => {
+parentPort.on('message', async (job) => {
   try {
     // STOP AND PROGRESS (2026-10-10). A pack is one long synchronous stretch: no message can reach
     // it. So the stop is a flag in SHARED memory the search reads as it goes (job.stop, set by the
     // pool for every job of a run at once), and progress is posted out as the layout gets better.
     const stop = job.stop ? new Int32Array(job.stop) : null;
-    const out = runPackJob(job.input, {
+    // A cut-stock or pairs job answers a promise (packJob.js); a plain job answers at once.
+    const out = await runPackJob(job.input, {
       shouldStop: () => !!stop && Atomics.load(stop, 0) !== 0,
       onProgress: (progress) => parentPort.postMessage({ id: job.id, progress }),
       // The best layout so far, for the run's checkpoint: when a plate is saved, else once a minute.

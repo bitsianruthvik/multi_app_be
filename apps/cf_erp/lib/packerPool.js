@@ -328,7 +328,7 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
     for (const i of order) {
       const p = prepare(i);
       if (p.skip) { results[i] = { ok: false, skipped: p.skip }; told(i); continue; }
-      const out = nest(p.input, { shouldStop: stopped, onProgress: (progress) => progressed(i, progress), onCheckpoint: (checkpoint) => checkpointed(i, checkpoint) });
+      const out = await nest(p.input, { shouldStop: stopped, onProgress: (progress) => progressed(i, progress), onCheckpoint: (checkpoint) => checkpointed(i, checkpoint) });
       results[i] = { ok: true, out };
       note(i, out);
       told(i);
@@ -352,15 +352,41 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
       let w = first;
       let doing = null;                               // { i, input, tries }
       let room = cap;
+      /*
+       * A HARD WALL CLOCK (2026-11-11, `input.hardDeadlineAt`): a job that says when it must be over (the length
+       * combiner, the pairing — nestExtras.js) is KILLED then, its worker replaced, and it answers
+       * `{ ok: false, error }`: its steel keeps the packers' layout. Its own clocks should end it long before; this is
+       * for a solve that will not stop, or a laptop that slept through it.
+       */
+      let hard = null;
+      const clearHard = () => { if (hard) { clearTimeout(hard); hard = null; } };
+      const armHard = (i, input) => {
+        clearHard();
+        const at = Number(input?.hardDeadlineAt);
+        if (!Number.isFinite(at)) return;
+        hard = setTimeout(() => {
+          hard = null;
+          if (!doing || doing.i !== i) return;
+          const dead = w;
+          results[i] = { ok: false, error: `stopped at its hard time limit (${Math.round((at - (Number(input.startedAt) || at)) / 1000)} s)`, killed: true };
+          stats.killed = (stats.killed ?? 0) + 1;
+          told(i);
+          doing = null;
+          try { w = startWorker(room); workers[slot] = w; wire(w); } catch (e) { reject(e); }
+          dead.terminate().catch(() => {});
+        }, Math.max(0, at - Date.now()));
+      };
       const take = () => {
         while (next < jobs.length) {
           const i = order[next]; next += 1;
           const p = prepare(i);
           if (p.skip) { results[i] = { ok: false, skipped: p.skip }; told(i); continue; }
           doing = { i, input: p.input, tries: 0 };
+          armHard(i, p.input);
           w.postMessage({ id: i, input: p.input, stop: stop?.buffer ?? null });
           return;
         }
+        clearHard();
         doing = null;
         resolve();
       };
@@ -374,6 +400,8 @@ export async function runAll(jobs, { onFallback = null, workers: workerCap = nul
           }
           if (msg.progress) { progressed(msg.id, msg.progress); return; }
           if (msg.checkpoint) { checkpointed(msg.id, msg.checkpoint); return; }
+          if (!doing || doing.i !== msg.id) return;    // a job already given up at its hard limit
+          clearHard();
           results[msg.id] = msg.ok ? { ok: true, out: msg.out } : { ok: false, error: msg.error };
           if (msg.ok) note(msg.id, msg.out);
           told(msg.id);
