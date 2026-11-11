@@ -2239,7 +2239,7 @@ async function planNestingOnce(db, companyId, orderLineId, input = {}) {
       // packed as composites and put back after. The pool's ranking keeps it only when it is cheaper.
       if (pr.shapeInput) baseOf.set(pr.g.key, jobs[jobs.length - mine.length]?.input ?? null);
       // Not on a run picked up again: it starts every steel from its checkpoint (nest_resume_test).
-      if (extras.pairs && pr.shapeInput && !kept && !input.resume) {
+      if (extras.pairs && pr.shapeInput && !kept && !input.resume && planBudgetMs >= COMBINER_MIN_PLAN_MS) {   // nor on a short (in-request) plan
         const pj = pairJobFor(pr.g.key, baseOf.get(pr.g.key), { effort: effortAsked, deadlineAt, planBudgetMs });
         // its OWN seed number (one above the steel's seeds): pickBest breaks ties by the lowest seed, and two tries with one
         // seed could each be kept as the winner — one of them already lightened (a crash on the bench, 2026-11-11).

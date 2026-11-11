@@ -29,6 +29,7 @@ export function extrasOf(v) {
 }
 
 /** Effort → the pairing search's own cap (ms) and the combiner's effort row. */
+export const COMBINER_WORKERS = 2;
 export const PAIR_SEARCH_MS = Object.freeze({ quick: 20_000, standard: 60_000, deep: 180_000, long: 300_000 });
 const csEffort = (e) => (e === 'long' ? 'deep' : CUTSTOCK_EFFORT[e] ? e : 'standard');
 
@@ -134,7 +135,9 @@ export async function cutStockPhase(steels, outBy, { effort = 'standard', worker
     } });
   }
   if (jobs.length) say(`Length combiner: ${jobs.length} steel${jobs.length === 1 ? '' : 's'}, up to ${Math.round(per / 1000)} s each`);
-  const runs = jobs.length ? await runAll(jobs, { workers, deadlineAt, stop }) : [];
+  // At most COMBINER_WORKERS at once: each holds a solver (WebAssembly memory, outside the worker's heap cap) and a rest
+  // pack — three of them were the peak of a Thane plan (2026-11-11). The pool may give fewer (its memory rule).
+  const runs = jobs.length ? await runAll(jobs, { workers: Math.min(workers ?? COMBINER_WORKERS, COMBINER_WORKERS), deadlineAt, stop }) : [];
   for (const m of meta) {
     const r = m.cached ? { ok: true, out: m.cached } : runs[m.job];
     const out = r?.ok ? r.out : null;

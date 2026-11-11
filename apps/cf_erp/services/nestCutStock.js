@@ -755,6 +755,7 @@ export async function runCutStockJob(input, hooks = {}) {
     } finally { rec.ms = Date.now() - tv; }
   }
   info.ms = Date.now() - t0;
+  HI = null;                                          // this job's solver memory goes with it (a worker may get another job)
   if (!best) return none('no complete answer');
   const used = new Set(best.nests.map((n) => n.sheetKey));
   const newSheets = [...used].map((k) => sheetMap.get(k)).filter((s) => s?.custom).map((s) => ({ key: s.key, length: s.length, width: s.width, areaCost: s.areaCost, penalty: s.penalty }));

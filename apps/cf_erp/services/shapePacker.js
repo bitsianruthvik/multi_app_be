@@ -115,6 +115,8 @@ const DEBUG = typeof process !== 'undefined' && !!process.env?.SHAPE_DEBUG;
  * numbers and is counted as a tenth.
  */
 const NFP_CACHE_MAX = 150_000;
+/** A cheaper layout (no plate saved) is checkpointed at most this often. */
+const CHECKPOINT_MIN_MS = 1_000;
 
 /** What `verifyLayout` forgives: a tenth of a micron. */
 export const VERIFY_TOL = 1e-4;
@@ -1522,7 +1524,11 @@ function* search(ctx, input) {
   const checkpointNow = () => {
     if (!ctx.checkpoint || !best || best === ck.sol) return;
     const now = Date.now();
-    if (!(best.sheets < ck.sheets || best.unplaced < (ck.sol?.unplaced ?? Infinity) || now - ck.at >= ctx.checkpointMs)) return;
+    // …and when the layout got CHEAPER without saving a plate (2026-11-11, nest_resume_test: 8 mm went from 14 plates to
+    // 15 cheaper ones; the run's figure took it at once, the checkpoint a minute later — a run that died in between was
+    // picked up with a figure no checkpoint held). At most once a CHECKPOINT_MIN_MS.
+    const cheaper = best.cost < (ck.sol?.cost ?? Infinity) - 1e-6 && now - ck.at >= CHECKPOINT_MIN_MS;
+    if (!(best.sheets < ck.sheets || best.unplaced < (ck.sol?.unplaced ?? Infinity) || cheaper || now - ck.at >= ctx.checkpointMs)) return;
     ck = { sol: best, sheets: best.sheets, at: now };
     const layout = best.states.filter((st) => !st.type.isFixedSheet).map((st) => ({
       sheetKey: st.type.key,
