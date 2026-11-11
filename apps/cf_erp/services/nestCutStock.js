@@ -390,7 +390,7 @@ export async function columnGeneration(ctx, { timeMs = 60000, deadline = Infinit
   for (let p = 0; p < ctx.parts.length; p++) {
     if (covered[p] || !(ctx.demand[p] > 0)) continue;
     if (Date.now() > deadline) throw new OutOfTime();
-    const pi = ctx.parts.map((_, i) => (i === p ? 1e6 : 0));
+    const pi = ctx.parts.map((_, i) => (i === p ? 1e15 : 0));   // far above any plate's cost (mm²)
     let r = price({ ...ctx, customOn: false, customList: null }, pi, { maxCols: 1 });
     if (!r.cols.length && ctx.customOn) r = price(ctx, pi, { maxCols: 1 });
     if (!r.cols.length) throw new Error(`part ${ctx.parts[p]} fits no plate`);
@@ -599,7 +599,9 @@ export async function runCutStockJob(input, hooks = {}) {
   const bought = (S.sheets ?? []).filter((s) => !s.preferred && !s.fixed);
   if (!bought.length) return none('no sheet to buy');
   const platePen = Number(R?.platePenalty) || 0;
-  const std = bought.map((s) => ({ key: String(s.key), L: Number(s.length), W: Number(s.width), cost: (Number(s.areaCost ?? s.length * s.width) || 0) + (Number(s.penalty) || 0) + platePen, available: Number(s.available) > 0 ? Number(s.available) : Infinity, areaCost: Number(s.areaCost ?? s.length * s.width), penalty: Number(s.penalty) || 0 }));
+  // The solver works in units of U mm² (a 12 m × 2.5 m plate is 3000): mm² costs (3e7) made its tolerances meaningless.
+  const U = 1e4;
+  const std = bought.map((s) => ({ key: String(s.key), L: Number(s.length), W: Number(s.width), cost: ((Number(s.areaCost ?? s.length * s.width) || 0) + (Number(s.penalty) || 0) + platePen) / U, available: Number(s.available) > 0 ? Number(s.available) : Infinity, areaCost: Number(s.areaCost ?? s.length * s.width), penalty: Number(s.penalty) || 0 }));
   const longest = Math.max(...std.map((z) => Math.max(z.L, z.W)));
   let custom = null;
   if (cs.custom) {
@@ -610,7 +612,7 @@ export async function runCutStockJob(input, hooks = {}) {
     custom = {
       minL: Number(c.minLength), maxL: Number(c.maxLength), minW: Number(c.minWidth), maxW: Number(c.maxWidth), step: Number(c.step) || 50,
       removed: new Set(c.removed ?? []),
-      costOf: (L, W) => L * W * (1 + pct + (Math.max(L, W) < shortRatio * longAll - 1e-6 ? shortPct : 0)) + platePen,
+      costOf: (L, W) => (L * W * (1 + pct + (Math.max(L, W) < shortRatio * longAll - 1e-6 ? shortPct : 0)) + platePen) / U,
       areaParts: (L, W) => ({ areaCost: L * W, penalty: L * W * (pct + (Math.max(L, W) < shortRatio * longAll - 1e-6 ? shortPct : 0)) }),
       moqOf: (L, W) => {
         const byP = Number(c.moqPieces) > 0 ? Number(c.moqPieces) : Infinity;
@@ -620,7 +622,7 @@ export async function runCutStockJob(input, hooks = {}) {
     };
     if (!(custom.maxL > 0 && custom.maxW > 0 && custom.minL > 0 && custom.minW > 0)) custom = null;
   }
-  const maxSizes = R?.maxSizes ?? null; const sizePenalty = Number(R?.sizePenalty) || 0;
+  const maxSizes = R?.maxSizes ?? null; const sizePenalty = (Number(R?.sizePenalty) || 0) / U;
   const pieces = (S.pieces ?? []).filter((p) => (Number(p.qty) || 0) > 0);
   const demandAll = new Map(pieces.map((p) => [String(p.key), Number(p.qty) || 0]));
   const engine = cs.engine ?? null;                   // the packers' answer to beat: { off, sizeOver, score }
@@ -649,10 +651,10 @@ export async function runCutStockJob(input, hooks = {}) {
       // THE BOUND: the lane parts' LP (Farley while iterating) is a lower bound on any answer of this variant (the rest
       // may land in the lanes' free space, so it adds nothing for sure). At or above the packers' score: no point going on.
       const beat = engine && engine.off === 0 && Number.isFinite(engine.score) ? engine.score : null;
-      const stopBelow = beat;
+      const stopBelow = beat != null ? beat / U : null;
       const mk = (S2) => makeContext({ kerf, margin, grid: Number(cs.grid) || 5, items, demand, std, custom, customList: S2, maxSizes, sizePenalty });
-      const ans = await integerAnswer(mk, { ...E, seed: Number(input.seed) || 1, rcTol: 0.5 }, deadline, stopBelow);
-      rec.laneLowerBound = ans?.lb != null ? Math.round(ans.lb) : null;
+      const ans = await integerAnswer(mk, { ...E, seed: Number(input.seed) || 1, rcTol: 0.2 }, deadline, stopBelow);
+      rec.laneLowerBound = ans?.lb != null ? Math.round(ans.lb * U) : null;
       if (!ans || ans.pruned) { rec.result = ans?.pruned ? 'bound: cannot beat the packers' : 'no integer answer'; continue; }
       const ctx = ans.ctx;
       // the plates, surplus copies not cut (from the last plates first)

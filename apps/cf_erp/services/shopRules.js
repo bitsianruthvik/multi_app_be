@@ -213,6 +213,14 @@ export function customPremiumOf(v) {
   return Number.isFinite(n) && n >= 0 && n <= 100 ? n : null;
 }
 
+/** combiner / pairs inside the same JSON (nestExtras.extrasOf, kept here so this file loads no packer): false only when said. */
+export function extrasOf(v) {
+  let o = v;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { o = null; } }
+  const off = (x) => x === false || x === 0 || x === '0' || x === 'false';
+  return { combiner: !off(o?.combiner), pairs: !off(o?.pairs) };
+}
+
 /** The screen's view: the switch, the saved rows, and the rules worked out at the shop's thicknesses. */
 export async function getShopRules(db, companyId) {
   const s = await readShopRules(db, companyId);
@@ -235,6 +243,9 @@ export async function getShopRules(db, companyId) {
     // % a custom plate costs over a standard one (null = the default, 10).
     customPremiumPct: customPremiumOf(s.customPlates),
     customPremiumPctDefault: CUSTOM_PREMIUM_PCT_DEFAULT,
+    // 2026-11-11 (nestExtras.js): the length combiner and the pairing of irregular shapes, ON unless switched off.
+    nestCombiner: extrasOf(s.customPlates).combiner,
+    nestPairs: extrasOf(s.customPlates).pairs,
     defaults: { ...SHOP_DEFAULTS, kerf: SHOP_KERF_POINTS },
     rows: s.rows.map((r) => ({ id: r.id, thicknessMm: Number(r.thickness_mm), ...Object.fromEntries(SHOP_RULE_FIELDS.map((f) => [f, num(r[COLS[f]])])), notes: r.notes ?? null })),
     resolved: thick.map((t) => shopRulesFor(t, s.rows)),
@@ -273,7 +284,7 @@ export async function saveShopRules(db, c, input = {}) {
   }
   // §90: the grade rule and the custom plate sizes (one statement for both, only when either is sent) — and the custom
   // plate premium, kept in the same JSON (`customPremiumPct`, % per kg; blank = the default, 10).
-  if (input.gradeRule !== undefined || input.customPlates !== undefined || input.customPremiumPct !== undefined) {
+  if (input.gradeRule !== undefined || input.customPlates !== undefined || input.customPremiumPct !== undefined || input.nestCombiner !== undefined || input.nestPairs !== undefined) {
     if (!s.plateSchema) throw conflict('SCHEMA_MISSING', 'The grade rule and custom plate sizes need init.sql §90 (TM/s90.sql) applied to this database first.');
     const rule = input.gradeRule == null || input.gradeRule === '' ? null : String(input.gradeRule).toLowerCase();
     if (rule != null && !GRADE_RULES.includes(rule)) throw bad(`Grade rule: one of ${GRADE_RULES.join(', ')}, or blank for the default (exact).`);
@@ -282,9 +293,15 @@ export async function saveShopRules(db, c, input = {}) {
     const pv = input.customPremiumPct === undefined ? customPremiumOf(s.customPlates)
       : input.customPremiumPct == null || input.customPremiumPct === '' ? null : Number(input.customPremiumPct);
     if (pv != null && !(Number.isFinite(pv) && pv >= 0 && pv <= 100)) throw bad(`Custom plate premium: a percentage 0–100, or blank for the default (${CUSTOM_PREMIUM_PCT_DEFAULT}).`);
-    if (pv != null || cp.value != null) {
+    // the combiner / pairs switches ride in the same JSON (kept as they are unless sent; stored only when off)
+    const ex0 = extrasOf(s.customPlates);
+    const combinerOn = input.nestCombiner === undefined ? ex0.combiner : input.nestCombiner !== false;
+    const pairsOn = input.nestPairs === undefined ? ex0.pairs : input.nestPairs !== false;
+    if (pv != null || cp.value != null || !combinerOn || !pairsOn) {
       const o = cp.value == null ? { on: false } : JSON.parse(cp.value);
       if (pv == null) delete o.premiumPct; else o.premiumPct = pv;
+      if (combinerOn) delete o.combiner; else o.combiner = false;
+      if (pairsOn) delete o.pairs; else o.pairs = false;
       cp.value = JSON.stringify(o);
     }
     await db.query(
