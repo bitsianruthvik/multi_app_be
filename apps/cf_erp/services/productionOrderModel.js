@@ -187,6 +187,77 @@ export function lineProductionOrders(orderCode, manyLines, l, defOf) {
  *   members: a batch's pieces (their own scope keys), else null.
  * A line whose item has no rows under it is made whole: per unit / per sub-assembly fall back to one per line.
  */
+/* CUSTOM (user, 2026-11-12; executionPlanModel CUSTOM): production orders made of BOM rows the person picked. */
+
+/** The line a custom key names: "L12" / "L12N345" → 12, else null. */
+export const customKeyLineId = (key) => { const m = /^L(\d+)(?:N\d+)?$/.exec(String(key)); return m ? Number(m[1]) : null; };
+
+/** Each custom key's label off the lines' trees ("Line 2 · G1 › Cross girder"), by key. */
+function customLabels(lines) {
+  const out = new Map();
+  const many = lines.length > 1;
+  for (const l of lines) {
+    const root = l.tree?.root;
+    const head = many ? `Line ${l.lineNo}` : null;
+    out.set(`L${l.lineId}`, head ? `${head} · ${l.itemName ?? 'whole line'}` : (l.itemName ?? 'whole line'));
+    if (!root) continue;
+    const rootCode = root.code ?? null;
+    const walk = (node) => {
+      for (const k of node.children) {
+        if (k.lineId == null) continue;
+        const key = `L${l.lineId}N${k.lineId}`;
+        if (!out.has(key)) out.set(key, head ? `${head} · ${nodeLabel(k, rootCode)}` : nodeLabel(k, rootCode));
+        walk(k);
+      }
+    };
+    walk(root);
+  }
+  return out;
+}
+
+/**
+ * The production orders of the lines on the custom level: one per chosen group ("C:<its first key>" — the same however
+ * the groups are listed), then one per line for what no group holds ("L<line>R"), unless the line itself was chosen.
+ * lines: [{ lineId, lineNo, itemName, plan, tree }] — plan.groups is the order's whole list on every custom line.
+ */
+export function customProductionOrders(orderCode, lines, defOf) {
+  const out = [];
+  if (!lines.length) return out;
+  const ids = new Set(lines.map((l) => Number(l.lineId)));
+  const label = customLabels(lines);
+  const seen = new Set();
+  const groups = [];
+  for (const l of lines) {
+    for (const g of l.plan.groups ?? []) {
+      const keys = g.keys.filter((k) => ids.has(customKeyLineId(k)));
+      const sig = JSON.stringify(g.keys);
+      if (!keys.length || seen.has(sig)) continue;
+      seen.add(sig);
+      groups.push({ name: g.name, keys });
+    }
+  }
+  const whole = new Set();
+  groups.forEach((g, i) => {
+    const lineIds = [...new Set(g.keys.map(customKeyLineId))];
+    for (const k of g.keys) if (/^L\d+$/.test(k)) whole.add(customKeyLineId(k));
+    const names = g.keys.map((k) => label.get(k) ?? k);
+    out.push({
+      scopeKey: `C:${[...g.keys].sort()[0]}`, level: 'custom', levelId: null, lineId: lineIds.length === 1 ? lineIds[0] : null, unitNo: null, lineIds,
+      label: `${orderCode} · ${groupLabel(g.name || `Production order ${i + 1}`, i + 1, names)}`,
+      dispatchLevel: 'same', dispatchLevelId: null, members: [...g.keys],
+    });
+  });
+  for (const l of lines) {
+    if (whole.has(Number(l.lineId))) continue;
+    const head = lines.length > 1 ? `Line ${l.lineNo} · ` : '';
+    out.push({
+      scopeKey: `L${l.lineId}R`, level: 'custom', levelId: null, lineId: Number(l.lineId), unitNo: null, lineIds: [Number(l.lineId)],
+      label: `${orderCode} · ${head}${groups.length ? 'the rest' : (l.itemName ?? 'whole line')}`, dispatchLevel: 'same', dispatchLevelId: null, members: null,
+    });
+  }
+  return out;
+}
+
 export function plannedProductionOrders(orderCode, lines, defOf) {
   const out = [];
   const manyLines = lines.length > 1;
@@ -199,10 +270,12 @@ export function plannedProductionOrders(orderCode, lines, defOf) {
       dispatchLevel: d.level, dispatchLevelId: d.levelId ?? null, members: null,
     });
   }
+  const custom = lines.filter((l) => l.plan.production.level === 'custom');
   for (const l of lines) {
-    if (l.plan.production.level === 'order') continue;
+    if (l.plan.production.level === 'order' || l.plan.production.level === 'custom') continue;
     out.push(...lineProductionOrders(orderCode, manyLines, l, defOf));
   }
+  out.push(...customProductionOrders(orderCode, custom, defOf));
   return out;
 }
 
@@ -233,6 +306,21 @@ export function assignPieces(lineId, items, orders, defOf) {
     const k = it.parent_id ?? 0;
     if (!kids.has(k)) kids.set(k, []);
     kids.get(k).push(it);
+  }
+  // CUSTOM (2026-11-12): a piece goes with the nearest row above it (or itself) that a production order holds; the rest
+  // goes to the line's "rest" order.
+  if (orders.some((o) => o.level === 'custom')) {
+    const holder = new Map();
+    for (const o of orders) for (const k of membersOf(o)) if (!holder.has(k)) holder.set(k, o);
+    const rest = byKey.get(`L${lineId}R`) ?? [...orders].sort((a, b) => a.id - b.id)[0];
+    const walk = (x, inherited) => {
+      const key = x.depth === 0 ? `L${lineId}` : x.bom_line_id != null ? `L${lineId}N${x.bom_line_id}` : null;
+      const mine = (key && holder.get(key)) ?? inherited;
+      out.set(x.id, (mine ?? rest).id);
+      for (const k of kids.get(x.id) ?? []) walk(k, mine);
+    };
+    for (const root of kids.get(0) ?? []) walk(root, null);
+    return out;
   }
   const byId = [...orders].sort((a, b) => a.id - b.id);
   const firstOf = byId[0];

@@ -113,7 +113,7 @@ export async function rowsOfLine(db, companyId, line) {
   const cutNodes = new Set([...(places.plate?.blanksIds ?? []), ...(places.plate?.offcutIds ?? []), ...(places.section?.blanksIds ?? []), ...(places.section?.offcutIds ?? [])].map(Number));
   const plateNodes = [...(places.plate?.blanksIds ?? [])];
   const [rows] = await db.query(
-    `SELECT m.id, m.code, m.name, m.classification_id, n.name AS level,
+    `SELECT m.id, m.code, m.name, m.classification_id, n.name AS level, m.created_at,
             m.record_kind, i.item_type, i.source_definition_id, d.code AS def_code, d.name AS def_name
        FROM cf_master_records m
        JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'temporary' AND i.deleted_at IS NULL AND i.owner_order_line_id = ?
@@ -162,7 +162,7 @@ export async function rowsOfLine(db, companyId, line) {
     mark: null, markNorm: null, lengthMm: null, widthMm: null, thicknessMm: null, density: null,
     // THE RULE (see the header): cut from plate by its own CUT_FROM — or, below, by a cut plate it already has.
     cutFrom: cutFrom.get(Number(r.id)) ?? null, isPlatePart: cutFrom.get(Number(r.id)) === 'PLATE', cutPlateIds: [], drawingIds: [],
-    parentId: null, seq: seqOf.get(Number(r.id)) ?? 0,
+    parentId: null, seq: seqOf.get(Number(r.id)) ?? 0, createdAt: r.created_at ?? null,
   }]));
   // The nearest row above that is one of the line's own (a cut piece or a catalog row in between is passed over).
   for (const p of out.values()) {

@@ -22,9 +22,9 @@
  * production order). It is captured, checked and previewed.
  */
 
-import { levelPieces, lineProductionOrders } from './productionOrderModel.js';
+import { customKeyLineId, customProductionOrders, levelPieces, lineProductionOrders } from './productionOrderModel.js';
 
-export const PRODUCTION_LEVELS = ['order', 'line', 'unit', 'assembly'];
+export const PRODUCTION_LEVELS = ['order', 'line', 'unit', 'assembly', 'custom'];
 export const DISPATCH_LEVELS = ['same', 'line', 'unit', 'assembly'];
 /** No row at all: one production order per line, dispatched the same way. */
 export const DEFAULT_PLAN = Object.freeze({
@@ -33,13 +33,21 @@ export const DEFAULT_PLAN = Object.freeze({
 });
 /** The levels a line can be split into BATCHES at (§97): per unit, per sub-assembly. */
 export const SPLIT_LEVELS = new Set(['unit', 'assembly']);
+/**
+ * CUSTOM (user, 2026-11-12: "In custom show the entire BOM and let them select a bunch (if selected at the node level, then
+ * assume it and the children together) and create a production order"). Set on the ORDER's row only. Its groups are
+ * [{ name, keys }] of BOM NODES — "L<line>" (a whole line) or "L<line>N<bom line id>" (that row, all its copies, with
+ * everything under it that no other group picked: the nearest pick wins) — and may span lines. Whatever no group holds is one more production order per line ("the rest",
+ * decided with the user the same day). productionOrderModel.customProductionOrders makes them.
+ */
+export const GROUP_LEVELS = new Set(['unit', 'assembly', 'custom']);
 /** At most this many batches on one plan row, and pieces in all of them (a sane bound on what is stored). */
 export const MAX_GROUPS = 500;
 export const MAX_GROUP_KEYS = 20000;
 /** How many labels a preview lists (the count is always the whole). */
 export const PREVIEW_LIMIT = 60;
 
-const RANK = { order: 0, line: 1, unit: 2, assembly: 3 };
+const RANK = { order: 0, line: 1, unit: 2, assembly: 3, custom: 4 };
 const EPS = 1e-9;
 const n = (count, word, plural = `${word}s`) => `${Number(count).toLocaleString('en-IN')} ${Number(count) === 1 ? word : plural}`;
 const isWhole = (q) => Math.abs(q - Math.round(q)) < EPS && q > 0;
@@ -67,11 +75,11 @@ export function groupsOf(v) {
   }));
 }
 /** The line a piece's key belongs to ("L12U3…" → 12), or null. */
-export const keyLineId = (key) => { const m = /^L(\d+)U/.exec(String(key)); return m ? Number(m[1]) : null; };
+export const keyLineId = (key) => { const m = /^L(\d+)U/.exec(String(key)); return m ? Number(m[1]) : customKeyLineId(key); };
 /** The batches of one line, from a plan that may hold several lines'. */
 export const groupsForLine = (groups, lineId) => (groups ?? []).filter((g) => g.keys.length > 0 && g.keys.every((k) => keyLineId(k) === Number(lineId)));
 /** A plan as one line reads it: only its own batches. */
-export const planForLine = (plan, lineId) => ({ ...plan, groups: groupsForLine(plan.groups, lineId) });
+export const planForLine = (plan, lineId) => (plan.production?.level === 'custom' ? { ...plan, groups: [...(plan.groups ?? [])] } : { ...plan, groups: groupsForLine(plan.groups, lineId) });
 const groupsWord = (gs) => JSON.stringify((gs ?? []).map((g) => [g.name ?? null, g.keys]));
 export const sameGroups = (a, b) => groupsWord(a) === groupsWord(b);
 export const samePlan = (a, b) => sameChoice(a?.production, b?.production) && sameChoice(a?.dispatch, b?.dispatch) && sameGroups(a?.groups, b?.groups);
@@ -80,7 +88,7 @@ export const samePlan = (a, b) => sameChoice(a?.production, b?.production) && sa
 export const planOfRow = (r) => ({
   production: choiceOf(r.production_level, r.production_level_id),
   dispatch: choiceOf(r.dispatch_level, r.dispatch_level_id),
-  groups: SPLIT_LEVELS.has(r.production_level) ? groupsOf(r.groups_json) : [],
+  groups: GROUP_LEVELS.has(r.production_level) ? groupsOf(r.groups_json) : [],
 });
 
 /**
@@ -105,7 +113,7 @@ export function effectivePlan(rows, lineId) {
  */
 export function checkGroups(line, plan, pieces) {
   const groups = plan.groups ?? [];
-  if (!groups.length) return [];
+  if (!groups.length || plan.production.level === 'custom') return [];
   const L = `Line ${line.lineNo}`;
   if (!SPLIT_LEVELS.has(plan.production.level)) return [`${L}: batches need "Split into batches". Choose it again or clear the batches.`];
   const label = new Map(pieces.map((p) => [p.key, p.label]));
@@ -130,8 +138,71 @@ export function checkGroups(line, plan, pieces) {
 
 /** One line's batch problems off its tree. l: { lineId, lineNo, quantity, itemName, plan, shape, tree }. */
 export function lineGroupProblems(l, defOf) {
+  if (l.plan.production.level === 'custom') return checkCustomGroups(l, l.plan, l.tree);
   if (!(l.plan.groups ?? []).length) return [];
   return checkGroups(l, l.plan, levelPieces(l, defOf));
+}
+
+/**
+ * The BOM nodes of one line, in tree order, for the custom picker: [{ key, parent, label, qty, depth }] (at most `limit`).
+ * l: { lineId, lineNo, quantity, itemName, tree }. A row's key is "L<line>N<bom line id>"; the line itself "L<line>".
+ */
+export function customNodes(l, limit = 5000) {
+  const out = [];
+  const root = l.tree?.root;
+  if (!root) return out;
+  const rootCode = root.code ?? null;
+  const rootKey = `L${l.lineId}`;
+  out.push({ key: rootKey, parent: null, label: l.itemName ?? root.name ?? `Line ${l.lineNo}`, qty: Number(l.quantity), depth: 0 });
+  const seen = new Set([rootKey]);
+  const walk = (node, parentKey) => {
+    for (const k of node.children) {
+      if (out.length >= limit) return;
+      if (k.lineId == null) continue;
+      const key = `L${l.lineId}N${k.lineId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ key, parent: parentKey, label: nodeLabel(k, rootCode), qty: Number(k.quantity) || 1, depth: k.depth });
+      walk(k, key);
+    }
+  };
+  walk(root, rootKey);
+  // Rows not coded yet share a name under one parent: number them (Girder line 1, 2, 3).
+  const same = new Map();
+  for (const x of out) { const k = `${x.parent}|${x.label}`; same.set(k, (same.get(k) ?? 0) + 1); }
+  const at = new Map();
+  for (const x of out) {
+    const k = `${x.parent}|${x.label}`;
+    if (same.get(k) < 2) continue;
+    const i = (at.get(k) ?? 0) + 1;
+    at.set(k, i);
+    x.label = `${x.label} ${i}`;
+  }
+  return out;
+}
+
+/** A custom plan's problems on one line: a group naming a row the line does not have, or a row held twice. */
+export function checkCustomGroups(line, plan, tree) {
+  const L = `Line ${line.lineNo}`;
+  const out = [];
+  if (plan.dispatch && plan.dispatch.level !== 'same') out.push('With production orders chosen from the BOM, shipping follows the production orders.');
+  const mine = (plan.groups ?? []).map((g, i) => ({ g, i, keys: g.keys.filter((k) => customKeyLineId(k) === Number(line.lineId)) })).filter((x) => x.keys.length);
+  if (!mine.length) return out;
+  const nodes = customNodes({ ...line, tree }, Infinity);
+  const parent = new Map(nodes.map((x) => [x.key, x.parent]));
+  const label = new Map(nodes.map((x) => [x.key, x.label]));
+  const owner = new Map();
+  for (const { g, i, keys } of mine) {
+    const name = g.name || `Production order ${i + 1}`;
+    for (const k of keys) {
+      if (!parent.has(k)) { out.push(`${L}: ${name} names a row the line no longer has — choose its rows again.`); continue; }
+      if (owner.has(k)) { out.push(`${L}: ${label.get(k)} is in ${owner.get(k)} and in ${name} — a row goes in one production order.`); continue; }
+      owner.set(k, name);
+    }
+  }
+  // A row picked inside another picked row is fine: the nearest pick wins (a row takes what is under it that no other
+  // production order holds — productionOrderModel.assignPieces walks it the same way).
+  return [...new Set(out)];
 }
 
 /**
@@ -279,6 +350,10 @@ export function productionCount(line, plan, shape) {
   const units = Math.max(1, Math.round(Number(line.quantity) || 1));
   if (P.level === 'order') return 0;
   if (P.level === 'line') return 1;
+  if (P.level === 'custom') {
+    const groups = (plan.groups ?? []).filter((g) => g.keys.some((k) => customKeyLineId(k) === Number(line.lineId)));
+    return groups.length + (groups.some((g) => g.keys.includes(`L${line.lineId}`)) ? 0 : 1);
+  }
   const batched = (plan.groups ?? []).reduce((s, g) => s + Math.max(0, g.keys.length - 1), 0);
   if (P.level === 'unit') return Math.max(1, units - batched);
   const lv = shape?.levels.find((x) => x.id === P.levelId);
@@ -291,7 +366,7 @@ export function productionCount(line, plan, shape) {
 export function dispatchCount(line, plan, shape) {
   const D = plan.dispatch;
   const units = Math.max(1, Math.round(Number(line.quantity) || 1));
-  if (D.level === 'same') return productionCount(line, plan, shape);
+  if (D.level === 'same' || plan.production.level === 'custom') return productionCount(line, plan, shape);
   if (D.level === 'line') return 1;
   if (D.level === 'unit') return units;
   const lv = shape?.levels.find((x) => x.id === D.levelId);
@@ -345,6 +420,16 @@ export function previewOrder(orderCode, lines, defOf, { limit = PREVIEW_LIMIT } 
   }
   // What a line makes: its count and its first labels. A line with batches is worked out exactly, off its tree.
   const madeBy = new Map();
+  // Custom (2026-11-12): the order's chosen groups once, then each line's rest — each on the first line it touches.
+  const customLines = lines.filter((l) => l.plan.production.level === 'custom');
+  if (customLines.length) {
+    const pos = customProductionOrders(orderCode, customLines, defOf);
+    for (const l of customLines) madeBy.set(l.lineId, { count: 0, labels: [] });
+    for (const po of pos) {
+      const first = madeBy.get(po.lineIds[0]);
+      if (first) { first.count += 1; first.labels.push(po.label); }
+    }
+  }
   const makes = (l) => {
     if (madeBy.has(l.lineId)) return madeBy.get(l.lineId);
     let m;
@@ -365,11 +450,11 @@ export function previewOrder(orderCode, lines, defOf, { limit = PREVIEW_LIMIT } 
     const ctx = { orderCode, manyLines, line: l, tree: l.tree, defOf, shape: l.shape };
     const mk = makes(l);
     const pc = mk.count;
-    const dc = l.plan.dispatch.level === 'same' ? (l.plan.production.level === 'order' ? 0 : pc) : dispatchCount(l, l.plan, l.shape);
+    const dc = l.plan.dispatch.level === 'same' || l.plan.production.level === 'custom' ? (l.plan.production.level === 'order' ? 0 : pc) : dispatchCount(l, l.plan, l.shape);
     perLine.set(l.lineId, { production: pc, dispatch: l.plan.production.level === 'order' && l.plan.dispatch.level === 'same' ? null : dc });
     prodCount += pc;
     if (pc && prod.length < limit) prod.push(...mk.labels.slice(0, limit - prod.length));
-    if (l.plan.dispatch.level !== 'same') {
+    if (l.plan.dispatch.level !== 'same' && l.plan.production.level !== 'custom') {
       dispCount += dc;
       if (disp.length < limit) {
         const D = l.plan.dispatch;
@@ -379,7 +464,7 @@ export function previewOrder(orderCode, lines, defOf, { limit = PREVIEW_LIMIT } 
     }
   }
   // 'same' everywhere it is asked: the production orders themselves (and the together-order once).
-  const sameLines = lines.filter((l) => l.plan.dispatch.level === 'same');
+  const sameLines = lines.filter((l) => l.plan.dispatch.level === 'same' || l.plan.production.level === 'custom');
   if (sameLines.length) {
     if (together.some((l) => l.plan.dispatch.level === 'same')) { dispCount += 1; disp.unshift(prod[0]); }
     for (const l of sameLines) {
@@ -408,11 +493,12 @@ function sentence(lead, { items, more }) {
 export function planWords(plan, shape) {
   const P = plan.production;
   const D = plan.dispatch;
-  const prod = P.level === 'order' ? 'one production order for the whole order'
+  const prod = P.level === 'custom' ? `${n((plan.groups ?? []).length, 'production order')} chosen from the BOM, and one per line for the rest`
+    : P.level === 'order' ? 'one production order for the whole order'
     : P.level === 'line' ? 'one production order for the line'
       : P.level === 'unit' ? 'one production order per unit'
         : `one production order per ${levelName(shape, P.levelId)}`;
-  const disp = D.level === 'same' ? 'dispatched the same way'
+  const disp = D.level === 'same' || P.level === 'custom' ? 'dispatched the same way'
     : D.level === 'line' ? 'dispatched per line'
       : D.level === 'unit' ? 'dispatched per unit'
         : `dispatched per ${levelName(shape, D.levelId)}`;
@@ -495,10 +581,16 @@ export function totalsOf(lines) {
   const together = lines.filter((l) => l.plan.production.level === 'order');
   if (together.length) production += 1;
   if (together.some((l) => l.plan.dispatch.level === 'same')) dispatch += 1;
+  // Custom groups may span lines: each counts once (on the first line it touches).
+  const counted = new Set();
   for (const l of lines) {
-    const pc = productionCount(l, l.plan, l.shape);
+    let pc = productionCount(l, l.plan, l.shape);
+    if (l.plan.production.level === 'custom') {
+      const own = (l.plan.groups ?? []).filter((g) => g.keys.some((k) => customKeyLineId(k) === Number(l.lineId)));
+      for (const g of own) { const k = JSON.stringify(g.keys); if (counted.has(k)) pc -= 1; else counted.add(k); }
+    }
     production += pc;
-    if (l.plan.dispatch.level === 'same') { if (l.plan.production.level !== 'order') dispatch += pc; }
+    if (l.plan.dispatch.level === 'same' || l.plan.production.level === 'custom') { if (l.plan.production.level !== 'order') dispatch += pc; }
     else dispatch += dispatchCount(l, l.plan, l.shape);
   }
   return { production, dispatch };

@@ -31,11 +31,14 @@ import { invalid, notFound, conflict } from '../lib/errors.js';
 import { explode } from './bomService.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
 import {
-  DEFAULT_PLAN, DISPATCH_LEVELS, MAX_GROUPS, MAX_GROUP_KEYS, PRODUCTION_LEVELS, PREVIEW_LIMIT, SPLIT_LEVELS,
-  checkGroups, checkLinePlan, choicesOf, effectivePlan, keyLineId, levelsOf, lineGroupProblems, nothingToChoose, planForLine,
+  DEFAULT_PLAN, DISPATCH_LEVELS, GROUP_LEVELS, MAX_GROUPS, MAX_GROUP_KEYS, PRODUCTION_LEVELS, PREVIEW_LIMIT, SPLIT_LEVELS,
+  checkCustomGroups, checkGroups, checkLinePlan, customNodes, choicesOf, effectivePlan, keyLineId, levelsOf, lineGroupProblems, nothingToChoose, planForLine,
   planSummary, planWords, previewOrder, sameChoice, samePlan, sharedLevels, templatesFor,
 } from './executionPlanModel.js';
-import { levelPieces } from './productionOrderModel.js';
+import { customKeyLineId, levelPieces } from './productionOrderModel.js';
+
+/** At most this many BOM rows a line are sent for the custom picker (a bigger line still saves and checks). */
+export const NODES_LIMIT = 5000;
 
 /** At most this many pieces a line are sent to the screen for its batches (a bigger line still saves and checks). */
 export const PIECES_LIMIT = 3000;
@@ -220,13 +223,16 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
     // The pieces of the split level (each unit, or each sub-assembly) — what the screen's batches are made of.
     const pieces = base.made ? levelPieces(base, defOf) : [];
     const problems = base.made
-      ? [...checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shape, names), ...checkGroups(base, plan, pieces)]
+      ? [...checkLinePlan({ lineNo: l.line_no, quantity: Number(l.quantity) }, plan, shape, names), ...checkGroups(base, plan, pieces),
+        ...(plan.production.level === 'custom' ? checkCustomGroups(base, plan, base.tree) : [])]
       : [];
-    return { ...base, pieces, problems };
+    // Custom (2026-11-12): the line's BOM rows, for the picker.
+    const nodes = base.made ? customNodes(base, NODES_LIMIT + 1) : [];
+    return { ...base, pieces, problems, nodes };
   });
   const madeLines = shaped.filter((l) => l.made);
   const preview = previewOrder(order.code, madeLines, defOf);
-  const problems = [...extra, ...shaped.flatMap((l) => l.problems)];
+  const problems = [...new Set([...extra, ...shaped.flatMap((l) => l.problems)])];
   // Choose by result (2026-10-24): every option with what it produces; the saved ones are never hidden.
   const savedOrderRow = savedRows.find((r) => r.order_line_id == null);
   const keep = {
@@ -272,6 +278,8 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
       pieces: l.pieces.slice(0, PIECES_LIMIT),
       piecesTotal: l.pieces.length,
       groups: l.plan.groups ?? [],
+      nodes: l.nodes.slice(0, NODES_LIMIT),
+      nodesTotal: l.nodes.length > NODES_LIMIT ? null : l.nodes.length,
       problems: l.problems,
       // The line's selects, labelled like the bars (null for a line from stock).
       options: choices.perLine.get(l.lineId) ?? null,
@@ -334,11 +342,34 @@ function readGroups(raw, what, problems, { lineOf, onlyLine = null }) {
   return out;
 }
 
+/**
+ * Custom groups from the body (2026-11-12): [{ name?, keys: ["L<line>" | "L<line>N<bom line id>", …] }]. A group may
+ * hold rows of several lines. Whether each row is real (and held once) is checked with the view (checkCustomGroups).
+ */
+function readCustomGroups(raw, problems, { lineOf }) {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) { problems.push('Production orders: must be a list.'); return []; }
+  if (raw.length > MAX_GROUPS) { problems.push(`Production orders: at most ${MAX_GROUPS}.`); return []; }
+  const out = [];
+  let total = 0;
+  raw.forEach((g, i) => {
+    const name = typeof g?.name === 'string' && g.name.trim() ? g.name.trim().slice(0, 80) : null;
+    const label = name ?? `Production order ${i + 1}`;
+    const keys = Array.isArray(g?.keys) ? [...new Set(g.keys.map((k) => String(k ?? '').trim()).filter(Boolean))] : null;
+    if (!keys?.length) { problems.push(`${label} has no rows — pick some or remove it.`); return; }
+    total += keys.length;
+    if (keys.some((k) => customKeyLineId(k) == null || lineOf(customKeyLineId(k)) == null)) { problems.push(`${label} names a row that is not on this order.`); return; }
+    out.push({ name, keys });
+  });
+  if (total > MAX_GROUP_KEYS) { problems.push(`Too many rows in production orders (${total}; at most ${MAX_GROUP_KEYS}).`); return []; }
+  return out;
+}
+
 /** A virtual stored row (the shape effectivePlan reads). Batches only on a split level. */
 const rowOf = (lineId, plan) => ({
   order_line_id: lineId, production_level: plan.production.level, production_level_id: plan.production.levelId,
   dispatch_level: plan.dispatch.level, dispatch_level_id: plan.dispatch.levelId,
-  groups_json: SPLIT_LEVELS.has(plan.production.level) && (plan.groups ?? []).length ? JSON.stringify(plan.groups) : null,
+  groups_json: GROUP_LEVELS.has(plan.production.level) && (plan.groups ?? []).length ? JSON.stringify(plan.groups) : null,
 });
 
 export async function saveExecutionPlan(db, c, orderId, input = {}) {
@@ -363,10 +394,14 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
   const groupsNext = (sent, stored, changed, what, onlyLine) => (sent !== undefined
     ? readGroups(sent, what, problems, { lineOf, onlyLine }) : changed ? [] : stored ?? []);
   const nextProd = prod ?? curOrder.production;
+  const isCustom = nextProd.level === 'custom';
   const nextOrder = {
     production: nextProd,
-    dispatch: disp ?? curOrder.dispatch,
-    groups: SPLIT_LEVELS.has(nextProd.level) ? groupsNext(input.groups, curOrder.groups, !sameChoice(nextProd, curOrder.production), 'Batches', null) : [],
+    // Custom: shipping follows the production orders.
+    dispatch: isCustom ? { level: 'same', levelId: null } : disp ?? curOrder.dispatch,
+    groups: isCustom
+      ? (input.groups !== undefined ? readCustomGroups(input.groups, problems, { lineOf }) : curOrder.production.level === 'custom' ? curOrder.groups ?? [] : [])
+      : SPLIT_LEVELS.has(nextProd.level) ? groupsNext(input.groups, curOrder.groups, !sameChoice(nextProd, curOrder.production), 'Batches', null) : [],
   };
 
   // The lines' own plans: the stored ones, with what was sent on top.
@@ -379,7 +414,7 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
     asked.add(lineId);
     if (x.own == null) { own.delete(lineId); continue; }
     const at = `Line ${line.line_no}`;
-    const p = readChoice(x.own.production ?? DEFAULT_PLAN.production, PRODUCTION_LEVELS, `${at}, production orders`, problems);
+    const p = readChoice(x.own.production ?? DEFAULT_PLAN.production, PRODUCTION_LEVELS.filter((lv) => lv !== 'custom'), `${at}, production orders`, problems);
     const d = readChoice(x.own.dispatch ?? DEFAULT_PLAN.dispatch, DISPATCH_LEVELS, `${at}, dispatch`, problems);
     if (p && d) {
       const before = own.get(lineId);
@@ -408,7 +443,7 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
     if (samePlan(plan, planForLine(nextOrder, id)) && !frozenOf(l)) own.delete(id);
   }
   // The order's row keeps only the batches of lines that follow it (a line of its own holds its own).
-  nextOrder.groups = nextOrder.groups.filter((g) => !own.has(keyLineId(g.keys[0])));
+  if (!isCustom) nextOrder.groups = nextOrder.groups.filter((g) => !own.has(keyLineId(g.keys[0])));
 
   const nextRows = nextRowsOf();
   const view = buildView({ ...loaded, rows: nextRows.map((r) => ({ ...r, saved_at: new Date(), saved_by: c.userId ?? null })) }, { dryRun, problems, savedRows: rows });

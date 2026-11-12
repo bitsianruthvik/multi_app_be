@@ -34,7 +34,7 @@ import {
   reviseDrawing, deleteDrawing, linkDrawing, removeLink, drawingCoverage, drawingsForRecord,
 } from '../services/drawingService.js';
 import { registerFile } from '../services/partDrawingService.js';
-import { lineModel3d } from '../services/model3dService.js';
+import { lineModel3d, placeAddedRow } from '../services/model3dService.js';
 import { linePhysicsInfo, linePhysicsPage } from '../services/physicsService.js';
 import { lineRowProgress, productionOrderLines } from '../services/rowProgressService.js';
 import { lineCurve, setLineCurve } from '../services/curveService.js';
@@ -46,6 +46,9 @@ const id = (req) => intParam(req.params.id);
 // THE 3D MODEL kept with an order line's standard drawing (view permission) — the drawing tool's 3D view (model3dService).
 router.get('/orders/:orderId/lines/:lineId/model3d', guard(PERM.ordersView),
   handle((req) => lineModel3d(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'))));
+// Where a new row's cuboid sits in the line's diagram (the line's own edit; model3dService.placeAddedRow).
+router.put('/orders/:orderId/lines/:lineId/model3d/place', guard(PERM.orders),
+  handle((req) => tx(req, (db, c) => placeAddedRow(db, c, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'), req.body ?? {}))));
 // THE PHYSICS VIEW kept with the line's standard (view permission; physicsService): its facts, and the page itself for a sandboxed frame.
 router.get('/orders/:orderId/lines/:lineId/physics', guard(PERM.ordersView),
   handle((req) => linePhysicsInfo(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'))));

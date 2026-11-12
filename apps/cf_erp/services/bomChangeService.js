@@ -144,6 +144,7 @@ import { arrangeBomLines, spaceAfterLine } from './bomOrderService.js';
 import { writeLineValues, loadContext, LINK_CHOICES } from './orderValuesService.js';
 import { readLinks, settleLine, linksBlock, linksOf, planLink, writeLink, writeUnlink, correspondingLine, isOwnRow } from './linkService.js';
 import { updateRecord } from './masterRecordService.js';
+import { withRemoved } from '../lib/lineModelEdits.js';
 
 export const OPS = ['quantity', 'flow', 'ownFlow', 'role', 'remove', 'paste', 'arrange', 'values', 'link', 'unlink'];
 /**
@@ -842,6 +843,29 @@ export async function applyBomChanges(db, c, input = {}, opts = {}) {
         if (!r.ok) continue;
       }
       results[ch.index] = { op: 'ownFlow', recordId: ch.recordId, from: saved, to: ch.flowId ?? null, changed };
+    }
+
+    // 2c. The diagram follows a removal (lib/lineModelEdits.js, user 2026-11-12): the drawing marks of every row
+    //     removed, read now — a removed row's values are cleared — and kept on the order line, never the standard.
+    if (removes.length && linkLineId) {
+      const ids = new Set();
+      const collect = (node) => { if (node.kind === 'temporary') ids.add(Number(node.id)); for (const k of node.children) collect(k); };
+      for (const ch of removes) collect(ch.entry.node);
+      if (ids.size) {
+        const [marks] = await db.query(
+          `SELECT DISTINCT v.value_text, v.value_number FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id AND s.code = 'DRAWING_MARK'
+            WHERE v.company_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL AND v.subject_id IN (?)`,
+          [companyId, [...ids]],
+        );
+        const list = marks.map((m) => m.value_text ?? (m.value_number != null ? String(Number(m.value_number)) : null)).filter(Boolean);
+        if (list.length) {
+          const [[row]] = await db.query('SELECT * FROM cf_sales_order_lines WHERE company_id = ? AND id = ?', [companyId, Number(linkLineId)]);
+          if (row && 'model_edits_json' in row) {
+            await db.query('UPDATE cf_sales_order_lines SET model_edits_json = ? WHERE company_id = ? AND id = ?',
+              [JSON.stringify(withRemoved(row.model_edits_json, list)), companyId, Number(linkLineId)]);
+          }
+        }
+      }
     }
 
     // 3. Removals, shallowest first: a parent takes its subtree with it, so a

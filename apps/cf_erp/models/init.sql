@@ -8358,3 +8358,33 @@ CREATE TABLE IF NOT EXISTS cf_model_value_runs (
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_spec_values'
             AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''model''%')
           + (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_model_value_runs') = 2, 'S100-OK', 'S100-MISSING') AS result;
+
+-- ============================================================================
+-- §101  BOM EDITS IN THE DIAGRAM, AND CUSTOM PRODUCTION ORDERS (2026-11-12)
+-- ============================================================================
+-- User, 2026-11-12: (1) "If they delete a row, that should get deleted from the diagram too. If they add a row and give
+-- dimensions, add that separately as a cuboid … If they replace the diagram of a part, then that should be handled too."
+-- Decided: the edits live on the ORDER LINE, the standard's model is never changed (lib/lineModelEdits.js).
+--   cf_sales_order_lines.model_edits_json  JSON { removed: [MARK], placed: { rowId: [x, y, z] } } — marks of rows removed in
+--                                          the Structure step (bomChangeService), and where a new row's cuboid was moved.
+-- (2) "Execution plan … options of entire order, per line, per qty and custom. In custom show the entire BOM and let them
+-- select a bunch (if selected at the node level, then assume it and the children together) and create a production order."
+--   production level 'custom' on cf_order_execution_plans (the order's row; groups_json = [{ name, keys: ["L<line>" |
+--   "L<line>N<bom line id>"] }]) and on cf_production_orders (scope key "C:<first key>" per group, "L<line>R" for the rest
+--   of a line nobody picked). executionPlanModel / productionOrderModel CUSTOM. Idempotent; safe to run again.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'model_edits_json');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_sales_order_lines ADD COLUMN model_edits_json JSON NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_order_execution_plans'
+             AND COLUMN_NAME = 'production_level' AND COLUMN_TYPE LIKE '%''custom''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_order_execution_plans MODIFY COLUMN production_level ENUM('order','line','unit','assembly','custom') NOT NULL DEFAULT 'line'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_orders'
+             AND COLUMN_NAME = 'level' AND COLUMN_TYPE LIKE '%''custom''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_production_orders MODIFY COLUMN level ENUM('order','line','unit','assembly','custom') NOT NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+            AND ((TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'model_edits_json')
+              OR (TABLE_NAME = 'cf_order_execution_plans' AND COLUMN_NAME = 'production_level' AND COLUMN_TYPE LIKE '%''custom''%')
+              OR (TABLE_NAME = 'cf_production_orders' AND COLUMN_NAME = 'level' AND COLUMN_TYPE LIKE '%''custom''%'))) = 3, 'S101-OK', 'S101-MISSING') AS result;
