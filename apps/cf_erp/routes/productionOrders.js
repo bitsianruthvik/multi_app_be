@@ -22,7 +22,7 @@ import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import { shipInput } from './tracker.js';
 import {
   getOrderProductionOrders, createProductionOrders, setTimeOverride, listProductionOrders, readProductionOrder,
-  releaseProductionOrders, takeBackProductionOrder, dispatchProductionOrder,
+  releaseProductionOrders, takeBackProductionOrder, dispatchProductionOrder, sendToPlanning, backToTimes,
 } from '../services/productionOrderService.js';
 
 const router = Router();
@@ -39,6 +39,9 @@ router.post('/orders/:id/production-orders', manage, handle((req) => (req.body?.
 router.put('/orders/:id/time-override', manage, handle((req) => tx(req, (db, c) => setTimeOverride(db, c, id(req), req.body ?? {}))));
 router.get('/production-orders', view, handle((req) => listProductionOrders(pool, company(req), req.query)));
 // Before /production-orders/:id, which would take 'release' for an id.
+// 2026-11-12: Setting times → Planning (the order's Production setup) and back.
+router.post('/production-orders/to-planning', manage, handle((req) => tx(req, (db, c) => sendToPlanning(db, c, req.body ?? {}))));
+router.post('/production-orders/:id/back-to-times', manage, handle((req) => tx(req, (db, c) => backToTimes(db, c, id(req)))));
 router.post('/production-orders/release', manage, handle((req) => tx(req, (db, c) => releaseProductionOrders(db, c, req.body ?? {}))));
 router.get('/production-orders/:id', view, handle((req) => readProductionOrder(pool, company(req), id(req))));
 router.post('/production-orders/:id/take-back', manage, handle((req) => tx(req, (db, c) => takeBackProductionOrder(db, c, id(req)))));

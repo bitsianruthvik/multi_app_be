@@ -1807,7 +1807,7 @@ function evaluate(data) {
       if (!met) blockers.push({ kind: 'wait', text: `Waiting for ${text}.` });
     }
     // §76: a step of a production order that is not released yet cannot start — on any screen.
-    if (s.production_order_id != null && s.po_status === 'yet_to_plan') {
+    if (s.production_order_id != null && ['yet_to_plan', 'planning'].includes(s.po_status)) {
       blockers.unshift({ kind: 'production_order', text: `Production order ${s.po_code} is not released yet.` });
     }
     const materials = reqsByStep.get(s.id) ?? [];

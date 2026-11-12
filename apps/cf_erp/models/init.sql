@@ -8388,3 +8388,18 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
             AND ((TABLE_NAME = 'cf_sales_order_lines' AND COLUMN_NAME = 'model_edits_json')
               OR (TABLE_NAME = 'cf_order_execution_plans' AND COLUMN_NAME = 'production_level' AND COLUMN_TYPE LIKE '%''custom''%')
               OR (TABLE_NAME = 'cf_production_orders' AND COLUMN_NAME = 'level' AND COLUMN_TYPE LIKE '%''custom''%'))) = 3, 'S101-OK', 'S101-MISSING') AS result;
+
+-- ============================================================================
+-- §102  PRODUCTION ORDER STAGE "PLANNING" (2026-11-12)
+-- ============================================================================
+-- User, 2026-11-12: "There should be some state management for production orders. It should first get created in execution
+-- plan and the values of time get set in the production tab … Once this is done production order should go into planning
+-- stage." cf_production_orders.status gains 'planning': Setting times (yet_to_plan, made when the execution plan is saved) →
+-- Planning (Send to planning, from the order's Production setup) → Released (planned) → … → Closed. Idempotent.
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_orders'
+             AND COLUMN_NAME = 'status' AND COLUMN_TYPE LIKE '%''planning''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_production_orders MODIFY COLUMN status ENUM('yet_to_plan','planning','planned','closed') NOT NULL DEFAULT 'yet_to_plan'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_orders'
+            AND COLUMN_NAME = 'status' AND COLUMN_TYPE LIKE '%''planning''%') = 1, 'S102-OK', 'S102-MISSING') AS result;

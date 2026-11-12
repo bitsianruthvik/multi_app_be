@@ -15,14 +15,21 @@
  * <path> is the chain of BOM line ids from the unit down to the sub-assembly's row — the same on the BOM tree (when
  * the orders are made) and on the tracker (when its pieces are stamped), so the two always meet.
  *
- * States (user, 2026-10-18): Yet to plan → Planned → In production → Dispatch → Closed. Stored: yet_to_plan,
- * planned (released), closed (dispatched). In production / Dispatch are worked out from its steps (stateOf).
+ * States (user, 2026-10-18; 2026-11-12: "It should first get created in execution plan and the values of time get set in the
+ * production tab … Once this is done production order should go into planning stage"):
+ *   Setting times → Planning → Released → In production → Dispatch → Closed.
+ * Stored: yet_to_plan (made from the execution plan; its times are being set in the order's Production setup), planning
+ * ("Send to planning": its times are checked — the planner's), planned (released to the floor), closed (dispatched).
+ * In production / Dispatch are worked out from its steps (stateOf).
  */
 
-export const PO_STATES = ['yet_to_plan', 'planned', 'in_production', 'dispatch', 'closed'];
+export const PO_STATES = ['yet_to_plan', 'planning', 'planned', 'in_production', 'dispatch', 'closed'];
 export const PO_STATE_LABEL = {
-  yet_to_plan: 'Yet to plan', planned: 'Planned', in_production: 'In production', dispatch: 'Dispatch', closed: 'Closed',
+  yet_to_plan: 'Setting times', planning: 'Planning', planned: 'Released', in_production: 'In production', dispatch: 'Dispatch', closed: 'Closed',
 };
+/** Stored statuses with nothing on the floor yet: no steps of it may start. */
+export const NOT_RELEASED = Object.freeze(['yet_to_plan', 'planning']);
+export const isReleased = (status) => !NOT_RELEASED.includes(status);
 
 const isWhole = (q) => Math.abs(q - Math.round(q)) < 1e-9 && q > 0;
 
@@ -373,6 +380,7 @@ export function assignPieces(lineId, items, orders, defOf) {
 export function stateOf(status, agg) {
   if (status === 'closed') return 'closed';
   if (status === 'yet_to_plan') return 'yet_to_plan';
+  if (status === 'planning') return 'planning';
   const steps = Number(agg?.steps ?? 0);
   const done = Number(agg?.done ?? 0);
   if (steps === 0 || done >= steps) return 'dispatch';

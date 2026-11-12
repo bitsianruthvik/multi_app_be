@@ -166,8 +166,9 @@ try {
   const SOQ = await order('Q', 'quoted');
   await line(SOQ, 1, A, 1);
   await plan(SOQ, 'line');
-  const early = await refusal(() => POS.createProductionOrders(conn, c, SOQ));
-  ok('refused before the customer\'s acceptance is approved (the order is not confirmed)', early?.code === 'NOT_READY' && /acceptance/.test(early.message), early?.message);
+  // 2026-11-12: made as soon as the execution plan is set — no confirmed order needed (release still needs one).
+  const early = await POS.createProductionOrders(conn, c, SOQ);
+  ok('made before the order is confirmed, from the saved plan: Setting times', early.created === 1 && early.productionOrders[0].state === 'yet_to_plan' && early.productionOrders[0].stateLabel === 'Setting times', JSON.stringify(early.productionOrders.map((p) => p.state)));
 
   const SO1 = await order('SO1', 'confirmed');
   const L11 = await line(SO1, 1, A, 1);
@@ -218,6 +219,13 @@ try {
     const floorNo = await refusal(() => FLOOR.startWork(conn, c, { machineId: mc.id, stepIds: [S12] }));
     ok('a floor start is refused in words', !!floorNo && JSON.stringify(floorNo.problems ?? floorNo.message).includes('is not released yet'), floorNo?.message);
   }
+  const notYet = await refusal(() => POS.releaseProductionOrders(conn, c, { ids: [po12.id] }));
+  ok('release is refused while it is still setting its times', notYet?.code === 'NOT_RELEASABLE' && /send it to planning/.test(notYet.message), notYet?.message);
+  const sent = await POS.sendToPlanning(conn, c, { ids: [po12.id] });
+  ok('Send to planning: Planning', sent.productionOrders[0].state === 'planning' && sent.productionOrders[0].actions.release === true && sent.productionOrders[0].actions.backToTimes === true);
+  const back12 = await POS.backToTimes(conn, c, po12.id);
+  ok('Back to times, and to planning again', back12.productionOrder.state === 'yet_to_plan' && (await POS.sendToPlanning(conn, c, { ids: [po12.id] })).productionOrders[0].state === 'planning');
+  ok('sending one in planning again is refused', (await refusal(() => POS.sendToPlanning(conn, c, { ids: [po12.id] })))?.code === 'NOT_SETTING_TIMES');
   const rel = await POS.releaseProductionOrders(conn, c, { ids: [po12.id] });
   ok('released: Planned, nothing new released (the line was)', rel.released[0] === po12.code && rel.productionOrders[0].state === 'planned' && rel.fromMr.length === 0);
   const twice = await refusal(() => POS.releaseProductionOrders(conn, c, { ids: [po12.id] }));
@@ -237,7 +245,7 @@ try {
   // Take back line 1's (nothing started): the line's release goes back too.
   const back = await POS.takeBackProductionOrder(conn, c, po11.id);
   const [[r11]] = await conn.query('SELECT deleted_at FROM cf_production_releases WHERE id = ?', [R11]);
-  ok('take back: Yet to plan, and the line\'s release is taken back with it', back.productionOrder.state === 'yet_to_plan' && back.releasesTakenBack === 1 && r11.deleted_at != null);
+  ok('take back: back to Planning, and the line\'s release is taken back with it', back.productionOrder.state === 'planning' && back.releasesTakenBack === 1 && r11.deleted_at != null);
   const treePo = await TREE.trackerTree(conn, COMPANY, { productionOrderId: po12.id, depth: 6 });
   ok('the Tracker scoped to a production order shows its pieces', treePo.productionOrder?.id === po12.id && treePo.nodes.some((n) => n.id === `p${P12}`) && treePo.nodes.every((n) => n.kind !== 'piece' || n.productionOrderId === po12.id));
 
@@ -289,12 +297,12 @@ try {
   section('F. Nesting frozen; list and read');
   const nl = await NEST.requireLine(conn, COMPANY, L12);
   const frozen = await refusal(async () => NEST.assertOpen(nl));
-  ok('nesting refuses a change once the line has a production order', frozen?.code === 'PRODUCTION_ORDER' && /nesting is frozen/.test(frozen.message), frozen?.message);
+  ok('nesting refuses a change once the line has a released production order', frozen?.code === 'PRODUCTION_ORDER' && /nesting is frozen/.test(frozen.message), frozen?.message);
   const nq = await NEST.requireLine(conn, COMPANY, (await conn.query('SELECT id FROM cf_sales_order_lines WHERE order_id = ?', [SOQ]))[0][0].id);
-  ok('a line without one is still open to nesting', (await refusal(async () => NEST.assertOpen(nq))) === null);
+  ok('a line whose production order is still setting its times is still open to nesting', (await refusal(async () => NEST.assertOpen(nq))) === null);
   const cnt = counting(conn);
   const list = await POS.listProductionOrders(cnt.db, COMPANY, { search: RUN, state: 'all' });
-  ok('the list groups by sales order, every state counted', list.rows.length === 3 && list.counts.all === 4 && list.counts.closed === 1, JSON.stringify(list.counts));
+  ok('the list groups by sales order, every state counted', list.rows.length === 4 && list.counts.all === 5 && list.counts.closed === 1 && list.counts.yet_to_plan === 2, JSON.stringify(list.counts));
   ok(`the list takes a fixed number of reads (${cnt.tally.n})`, cnt.tally.n <= 4);
   const cnt2 = counting(conn);
   await POS.listProductionOrdersOf(cnt2.db, COMPANY, { orderIds: [SO1, SO2, SOS] });

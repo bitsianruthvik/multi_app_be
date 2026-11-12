@@ -288,7 +288,7 @@ function buildView({ order, lines, rows, trees, defOf }, { problems: extra = [],
     templates: templatesFor(shaped.filter((l) => l.made)),
     preview: { production: preview.production, dispatch: preview.dispatch, limit: PREVIEW_LIMIT },
     problems,
-    note: 'The Production step makes the production orders from this plan (Create production orders). A line is nested until it has one; then its nesting is frozen.',
+    note: 'Saving the plan makes the production orders; their times are set in Production setup, then they go to planning. A line is nested until one of its production orders is released; then its nesting is frozen.',
   };
 }
 
@@ -478,7 +478,14 @@ export async function saveExecutionPlan(db, c, orderId, input = {}) {
         ...(withGroups ? [w.groups_json] : []), c.userId ?? null]),
     );
   }
-  return getExecutionPlan(db, c.companyId, order.id);
+  // 2026-11-12 (user): production orders are made from the execution plan — at once, not after the freeze. One still
+  // setting its times that the plan no longer asks for goes; one already in planning or released refuses the change.
+  const { syncProductionOrders } = await import('./productionOrderService.js');
+  const sync = await syncProductionOrders(db, c, order.id);
+  if (sync.blocked.length) {
+    throw invalid('PRODUCTION_ORDERS_IN_PLANNING', `The plan would drop ${sync.blocked.join(', ')}, which ${sync.blocked.length === 1 ? 'is' : 'are'} in planning or released already. Send ${sync.blocked.length === 1 ? 'it' : 'them'} back to setting times first.`, { problems: [`${sync.blocked.join(', ')} in planning or released`] });
+  }
+  return { ...(await getExecutionPlan(db, c.companyId, order.id)), productionOrders: { created: sync.created, dropped: sync.dropped } };
 }
 
 /**

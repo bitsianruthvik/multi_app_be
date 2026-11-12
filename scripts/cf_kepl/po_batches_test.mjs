@@ -228,13 +228,12 @@ try {
   v = await tryPlan({ lines: [{ lineId: L1.id, own: { production: { level: 'unit' }, dispatch: { level: 'same' }, groups: [{ keys: [`L${L2.id}U1`] }] } }] });
   ok('a line\'s own batch holding another line\'s piece is refused', v.problems.some((p) => p === 'Line 1, batches: Batch 1 holds pieces of another line.'), JSON.stringify(v.problems));
 
-  // Production orders from the saved plan (4 + 8 on line 1).
-  await EP.saveExecutionPlan(conn, c, order.id, { production: asm, dispatch: { level: 'same' }, groups: g48 });
-  await conn.query("UPDATE cf_sales_orders SET status = 'confirmed' WHERE id = ?", [order.id]);
-  await conn.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE order_id = ?', [order.id]);
+  // Production orders from the saved plan (4 + 8 on line 1) — made by the save itself (2026-11-12).
+  const savedPlan = await EP.saveExecutionPlan(conn, c, order.id, { production: asm, dispatch: { level: 'same' }, groups: g48 });
+  const [[{ nPo }]] = await conn.query('SELECT COUNT(*) AS nPo FROM cf_production_orders WHERE order_id = ? AND deleted_at IS NULL', [order.id]);
+  eq('saving the plan made (or kept) its 10 production orders, the ones of earlier plans dropped', [Number(nPo), savedPlan.productionOrders?.dropped >= 0], [10, true]);
   const dry = await POS.createProductionOrders(conn, c, order.id, { dryRun: true });
-  eq('create (dry run): 10 to make', [dry.toCreate, dry.why], [10, null]);
-  await POS.createProductionOrders(conn, c, order.id, {});
+  eq('create (dry run): nothing left to make', [dry.toCreate, dry.why], [0, null]);
   const [made] = await conn.query('SELECT scope_key, label, members_json FROM cf_production_orders WHERE order_id = ? AND deleted_at IS NULL ORDER BY seq', [order.id]);
   const mem = (r) => (r.members_json == null ? null : typeof r.members_json === 'string' ? JSON.parse(r.members_json) : r.members_json);
   // Each batch stands where its first piece stood: batch 1 (span 1), the rest of span 1, batch 2 (spans 2-3), …

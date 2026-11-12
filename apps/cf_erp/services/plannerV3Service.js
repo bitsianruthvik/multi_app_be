@@ -538,7 +538,7 @@ function shapeOrders(plan) {
     const slipDays = baseEnd && endText ? daysBetween(baseEnd, endText) : null;
     return {
       id: p.id, code: p.row.code, label: p.row.label, orderId: p.orderId, orderCode: p.row.order_code,
-      status: p.row.status, released: p.row.status !== 'yet_to_plan',
+      status: p.row.status, released: !['yet_to_plan', 'planning'].includes(p.row.status),
       state: !ids.length ? 'not_released' : finished ? 'finished' : started ? 'in_production' : 'planned',
       rank: rankOf.get(p.id), manual: { earliestStart: p.earliest, rank: p.rank, pinned: p.pinned },
       committedDate: p.committed, money: p.money, minutesLeft: r3(p.left),

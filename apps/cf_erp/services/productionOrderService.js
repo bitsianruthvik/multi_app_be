@@ -24,9 +24,9 @@
 import { invalid, notFound, conflict } from '../lib/errors.js';
 import { likeOf } from '../lib/listing.js';
 import { LOCKED_ORDER_STATUSES } from './records.js';
-import { loadAll, madeOf } from './executionPlanService.js';
+import { loadAll, madeOf, planGate } from './executionPlanService.js';
 import { effectivePlan, levelsOf, checkLinePlan, lineGroupProblems } from './executionPlanModel.js';
-import { PO_STATES, PO_STATE_LABEL, assignPieces, plannedProductionOrders, stateOf } from './productionOrderModel.js';
+import { PO_STATES, PO_STATE_LABEL, assignPieces, isReleased, plannedProductionOrders, stateOf } from './productionOrderModel.js';
 import { releaseLine, takeMrEarmarks, unrelease, evaluatedTracker, shapeStep } from './releaseService.js';
 import { shipLine } from './dispatchService.js';
 import { estimatorForLine, estimateOnMachine } from './timeEstimateService.js';
@@ -117,7 +117,10 @@ function shape(po, figures) {
     releasedBy: po.released_by_name ?? null,
     dispatchedAt: po.dispatched_at ?? null,
     actions: {
-      release: po.status === 'yet_to_plan',
+      // 2026-11-12: Setting times → (Send to planning) → Planning → (Release) → Released.
+      toPlanning: po.status === 'yet_to_plan',
+      backToTimes: po.status === 'planning',
+      release: po.status === 'planning',
       takeBack: po.status === 'planned' && Number(agg?.started ?? 0) === 0,
       dispatch: po.status === 'planned' && (state === 'dispatch' || (['unit'].includes(po.dispatch_level) && units.some((u) => u.finished - u.shipped > EPS))),
     },
@@ -149,7 +152,7 @@ export async function readProductionOrder(db, companyId, id) {
   );
   const pieces = [];
   let piecesTotal = 0;
-  if (rels.length && po.status !== 'yet_to_plan') {
+  if (rels.length && isReleased(po.status)) {
     const data = await evaluatedTracker(db, companyId, rels.map((r) => r.id));
     for (const it of data?.items ?? []) {
       if (Number(it.production_order_id) !== Number(po.id)) continue;
@@ -240,15 +243,14 @@ async function planOf(db, companyId, orderId, { lock = false } = {}) {
     return x;
   });
   const planned = plannedProductionOrders(order.code, shaped, defOf);
+  // 2026-11-12 (user): "This screen should be available as soon as the execution order is set. It has nothing to do with
+  // nesting." Made once the plan is saved (or there is nothing to choose); confirming, freezing and nesting gate the RELEASE.
   let why = null;
   if (LOCKED_ORDER_STATUSES.has(order.status)) why = `${order.code} is ${order.status} — nothing more is made for it.`;
-  else if (order.status !== 'confirmed') why = order.order_type === 'customer'
-    ? "Production orders are made once the customer's acceptance is approved (the order is confirmed)."
-    : 'Confirm the order first — production orders are made for a confirmed order.';
   else if (!made.length) why = 'Nothing on this order is made — every line comes from stock.';
   else {
-    const open = made.filter((l) => l.line_type === 'custom' && !l.locked_at);
-    if (open.length) why = `Freeze the design of ${open.length === 1 ? `line ${open[0].line_no}` : `lines ${open.map((l) => l.line_no).join(', ')}`} first.`;
+    const gate = await planGate(db, companyId, order.id);
+    if (gate.required && !gate.saved && !gate.nothingToChoose) why = 'Save the execution plan first — the production orders are made from it.';
     else if (problems.length) why = problems[0];
   }
   return { order, lines, made, planned, why, problems };
@@ -293,6 +295,58 @@ export async function createProductionOrders(db, c, orderId, input = {}) {
 }
 
 /* ===========================================================================
+ * Setting times ⇄ Planning (2026-11-12)
+ * ======================================================================== */
+
+/**
+ * POST /production-orders/to-planning { ids } — Setting times → Planning: the times are checked (user: "Once this is done
+ * production order should go into planning stage"). All or none.
+ */
+export async function sendToPlanning(db, c, input = {}) {
+  const pos = await lockOrders(db, c.companyId, input.ids);
+  const problems = pos.filter((po) => po.status !== 'yet_to_plan').map((po) => `${po.code} is ${PO_STATE_LABEL[po.status] ?? po.status} already.`);
+  if (problems.length) throw invalid('NOT_SETTING_TIMES', problems.length === 1 ? problems[0] : 'Some of these are past setting their times.', { problems });
+  await db.query("UPDATE cf_production_orders SET status = 'planning' WHERE company_id = ? AND id IN (?)", [c.companyId, pos.map((p) => p.id)]);
+  return { sent: pos.map((p) => p.code), productionOrders: await listProductionOrdersOf(db, c.companyId, { ids: pos.map((p) => p.id) }) };
+}
+
+/** POST /production-orders/:id/back-to-times — Planning → Setting times (nothing of it is released). */
+export async function backToTimes(db, c, id) {
+  const [po] = await lockOrders(db, c.companyId, [id]);
+  if (po.status !== 'planning') throw conflict('NOT_PLANNING', `${po.code} is not in planning — ${po.status === 'yet_to_plan' ? 'its times are being set already' : 'it is released; take it back first'}.`);
+  await db.query("UPDATE cf_production_orders SET status = 'yet_to_plan' WHERE company_id = ? AND id = ?", [c.companyId, po.id]);
+  const [shaped] = await listProductionOrdersOf(db, c.companyId, { ids: [po.id] });
+  return { productionOrder: shaped };
+}
+
+/**
+ * The order's production orders brought in line with its execution plan (2026-11-12: "It should first get created in
+ * execution plan"). Called after the plan is saved: makes the ones the plan asks for that do not exist; drops the ones it
+ * no longer asks for while they are still setting their times. One past that (in planning, released, closed) that the plan
+ * no longer asks for is a problem — the caller refuses the plan change with it.
+ * → { created, dropped, blocked: [code] }. dryRun: works it out, writes nothing.
+ */
+export async function syncProductionOrders(db, c, orderId, { dryRun = false } = {}) {
+  const p = await planOf(db, c.companyId, orderId);
+  const [existing] = await db.query(
+    'SELECT id, seq, code, scope_key, status FROM cf_production_orders WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL',
+    [c.companyId, p.order.id],
+  );
+  const want = new Set(p.planned.map((x) => x.scopeKey));
+  const gone = existing.filter((e) => !want.has(e.scope_key));
+  const blocked = gone.filter((e) => e.status !== 'yet_to_plan').map((e) => e.code);
+  if (dryRun) return { created: p.planned.filter((x) => !existing.some((e) => e.scope_key === x.scopeKey)).length, dropped: gone.length - blocked.length, blocked };
+  if (blocked.length) return { created: 0, dropped: 0, blocked };
+  const drop = gone.filter((e) => e.status === 'yet_to_plan').map((e) => e.id);
+  if (drop.length) await db.query('UPDATE cf_production_orders SET deleted_at = NOW() WHERE company_id = ? AND id IN (?)', [c.companyId, drop]);
+  let created = 0;
+  if (!p.why && p.planned.some((x) => !existing.some((e) => e.scope_key === x.scopeKey && !drop.includes(e.id)))) {
+    created = (await createProductionOrders(db, c, p.order.id, {})).created ?? 0;
+  }
+  return { created, dropped: drop.length, blocked: [] };
+}
+
+/* ===========================================================================
  * Release, take back, dispatch
  * ======================================================================== */
 
@@ -312,7 +366,8 @@ export async function releaseProductionOrders(db, c, input = {}) {
   const pos = await lockOrders(db, c.companyId, input.ids);
   const problems = [];
   for (const po of pos) {
-    if (po.status !== 'yet_to_plan') problems.push(`${po.code} is ${PO_STATE_LABEL[po.status === 'closed' ? 'closed' : 'planned'].toLowerCase()} already.`);
+    if (po.status === 'yet_to_plan') problems.push(`${po.code} is still setting its times — send it to planning first (the order's Production setup).`);
+    else if (po.status !== 'planning') problems.push(`${po.code} is ${PO_STATE_LABEL[po.status === 'closed' ? 'closed' : 'planned'].toLowerCase()} already.`);
     else if (po.order_status !== 'confirmed') problems.push(`${po.code}: order ${po.order_code} is ${po.order_status} — production orders are released for a confirmed order.`);
   }
   if (problems.length) throw invalid('NOT_RELEASABLE', problems.length === 1 ? problems[0] : 'Some of these production orders cannot be released.', { problems });
@@ -349,11 +404,12 @@ export async function takeBackProductionOrder(db, c, id) {
     [c.companyId, po.id],
   );
   if (Number(agg.started)) throw conflict('STARTED', `Work has started on ${po.code} — a started production order is not taken back.`);
-  await db.query("UPDATE cf_production_orders SET status = 'yet_to_plan', released_at = NULL, released_by = NULL WHERE company_id = ? AND id = ?", [c.companyId, po.id]);
+  // Back to Planning (2026-11-12): its times were sent to planning already.
+  await db.query("UPDATE cf_production_orders SET status = 'planning', released_at = NULL, released_by = NULL WHERE company_id = ? AND id = ?", [c.companyId, po.id]);
   // A line no other released production order needs goes back too (nothing started, nothing issued — unrelease checks).
   const lines = parseJson(po.lines_json, []).map(Number);
   const [others] = await db.query(
-    "SELECT lines_json FROM cf_production_orders WHERE company_id = ? AND order_id = ? AND id <> ? AND deleted_at IS NULL AND status <> 'yet_to_plan'",
+    "SELECT lines_json FROM cf_production_orders WHERE company_id = ? AND order_id = ? AND id <> ? AND deleted_at IS NULL AND status NOT IN ('yet_to_plan', 'planning')",
     [c.companyId, po.order_id, po.id],
   );
   const stillNeeded = new Set(others.flatMap((o) => parseJson(o.lines_json, []).map(Number)));
@@ -374,7 +430,7 @@ export async function takeBackProductionOrder(db, c, id) {
 export async function dispatchProductionOrder(db, c, id, input = {}) {
   const [po] = await lockOrders(db, c.companyId, [id]);
   const [shaped] = await listProductionOrdersOf(db, c.companyId, { ids: [po.id] });
-  if (po.status === 'yet_to_plan') throw conflict('NOT_RELEASED', `${po.code} is not released yet.`);
+  if (!isReleased(po.status)) throw conflict('NOT_RELEASED', `${po.code} is not released yet.`);
   if (po.status === 'closed') throw conflict('CLOSED', `${po.code} is closed — it has been dispatched.`);
   const perUnit = po.dispatch_level === 'unit';
   if (shaped.state !== 'dispatch' && !perUnit) {

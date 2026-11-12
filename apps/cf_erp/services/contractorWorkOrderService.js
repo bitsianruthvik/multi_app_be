@@ -243,7 +243,7 @@ async function loadGrid(db, companyId, productionOrderId, { lock = false } = {})
 
   // Released: which cells' steps already started in-house (they cannot be given away).
   const started = new Set();
-  if (po.status !== 'yet_to_plan' && lineIds.length) {
+  if (!['yet_to_plan', 'planning'].includes(po.status) && lineIds.length) {
     const [items] = await db.query(
       `SELECT pi.id, pi.parent_id, pi.depth, pi.bom_line_id, pi.item_id, r.order_line_id
          FROM cf_production_items pi JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
@@ -483,7 +483,7 @@ export async function createContractorWorkOrder(db, c, productionOrderId, input 
     lines.flatMap((l) => l.cells.map((x) => [c.companyId, woId, g.po.id, x.lineId, x.bomLineId, x.rowKey.slice(0, 1000), hashOf(x.rowKey), l.operation.id,
       lineOfItem.get(Number(items.get(Number(l.operation.id)))), x.quantity, x.unitKg, x.tonnes])));
   await askPoApproval(db, c, poId);
-  if (g.po.status !== 'yet_to_plan') await stampContractorSteps(db, c, { productionOrderIds: [g.po.id] });
+  if (!['yet_to_plan', 'planning'].includes(g.po.status)) await stampContractorSteps(db, c, { productionOrderIds: [g.po.id] });
   return readContractorWorkOrder(db, c.companyId, woId);
 }
 

@@ -662,12 +662,33 @@ export const STAGE_CATALOGUE = [
   },
   {
     key: 'production',
-    label: 'Production',
-    description: 'The times of every operation, then the production orders (from the execution plan) released to the shop. Needs a confirmed order and a frozen design; the steps wait for their material.',
+    // 2026-11-12 (user): "This is only to set the production related stuff like timing … available as soon as the execution
+    // order is set. It has nothing to do with nesting." The production orders (made from the execution plan) get their
+    // times here and are sent to planning; releasing them is Planning's (and still needs a confirmed, frozen, nested line).
+    label: 'Production setup',
+    description: "The line's production orders, made from the execution plan, get the times of every operation here; then they are sent to planning. Releasing them to the floor happens in Planning.",
     /** Something under the line is made: a temporary item, or a catalog item sourced 'make'. */
     applies: (ctx) => ctx.made.length > 0,
     state(ctx) {
       const { release } = ctx;
+      const pos = ctx.posByLine ? ctx.posByLine.get(Number(ctx.line.id)) ?? [] : null;
+      if (pos && !release) {
+        if (!pos.length) {
+          return {
+            state: 'todo', detail: 'No production orders yet — they are made when the execution plan is saved', blockers: [],
+            waitingOn: { stageKey: 'execution_plan', message: 'Save the execution plan — the production orders are made from it.' },
+          };
+        }
+        const setting = pos.filter((p) => p.status === 'yet_to_plan');
+        if (setting.length) {
+          return {
+            state: setting.length < pos.length ? 'partial' : 'todo',
+            detail: `${n(setting.length, 'production order')} setting ${setting.length === 1 ? 'its' : 'their'} times — send ${setting.length === 1 ? 'it' : 'them'} to planning when checked`,
+            blockers: [{ count: setting.length, message: `Line ${ctx.line.line_no}: ${nameList(setting.map((p) => p.code), 3)} still setting times.` }],
+          };
+        }
+        return { state: 'done', detail: `${n(pos.length, 'production order')} in planning`, blockers: [] };
+      }
       if (!release) {
         const mustFreeze = ctx.line.line_type === 'custom' && !ctx.lock.lockedAt;
         const openPlates = ctx.planned && !ctx.planned.ready ? ctx.planned.openPlates : 0;
@@ -749,7 +770,7 @@ async function rulesOf(db, companyId, processIds) {
 }
 
 /** A label a stage kind used to carry, read as the kind's label now (2026-11-12: Material request → Material required). */
-const RENAMED_LABELS = { buying: new Set(['material request', 'buying']) };
+const RENAMED_LABELS = { buying: new Set(['material request', 'buying']), production: new Set(['production']) };
 const stageLabel = (s) => (s.label && !RENAMED_LABELS[s.stage_key]?.has(String(s.label).trim().toLowerCase()) ? s.label : CATALOGUE_BY_KEY.get(s.stage_key)?.label || s.label || s.stage_key);
 
 const shapeStage = (s) => ({
@@ -2043,6 +2064,18 @@ export async function orderProcess(db, companyId, orderId) {
     const [acc, [mrs]] = await accP;
     ctx.acceptance = acc.get(Number(order.id)) ?? null;
     ctx.mrByLine = new Map(mrs.map((r) => [Number(r.order_line_id), { id: r.id, code: r.code, held: !!Number(r.held_for_acceptance) }]));
+  }
+  // The order's production orders by line (2026-11-12, Production setup): which still set their times. One read.
+  if (stageRows.some((s) => s.stage_key === 'production')) {
+    try {
+      const [pos] = await db.query('SELECT id, code, status, lines_json FROM cf_production_orders WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [companyId, order.id]);
+      ctx.posByLine = new Map();
+      for (const p of pos) {
+        let ids = [];
+        try { ids = JSON.parse(typeof p.lines_json === 'string' ? p.lines_json : JSON.stringify(p.lines_json ?? [])); } catch { ids = []; }
+        for (const id of ids) { const k = Number(id); if (!ctx.posByLine.has(k)) ctx.posByLine.set(k, []); ctx.posByLine.get(k).push({ id: p.id, code: p.code, status: p.status }); }
+      }
+    } catch { ctx.posByLine = null; }
   }
   const perLine = lines.map((line) => {
     const lctx = lineContext(ctx, order, line, { planStage, acceptanceStage: stageRows.some((s) => s.stage_key === 'acceptance') });

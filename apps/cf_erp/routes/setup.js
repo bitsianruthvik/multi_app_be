@@ -63,13 +63,14 @@ const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 // each node is there; &all=1 → the whole side, hidden nodes flagged (pickers).
 // Without ?screen it is the whole tree, as before. Machines is readable with
 // the production grant, because that is what the Machines screen holds.
-router.get('/classification', guardAny(PERM.view, PERM.productionView), handle((req) => {
+router.get('/classification', guardAny(PERM.view, PERM.productionView, PERM.maintenance, PERM.stores, PERM.inventoryView), handle((req) => {
   const screen = req.query.screen;
   if (!screen) {
     assertAnyPerm(req, PERM.view);
     return listTree(pool, ctx(req).companyId);
   }
-  if (screen === 'machines') assertAnyPerm(req, PERM.view, PERM.productionView);
+  // 2026-11-12: the machine register is Maintenance's, and Stores read it.
+  if (screen === 'machines') assertAnyPerm(req, PERM.view, PERM.productionView, PERM.maintenance, PERM.stores, PERM.inventoryView);
   else assertAnyPerm(req, PERM.view);
   return screenTree(pool, ctx(req).companyId, String(screen), { all: ['1', 'true'].includes(String(req.query.all ?? '')) });
 }));

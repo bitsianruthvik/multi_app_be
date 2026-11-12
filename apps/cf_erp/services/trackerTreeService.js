@@ -101,7 +101,7 @@ function pickerOf(lines, productionOrders = []) {
 /** §76: the released production orders (for the picker) — one read. */
 async function releasedProductionOrders(db, companyId) {
   const [rows] = await db.query(
-    "SELECT id, order_id, code, label, lines_json FROM cf_production_orders WHERE company_id = ? AND deleted_at IS NULL AND status <> 'yet_to_plan' ORDER BY order_id, seq",
+    "SELECT id, order_id, code, label, lines_json FROM cf_production_orders WHERE company_id = ? AND deleted_at IS NULL AND status NOT IN ('yet_to_plan', 'planning') ORDER BY order_id, seq",
     [companyId],
   );
   return rows;

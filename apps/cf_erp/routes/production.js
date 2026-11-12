@@ -68,7 +68,7 @@
  */
 import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
-import { PERM, guard, handle, ctx, intParam } from '../lib/http.js';
+import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
   listMachines, getMachine, createMachine, updateMachine, deleteMachine, getMachineSpecs, setMachineValues, getMachineHistory, machineTimeImpact,
 } from '../services/machineService.js';
@@ -94,15 +94,19 @@ const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const id = (req) => intParam(req.params.id);
 const view = guard(PERM.productionView);
 const manage = guard(PERM.production);
+// 2026-11-12: machines live in Maintenance — maintenance changes the register as production manage does; Stores (and
+// inventory view) see it.
+const machineView = guardAny(PERM.productionView, PERM.maintenance, PERM.stores, PERM.inventoryView);
+const machineManage = guardAny(PERM.production, PERM.maintenance);
 
-router.get('/machines', view, handle((req) => listMachines(pool, ctx(req).companyId, req.query)));
-router.post('/machines', manage, handle((req) => tx(req, (db, c) => createMachine(db, c, req.body ?? {}))));
-router.get('/machines/:id', view, handle((req) => getMachine(pool, ctx(req).companyId, id(req))));
-router.put('/machines/:id', manage, handle((req) => tx(req, (db, c) => updateMachine(db, c, id(req), req.body ?? {}))));
-router.delete('/machines/:id', manage, handle((req) => tx(req, (db, c) => deleteMachine(db, c, id(req)))));
-router.get('/machines/:id/specs', view, handle((req) => getMachineSpecs(pool, ctx(req).companyId, id(req))));
-router.put('/machines/:id/values', manage, handle((req) => tx(req, (db, c) => setMachineValues(db, c, id(req), req.body?.values ?? []))));
-router.get('/machines/:id/history', view, handle((req) => getMachineHistory(pool, ctx(req).companyId, id(req), Number(req.query.limit) || 200)));
+router.get('/machines', machineView, handle((req) => listMachines(pool, ctx(req).companyId, req.query)));
+router.post('/machines', machineManage, handle((req) => tx(req, (db, c) => createMachine(db, c, req.body ?? {}))));
+router.get('/machines/:id', machineView, handle((req) => getMachine(pool, ctx(req).companyId, id(req))));
+router.put('/machines/:id', machineManage, handle((req) => tx(req, (db, c) => updateMachine(db, c, id(req), req.body ?? {}))));
+router.delete('/machines/:id', machineManage, handle((req) => tx(req, (db, c) => deleteMachine(db, c, id(req)))));
+router.get('/machines/:id/specs', machineView, handle((req) => getMachineSpecs(pool, ctx(req).companyId, id(req))));
+router.put('/machines/:id/values', machineManage, handle((req) => tx(req, (db, c) => setMachineValues(db, c, id(req), req.body?.values ?? []))));
+router.get('/machines/:id/history', machineView, handle((req) => getMachineHistory(pool, ctx(req).companyId, id(req), Number(req.query.limit) || 200)));
 
 // Machine types are classification nodes, but they belong to the Machines
 // screen: somebody who may add a machine can add the type it needs without the
@@ -112,23 +116,23 @@ router.get('/machines/:id/history', view, handle((req) => getMachineHistory(pool
 // POST makes a type (with its Family and Subfamily, if they are new). PUT and
 // DELETE take ANY level of a machine family — a screen that can make a Family
 // inline and then never rename or retire it is the same dead end one step up.
-router.get('/machine-types', view, handle((req) => listMachineTypes(pool, ctx(req).companyId)));
-router.post('/machine-types', manage, handle((req) => tx(req, (db, c) => createMachineType(db, c, req.body ?? {}))));
-router.put('/machine-types/:id', manage, handle((req) => tx(req, (db, c) => updateMachineNode(db, c, id(req), req.body ?? {}))));
-router.delete('/machine-types/:id', manage, handle((req) => tx(req, (db, c) => deleteMachineNode(db, c, id(req)))));
+router.get('/machine-types', machineView, handle((req) => listMachineTypes(pool, ctx(req).companyId)));
+router.post('/machine-types', machineManage, handle((req) => tx(req, (db, c) => createMachineType(db, c, req.body ?? {}))));
+router.put('/machine-types/:id', machineManage, handle((req) => tx(req, (db, c) => updateMachineNode(db, c, id(req), req.body ?? {}))));
+router.delete('/machine-types/:id', machineManage, handle((req) => tx(req, (db, c) => deleteMachineNode(db, c, id(req)))));
 
 // CHARTS (chartService) — on a machine type or a machine, in one form: name, the result's unit, its
 // columns (the piece's value each is read by), values. A machine type's chart is every machine's
 // of that type unless a machine has its own (PUT …/machines/:id/charts/:specId/values).
 const specId = (req) => intParam(req.params.specId, 'specId');
 const chartValue = (req) => (req.body?.value === undefined ? null : req.body.value);
-router.get('/machine-types/:id/details', view, handle((req) => machineTypeDetails(pool, ctx(req).companyId, id(req))));
-router.get('/machine-types/:id/charts', view, handle((req) => listCharts(pool, ctx(req).companyId, { type: 'classification', id: id(req) })));
-router.post('/machine-types/:id/charts', manage, handle((req) => tx(req, (db, c) => createChart(db, c, { type: 'classification', id: id(req) }, req.body ?? {}))));
-router.put('/machine-types/:id/charts/:specId/values', manage, handle((req) => tx(req, (db, c) => setChartValue(db, c, { type: 'classification', id: id(req) }, specId(req), chartValue(req)))));
-router.get('/machines/:id/charts', view, handle((req) => listCharts(pool, ctx(req).companyId, { type: 'machine', id: id(req) })));
-router.post('/machines/:id/charts', manage, handle((req) => tx(req, (db, c) => createChart(db, c, { type: 'machine', id: id(req) }, req.body ?? {}))));
-router.put('/machines/:id/charts/:specId/values', manage, handle((req) => tx(req, (db, c) => setChartValue(db, c, { type: 'machine', id: id(req) }, specId(req), chartValue(req)))));
+router.get('/machine-types/:id/details', machineView, handle((req) => machineTypeDetails(pool, ctx(req).companyId, id(req))));
+router.get('/machine-types/:id/charts', machineView, handle((req) => listCharts(pool, ctx(req).companyId, { type: 'classification', id: id(req) })));
+router.post('/machine-types/:id/charts', machineManage, handle((req) => tx(req, (db, c) => createChart(db, c, { type: 'classification', id: id(req) }, req.body ?? {}))));
+router.put('/machine-types/:id/charts/:specId/values', machineManage, handle((req) => tx(req, (db, c) => setChartValue(db, c, { type: 'classification', id: id(req) }, specId(req), chartValue(req)))));
+router.get('/machines/:id/charts', machineView, handle((req) => listCharts(pool, ctx(req).companyId, { type: 'machine', id: id(req) })));
+router.post('/machines/:id/charts', machineManage, handle((req) => tx(req, (db, c) => createChart(db, c, { type: 'machine', id: id(req) }, req.body ?? {}))));
+router.put('/machines/:id/charts/:specId/values', machineManage, handle((req) => tx(req, (db, c) => setChartValue(db, c, { type: 'machine', id: id(req) }, specId(req), chartValue(req)))));
 // §58 — what a machine's own chart means for the plan. time-impact: the steps planned on it now.
 // charts/:specId/impact: a DRY RUN of saving those rows (the write is made and rolled back).
 const DRY = Symbol('dry run');
@@ -137,8 +141,8 @@ const dryTx = async (req, fn) => {
   try { await tx(req, async (db, c) => { out = await fn(db, c); throw DRY; }); } catch (e) { if (e !== DRY) throw e; }
   return out;
 };
-router.get('/machines/:id/time-impact', view, handle((req) => machineTimeImpact(pool, ctx(req).companyId, id(req))));
-router.post('/machines/:id/charts/:specId/impact', manage, handle((req) => dryTx(req, (db, c) => chartValueImpact(db, c, id(req), specId(req), chartValue(req)))));
+router.get('/machines/:id/time-impact', machineView, handle((req) => machineTimeImpact(pool, ctx(req).companyId, id(req))));
+router.post('/machines/:id/charts/:specId/impact', machineManage, handle((req) => dryTx(req, (db, c) => chartValueImpact(db, c, id(req), specId(req), chartValue(req)))));
 router.put('/charts/:specId', manage, handle((req) => tx(req, (db, c) => updateChart(db, c, specId(req), req.body ?? {}))));
 router.delete('/charts/:specId', manage, handle((req) => tx(req, (db, c) => deleteChart(db, c, specId(req)))));
 
@@ -172,14 +176,14 @@ router.delete('/flow-steps/:id', manage, handle((req) => tx(req, (db, c) => remo
 router.post('/flow-steps/:id/waits', manage, handle((req) => tx(req, (db, c) => addWaitRule(db, c, id(req), req.body ?? {}))));
 router.delete('/flow-waits/:id', manage, handle((req) => tx(req, (db, c) => removeWaitRule(db, c, id(req)))));
 
-router.get('/machines/:id/shifts', view, handle((req) => listShifts(pool, ctx(req).companyId, id(req))));
-router.post('/machines/:id/shifts', manage, handle((req) => tx(req, (db, c) => createShift(db, c, id(req), req.body ?? {}))));
-router.post('/machines/:id/shifts/copy', manage, handle((req) => tx(req, (db, c) => copyShifts(db, c, id(req), req.body?.fromMachineId))));
-router.put('/machine-shifts/:id', manage, handle((req) => tx(req, (db, c) => updateShift(db, c, id(req), req.body ?? {}))));
-router.delete('/machine-shifts/:id', manage, handle((req) => tx(req, (db, c) => deleteShift(db, c, id(req)))));
-router.get('/machines/:id/exceptions', view, handle((req) => listExceptions(pool, ctx(req).companyId, id(req), req.query)));
-router.post('/machines/:id/exceptions', manage, handle((req) => tx(req, (db, c) => createException(db, c, id(req), req.body ?? {}))));
-router.delete('/machine-exceptions/:id', manage, handle((req) => tx(req, (db, c) => deleteException(db, c, id(req)))));
-router.get('/machines/:id/calendar', view, handle((req) => machineCalendar(pool, ctx(req).companyId, id(req), req.query)));
+router.get('/machines/:id/shifts', machineView, handle((req) => listShifts(pool, ctx(req).companyId, id(req))));
+router.post('/machines/:id/shifts', machineManage, handle((req) => tx(req, (db, c) => createShift(db, c, id(req), req.body ?? {}))));
+router.post('/machines/:id/shifts/copy', machineManage, handle((req) => tx(req, (db, c) => copyShifts(db, c, id(req), req.body?.fromMachineId))));
+router.put('/machine-shifts/:id', machineManage, handle((req) => tx(req, (db, c) => updateShift(db, c, id(req), req.body ?? {}))));
+router.delete('/machine-shifts/:id', machineManage, handle((req) => tx(req, (db, c) => deleteShift(db, c, id(req)))));
+router.get('/machines/:id/exceptions', machineView, handle((req) => listExceptions(pool, ctx(req).companyId, id(req), req.query)));
+router.post('/machines/:id/exceptions', machineManage, handle((req) => tx(req, (db, c) => createException(db, c, id(req), req.body ?? {}))));
+router.delete('/machine-exceptions/:id', machineManage, handle((req) => tx(req, (db, c) => deleteException(db, c, id(req)))));
+router.get('/machines/:id/calendar', machineView, handle((req) => machineCalendar(pool, ctx(req).companyId, id(req), req.query)));
 
 export default router;

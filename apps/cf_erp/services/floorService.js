@@ -235,7 +235,7 @@ function stepProblem(s, machine, eligible) {
   if (LOCKED_ORDER_STATUSES.has(s.order_status)) return `${name}: order ${s.order_code} is ${s.order_status} — nothing more is recorded on it.`;
   if (s.work_order_id) return `${name} is on a contractor work order — it is not done in-house.`;
   // §76: work is recorded only on a RELEASED production order.
-  if (s.production_order_id != null && s.po_status === 'yet_to_plan') return `${name}: production order ${s.po_code} is not released yet.`;
+  if (s.production_order_id != null && ['yet_to_plan', 'planning'].includes(s.po_status)) return `${name}: production order ${s.po_code} is not released yet.`;
   if (s.state === 'on_hold') return `${name} is on hold — resume it first.`;
   if (eligible && !eligible.has(s.operation_id)) return `${machine.code} is not set up to do ${s.op_name} (${s.op_code}).`;
   return null;
@@ -613,7 +613,7 @@ export async function machineQueue(db, companyId, machineId, q = {}) {
   const rows = [];
   for (const s of data.steps) {
     if (s.state === 'done' || s.work_order_id || !eligible.has(s.operation_id) || openByStep.has(s.id)) continue;
-    if (s.production_order_id != null && s.po_status === 'yet_to_plan') continue;   // §76: not released yet — not on the floor
+    if (s.production_order_id != null && ['yet_to_plan', 'planning'].includes(s.po_status)) continue;   // §76: not released yet — not on the floor
     const it = itemById.get(s.production_item_id);
     const rel = relById.get(it.release_id);
     const shaped = shapeFloorStep(s, it, rel);
