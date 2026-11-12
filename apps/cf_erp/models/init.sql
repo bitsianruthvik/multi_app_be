@@ -8451,3 +8451,140 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
               OR (TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'machine_request_json')
               OR (TABLE_NAME = 'cf_buy_requests' AND COLUMN_NAME = 'approval_state'))) = 3
           AND EXISTS (SELECT 1 FROM features WHERE feature_tag = 'cf_erp_approve_machine_purchase'), 'S103-OK', 'S103-MISSING') AS result;
+
+-- ============================================================================
+-- §104  THE MACHINE LIFECYCLE (2026-11-12)
+-- ============================================================================
+-- User: "Machine once procured should go to the set up stage. There should be an automatic ticket raised with the
+-- maintenance team for setting it up. When they close the ticket, it should go to live status. When in setup, they can
+-- raise MR for that machine … move locations from store to maintenance to store back. Store should be able to check in
+-- and check out the machines and tools to various people and projects. … condemned. To condemn the maintenance team
+-- should raise, MD approval should be given. … a log of everyone or every area or every order it was used for. Tools
+-- should also be used as machines. Machines should have a depreciation period. And usage per order should take in the
+-- portion of time it is on that order as one of the overhead costs for the order."
+-- Decided with the user: durable tools (tracked piece by piece) join the register; the GRN asks Stores for each unit
+-- (serial, type, code) before the entries are made; places are stocking areas (+ purpose 'maintenance'); check-out to a
+-- login user, an HRMS employee, a contractor, an order or an area; straight-line depreciation from the Live date; the
+-- order pays by DAYS, a day shared between orders by their run hours that day (a day with none goes to the order it was
+-- checked out to; else idle); condemn → the MD → disposal recorded (scrapped / sold, amount; the rest written off).
+-- Setup-ticket issues: Installation (capitalised, default) or Consumable (expense, default for consumable families).
+--   cf_machines  kind, stage, area_id, received_on, live_on, cost, salvage_value, life_years, grn_bill_line_id,
+--                stage_before (a condemn sent back returns there), condemned_on, disposal, disposal_on,
+--                disposal_amount, disposal_note. Existing machines are 'live'. status stays the planner's switch:
+--                setup and condemned machines are 'inactive'.
+--   cf_machine_events     the log (moves, check-outs, stages, tickets, cost) — production use is read from the work sessions.
+--   cf_machine_checkouts  who or what has it; one open per machine.
+--   cf_machine_setup_items  a setup ticket's issued item treated otherwise than its default.
+--   cf_maintenance_orders.source + 'setup' (appended); cf_stocking_areas.purpose + 'maintenance' (appended).
+--   features cf_erp_approve_machine_condemn (the MD's yes), granted to the roles holding cf_erp_approve_machine_purchase.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machines' AND COLUMN_NAME = 'stage');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_machines
+  ADD COLUMN kind VARCHAR(10) NOT NULL DEFAULT 'machine',
+  ADD COLUMN stage VARCHAR(20) NOT NULL DEFAULT 'live',
+  ADD COLUMN stage_before VARCHAR(20) NULL,
+  ADD COLUMN area_id INT NULL,
+  ADD COLUMN received_on DATE NULL,
+  ADD COLUMN live_on DATE NULL,
+  ADD COLUMN cost DECIMAL(18,2) NULL,
+  ADD COLUMN salvage_value DECIMAL(18,2) NULL,
+  ADD COLUMN life_years DECIMAL(6,2) NULL,
+  ADD COLUMN grn_bill_line_id INT NULL,
+  ADD COLUMN condemned_on DATE NULL,
+  ADD COLUMN disposal VARCHAR(10) NULL,
+  ADD COLUMN disposal_on DATE NULL,
+  ADD COLUMN disposal_amount DECIMAL(18,2) NULL,
+  ADD COLUMN disposal_note VARCHAR(500) NULL,
+  ADD KEY idx_cmc_stage (company_id, stage, kind)", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_machine_events (
+  id           INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT           NOT NULL,
+  machine_id   INT           NOT NULL,
+  at           DATETIME      NULL,       -- the plant clock (created_at is the database clock — UTC on TiDB)
+  event        VARCHAR(24)   NOT NULL,   -- received / ticket / moved / checked_out / checked_in / live / condemn_asked / condemn_refused / condemned / disposed / cost
+  area_id      INT           NULL,
+  from_area_id INT           NULL,
+  checkout_id  INT           NULL,
+  ref_code     VARCHAR(60)   NULL,       -- an MO, an approval, a GRN
+  note         VARCHAR(1000) NULL,
+  created_by   INT           NULL,
+  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_cme2_machine (company_id, machine_id, created_at),
+  CONSTRAINT fk_cme2_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machine_events' AND COLUMN_NAME = 'at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_machine_events ADD COLUMN at DATETIME NULL AFTER machine_id', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_machine_checkouts (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  machine_id    INT           NOT NULL,
+  to_kind       VARCHAR(12)   NOT NULL,  -- user / employee / contractor / order / area
+  user_id       INT           NULL,
+  employee_id   INT           NULL,
+  party_id      INT           NULL,
+  order_id      INT           NULL,
+  area_id       INT           NULL,
+  taken_by      VARCHAR(120)  NULL,      -- the person who took it (an order or an area is not a person)
+  out_at        DATETIME      NOT NULL,
+  due_on        DATE          NULL,
+  note          VARCHAR(500)  NULL,
+  in_at         DATETIME      NULL,
+  in_note       VARCHAR(500)  NULL,
+  in_by         INT           NULL,
+  created_by    INT           NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  open_machine  INT GENERATED ALWAYS AS (IF(in_at IS NULL, machine_id, NULL)) VIRTUAL,
+  UNIQUE KEY uq_cmco_open (company_id, open_machine),
+  KEY idx_cmco_machine (company_id, machine_id, out_at),
+  KEY idx_cmco_order (company_id, order_id),
+  CONSTRAINT fk_cmco_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_machine_setup_items (
+  id          INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT          NOT NULL,
+  machine_id  INT          NOT NULL,
+  item_id     INT          NOT NULL,
+  treatment   VARCHAR(10)  NOT NULL,     -- capital / expense
+  created_by  INT          NULL,
+  updated_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_cmsi (company_id, machine_id, item_id),
+  CONSTRAINT fk_cmsi_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_maintenance_orders'
+             AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''setup''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_maintenance_orders MODIFY COLUMN source ENUM('fault','preventive','manual','setup') NOT NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stocking_areas'
+             AND COLUMN_NAME = 'purpose' AND COLUMN_TYPE LIKE '%''maintenance''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_stocking_areas MODIFY COLUMN purpose ENUM('storage','wip','quarantine','dispatch','scrap','maintenance') NOT NULL DEFAULT 'storage'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: approve condemning a machine', 'cf_erp_approve_machine_condemn', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_approve_machine_condemn');
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id) FROM features f
+ WHERE f.feature_tag = 'cf_erp_approve_machine_condemn' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_approve_machine_condemn' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM role_capability po JOIN features_capability pfc ON pfc.capability_id = po.capability_id AND pfc.deleted_at IS NULL
+                WHERE po.role_id = r.id AND po.app_id = a.id AND po.deleted_at IS NULL AND pfc.name = 'cf_erp_approve_machine_purchase')
+   AND NOT EXISTS (SELECT 1 FROM role_capability x WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+            AND ((TABLE_NAME = 'cf_machines' AND COLUMN_NAME IN ('stage', 'kind', 'area_id', 'live_on', 'cost', 'life_years', 'disposal'))
+              OR (TABLE_NAME = 'cf_maintenance_orders' AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''setup''%')
+              OR (TABLE_NAME = 'cf_stocking_areas' AND COLUMN_NAME = 'purpose' AND COLUMN_TYPE LIKE '%''maintenance''%'))) = 9
+          AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('cf_machine_events', 'cf_machine_checkouts', 'cf_machine_setup_items')) = 3
+          AND EXISTS (SELECT 1 FROM features WHERE feature_tag = 'cf_erp_approve_machine_condemn'), 'S104-OK', 'S104-MISSING') AS result;

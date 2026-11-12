@@ -28,6 +28,8 @@ export const APPROVAL_TYPES = {
   // §103 (2026-11-12): a new machine's PR — Maintenance first (with a comment), then the MD (machineRequestService).
   machine_pr_maintenance: { perm: 'cf_erp_maintenance', label: 'New machine — Maintenance', subjectType: 'purchase_request' },
   machine_pr_md: { perm: 'cf_erp_approve_machine_purchase', label: 'New machine — MD', subjectType: 'purchase_request' },
+  // §104 (2026-11-12): Maintenance asks to condemn a machine or tool; the MD decides (machineLifeService).
+  machine_condemn: { perm: 'cf_erp_approve_machine_condemn', label: 'Condemn a machine', subjectType: 'machine' },
 };
 export const APPROVAL_TYPE_KEYS = Object.keys(APPROVAL_TYPES);
 export const APPROVAL_PERMS = APPROVAL_TYPE_KEYS.map((k) => APPROVAL_TYPES[k].perm);
@@ -45,6 +47,7 @@ const HANDLERS = {
   rebaseline: () => import('./plannerV3Service.js').then((m) => m.rebaselineApprovalHandler),
   machine_pr_maintenance: () => import('./machineRequestService.js').then((m) => m.maintenanceApprovalHandler),
   machine_pr_md: () => import('./machineRequestService.js').then((m) => m.mdApprovalHandler),
+  machine_condemn: () => import('./machineLifeService.js').then((m) => m.condemnApprovalHandler),
 };
 
 const blank = (v) => v == null || String(v).trim() === '';

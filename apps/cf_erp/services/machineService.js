@@ -51,6 +51,10 @@ export async function listMachines(db, companyId, q = {}) {
   const where = ['mc.company_id = ?', 'mc.deleted_at IS NULL'];
   const params = [companyId];
   if (!blank(q.status)) { where.push('mc.status = ?'); params.push(q.status); }
+  // §104: the lifecycle — ?stage=setup|live|condemn_requested|condemned (or 'current' = not condemned), ?kind=machine|tool.
+  if (q.stage === 'current') where.push("mc.stage <> 'condemned'");
+  else if (!blank(q.stage)) { where.push('mc.stage = ?'); params.push(String(q.stage)); }
+  if (!blank(q.kind)) { where.push('mc.kind = ?'); params.push(String(q.kind)); }
   if (!blank(q.classificationId)) { where.push('mc.classification_id IN (?)'); params.push(await subtreeIds(db, companyId, Number(q.classificationId))); }
   if (!blank(q.search)) {
     const like = `%${String(q.search).trim().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
@@ -63,7 +67,8 @@ export async function listMachines(db, companyId, q = {}) {
   const requestedOffset = Number(q.offset);
   const offset = Number.isSafeInteger(requestedOffset) && requestedOffset > 0 ? requestedOffset : 0;
   const [rows] = await db.query(`${SELECT} WHERE ${where.join(' AND ')} ORDER BY mc.code, mc.id LIMIT 500 OFFSET ?`, [...params, offset]);
-  return rows.map((m) => shape(m, production));
+  const life = await (await import('./machineLifeService.js')).lifeColumns(db, companyId, rows.map((m) => Number(m.id)));
+  return rows.map((m) => ({ ...shape(m, production), ...(life.get(Number(m.id)) ?? {}) }));
 }
 
 async function loadShaped(db, companyId, id) {
@@ -74,7 +79,7 @@ async function loadShaped(db, companyId, id) {
 
 export async function getMachine(db, companyId, id) {
   const m = await loadShaped(db, companyId, id);
-  const out = shape(m, await productionMachineIds(db, companyId));
+  const out = { ...shape(m, await productionMachineIds(db, companyId)), kind: m.kind ?? 'machine', stage: m.stage ?? 'live' };
   const path = await ancestors(db, companyId, m.classification_id);
   out.classificationPath = path.map((n) => ({ id: n.id, code: n.code, name: n.name, level: levelName(n.depth) }));
   out.operations = await operationsForMachine(db, companyId, m);

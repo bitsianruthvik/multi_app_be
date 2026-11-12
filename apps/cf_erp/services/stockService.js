@@ -496,7 +496,10 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   // §74 (user, 2026-10-18): every ISSUE says what it is USED FOR — a sales order (optionally its line) or General
   // (overhead). Order costing reads consumables from these.
   let usedFor = null;
-  if (type === 'issue') {
+  if (type === 'issue' && opts.asset === true) {
+    // §104: a machine / durable tool put on the register leaves stock as an ASSET — not a consumable of any order. Server-only.
+    usedFor = 'asset';
+  } else if (type === 'issue') {
     const asked = blank(input.usedFor) ? null : String(input.usedFor);
     if (asked && !USED_FOR.includes(asked)) problems.push('Used for is a sales order or General.');
     else if (asked === 'general' && !blank(input.orderId)) problems.push('An issue is used for a sales order or for General — not both.');

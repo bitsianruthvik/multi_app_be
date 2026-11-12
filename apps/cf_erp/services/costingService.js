@@ -27,6 +27,7 @@ import { orderCosts, orderCostSheets } from './valuationService.js';
 import { billingFacts, cardsOf, todayText } from './billingService.js';
 import { contractorCostOf } from './contractorWorkOrderService.js';
 import { scrapRate } from './scrapService.js';
+import { machineUseOf } from './machineLifeService.js';   // §104: machine use on an order
 
 const EPS = 1e-6;
 const round3 = (n) => Math.round((Number(n) + Number.EPSILON) * 1000) / 1000;
@@ -105,17 +106,19 @@ export function scrapOffcutsOf(s, rate, earned = null, terms = null) {
   };
 }
 
-function sheetRow(F, P, s, summary, cw = null, rate = null) {
+function sheetRow(F, P, s, summary, cw = null, rate = null, mu = null) {
   const earned = earnedOf(F, P);
   const material = s?.material ?? 0;
   const consumables = s?.consumables ?? 0;
   const contractor = cw?.paid ?? 0;
   const credits = s?.credits?.total ?? 0;
-  const margin = round2(earned.total - material - consumables - contractor + credits);
+  // §104: machine use — each machine's depreciation for the days it worked on this order (shared by run hours).
+  const machineUse = mu?.total ?? 0;
+  const margin = round2(earned.total - material - consumables - contractor - machineUse + credits);
   return {
     order: { id: F.order.id, code: F.order.code, title: F.order.title, status: F.order.status, customer: F.order.customer },
     contract: earned.contract, charged: earned.total, invoiced: summary.billed, received: summary.received,
-    material, consumables, contractor, credits, creditsScrap: s?.credits?.scrap ?? 0, creditsOffcuts: s?.credits?.offcuts ?? 0,
+    material, consumables, contractor, machineUse, machineUseDetail: mu?.machines ?? [], credits, creditsScrap: s?.credits?.scrap ?? 0, creditsOffcuts: s?.credits?.offcuts ?? 0,
     customerMaterial: s?.customer ?? { rows: 0, quantity: 0 }, uncostedRows: s?.uncostedRows ?? 0,
     margin, marginPct: earned.total > EPS ? round2((margin / earned.total) * 100) : null,
     contractorWork: cw ?? { paid: 0, doneValue: 0, committed: 0, workOrders: [] },
@@ -127,11 +130,11 @@ function sheetRow(F, P, s, summary, cw = null, rate = null) {
 /** GET /accounts/costing?search= — one row per accepted customer order (confirmed, or closed in 180 days). Fixed reads. */
 export async function costingList(db, companyId, q = {}) {
   const facts = await billingFacts(db, companyId, { search: q.search });
-  const [sheets, cws, rate] = await Promise.all([orderCostSheets(db, companyId, facts.map((F) => F.order.id)), contractorCostOf(db, companyId, facts.map((F) => F.order.id)), scrapRate(db, companyId)]);
+  const [sheets, cws, rate, mus] = await Promise.all([orderCostSheets(db, companyId, facts.map((F) => F.order.id)), contractorCostOf(db, companyId, facts.map((F) => F.order.id)), scrapRate(db, companyId), machineUseOf(db, companyId, facts.map((F) => F.order.id))]);
   const today = todayText();
   const rows = facts.map((F) => {
     const { summary, progress } = cardsOf(F, today);
-    const { earned, contractorWork, scrapOffcuts: so, ...row } = sheetRow(F, progress, sheets.get(F.order.id), summary, cws.get(F.order.id), rate);
+    const { earned, contractorWork, scrapOffcuts: so, machineUseDetail, ...row } = sheetRow(F, progress, sheets.get(F.order.id), summary, cws.get(F.order.id), rate, mus.get(Number(F.order.id)));
     // The list keeps it short: the kilograms, what the charges earned for them, and how many things are not costed.
     return { ...row, scrapKg: so.actual.scrapKg, offcutKg: so.actual.offcutKg, scrapCharged: so.charged.earned, flags: so.flags.length };
   });
@@ -143,7 +146,7 @@ export async function costingList(db, companyId, q = {}) {
   const sum = (k) => round2(rows.reduce((t, r) => t + Number(r[k] ?? 0), 0));
   return {
     rows,
-    totals: { contract: sum('contract'), charged: sum('charged'), material: sum('material'), consumables: sum('consumables'), contractor: sum('contractor'), credits: sum('credits'), margin: sum('margin') },
+    totals: { contract: sum('contract'), charged: sum('charged'), material: sum('material'), consumables: sum('consumables'), contractor: sum('contractor'), machineUse: sum('machineUse'), credits: sum('credits'), margin: sum('margin') },
     generalThisMonth: { value: round2(Number(general?.value ?? 0)), uncostedRows: Number(general?.uncosted ?? 0) },
   };
 }
@@ -152,7 +155,8 @@ export async function costingList(db, companyId, q = {}) {
  *  per-line nest figures (valuationService.orderCosts). */
 export async function costSheet(db, companyId, orderId) {
   // Side by side (speed, 2026-10-19): none of these needs the billing facts.
-  const [facts, sheets, detail, cws, rate] = await Promise.all([billingFacts(db, companyId, { orderIds: [Number(orderId)] }), orderCostSheets(db, companyId, [Number(orderId)]), orderCosts(db, companyId, orderId), contractorCostOf(db, companyId, [Number(orderId)]), scrapRate(db, companyId)]);
+  const [facts, sheets, detail, cws, rate, mus] = await Promise.all([billingFacts(db, companyId, { orderIds: [Number(orderId)] }), orderCostSheets(db, companyId, [Number(orderId)]), orderCosts(db, companyId, orderId), contractorCostOf(db, companyId, [Number(orderId)]), scrapRate(db, companyId), machineUseOf(db, companyId, [Number(orderId)])]);
+  const mu = mus.get(Number(orderId)) ?? null;
   const cw = cws.get(Number(orderId));
   const F = facts[0];
   const s = sheets.get(Number(orderId));
@@ -160,16 +164,16 @@ export async function costSheet(db, companyId, orderId) {
     // No accepted terms: nothing is charged yet, the costs still are.
     const [[o]] = await db.query('SELECT o.id, o.code, o.title, o.status, p.name AS customer_name FROM cf_sales_orders o LEFT JOIN cf_parties p ON p.id = o.customer_id WHERE o.company_id = ? AND o.id = ? AND o.deleted_at IS NULL', [companyId, Number(orderId)]);
     if (!o) throw notFound('Sales order');
-    const material = s?.material ?? 0; const consumables = s?.consumables ?? 0; const credits = s?.credits?.total ?? 0; const contractor = cw?.paid ?? 0;
+    const material = s?.material ?? 0; const consumables = s?.consumables ?? 0; const credits = s?.credits?.total ?? 0; const contractor = cw?.paid ?? 0; const machineUse = mu?.total ?? 0;
     return {
       order: { id: o.id, code: o.code, title: o.title ?? null, status: o.status, customer: o.customer_name ?? null }, hasTerms: false,
-      contract: 0, charged: 0, invoiced: 0, received: 0, material, consumables, contractor, contractorWork: cw, credits, creditsScrap: s?.credits?.scrap ?? 0, creditsOffcuts: s?.credits?.offcuts ?? 0,
+      contract: 0, charged: 0, invoiced: 0, received: 0, material, consumables, contractor, machineUse, machineUseDetail: mu?.machines ?? [], contractorWork: cw, credits, creditsScrap: s?.credits?.scrap ?? 0, creditsOffcuts: s?.credits?.offcuts ?? 0,
       customerMaterial: s?.customer ?? { rows: 0, quantity: 0 }, uncostedRows: s?.uncostedRows ?? 0,
-      margin: round2(-material - consumables - contractor + credits), marginPct: null, earned: { rows: [], total: 0, contract: 0 }, items: s?.items ?? [], lines: detail.lines, totals: detail.totals,
+      margin: round2(-material - consumables - contractor - machineUse + credits), marginPct: null, earned: { rows: [], total: 0, contract: 0 }, items: s?.items ?? [], lines: detail.lines, totals: detail.totals,
       scrapOffcuts: scrapOffcutsOf(s, rate),
     };
   }
   const { summary, progress } = cardsOf(F, todayText());
-  return { ...sheetRow(F, progress, s, summary, cw, rate), hasTerms: true, items: s?.items ?? [], lines: detail.lines, totals: detail.totals };
+  return { ...sheetRow(F, progress, s, summary, cw, rate, mu), hasTerms: true, items: s?.items ?? [], lines: detail.lines, totals: detail.totals };
 }
 

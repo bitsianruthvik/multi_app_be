@@ -57,6 +57,8 @@ import addLineRoutes from './addLine.js';
 import toolsResourcesRoutes from './toolsResources.js';
 // Maintenance: machines board, faults, maintenance orders, preventive plans, planned downtime (init.sql §82).
 import maintenanceRoutes from './maintenance.js';
+// §104: the machine lifecycle — register from GRN, setup, place, custody, condemn, cost.
+import machineLifeRoutes from './machineLife.js';
 // The stores chain: the general MR, To reorder, how items are procured, a machine's store (init.sql §79).
 import storesRoutes from './stores.js';
 // Step 6: contractor work orders from a production order, in Accounts (init.sql §85).
@@ -172,6 +174,7 @@ router.use(productionOrderRoutes);
 router.use(addLineRoutes);
 router.use(toolsResourcesRoutes);
 router.use(maintenanceRoutes);
+router.use(machineLifeRoutes);
 router.use(storesRoutes);
 router.use(contractorWorkOrderRoutes);
 router.use(timingSheetRoutes);

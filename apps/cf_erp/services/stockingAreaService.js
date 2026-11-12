@@ -7,7 +7,7 @@
 import { conflict, notFound, assertNoProblems } from '../lib/errors.js';
 import { loadMachine, requireMachine } from './records.js';
 
-export const PURPOSES = ['storage', 'wip', 'quarantine', 'dispatch', 'scrap'];   // scrap: §67
+export const PURPOSES = ['storage', 'wip', 'quarantine', 'dispatch', 'scrap', 'maintenance'];   // scrap: §67; maintenance: §104 (a maintenance bay — machines and tools are moved there)
 
 /**
  * WHERE GOODS FROM OUTSIDE MAY BE RECEIVED (2026-10-19): a store, or quarantine to be inspected. Production takes plates

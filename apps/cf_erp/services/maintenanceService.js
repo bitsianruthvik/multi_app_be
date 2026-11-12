@@ -460,6 +460,18 @@ export async function createOrder(db, c, input = {}) {
   return { order: mo };
 }
 
+/**
+ * §104: the SETUP TICKET of a machine just registered (machineLifeService.registerReceived) — a maintenance order, source
+ * 'setup', on a machine that is not active yet (no stop: it is not running). Closing it makes the machine live.
+ */
+export async function openSetupTicket(db, c, machine) {
+  const { wall } = await plantNow(db, c.companyId);
+  await insertOrders(db, c, [{ machineId: machine.id, source: 'setup', title: `Set up ${machine.code} — ${machine.name}`.slice(0, 255),
+    note: 'Install, connect and test it. Raise an MR for what it needs (wires, consumables). Close this ticket and it goes live.', raisedAt: wall }]);
+  const [[mo]] = await db.query("SELECT id, code FROM cf_maintenance_orders WHERE company_id = ? AND machine_id = ? AND source = 'setup' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", [c.companyId, machine.id]);
+  return mo;
+}
+
 async function requireOrder(db, companyId, id) {
   const [[mo]] = await db.query('SELECT * FROM cf_maintenance_orders WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [companyId, id]);
   if (!mo) throw notFound('Maintenance order');
@@ -481,7 +493,7 @@ export async function setStatus(db, c, id, input = {}) {
   if (!(TRANSITIONS[mo.status] ?? []).includes(to)) throw invalid('INVALID', `${mo.code} cannot go from ${MO_STATUS_LABEL[mo.status]} to ${MO_STATUS_LABEL[to] ?? to}.`);
   const { wall } = await plantNow(db, c.companyId);
   let stopId = mo.stop_id;
-  if (to === 'in_progress' && !stopId && input.stopMachine !== false) {
+  if (to === 'in_progress' && !stopId && input.stopMachine !== false && mo.source !== 'setup') {
     const machine = await requireActiveMachine(db, c.companyId, mo.machine_id);
     const reason = await reasonByCode(db, c.companyId, ['CLEANING', 'MAINT', 'PM', 'BREAKDOWN']);
     stopId = (await takeDown(db, c, machine, { reasonId: reason.id, note: `${mo.code}: ${mo.title}`, wall })).stopId;
@@ -572,6 +584,11 @@ export async function closeOrder(db, c, id, input = {}) {
   if (otherCost > 0 && !costNote) throw invalid('INVALID', 'Say what the other cost was for.');
   const workDone = blank(input.workDone) ? null : String(input.workDone).slice(0, 1000);
   const out = await finish(db, c, mo, { status: 'done', workDone, otherCost, costNote });
+  // §104: a closed setup ticket makes the machine live.
+  if (mo.source === 'setup') {
+    await (await import('./machineLifeService.js')).goLive(db, c, mo.machine_id, { refCode: mo.code, note: workDone });
+    return { ...out, order: await getOrder(db, c.companyId, id), live: true, message: `${mo.code} is done — the machine is live.` };
+  }
   return { ...out, order: await getOrder(db, c.companyId, id), message: `${mo.code} is done — the machine is back up.` };
 }
 

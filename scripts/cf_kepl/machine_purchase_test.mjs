@@ -104,6 +104,8 @@ try {
   await AP.decide(conn, md, ap4.id, { decision: 'approve' }, asMd);
   pr = await PRS.getPr(conn, COMPANY, prId);
   ok('approved: Purchase may buy it', pr.approval?.state === 'approved' && pr.canEdit === true);
+  const [[model]] = await conn.query('SELECT code, status FROM cf_master_records WHERE id = ?', [r.modelId]);
+  ok('§104: the new model has a code and is active now (a GRN refuses a draft)', model.status === 'active' && /^MM-|./.test(model.code ?? ''), JSON.stringify(model));
   if (sup) {
     const withVendor = await PRS.addVendor(conn, c, prId, { supplierId: sup.id });
     ok('Purchase adds a vendor now', withVendor.vendors.length === 1);

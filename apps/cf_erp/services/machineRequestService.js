@@ -90,6 +90,8 @@ export async function requestMachine(db, c, input = {}) {
     }, { fallbackName: model.name });
     modelId = Number(made.id);
     createdModel = true;
+    // §104: a model with no coding rule gets a quiet code (MM-000123) so it can be activated once it is approved to buy.
+    await db.query("UPDATE cf_master_records SET code = CONCAT('MM-', IF(id < 1000000, LPAD(id, 6, '0'), id)) WHERE company_id = ? AND id = ? AND code IS NULL", [c.companyId, modelId]);
   }
   const lines = [
     `New machine: ${purpose}`,
@@ -179,7 +181,19 @@ export const maintenanceApprovalHandler = {
 export const mdApprovalHandler = {
   async onApprove(db, c, row) {
     await db.query("UPDATE cf_buy_requests SET approval_state = 'approved' WHERE company_id = ? AND id = ? AND approval_state = 'md'", [c.companyId, row.subject_id]);
-    return { approved: true };
+    // §104: a new model (a draft catalog item) is activated now it is approved to buy — a GRN refuses a draft item.
+    const [drafts] = await db.query(
+      `SELECT DISTINCT m.id FROM cf_buy_request_lines bl JOIN cf_master_records m ON m.id = bl.item_id
+        WHERE bl.company_id = ? AND bl.request_id = ? AND bl.deleted_at IS NULL AND m.status = 'draft'`, [c.companyId, row.subject_id]);
+    const activated = [];
+    if (drafts.length) {
+      const { setStatus } = await import('./masterRecordService.js');
+      for (const d of drafts) {
+        await db.query("UPDATE cf_master_records SET code = CONCAT('MM-', IF(id < 1000000, LPAD(id, 6, '0'), id)) WHERE company_id = ? AND id = ? AND code IS NULL", [c.companyId, d.id]);
+        try { await setStatus(db, c, d.id, 'active'); activated.push(Number(d.id)); } catch { /* left as a draft: the catalog says what it lacks */ }
+      }
+    }
+    return { approved: true, activated };
   },
   onReject: reject('md'),
   onWithdraw: withdraw('md'),
