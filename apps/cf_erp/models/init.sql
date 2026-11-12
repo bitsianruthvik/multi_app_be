@@ -8396,9 +8396,10 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
 -- plan and the values of time get set in the production tab … Once this is done production order should go into planning
 -- stage." cf_production_orders.status gains 'planning': Setting times (yet_to_plan, made when the execution plan is saved) →
 -- Planning (Send to planning, from the order's Production setup) → Released (planned) → … → Closed. Idempotent.
+-- 'planning' is APPENDED: TiDB refuses an ENUM change that reorders the values (nothing reads the ENUM's order).
 SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_orders'
              AND COLUMN_NAME = 'status' AND COLUMN_TYPE LIKE '%''planning''%');
-SET @sql = IF(@has = 0, "ALTER TABLE cf_production_orders MODIFY COLUMN status ENUM('yet_to_plan','planning','planned','closed') NOT NULL DEFAULT 'yet_to_plan'", 'SELECT 1');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_production_orders MODIFY COLUMN status ENUM('yet_to_plan','planned','closed','planning') NOT NULL DEFAULT 'yet_to_plan'", 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_orders'
