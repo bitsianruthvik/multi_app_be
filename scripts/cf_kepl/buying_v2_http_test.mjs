@@ -202,9 +202,9 @@ try {
   const lineA = byItem(r.json.requisitions[0], fx.A).id; const lineB = byItem(r.json.requisitions[0], fx.B).id; const lineC = byItem(r.json.requisitions[0], fx.C).id;
   // Customer acceptance › Material: the per-line supply select — orders manage OR inventory manage, as the order-level one.
   r = await call('PUT', `/order-lines/${fx.O2.line.id}/material-supply`, { token: T_SALES, body: { supply: 'we_buy' } });
-  // (The fixture's order is confirmed, so the service then says the supply is fixed — the point is it is no 403.)
-  ok("Sales (orders manage alone) passes the line-supply permission: the service answers (fixed once accepted), not 403",
-    r.status !== 403 && r.json?.code === 'INVALID' && /cannot be changed/.test(r.json?.message ?? ''), `${r.status} ${r.text.slice(0, 160)}`);
+  // (2026-11-12: the supply may still be set after the acceptance, until an MR is with Purchase — the point is it is no 403.)
+  ok("Sales (orders manage alone) passes the line-supply permission: the service answers, not 403",
+    r.status === 200, `${r.status} ${r.text.slice(0, 160)}`);
   r = await call('PUT', `/order-lines/${fx.O2.line.id}/material-supply`, { token: T_BUYER, body: { supply: null } });
   ok("a line's material supply as Purchase (neither manage grant) → 403", r.status === 403, `${r.status} ${r.text.slice(0, 120)}`);
   r = await call('POST', `/orders/${fx.O2.id}/requisitions`, { token: T_SALES, body: {} });

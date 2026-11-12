@@ -157,11 +157,11 @@ try {
   ];
   const stages = [{ key: 's1', name: 'Inspection by RITES' }, { key: 's2', name: 'Erection at site' }];
 
-  /** Raise the MR (shared, held), send the terms, approve them → confirmed. */
+  /** Send the terms, approve them → confirmed; then raise the MR (2026-11-12: it opens once the MD has accepted). */
   const accept = async (o, milestones) => {
-    const raised = await RQ.raiseRequisitions(db, c, o.id, { earmark: true });
     const saved = await ACC.saveAcceptance(db, c, o.id, { ...charges, milestones, stages });
     await AP.decide(db, md, saved.pending.approvalId, { decision: 'approve' }, asMd);
+    const raised = await RQ.raiseRequisitions(db, c, o.id, { earmark: true });
     const a = await ACC.getAcceptance(db, COMPANY, o.id);
     return { mr: raised.requisitions[0], acceptance: a, value: a.approved.estimate.value };
   };

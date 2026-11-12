@@ -770,13 +770,11 @@ try {
       { const GD = await G.girderOrder('GD', 1, { status: 'inquiry' });
         await G.receive(G.A, PER_GIRDER.A);
         const freeBefore = (await availability(db, COMPANY, [G.A])).get(G.A).free;
-        const pr = (await RQ.raiseRequisitions(db, c, GD.id, {})).requisitions[0];
-        // §73: an inquiry's MR is SHARED with the customer and HELD — it holds no stock until the acceptance is approved.
-        const heldNo = await refusal(() => stockCheck(pr.id, { apply: true, lineIds: [prLine(pr, G.A).id] }));
-        ok('(f) an inquiry\'s frozen line can be requisitioned; it holds no stock until the customer accepts (§73)', pr.heldForAcceptance === true && heldNo?.code === 'HELD_FOR_ACCEPTANCE' && (await availability(db, COMPANY, [G.A])).get(G.A).free === freeBefore, heldNo?.message);
+        // 2026-11-12: an inquiry raises no MR — it opens once the customer and the MD have accepted the order.
+        const early = await refusal(() => RQ.raiseRequisitions(db, c, GD.id, {}));
+        ok('(f) an inquiry\'s frozen line cannot be requisitioned yet; nothing is held', early?.code === 'NOT_ACCEPTED' && (await availability(db, COMPANY, [G.A])).get(G.A).free === freeBefore, early?.message);
         await SO.deleteOrder(db, c, GD.id);
-        const [[left]] = await db.query('SELECT COUNT(*) AS n FROM cf_requisitions WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [COMPANY, pr.id]);
-        ok('(f) order deleted: its requisition is retired and the stock is free again', Number(left.n) === 0 && (await availability(db, COMPANY, [G.A])).get(G.A).free === freeBefore); }
+        ok('(f) the inquiry can still be deleted, the stock untouched', (await availability(db, COMPANY, [G.A])).get(G.A).free === freeBefore); }
     }
   }
 } catch (err) {

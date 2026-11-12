@@ -160,7 +160,9 @@ const readSettings = (v) => {
  * row is kept and hidden like 'confirm'; a process that had Line items but no Structure is READ with its Line
  * items row standing in as Structure (getProcess), so it never loses its first step.
  */
-export const RETIRED_STAGE_KEYS = new Set(['confirm', 'cut_pieces', 'lines']);
+// 'acceptance' (2026-11-12, user): "The customer acceptance shouldn't be part of the flow. Let that be a button on the sales
+// order" — the order header's Customer accepted button and its Acceptance & terms tab; MD's approval confirms the order.
+export const RETIRED_STAGE_KEYS = new Set(['confirm', 'cut_pieces', 'lines', 'acceptance']);
 /** The same keys as an SQL list literal, for the counts and the replace below. Constants, never input. */
 const RETIRED_SQL = [...RETIRED_STAGE_KEYS].map((k) => `'${k}'`).join(', ');
 const confirmFirst = (message) => ({ stageKey: null, action: 'confirm', message });
@@ -511,8 +513,10 @@ export const STAGE_CATALOGUE = [
     /** The material request is raised for the whole order (OrderPurchasePanel), so the tabs show its roll-up. */
     scope: 'order',
     // "Instead of 'buying' in sales order, just mention material request" (user, 2026-10-16, §66). The key stays.
-    label: 'Material request',
-    description: 'The material request (MR): the material the order consumes but does not make — earmarked from stock, bought on purchase orders, or sent by the customer — before production, once the order is confirmed and the design frozen (and nested).',
+    // "Instead of Material request, we should call it material required" (user, 2026-11-12): what the order needs and what
+    // the store has; the material request is raised from it once the MD has accepted the order.
+    label: 'Material required',
+    description: 'The material the order needs and what the store has of it; the material request (MR) is raised from it once the customer has accepted and the MD has approved the order (the order is confirmed).',
     /** The line draws material from stock at all — whether or not any is short today. */
     applies: (ctx) => ctx.material.length > 0 || ctx.buyRows.length > 0,
     state(ctx) {
@@ -553,18 +557,20 @@ export const STAGE_CATALOGUE = [
         };
       }
       /*
-       * BEFORE THE CUSTOMER ACCEPTS (§73): the MR is raised and SHARED with the customer, and held — Purchase starts once
-       * the acceptance is approved. So this step is done when the line's MR is raised.
+       * BEFORE THE ORDER IS CONFIRMED (2026-11-12, user): "Only after customer accepts should we enable the material request
+       * button … Once the customer acceptance happens, it should go to MD acceptance. If MD accepts … only now should that
+       * material request button become available." An MR raised earlier (the §73 way) still counts.
        */
       if (!ctx.confirmed) {
         const mr = ctx.mrByLine?.get(Number(ctx.line.id)) ?? null;
-        return mr
-          ? { state: 'done', detail: `${mr.code} raised and shared with the customer — Purchase starts once the acceptance is approved`, blockers: [] }
-          : {
-            state: 'todo',
-            detail: 'Raise the MR and share it with the customer',
-            blockers: [{ count: 0, message: `Line ${ctx.line.line_no} has no material request yet — raise it, then share it with the customer.` }],
-          };
+        if (mr) return { state: 'done', detail: `${mr.code} raised — Purchase starts once the order is confirmed`, blockers: [] };
+        const pending = !!ctx.acceptance?.pending;
+        return {
+          state: 'todo',
+          detail: pending ? 'Customer accepted — waiting for the MD to accept the order' : "Waiting for the customer's acceptance",
+          blockers: [],
+          waitingOn: { stageKey: null, action: 'acceptance', message: pending ? 'The MD has not accepted the order yet — the material request opens then.' : "Mark the customer's acceptance first (Customer accepted, on the order)." },
+        };
       }
       const rows = ctx.buyRows;
       if (!rows.length) return { state: 'done', detail: 'Nothing to buy', blockers: [] };
@@ -669,7 +675,7 @@ export const STAGE_CATALOGUE = [
           // Not buying: release does not wait for the steel — its steps do.
           waitingOn: !ctx.confirmed ? (ctx.order.order_type === 'customer'
             // The process's Customer acceptance stage, or (an older process without it) the order's plain acceptance tab.
-            ? { stageKey: ctx.acceptanceStage ? 'acceptance' : null, action: ctx.acceptanceStage ? null : 'acceptance', message: "The customer's acceptance must be approved first — release needs a confirmed order." }
+            ? { stageKey: null, action: 'acceptance', message: "The customer's acceptance and the MD's approval come first — release needs a confirmed order." }
             : confirmFirst('Confirm the order first — release needs a confirmed order.'))
             : mustFreeze ? { stageKey: 'lock', message: 'Freeze the design first — release takes its piece codes from the frozen design.' }
               : openPlates ? { stageKey: 'nesting', message: `Nest the line first — ${n(openPlates, 'cut plate')} ${openPlates === 1 ? 'has' : 'have'} no plate yet.` }
@@ -698,7 +704,7 @@ export const STAGE_KEYS = STAGE_CATALOGUE.map((s) => s.key);
 
 /** What `GET /stage-catalogue` serves: the kinds a process can be built from. */
 export function stageCatalogue() {
-  return STAGE_CATALOGUE.map(({ key, label, description, scope }) => ({ key, label, description, scope: scope ?? 'line' }));
+  return STAGE_CATALOGUE.filter((s) => !RETIRED_STAGE_KEYS.has(s.key)).map(({ key, label, description, scope }) => ({ key, label, description, scope: scope ?? 'line' }));
 }
 
 /**
@@ -742,10 +748,14 @@ async function rulesOf(db, companyId, processIds) {
   return out;
 }
 
+/** A label a stage kind used to carry, read as the kind's label now (2026-11-12: Material request → Material required). */
+const RENAMED_LABELS = { buying: new Set(['material request', 'buying']) };
+const stageLabel = (s) => (s.label && !RENAMED_LABELS[s.stage_key]?.has(String(s.label).trim().toLowerCase()) ? s.label : CATALOGUE_BY_KEY.get(s.stage_key)?.label || s.label || s.stage_key);
+
 const shapeStage = (s) => ({
   id: s.id,
   stageKey: s.stage_key,
-  label: s.label || CATALOGUE_BY_KEY.get(s.stage_key)?.label || s.stage_key,
+  label: stageLabel(s),
   sequence: s.sequence,
   requirement: s.requirement,
   overrideSpec: s.override_spec_id ? { id: s.override_spec_id, code: s.spec_code ?? null, name: s.spec_name ?? null } : null,

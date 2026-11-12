@@ -655,8 +655,11 @@ export async function startAutoCompare(db, c, lineId, { trigger = 'upload', reru
 const AUTO = new Map();
 const autoPending = new Set();
 const autoKey = (companyId, lineId) => `${Number(companyId)}:${Number(lineId)}`;
-/** CF_NEST_AUTO_COMPARE=off turns the automatic run off (suites that test other things set it). */
-export const autoCompareOff = () => /^(0|off|false|no)$/i.test(String(process.env.CF_NEST_AUTO_COMPARE ?? '').trim());
+/**
+ * OFF unless CF_NEST_AUTO_COMPARE=on (user, 2026-11-12: "Once manual nesting is selected, only when we click on 'Compare with
+ * AI' should it run the AI version"). An upload no longer starts AI's run; the Compare with AI tab starts it (startCompare).
+ */
+export const autoCompareOff = () => !/^(1|on|true|yes)$/i.test(String(process.env.CF_NEST_AUTO_COMPARE ?? '').trim());
 
 /** What the server is doing about the line's automatic comparison, for the GET (null: nothing in this process). */
 export function autoCompareState(companyId, lineId) {

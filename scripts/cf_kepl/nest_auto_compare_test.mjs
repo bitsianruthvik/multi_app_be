@@ -28,7 +28,7 @@ import express from 'express';
 
 // A Standard run here is capped at 12 s (10 min × 0.02); the fixture line is done in a few seconds anyway.
 process.env.CF_NEST_BUDGET_SCALE = process.env.CF_NEST_BUDGET_SCALE ?? '0.02';
-delete process.env.CF_NEST_AUTO_COMPARE;
+process.env.CF_NEST_AUTO_COMPARE = 'on';   // off by default since 2026-11-12 (Compare with AI starts it); this suite tests the mechanism
 
 const BE = process.cwd();
 const imp = (p) => import(pathToFileURL(path.join(BE, p)).href);
@@ -353,7 +353,7 @@ try {
   process.env.CF_NEST_AUTO_COMPARE = 'off';
   r = await call('POST', `${base}/nesting/files`, { body: { files: asRequest(part), dryRun: false, mode: 'replace' } });
   ok('saved, nothing queued (no autoCompare)', r.status === 200 && r.json?.applied === true && r.json.autoCompare === undefined, J([r.json?.applied, r.json?.autoCompare]));
-  delete process.env.CF_NEST_AUTO_COMPARE;
+  process.env.CF_NEST_AUTO_COMPARE = 'on';
   await R.settleRuns();
 
   /* ───────────── 12 ───────────── */

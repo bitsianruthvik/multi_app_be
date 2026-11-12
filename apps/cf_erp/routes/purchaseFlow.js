@@ -23,6 +23,7 @@ import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import { orderRequisitions, raiseRequisitions, lineRequisition, getRequisition } from '../services/requisitionService.js';
 import { lineMaterialReady } from '../services/materialReadyService.js';
+import { materialsRequired } from '../services/materialRequiredService.js';
 import { setLineSupply, updateOrder } from '../services/salesOrderService.js';
 import { customerReturns } from '../services/customerMaterialService.js';
 
@@ -36,6 +37,8 @@ const orderView = guardAny(PERM.inventoryView, PERM.ordersView);
 const manage = guardAny(PERM.inventory, PERM.orders);
 const body = (req) => req.body ?? {};
 
+// Material required (2026-11-12): what the order needs and what the store has — a view; the MR button gates on it.
+router.get('/orders/:id/materials-required', orderView, handle((req) => materialsRequired(pool, ctx(req).companyId, id(req))));
 router.get('/orders/:id/requisitions', orderView, handle((req) => orderRequisitions(pool, ctx(req).companyId, id(req))));
 router.post('/orders/:id/requisitions', manage, handle((req) => tx(req, (db, c) => raiseRequisitions(db, c, id(req), body(req)))));
 router.get('/order-lines/:id/requisition', orderView, handle((req) => lineRequisition(pool, ctx(req).companyId, id(req))));

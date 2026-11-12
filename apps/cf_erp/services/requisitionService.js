@@ -637,6 +637,11 @@ export async function raiseRequisitions(db, c, orderId, input = {}) {
   if (!OPEN_ORDER_STATUSES.includes(o.status)) {
     throw invalid('NOT_OPEN', `${o.code} is ${o.status} — a material request is raised for an inquiry, a quoted or a confirmed order.`);
   }
+  // 2026-11-12 (user): a customer's order raises its MR only once the customer has accepted and the MD has accepted the
+  // order (it is confirmed). The §73 "raise and share before the acceptance" is gone; MRs raised that way stay held.
+  if (o.order_type === 'customer' && o.status !== 'confirmed') {
+    throw invalid('NOT_ACCEPTED', `${o.code} is not confirmed yet — the material request opens once the customer has accepted and the MD has accepted the order.`);
+  }
   let lines = await openLines(db, c.companyId, { orderIds: [o.id] });
   if (Array.isArray(input.lineIds)) {
     const want = new Set(input.lineIds.map(Number));

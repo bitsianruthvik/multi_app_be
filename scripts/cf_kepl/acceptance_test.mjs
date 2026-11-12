@@ -13,7 +13,8 @@
  *   2  a new acceptance starts from the default templates; the estimate (weight × rate, a FORMULA on the part rows, the
  *      material row on the lines we buy, lump sums, milestones, margin over material)
  *   3  every trigger type checked (good and bad), pro-rata only where allowed, credit days, 100 %, formula bases
- *   4  the MR raised before acceptance is SHARED and HELD: nothing earmarked, no PR, no customer PO; PDF + Excel of it
+ *   4  (2026-11-12) no MR before the MD accepts: raising it is refused; Material required waits on the acceptance;
+ *      the acceptance is no stage of its own (the header's Customer accepted); accounting may be left for later
  *   5  confirm only through the acceptance: the status route refuses, allowed moves leave it out
  *   6  save → pending approval (re-save replaces it); the stage and the board say so; supply editable until accepted
  *   7  the inbox per permission; requester ≠ approver; a rejection needs a reason and sends it back
@@ -40,6 +41,7 @@ const AP = await imp('apps/cf_erp/services/approvalService.js');
 const BOARD = await imp('apps/cf_erp/services/orderBoardService.js');
 const DOC = await imp('apps/cf_erp/services/mrDocumentService.js');
 const RQ = await imp('apps/cf_erp/services/requisitionService.js');
+const MREQ = await imp('apps/cf_erp/services/materialRequiredService.js');
 const PRS = await imp('apps/cf_erp/services/purchaseRequestService.js');
 const PS = await imp('apps/cf_erp/services/purchaseService.js');
 const SO = await imp('apps/cf_erp/services/salesOrderService.js');
@@ -167,11 +169,9 @@ try {
   section('3. Milestone triggers — every type, good and bad');
   const base = () => JSON.parse(JSON.stringify(A1.terms));
   const tryTerms = (patch) => { const t = base(); patch(t); return ACC.saveAcceptance(db, c, O1.id, { ...t, dryRun: true }); };
-  // The MR is not raised yet (step 4): every dry run says so first; the triggers are judged on the rest.
-  const problemsOf = async (patch) => (await tryTerms(patch)).problems.filter((p) => p !== ACC.MR_FIRST);
-  ok('before the MR is raised and shared, the check says so first', (await tryTerms(() => {})).problems[0] === ACC.MR_FIRST);
-  const noMr = await refusal(() => ACC.saveAcceptance(db, c, O1.id, base()));
-  ok('…and sending for approval is refused, naming the MR step', said(noMr, /Raise the MR in the Material request step and share it with the customer first/), j(noMr?.problems));
+  // 2026-11-12: no MR is needed first — the triggers are judged on their own.
+  const problemsOf = async (patch) => (await tryTerms(patch)).problems;
+  ok('no MR is asked for before the acceptance', !(await tryTerms(() => {})).problems.some((p) => /\bMR\b/.test(p)));
   const one = (trigger, extra = {}) => (t) => { t.milestones = [{ key: 'x1', label: 'All', kind: 'percent', value: 100, trigger, creditDays: 0, ...extra }]; };
   eq('the prefilled terms are clean', await problemsOf(() => {}), []);
   for (const tt of ['order_accepted', 'design_frozen', 'material_in_place', 'production_started', 'fully_dispatched']) {
@@ -201,36 +201,29 @@ try {
   ok('a formula with an unknown value is refused', (await problemsOf((t) => { t.charges[1].basis.expression = 'NOPE_X * 2'; })).some((p) => /not a number specification/.test(p)));
   ok('a formula needs its unit', (await problemsOf((t) => { t.charges[1].basis.unit = ''; })).some((p) => /unit of the formula/.test(p)));
   ok('a charge needs its operation and rate', (await problemsOf((t) => { t.charges[0].operationId = null; t.charges[0].rate = ''; })).length >= 2);
-  ok('nothing to charge is refused', (await problemsOf((t) => { t.charges = []; t.material = null; t.lumpSums = []; })).some((p) => /at least one charge/.test(p)));
+  eq('accounting left for later: no charges, no milestones is fine', await problemsOf((t) => { t.charges = []; t.material = null; t.lumpSums = []; t.milestones = []; t.stages = []; }), []);
+  ok('the acceptance date must be a date', (await ACC.saveAcceptance(db, c, O1.id, { ...base(), accepted: { on: 'soon' }, dryRun: true })).problems.some((p) => /Accepted on/.test(p)));
 
   /* ════════════════════ 4. the MR before acceptance: shared, held ════════════════════ */
-  section('4. Raise the MR before acceptance — shared with the customer, nothing downstream');
-  const raised = await RQ.raiseRequisitions(db, c, O1.id, { earmark: true });
-  const mr1 = raised.requisitions[0];
-  ok('the MR is raised HELD for acceptance; nothing earmarked, no customer PO', raised.heldForAcceptance === true && mr1.heldForAcceptance === true && raised.earmarked.length === 0 && raised.customerPurchaseOrders.length === 0, j([raised.heldForAcceptance, raised.earmarked]));
-  let screen = await PRS.mrScreen(db, COMPANY, mr1.id);
-  ok('the MR screen in Purchase cannot be edited yet, and says why', screen.canEdit === false && /waits for the customer's acceptance/.test(screen.reason), screen.reason);
-  const held = await refusal(() => PRS.saveMr(db, c, mr1.id, { lines: [] }));
-  ok('saving the MR (stock take, the PR) is refused while held', held?.code === 'HELD_FOR_ACCEPTANCE', held?.message);
-  const [[{ prs0 }]] = await db.query('SELECT COUNT(*) AS prs0 FROM cf_buy_requests WHERE company_id = ? AND order_id = ? AND deleted_at IS NULL', [COMPANY, O1.id]);
-  ok('no purchase request exists', Number(prs0) === 0);
-  const pdf = await DOC.mrDocument(db, COMPANY, O1.id, 'pdf');
-  const xlsx = await DOC.mrDocument(db, COMPANY, O1.id, 'xlsx');
-  ok('the MR as a PDF for the customer', pdf.buffer.subarray(0, 4).toString() === '%PDF' && pdf.rows === 3 && /\.pdf$/.test(pdf.filename), `${pdf.rows} rows`);
-  ok('the MR as an Excel file', xlsx.buffer.subarray(0, 2).toString() === 'PK' && xlsx.rows === 3 && /\.xlsx$/.test(xlsx.filename));
-  ok('the PDF text is drawable (× becomes x)', DOC.pdfText('14 × 3000 ₹') === '14 x 3000 Rs ');
+  section('4. No MR before the MD accepts; Material required waits; acceptance is no stage');
+  const early = await refusal(() => RQ.raiseRequisitions(db, c, O1.id, { earmark: true }));
+  ok('raising the MR before the order is confirmed is refused', early?.code === 'NOT_ACCEPTED', early?.message);
+  let need = await MREQ.materialsRequired(db, COMPANY, O1.id);
+  ok('Material required lists the need and the store, and the MR is not open yet', need.items.length === 3 && need.canRequest === false && need.acceptance === 'none' && /customer's acceptance/.test(need.requestWhy) && need.items.every((m) => m.inStore >= 0 && m.short >= 0), j([need.items.length, need.canRequest, need.requestWhy]));
   let proc = await PROC.orderProcess(db, COMPANY, O1.id);
   const st = (p, k) => p.stages.find((s) => s.stageKey === k);
-  ok('Material request is done once the MR is raised and shared', st(proc, 'buying').state === 'done' && /shared with the customer/.test(st(proc, 'buying').detail), j(st(proc, 'buying')));
-  ok('Customer acceptance is to do; Production waits for it', st(proc, 'acceptance').state === 'todo' && st(proc, 'production').waitingOn?.stageKey === 'acceptance', j([st(proc, 'acceptance'), st(proc, 'production').waitingOn]));
-  ok('the stage catalogue puts acceptance after the MR, before production', proc.stages.map((s) => s.stageKey).join(',') === 'structure,lock,nesting,buying,acceptance,production', proc.stages.map((s) => s.stageKey).join(','));
+  ok('Material required waits for the customer\'s acceptance', st(proc, 'buying').state === 'todo' && st(proc, 'buying').waitingOn?.action === 'acceptance' && st(proc, 'buying').label === 'Material required', j(st(proc, 'buying')));
+  ok('Production waits for the acceptance (no stage of its own)', st(proc, 'production').waitingOn?.action === 'acceptance' && !st(proc, 'acceptance'), j(st(proc, 'production').waitingOn));
+  ok('the stages: acceptance is gone from the flow', proc.stages.map((s) => s.stageKey).join(',') === 'structure,lock,nesting,buying,production', proc.stages.map((s) => s.stageKey).join(','));
+  ok('the PDF text is drawable (× becomes x)', DOC.pdfText('14 × 3000 ₹') === '14 x 3000 Rs ');
+  let mr1 = null;
+  let screen = null;
 
   /* ════════════════════ 5. confirm only through the acceptance ════════════════════ */
   section('5. Confirmed = accepted: the plain Confirm is gone');
   const viaRoute = await refusal(() => SO.setOrderStatus(db, c, O1.id, 'confirmed', { fromRoute: true }));
   ok('the status route refuses to confirm a customer order', viaRoute?.code === 'ACCEPTANCE_FIRST', viaRoute?.message);
-  const viaService = await refusal(() => SO.setOrderStatus(db, c, O1.id, 'confirmed'));
-  ok('…and so does any other caller, when the process has the acceptance stage', viaService?.code === 'ACCEPTANCE_FIRST');
+  // (2026-11-12: the acceptance is no process stage any more; a script may still confirm directly — fixtures do. People only reach the route.)
   const o1 = await SO.getOrder(db, COMPANY, O1.id);
   ok('the order offers no Confirm move', !o1.allowedTransitions.includes('confirmed') && o1.allowedTransitions.includes('quoted'), j(o1.allowedTransitions));
 
@@ -242,17 +235,18 @@ try {
   A1 = await ACC.saveAcceptance(db, c, O1.id, { ...base(), note: 'Customer agreed — transport added.' });
   ok('saving again replaces the pending version (still v1, one approval)', A1.pending.version === 1 && A1.pending.approvalId === firstApproval && A1.versions.length === 1);
   proc = await PROC.orderProcess(db, COMPANY, O1.id);
-  ok('the stage says it waits for Management', st(proc, 'acceptance').state === 'partial' && /waiting for approval/.test(st(proc, 'acceptance').detail));
+  ok('Material required says it waits for the MD', /waiting for the MD/.test(st(proc, 'buying').detail), st(proc, 'buying').detail);
+  need = await MREQ.materialsRequired(db, COMPANY, O1.id);
+  ok('…and its MR button is still shut', need.canRequest === false && need.acceptance === 'pending' && /MD/.test(need.requestWhy));
+  ok('the order says the customer accepted, waiting for the MD', (await SO.getOrder(db, COMPANY, O1.id)).acceptance?.state === 'pending');
+  ok('the acceptance date defaults to today', A1.accepted?.on === new Date().toISOString().slice(0, 10), j(A1.accepted));
   let board = await BOARD.orderBoard(db, COMPANY, { search: tag });
   const card = (b, id) => b.lanes.flatMap((l) => l.cards).find((x) => x.id === id);
   ok('the board shows it in Pending approval', card(board, O1.id)?.lane === 'pending_approval', card(board, O1.id)?.lane);
-  // Supply stays editable until accepted; the held MR follows.
+  // Supply stays editable (inventory details may be set later).
   await SO.setLineSupply(db, c, O1.lineId, { supply: 'customer' });
-  let [[mrRow]] = await db.query('SELECT supply FROM cf_requisitions WHERE id = ?', [mr1.id]);
-  ok('while held, the MR follows a change of who supplies the line', mrRow.supply === 'customer');
   await SO.setLineSupply(db, c, O1.lineId, { supply: null });
-  [[mrRow]] = await db.query('SELECT supply FROM cf_requisitions WHERE id = ?', [mr1.id]);
-  ok('…and back', mrRow.supply === 'we_buy');
+  ok('who supplies the line can change while it waits', true);
 
   /* ════════════════════ 7. the inbox, per permission; requester ≠ approver; reject ════════════════════ */
   section('7. Management inbox — per permission, requester ≠ approver, sent back');
@@ -296,7 +290,7 @@ try {
   A1 = await ACC.getAcceptance(db, COMPANY, O1.id);
   ok('sent back: the reason is shown, the order is not confirmed', A1.state === 'rejected' && A1.sentBack.decisionNote === 'Painting rate is too low.' && A1.order.status === 'inquiry', j([A1.state, A1.order.status]));
   proc = await PROC.orderProcess(db, COMPANY, O1.id);
-  ok('the stage says it was sent back, and why', /Sent back: Painting rate is too low/.test(st(proc, 'acceptance').detail), st(proc, 'acceptance').detail);
+  ok('the order says it was sent back, and why', (await SO.getOrder(db, COMPANY, O1.id)).acceptance?.state === 'sent_back' && A1.sentBack.decisionNote === 'Painting rate is too low.');
   const twice = await refusal(() => AP.decide(db, md, firstApproval, { decision: 'approve' }, asMd));
   ok('a decided approval cannot be decided again', twice?.code === 'NOT_PENDING');
 
@@ -310,18 +304,27 @@ try {
   A1 = await ACC.getAcceptance(db, COMPANY, O1.id);
   ok('the terms are LOCKED (approved v2 in force)', A1.locked === true && A1.approved.version === 2 && A1.order.status === 'confirmed' && A1.state === 'approved', j([A1.locked, A1.approved?.version, A1.order.status]));
   ok('a change now is a rate change (said before the save)', /rate change/.test(A1.saveMeans));
-  ok('who supplies the material is fixed now', A1.supplyEditable === false);
+  ok('who supplies the material can still be set (no MR with Purchase yet)', A1.supplyEditable === true);
+  need = await MREQ.materialsRequired(db, COMPANY, O1.id);
+  ok('Material required: the MR button opens now', need.canRequest === true && need.acceptance === 'accepted', j([need.canRequest, need.requestWhy]));
+  const raised = await RQ.raiseRequisitions(db, c, O1.id, { earmark: true });
+  mr1 = raised.requisitions[0];
+  ok('the MR is raised straight to Stores (not held)', raised.heldForAcceptance !== true && mr1.heldForAcceptance === false, j(raised.heldForAcceptance));
+  const pdf = await DOC.mrDocument(db, COMPANY, O1.id, 'pdf');
+  const xlsx = await DOC.mrDocument(db, COMPANY, O1.id, 'xlsx');
+  ok('the MR as a PDF', pdf.buffer.subarray(0, 4).toString() === '%PDF' && pdf.rows === 3 && /\.pdf$/.test(pdf.filename), `${pdf.rows} rows`);
+  ok('the MR as an Excel file', xlsx.buffer.subarray(0, 2).toString() === 'PK' && xlsx.rows === 3 && /\.xlsx$/.test(xlsx.filename));
   const fixedSupply = await refusal(() => SO.setLineSupply(db, c, O1.lineId, { supply: 'customer' }));
-  ok('…and the server refuses a change', fixedSupply?.status === 422);
+  ok('once the MR is with Purchase, who supplies the line is fixed', fixedSupply?.status === 422);
   screen = await PRS.mrScreen(db, COMPANY, mr1.id);
-  ok('the MR is released: Purchase can edit it', screen.heldForAcceptance === false && screen.canEdit === true);
+  ok('Purchase can edit the MR', screen.heldForAcceptance === false && screen.canEdit === true);
   screen = await PRS.saveMr(db, c, mr1.id, { lines: screen.lines.map((l) => ({ lineId: l.id, takeFromStock: 0 })) });
   ok('saving the MR now makes its purchase request', !!screen.purchaseRequest?.id, j(screen.purchaseRequest));
   ok('the post-production checklist is made from the stages', A1.postStages.map((s) => s.name).join(' | ') === 'Inspection by RITES | Erection at site');
   let events = await ACC.orderEvents(db, COMPANY, O1.id);
   ok('an event "order_accepted" is recorded', events.some((e) => e.type === 'order_accepted'));
   proc = await PROC.orderProcess(db, COMPANY, O1.id);
-  ok('Customer acceptance is done', st(proc, 'acceptance').state === 'done' && /approved/.test(st(proc, 'acceptance').detail));
+  ok('the order says it is accepted', (await SO.getOrder(db, COMPANY, O1.id)).acceptance?.state === 'accepted');
   board = await BOARD.orderBoard(db, COMPANY, { search: tag });
   ok('the board moves it to Material by itself', card(board, O1.id)?.lane === 'material' && /locked/.test(card(board, O1.id).facts.material), j(card(board, O1.id)?.facts));
 
@@ -428,17 +431,10 @@ try {
   ok('laneOf: an inquiry with nothing pending is Inquiry', BOARD.laneOf({ status: 'inquiry', acceptancePending: false }) === 'inquiry');
 
   /* ════════════════════ 8b. a customer-supplied order: its ₹0 PO waits for the acceptance ════════════════════ */
-  section('8b. Customer supplies the material — the ₹0 PO is made only on approval, dated as promised');
+  section('8b. Customer supplies the material — the ₹0 PO is made with the MR, after the MD accepts, dated as promised');
   const O2 = await makeOrder('C', 1);
   await SO.updateOrder(db, c, O2.id, { materialSupply: 'customer' });
-  const r2 = await RQ.raiseRequisitions(db, c, O2.id, { customerDate: '2026-11-05' });
-  ok('held: no ₹0 PO to the customer yet', r2.heldForAcceptance && r2.customerPurchaseOrders.length === 0);
-  await SO.updateOrder(db, c, O2.id, { materialSupply: 'we_buy' });
-  let [[mr2]] = await db.query('SELECT supply FROM cf_requisitions WHERE order_id = ? AND deleted_at IS NULL', [O2.id]);
-  ok('the order\'s supply is still editable while the MR is held — the MR follows', mr2.supply === 'we_buy');
-  await SO.updateOrder(db, c, O2.id, { materialSupply: 'customer' });
-  [[mr2]] = await db.query('SELECT supply FROM cf_requisitions WHERE order_id = ? AND deleted_at IS NULL', [O2.id]);
-  ok('…and back to the customer', mr2.supply === 'customer');
+  ok('no MR before the MD accepts', (await refusal(() => RQ.raiseRequisitions(db, c, O2.id, { customerDate: '2026-11-05' })))?.code === 'NOT_ACCEPTED');
   let A2 = await ACC.getAcceptance(db, COMPANY, O2.id);
   const t4 = JSON.parse(JSON.stringify(A2.terms));
   const noMat = (await ACC.saveAcceptance(db, c, O2.id, { ...t4, dryRun: true })).problems;
@@ -448,8 +444,9 @@ try {
   t4.milestones[1].proRata = true;
   A2 = await ACC.saveAcceptance(db, c, O2.id, t4);
   await AP.decide(db, md, A2.pending.approvalId, { decision: 'approve' }, asMd);
+  await RQ.raiseRequisitions(db, c, O2.id, { customerDate: '2026-11-05' });
   const [cpo] = await db.query('SELECT p.id, p.expected_date, p.supplied_by_customer, p.status FROM cf_purchase_orders p WHERE p.company_id = ? AND p.for_order_id = ? AND p.deleted_at IS NULL', [COMPANY, O2.id]);
-  ok('approved: the customer\'s ₹0 PO, placed, dated as they promised', cpo.length === 1 && Number(cpo[0].supplied_by_customer) === 1 && cpo[0].status === 'ordered' && String(cpo[0].expected_date instanceof Date ? `${cpo[0].expected_date.getFullYear()}-${String(cpo[0].expected_date.getMonth() + 1).padStart(2, '0')}-${String(cpo[0].expected_date.getDate()).padStart(2, '0')}` : cpo[0].expected_date).slice(0, 10) === '2026-11-05', j(cpo));
+  ok('approved, MR raised: the customer\'s ₹0 PO, placed, dated as they promised', cpo.length === 1 && Number(cpo[0].supplied_by_customer) === 1 && cpo[0].status === 'ordered' && String(cpo[0].expected_date instanceof Date ? `${cpo[0].expected_date.getFullYear()}-${String(cpo[0].expected_date.getMonth() + 1).padStart(2, '0')}-${String(cpo[0].expected_date.getDate()).padStart(2, '0')}` : cpo[0].expected_date).slice(0, 10) === '2026-11-05', j(cpo));
 
   /* ════════════════════ 13. a stock order; a revision ════════════════════ */
   section('13. A stock order confirms with its button; a revision carries the acceptance');

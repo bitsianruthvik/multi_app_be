@@ -9,7 +9,7 @@ import { purchaseCounts } from './purchaseService.js';
 
 const blank = (v) => v == null || String(v).trim() === '';
 const OPEN = "('draft','inquiry','quoted','confirmed')";
-const QUEUE_ORDER = { overdue: 1, onhold: 2, ready: 3, material: 4, buy: 5, deliveries: 6, delivered: 7, release: 8, inquiries: 9, quoted: 10, selections: 11, drafts: 12, flows: 13, shifts: 14, untimed: 15, held: 16 };
+const QUEUE_ORDER = { accept: 0, overdue: 1, onhold: 2, ready: 3, material: 4, buy: 5, deliveries: 6, delivered: 7, release: 8, inquiries: 9, quoted: 10, selections: 11, drafts: 12, flows: 13, shifts: 14, untimed: 15, held: 16 };
 
 async function one(db, sql, params) {
   const [[row]] = await db.query(sql, params);
@@ -107,6 +107,8 @@ export async function cockpit(db, companyId) {
        AND EXISTS (SELECT 1 FROM cf_sales_order_lines l WHERE l.company_id = o.company_id AND l.order_id = o.id AND l.deleted_at IS NULL)
        AND NOT EXISTS (SELECT 1 FROM cf_sales_order_lines l WHERE l.company_id = o.company_id AND l.order_id = o.id AND l.deleted_at IS NULL
                          AND l.delivered_qty < l.quantity)`, c);
+  // Orders the customer accepted, waiting for the MD (2026-11-12, user: "this should be visible as a request in his dashboard").
+  const acceptP = one(db, "SELECT COUNT(*) FROM cf_approvals WHERE company_id = ? AND status = 'pending' AND approval_type IN ('order_acceptance', 'rate_change')", c).catch(() => 0);
   for (const p of [tP, bP, releaseP, deliveredP]) p.catch(() => {});   // awaited below; never an unhandled rejection meanwhile
   const [inquiries, quoted, confirmed, overdue, selections, itemDrafts, defDrafts, draftFlows, idleMachines, heldBatches, untimedOps, openOrders, machines, stockLines] = await Promise.all([
     one(db, "SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status = 'inquiry'", c),
@@ -136,8 +138,10 @@ export async function cockpit(db, companyId) {
     one(db, 'SELECT COUNT(*) FROM cf_stock_balances WHERE company_id = ? AND quantity <> 0', c),
   ]);
   const plural = (n, one1, many) => (n === 1 ? one1 : many);
-  const [t, toRelease, delivered, b] = await Promise.all([tP, releaseP, deliveredP, bP]);
+  const [t, toRelease, delivered, b, toAccept] = await Promise.all([tP, releaseP, deliveredP, bP, acceptP]);
   const queues = [
+    { key: 'accept', title: 'Orders to accept', count: toAccept, unit: plural(toAccept, 'order', 'orders'), tone: 'warning', perm: ['cf_erp_approve_order_acceptance', 'cf_erp_approve_rate_change'],
+      description: 'The customer accepted these orders. Accept one to confirm it; its material request opens then.', actionLabel: 'Open Approvals', path: 'approvals' },
     { key: 'buy', title: 'Material to buy', count: b.toBuy, unit: plural(b.toBuy, 'item', 'items'), tone: 'danger',
       description: 'Short after what is held and what is already on order — nobody has this steel.', actionLabel: 'Open material requests', path: 'material-requests' },
     { key: 'approve', title: 'Purchase orders to approve', count: b.pendingApproval, unit: plural(b.pendingApproval, 'order', 'orders'), tone: 'warning',

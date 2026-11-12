@@ -700,19 +700,6 @@ function confirmProblems(facts) {
 }
 
 export const MR_FIRST = 'Raise the MR in the Material request step and share it with the customer first.';
-/**
- * Is the order's MR raised (shared)? Cheap (a dry run, every keystroke): any MR at all. Full (the save): every line that
- * can raise one has it — orderRequisitions' own answer (the engine read).
- */
-async function mrProblems(db, companyId, o, { full }) {
-  const mrs = await mrsOf(db, companyId, o.id);
-  if (!mrs.length) return [MR_FIRST];
-  if (!full) return [];
-  const { orderRequisitions } = await import('./requisitionService.js');
-  const missing = (await orderRequisitions(db, companyId, o.id)).linesWithout.filter((w) => w.canRaise).map((w) => w.line.lineNo);
-  return missing.length ? [`${MR_FIRST} Line${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'have' : 'has'} no MR yet.`] : [];
-}
-
 /** The order's MRs, in short — what the step says about sharing them with the customer. 1 read. */
 async function mrsOf(db, companyId, orderId) {
   const [rows] = await db.query(
@@ -767,9 +754,11 @@ export async function getAcceptance(db, companyId, orderId) {
     locked: !!approved,
     editable,
     editReason: o.order_type !== 'customer' ? 'A stock order has no customer to accept it.' : stopped ? `${o.code} is ${o.status} — its terms do not change.` : null,
-    saveMeans: !editable ? null : pending ? 'Saving replaces the terms waiting for approval.' : approved ? 'Saving sends a rate change to Management. The approved terms stay in force until it is approved.' : 'Saving sends the terms to Management. The order is confirmed when they are approved.',
-    supplyEditable: editable && !approved && !mrs.some((m) => !m.held),
+    saveMeans: !editable ? null : pending ? 'Saving replaces the terms waiting for the MD.' : approved ? 'Saving sends a rate change to the MD. The accepted terms stay in force until the MD approves it.' : 'Saving sends the acceptance to the MD. The order is confirmed when the MD accepts it.',
+    supplyEditable: editable && !mrs.some((m) => !m.held),
     terms: read,
+    // The acceptance itself (2026-11-12): when the customer accepted and their PO / reference; null before.
+    accepted: shown?.terms?.accepted ?? null,
     fromTemplates: !shown,
     // The operation a pro-rata charge with none starts at (also for a charges template filled in on the screen), and
     // the charges prefilled with it here — the screen says so beside them.
@@ -782,7 +771,7 @@ export async function getAcceptance(db, companyId, orderId) {
     versions: versions.map(({ terms: _t, estimate: _e, ...v }) => v),
     confirmProblems: approved ? [] : confirmProblems(facts),
     mrs,
-    mrNote: !mrs.length ? 'No MR yet. Raise it in the Material request step and share it with the customer first.'
+    mrNote: !mrs.length ? 'No MR yet. It is raised in Material required once the MD has accepted the order.'
       : mrs.some((m) => m.held) ? 'The MR is shared with the customer and held: Purchase starts once the acceptance is approved.' : 'The MR is with Purchase.',
     postStages: stagesBy.get(Number(o.id)) ?? [],
     lists: termLists(ctx),
@@ -813,6 +802,7 @@ export function termChanges(before, after) {
   if (stable(before.lumpSums ?? []) !== stable(after.lumpSums ?? [])) out.push('Lump sums changed.');
   if (stable(before.milestones ?? []) !== stable(after.milestones ?? [])) out.push('Payment milestones changed.');
   if (stable(before.stages ?? []) !== stable(after.stages ?? [])) out.push('Post-production stages changed.');
+  if (stable(before.accepted ?? null) !== stable(after.accepted ?? null)) out.push(`Customer PO / acceptance date: ${after.accepted?.poRef ?? '—'} on ${after.accepted?.on ?? '—'}.`);
   return out;
 }
 
@@ -830,12 +820,21 @@ export async function saveAcceptance(db, c, orderId, input = {}) {
   if (!OPEN_FOR_TERMS.includes(o.status)) throw invalid('NOT_OPEN', `${o.code} is ${o.status} — its terms do not change.`);
   const ctx = await termContext(db, c.companyId);
   const full = { ...ctx, anyWeBuy: facts.lines.some((l) => l.supply === 'we_buy'), anyCustomer: facts.lines.some((l) => l.supply === 'customer') };
-  const { terms, problems } = readTerms(input, full);
+  // 2026-11-12 (user): "They might just accept the order without setting the other details for now. They can set those
+  // later." The accounting part (charges, milestones, stages) is optional; what is given must still be right.
+  const { terms, problems } = readTerms(input, full, { requireAll: false });
+  const pct = terms.milestones.filter((m) => m.kind === 'percent').reduce((t, m) => t + (Number(m.value) || 0), 0);
+  if (terms.milestones.length && !terms.milestones.some((m) => m.kind === 'amount') && Math.abs(pct - 100) > 1e-6) problems.push(`The milestones add up to ${Math.round(pct * 1e4) / 1e4} % — make them 100 %, or leave them for later.`);
+  if (pct > 100 + 1e-6) problems.push(`The milestones add up to ${Math.round(pct * 1e4) / 1e4} % — at most 100 %.`);
   const versions = await versionsOf(db, c.companyId, o.id);
   const { approved, pending } = standing(versions);
+  // The acceptance itself: when the customer accepted (today unless said) and their PO / reference.
+  const acc = input.accepted ?? approved?.terms?.accepted ?? pending?.terms?.accepted ?? {};
+  const on = blank(acc.on) ? new Date().toISOString().slice(0, 10) : String(acc.on).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(on) || Number.isNaN(Date.parse(on))) problems.push('Accepted on: give a date.');
+  terms.accepted = { on, poRef: blank(acc.poRef) ? null : text(acc.poRef, 100) };
   if (!approved) problems.push(...confirmProblems(facts));
-  // Decided 2026-10-18: the MR is raised and SHARED with the customer before the acceptance is sent (the first one).
-  if (!approved) problems.push(...await mrProblems(db, c.companyId, facts.o, { full: !input.dryRun }));
+  // The MR is no longer raised before the acceptance (2026-11-12): it opens once the MD has accepted the order.
   const estimate = await estimateTerms(db, c.companyId, facts, terms, full);
   const changes = approved ? termChanges(approved.terms, terms) : [];
   if (approved && !changes.length && !input.dryRun) problems.push('Nothing changed from the approved terms.');
@@ -861,7 +860,10 @@ export async function saveAcceptance(db, c, orderId, input = {}) {
     type: pending?.kind === 'rate_change' || kind === 'rate_change' ? 'rate_change' : 'order_acceptance',
     subjectId: id, subjectCode: o.code, orderId: o.id,
     title: kind === 'rate_change' ? `Rate change on ${o.code}${facts.o.customer_name ? ` (${facts.o.customer_name})` : ''}` : `Customer acceptance of ${o.code}${facts.o.customer_name ? ` (${facts.o.customer_name})` : ''}`,
-    summary: kind === 'rate_change' ? changes.slice(0, 4).join(' ') : `Estimated value ${money(estimate.value)}; ${terms.charges.length} charge${terms.charges.length === 1 ? '' : 's'}, ${terms.milestones.length} milestone${terms.milestones.length === 1 ? '' : 's'}.`,
+    summary: kind === 'rate_change' ? changes.slice(0, 4).join(' ')
+      : `Accepted on ${terms.accepted.on}${terms.accepted.poRef ? `, PO ${terms.accepted.poRef}` : ''}. ${terms.charges.length || terms.milestones.length || terms.material || terms.lumpSums.length
+        ? `Estimated value ${money(estimate.value)}; ${terms.charges.length} charge${terms.charges.length === 1 ? '' : 's'}, ${terms.milestones.length} milestone${terms.milestones.length === 1 ? '' : 's'}.`
+        : 'Charges and payment terms to follow.'}`,
     amount: estimate.value, note,
   });
   await db.query('UPDATE cf_order_acceptances SET approval_id = ? WHERE company_id = ? AND id = ?', [approvalId, c.companyId, id]);

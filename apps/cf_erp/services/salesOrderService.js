@@ -369,15 +369,21 @@ export async function getOrder(db, companyId, id) {
   );
   linesP.catch(() => { /* awaited below; an order that is not there throws first */ });
   const o = await requireOrder(db, companyId, id);
-  const [[[cust]], [revs], [lines], terms] = await Promise.all([
+  const [[[cust]], [revs], [lines], terms, accStates] = await Promise.all([
     o.customer_id ? db.query('SELECT code, name FROM cf_parties WHERE id = ?', [o.customer_id]) : [[null]],
     // Every revision of this order, oldest first — one index lookup on the number.
     db.query('SELECT id, revision, status, revised_at FROM cf_sales_orders WHERE company_id = ? AND code_active = ? ORDER BY revision', [companyId, String(o.code).toLowerCase()]),
     linesP,
     // The accepted terms (orderValueService) — side by side with the reads above, no extra wait.
     acceptedValuesOf(db, companyId, [o.id]),
+    // Where the customer's acceptance stands (2026-11-12): the header's Customer accepted button / Waiting for the MD.
+    o.order_type === 'customer' ? import('./acceptanceService.js').then((m) => m.acceptanceStates(db, companyId, [o.id])).catch(() => null) : null,
   ]);
   const order = shapeOrder({ ...o, customer_code: cust?.code, customer_name: cust?.name });
+  const acc = accStates?.get(Number(o.id)) ?? null;
+  order.acceptance = o.order_type !== 'customer' ? null
+    : { state: acc?.pending ? 'pending' : acc?.approved || ['confirmed', 'closed'].includes(o.status) ? 'accepted' : acc?.sentBack?.status === 'rejected' ? 'sent_back' : 'none',
+      sentBackNote: acc?.sentBack?.status === 'rejected' && !acc?.pending ? acc.sentBack.decisionNote ?? null : null };
   // The standard drawing each line came from (init.sql §69) — only asked when a line names one.
   const stdIds = [...new Set(lines.map((l) => l.standard_id).filter(Boolean))];
   const verIds = [...new Set(lines.map((l) => l.standard_version_id).filter(Boolean))];
@@ -474,7 +480,7 @@ export async function setLineSupply(db, c, lineId, input = {}) {
   const changed = (supply ?? null) !== (l.material_supply ?? null);
   // §73: fixed once the line's MR is RELEASED to Purchase; an MR held for the customer's acceptance follows the change.
   if (l.mr_code && changed) problems.push(`Line ${l.line_no}'s material request ${l.mr_code} is with Purchase — who supplies its material is fixed now.`);
-  else if (changed && l.order_type === 'customer' && ['confirmed', 'closed'].includes(l.status)) problems.push(`${l.order_code}'s acceptance is approved — who supplies the material is part of the accepted terms now.`);
+  // 2026-11-12 (user): inventory details can be set after the acceptance — only an MR already with Purchase fixes the supply.
   assertNoProblems(problems, `Line ${l.line_no} of ${l.order_code}: the material supply cannot be changed.`);
   await db.query('UPDATE cf_sales_order_lines SET material_supply = ? WHERE company_id = ? AND id = ?', [supply, c.companyId, l.id]);
   if (changed) await (await import('./requisitionService.js')).followSupplyOfHeld(db, c, l.order_id);
@@ -578,7 +584,7 @@ export async function updateOrder(db, c, id, input = {}) {
       // change) — and, for a customer's order, once its acceptance is approved (it is part of the accepted terms).
       const [mrs] = await db.query('SELECT code FROM cf_requisitions WHERE company_id = ? AND order_id = ? AND held_for_acceptance = 0 AND deleted_at IS NULL ORDER BY id LIMIT 3', [c.companyId, id]);
       if (mrs.length) problems.push(`Who supplies the material is fixed once a material request is released to Purchase (${mrs.map((r) => r.code).join(', ')}). Set it on a line that has no MR yet.`);
-      else if (o.order_type === 'customer' && ['confirmed', 'closed'].includes(o.status)) problems.push(`${o.code}'s acceptance is approved — who supplies the material is part of the accepted terms now.`);
+      // 2026-11-12 (user): inventory details may be set after the acceptance too — only an MR with Purchase fixes it.
       else { sets.material_supply = supply; followHeld = true; }
     }
   }
