@@ -31,6 +31,7 @@ import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
   listMrs, mrScreen, saveMr, issueMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
 } from '../services/purchaseRequestService.js';
+import { askApprovalAgain, listMachineModels, requestMachine } from '../services/machineRequestService.js';
 
 const router = Router();
 const id = (req) => intParam(req.params.id);
@@ -55,6 +56,11 @@ router.put('/purchase-request-vendors/:id', manage, handle((req) => tx(req, (db,
 router.delete('/purchase-request-vendors/:id', manage, handle((req) => tx(req, (db, c) => removeVendor(db, c, id(req)))));
 router.put('/purchase-request-vendors/:id/quotes', manage, handle((req) => tx(req, (db, c) => setQuotes(db, c, id(req), body(req)))));
 router.get('/purchase-request-vendors/:id/pending-pos', view, handle((req) => pendingPosOfVendor(pool, company(req), id(req))));
+// §103 (2026-11-12): a new machine — requested by production / planning or maintenance (an MR for: New machine); its PR
+// asked again by Stores after a send-back.
+router.get('/machine-models', guardAny(PERM.production, PERM.maintenance), handle((req) => listMachineModels(pool, company(req), req.query)));
+router.post('/machine-requests', guardAny(PERM.production, PERM.maintenance), handle((req) => tx(req, (db, c) => requestMachine(db, c, body(req)))));
+router.post('/purchase-requests/:id/ask-approval', mrManage, handle((req) => tx(req, (db, c) => askApprovalAgain(db, c, id(req)))));
 router.post('/purchase-request-vendors/:id/purchase-orders', manage, handle((req) => tx(req, (db, c) => raisePo(db, c, id(req), body(req)))));
 
 export default router;

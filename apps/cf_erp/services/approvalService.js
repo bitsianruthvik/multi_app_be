@@ -25,6 +25,9 @@ export const APPROVAL_TYPES = {
   contractor_po: { perm: 'cf_erp_approve_contractor_po', label: 'Contractor PO', subjectType: 'purchase_order' },
   po_close_short: { perm: 'cf_erp_approve_po_close_short', label: 'Close a PO short', subjectType: 'purchase_order' },
   rebaseline: { perm: 'cf_erp_approve_rebaseline', label: 'Re-baseline', subjectType: 'plan' },
+  // §103 (2026-11-12): a new machine's PR — Maintenance first (with a comment), then the MD (machineRequestService).
+  machine_pr_maintenance: { perm: 'cf_erp_maintenance', label: 'New machine — Maintenance', subjectType: 'purchase_request' },
+  machine_pr_md: { perm: 'cf_erp_approve_machine_purchase', label: 'New machine — MD', subjectType: 'purchase_request' },
 };
 export const APPROVAL_TYPE_KEYS = Object.keys(APPROVAL_TYPES);
 export const APPROVAL_PERMS = APPROVAL_TYPE_KEYS.map((k) => APPROVAL_TYPES[k].perm);
@@ -40,6 +43,8 @@ const HANDLERS = {
   po_close_short: () => import('./purchaseService.js').then((m) => m.closeShortApprovalHandler),
   // Step 5 (§84): the saved plan becomes the baseline (plannerV3Service).
   rebaseline: () => import('./plannerV3Service.js').then((m) => m.rebaselineApprovalHandler),
+  machine_pr_maintenance: () => import('./machineRequestService.js').then((m) => m.maintenanceApprovalHandler),
+  machine_pr_md: () => import('./machineRequestService.js').then((m) => m.mdApprovalHandler),
 };
 
 const blank = (v) => v == null || String(v).trim() === '';

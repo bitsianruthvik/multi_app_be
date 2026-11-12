@@ -8403,3 +8403,50 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_orders'
             AND COLUMN_NAME = 'status' AND COLUMN_TYPE LIKE '%''planning''%') = 1, 'S102-OK', 'S102-MISSING') AS result;
+
+-- ============================================================================
+-- §103  BUYING A NEW MACHINE (2026-11-12)
+-- ============================================================================
+-- User: "Creating new machines, production or planning can make the request. It will be an MR request to stores. Stores
+-- should create a PR which needs a permission from maintenance (need to add their comments). Then it needs to go to MD …
+-- procurement … PO which first goes to MD for approval and then goes PO waiting for GRN." Decided: machine MODELS are
+-- catalog items (Capital equipment › Machinery › Machines, made by machineRequestService); the register stays the machines.
+--   cf_requisitions.for_type          + 'machine'
+--   cf_requisitions.machine_request_json JSON NULL  { purpose, needBy, machineTypeId, machineTypeName, modelId, createdModel, quantity, notes }
+--   cf_buy_requests.approval_state    VARCHAR(12) NULL — NULL: none needed; 'maintenance' → 'md' → 'approved'; 'rejected'
+--   features cf_erp_approve_machine_purchase (the MD's step), granted to admin roles, Placebo's MD and every role that
+--   approves purchase orders. Maintenance's step uses cf_erp_maintenance. Idempotent.
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions'
+             AND COLUMN_NAME = 'for_type' AND COLUMN_TYPE LIKE '%''machine''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_requisitions MODIFY COLUMN for_type ENUM('sales_order','maintenance_order','stock','general','machine') NOT NULL DEFAULT 'sales_order'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'machine_request_json');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_requisitions ADD COLUMN machine_request_json JSON NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND COLUMN_NAME = 'approval_state');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_buy_requests ADD COLUMN approval_state VARCHAR(12) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: approve buying a new machine', 'cf_erp_approve_machine_purchase', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_approve_machine_purchase');
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id) FROM features f
+ WHERE f.feature_tag = 'cf_erp_approve_machine_purchase' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_approve_machine_purchase' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND (LOWER(r.name) = 'admin' OR (a.company_id = 30005 AND UPPER(r.name) = 'MD')
+        OR EXISTS (SELECT 1 FROM role_capability po JOIN features_capability pfc ON pfc.capability_id = po.capability_id AND pfc.deleted_at IS NULL
+                    WHERE po.role_id = r.id AND po.app_id = a.id AND po.deleted_at IS NULL AND pfc.name = 'cf_erp_approve_purchase_order'))
+   AND NOT EXISTS (SELECT 1 FROM role_capability x WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+            AND ((TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'for_type' AND COLUMN_TYPE LIKE '%''machine''%')
+              OR (TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'machine_request_json')
+              OR (TABLE_NAME = 'cf_buy_requests' AND COLUMN_NAME = 'approval_state'))) = 3
+          AND EXISTS (SELECT 1 FROM features WHERE feature_tag = 'cf_erp_approve_machine_purchase'), 'S103-OK', 'S103-MISSING') AS result;

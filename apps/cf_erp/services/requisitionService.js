@@ -83,8 +83,10 @@ export const heldMessage = (code) => `${code} waits for the customer's acceptanc
  * line's need, and its holds / PO shares are its own (held for nobody else, not for the order as a whole — so the
  * order's own MRs never count them twice).
  */
-export const FOR_TYPES = ['sales_order', 'maintenance_order', 'stock', 'general'];
-export const FOR_LABEL = { sales_order: 'Sales order', maintenance_order: 'Maintenance order', stock: 'Stock', general: 'General' };
+// 'machine' (§103, 2026-11-12): a new machine, raised by Request a new machine (machineRequestService) — its PR waits for
+// Maintenance and the MD before Purchase quotes it.
+export const FOR_TYPES = ['sales_order', 'maintenance_order', 'stock', 'general', 'machine'];
+export const FOR_LABEL = { sales_order: 'Sales order', maintenance_order: 'Maintenance order', stock: 'Stock', general: 'General', machine: 'New machine' };
 export const forTypeOf = (v) => (FOR_TYPES.includes(v) ? v : 'sales_order');
 
 /*
@@ -515,6 +517,7 @@ export async function createRequisition(db, c, input = {}, { internal = false } 
   if (forType === 'sales_order' && orderId == null) problems.push('An MR for a sales order names the order.');
   if (forType === 'maintenance_order' && maintId == null) problems.push('An MR for a maintenance order names the maintenance order.');
   if (forType === 'stock' && orderId != null) problems.push('An MR for stock is for no order — leave the sales order out.');
+  if (forType === 'machine' && orderId != null) problems.push('An MR for a new machine is for no order — leave the sales order out.');
   if (forType !== 'maintenance_order' && maintId != null) problems.push('Only an MR for a maintenance order names one.');
   const rows = Array.isArray(input.lines) ? input.lines : [];
   if (!rows.length) problems.push('Add at least one item.');

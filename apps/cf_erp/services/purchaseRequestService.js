@@ -509,11 +509,14 @@ export async function raiseStoresPr(db, c, input = {}) {
 async function upsertPr(db, c, head, lines, toBuy) {
   const [[pr]] = await db.query('SELECT id FROM cf_buy_requests WHERE company_id = ? AND requisition_id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, head.id]);
   let prId = pr?.id ?? null;
+  let newMachinePr = null;
   if (!prId) {
     if (![...toBuy.values()].some((q) => q > EPS)) return null;
     const [ins] = await db.query('INSERT INTO cf_buy_requests (company_id, requisition_id, order_id, created_by) VALUES (?, ?, ?, ?)', [c.companyId, head.id, head.order_id, c.userId ?? null]);
     prId = ins.insertId;
     await db.query("UPDATE cf_buy_requests SET code = CONCAT('PR-', LPAD(id, 6, '0')) WHERE company_id = ? AND id = ?", [c.companyId, prId]);
+    // §103: a new machine's PR waits for Maintenance, then the MD, before Purchase may quote it.
+    if (head.for_type === 'machine') newMachinePr = prId;
   }
   const [have] = await db.query('SELECT id, requisition_line_id, quantity FROM cf_buy_request_lines WHERE company_id = ? AND request_id = ? AND deleted_at IS NULL', [c.companyId, prId]);
   const byRl = new Map(have.map((r) => [Number(r.requisition_line_id), r]));
@@ -529,6 +532,7 @@ async function upsertPr(db, c, head, lines, toBuy) {
   const listed = new Set(lines.map((l) => Number(l.id)));
   for (const r of have) if (!listed.has(Number(r.requisition_line_id)) && Number(r.quantity) > EPS) updates.push([r.id, 0]);
   await insertRows(db, 'cf_buy_request_lines', ['company_id', 'request_id', 'requisition_line_id', 'item_id', 'quantity', 'uom', 'created_by'], inserts);
+  if (newMachinePr) await (await import('./machineRequestService.js')).askMaintenance(db, c, newMachinePr);
   if (updates.length) {
     await db.query(`UPDATE cf_buy_request_lines SET quantity = CASE id ${updates.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
       [...updates.flat(), c.companyId, updates.map((u) => u[0])]);
@@ -552,7 +556,7 @@ export async function readPrs(db, companyId, filter = {}) {
   const like = likeOf(filter.search);
   if (like) { where.push('(br.code LIKE ? OR r.code LIKE ? OR o.code LIKE ? OR cu.name LIKE ?)'); args.push(like, like, like, like); }
   const [heads] = await db.query(
-    `SELECT br.id, br.code, br.requisition_id, br.order_id, br.notes, br.created_at, r.code AS mr_code, r.order_line_id, sl.line_no, r.for_type,
+    `SELECT br.id, br.code, br.requisition_id, br.order_id, br.notes, br.created_at, br.approval_state, r.machine_request_json, r.code AS mr_code, r.order_line_id, sl.line_no, r.for_type,
             o.code AS order_code, o.status AS order_status, o.customer_id, cu.name AS customer_name, m.code AS line_item_code, m.name AS line_item_name, sl.description
        FROM cf_buy_requests br
        JOIN cf_requisitions r ON r.id = br.requisition_id
@@ -641,7 +645,10 @@ export async function readPrs(db, companyId, filter = {}) {
       manual: h.order_line_id == null,
       order: h.order_id == null ? null : { id: h.order_id, code: h.order_code, status: h.order_status, customer: h.customer_id ? { id: h.customer_id, name: h.customer_name } : null },
       line: h.order_line_id == null ? null : { id: h.order_line_id, lineNo: h.line_no, name: h.line_item_name ?? h.description ?? `Line ${h.line_no}` },
-      canEdit: h.order_line_id == null || BUYABLE_ORDER_STATUSES.includes(h.order_status),
+      canEdit: (h.order_line_id == null || BUYABLE_ORDER_STATUSES.includes(h.order_status)) && (!h.approval_state || h.approval_state === 'approved'),
+      // §103: a new machine's PR — its approvals and the request behind it.
+      approval: h.approval_state ? { state: h.approval_state, label: ({ maintenance: 'Waiting for Maintenance', md: 'Waiting for the MD', approved: 'Approved', rejected: 'Sent back' })[h.approval_state] ?? h.approval_state } : null,
+      machineRequest: h.machine_request_json ? (typeof h.machine_request_json === 'string' ? JSON.parse(h.machine_request_json) : h.machine_request_json) : null,
       createdAt: h.created_at, notes: h.notes ?? null,
       lines: shaped, vendors: cols, purchaseOrders: [...pos.values()],
       counts: { lines: counted.length, open: counted.filter((l) => l.open > EPS).length, vendors: cols.length },
@@ -674,7 +681,7 @@ export async function listPrs(db, companyId, q = {}) {
 
 async function requirePrRow(db, companyId, id, { lock = false } = {}) {
   const [[p]] = await db.query(
-    `SELECT br.id, br.code, br.order_id, o.code AS order_code, o.status AS order_status, r.order_line_id
+    `SELECT br.id, br.code, br.order_id, br.approval_state, o.code AS order_code, o.status AS order_status, r.order_line_id
        FROM cf_buy_requests br JOIN cf_requisitions r ON r.id = br.requisition_id LEFT JOIN cf_sales_orders o ON o.id = br.order_id
       WHERE br.company_id = ? AND br.id = ? AND br.deleted_at IS NULL${lock ? ' FOR UPDATE' : ''}`,
     [companyId, Number(id)],
@@ -682,6 +689,8 @@ async function requirePrRow(db, companyId, id, { lock = false } = {}) {
   if (!p) throw notFound('Purchase request');
   // §79: the PR of an MR raised by hand is bought whatever the order (if any) is doing.
   if (lock && p.order_line_id != null && !BUYABLE_ORDER_STATUSES.includes(p.order_status)) throw invalid('NOT_OPEN', `${p.order_code} is ${p.order_status} — nothing more is bought for it.`);
+  // §103: a new machine's PR waits for Maintenance and the MD.
+  if (lock && p.approval_state && p.approval_state !== 'approved') throw invalid('WAITING_FOR_APPROVAL', (await import('./machineRequestService.js')).approvalBlock(p.approval_state));
   return p;
 }
 async function requireVendorRow(db, companyId, vendorId, { lock = false } = {}) {
