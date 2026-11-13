@@ -8591,3 +8591,158 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
               OR (TABLE_NAME = 'cf_stocking_areas' AND COLUMN_NAME = 'purpose' AND COLUMN_TYPE LIKE '%''maintenance''%'))) = 9
           AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('cf_machine_events', 'cf_machine_checkouts', 'cf_machine_setup_items')) = 3
           AND EXISTS (SELECT 1 FROM features WHERE feature_tag = 'cf_erp_approve_machine_condemn'), 'S104-OK', 'S104-MISSING') AS result;
+
+-- ============================================================================
+-- §105  PLANNING: THE MONTH PLAN, THE WEEK PLAN, THE DAILY ROSTER, ALERTS (2026-11-13)
+-- ============================================================================
+-- User, 2026-11-13: "We basically should have a plan made at the start of the month and locked. This takes into
+-- consideration the priority order of the production orders and all the machines that will be used that month … the
+-- dates of availability of various material … The AI should run an optimization plan to get out the max output in the
+-- entire month (it should consider the execution plan's shipping units) … suggestions … how to use more machines to
+-- improve the tonnage … The plan will be created by the planner and will be frozen once MD approves. From this plan the
+-- weekly plan comes out. At the end of every week … next week's plan to maximize the output for the month based on that
+-- time's reality … MD should be notified … Let the daily plan be the output which the production team gets … All sorts
+-- of alerts should be raised to the planning team based on what resource changed from their plan."
+-- Decided with the user: output = FINISHED SHIPPING UNITS (full tonnage on the day the last work ends); the planner ranks
+-- the orders and the optimiser may not delay an order beyond a tolerance; the optimiser is built into the backend
+-- (services/monthPlanEngine.js: schedule generation + iterated greedy search, with a relaxation bound).
+--   cf_mplans       one plan of a month, versioned: draft → pending (with the MD) → frozen; a later version supersedes.
+--                   inputs_json = { machineIds, contractorMachines, ranks, toleranceDays, from } and result_json = the
+--                   optimiser's answer with the facts it planned from (units, material dates, capacity) — the plan is a
+--                   document: what was assumed is kept beside what was decided, so the review can say what changed.
+--   cf_wplans       the plan of one week (Monday), re-optimised from that day's reality for the same month goal;
+--                   draft → published (the MD is told) → closed (actual_json = what happened; review_json = why).
+--   cf_dplans       the roster of one day: tasks per machine / contractor, suggested then arranged by hand; published
+--                   to production.
+--   cf_plan_alerts  what changed against the plan (a machine down, a PO date moved, material late, a contractor behind,
+--                   an order's structure changed …): one row per thing (dedupe_key), open → dismissed / resolved.
+--   cf_operation_consumables  what an operation uses up per run hour or per tonne (the first, plain form of the
+--                   consumption formulas to come) — the plan turns it into what Stores must have, by when.
+--   features cf_erp_approve_month_plan (the MD freezes the month plan), granted to the roles that approve a re-baseline.
+CREATE TABLE IF NOT EXISTS cf_mplans (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  month          DATE          NOT NULL,            -- the first day of the month
+  version        INT           NOT NULL DEFAULT 1,
+  status         VARCHAR(12)   NOT NULL DEFAULT 'draft',   -- draft / pending / frozen / superseded / rejected
+  tolerance_days INT           NOT NULL DEFAULT 3,
+  inputs_json    JSON          NULL,
+  result_json    JSON          NULL,
+  tonnes         DECIMAL(14,3) NULL,                -- planned to finish in the month
+  bound_tonnes   DECIMAL(14,3) NULL,
+  note           VARCHAR(1000) NULL,
+  approval_id    INT           NULL,
+  run_at         DATETIME      NULL,
+  sent_at        DATETIME      NULL,
+  frozen_at      DATETIME      NULL,
+  frozen_by      INT           NULL,
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT           NULL,
+  KEY idx_cmp_month (company_id, month, status),
+  CONSTRAINT fk_cmp_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_wplans (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  mplan_id       INT           NULL,
+  week_start     DATE          NOT NULL,            -- a Monday (the month's first week starts on the 1st)
+  week_end       DATE          NOT NULL,
+  status         VARCHAR(12)   NOT NULL DEFAULT 'draft',   -- draft / published / closed
+  inputs_json    JSON          NULL,
+  result_json    JSON          NULL,
+  actual_json    JSON          NULL,
+  review_json    JSON          NULL,
+  tonnes_week    DECIMAL(14,3) NULL,                -- planned to finish in this week
+  tonnes_month   DECIMAL(14,3) NULL,                -- the month's forecast as of this plan
+  note           VARCHAR(1000) NULL,
+  run_at         DATETIME      NULL,
+  published_at   DATETIME      NULL,
+  published_by   INT           NULL,
+  closed_at      DATETIME      NULL,
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT           NULL,
+  week_live      DATE GENERATED ALWAYS AS (IF(deleted_at IS NULL, week_start, NULL)) VIRTUAL,
+  UNIQUE KEY uq_cwp_week (company_id, week_live),
+  CONSTRAINT fk_cwp_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_dplans (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  plan_date      DATE          NOT NULL,
+  status         VARCHAR(12)   NOT NULL DEFAULT 'draft',   -- draft / published
+  tasks_json     JSON          NULL,
+  note           VARCHAR(1000) NULL,
+  published_at   DATETIME      NULL,
+  published_by   INT           NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT           NULL,
+  UNIQUE KEY uq_cdp_day (company_id, plan_date),
+  CONSTRAINT fk_cdp_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_plan_alerts (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  dedupe_key     VARCHAR(140)  NOT NULL,
+  kind           VARCHAR(30)   NOT NULL,            -- machine_down / machine_out / material_date / material_short / consumable_short / contractor_behind / order_changed / new_order / behind_plan / not_in_plan
+  severity       VARCHAR(10)   NOT NULL DEFAULT 'warning',   -- info / warning / danger
+  title          VARCHAR(255)  NOT NULL,
+  detail         VARCHAR(1000) NULL,
+  subject_type   VARCHAR(30)   NULL,
+  subject_id     INT           NULL,
+  link           VARCHAR(255)  NULL,                -- where to look (an app path)
+  impact_tonnes  DECIMAL(14,3) NULL,
+  impact_json    JSON          NULL,
+  status         VARCHAR(12)   NOT NULL DEFAULT 'open',      -- open / dismissed / resolved
+  at             DATETIME      NULL,                -- the plant clock
+  closed_at      DATETIME      NULL,
+  closed_by      INT           NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_cpa_key (company_id, dedupe_key),
+  KEY idx_cpa_status (company_id, status),
+  CONSTRAINT fk_cpa_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_operation_consumables (
+  id             INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id     INT           NOT NULL,
+  operation_id   INT           NOT NULL,
+  item_id        INT           NOT NULL,
+  per            VARCHAR(8)    NOT NULL DEFAULT 'hour',      -- hour (of run time) / tonne (of work)
+  quantity       DECIMAL(14,4) NOT NULL,
+  deleted_at     DATETIME      DEFAULT NULL,
+  created_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at     TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by     INT           NULL,
+  KEY idx_coc_op (company_id, operation_id),
+  CONSTRAINT fk_coc_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: approve (freeze) the month plan', 'cf_erp_approve_month_plan', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_approve_month_plan');
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id) FROM features f
+ WHERE f.feature_tag = 'cf_erp_approve_month_plan' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_approve_month_plan' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM role_capability po JOIN features_capability pfc ON pfc.capability_id = po.capability_id AND pfc.deleted_at IS NULL
+                WHERE po.role_id = r.id AND po.app_id = a.id AND po.deleted_at IS NULL AND pfc.name IN ('cf_erp_approve_rebaseline', 'cf_erp_approve_machine_purchase'))
+   AND NOT EXISTS (SELECT 1 FROM role_capability x WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME IN ('cf_mplans', 'cf_wplans', 'cf_dplans', 'cf_plan_alerts', 'cf_operation_consumables')) = 5
+          AND EXISTS (SELECT 1 FROM features WHERE feature_tag = 'cf_erp_approve_month_plan'), 'S105-OK', 'S105-MISSING') AS result;
