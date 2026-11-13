@@ -386,8 +386,9 @@ function shapeHead(r) {
 
 export async function plansOfMonth(db, companyId, month) {
   const { first } = monthBounds(month);
-  const [rows] = await db.query('SELECT * FROM cf_mplans WHERE company_id = ? AND month = ? AND deleted_at IS NULL ORDER BY version DESC', [companyId, first]);
-  return rows;
+  // Sorted here, not in SQL: the rows carry the plan documents (JSON) and MySQL will not sort rows that large.
+  const [rows] = await db.query('SELECT * FROM cf_mplans WHERE company_id = ? AND month = ? AND deleted_at IS NULL', [companyId, first]);
+  return rows.sort((a, b) => b.version - a.version);
 }
 
 /** The frozen plan of a month (the latest), or null. */

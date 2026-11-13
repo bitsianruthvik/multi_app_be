@@ -474,7 +474,9 @@ export async function publishedRoster(db, companyId, q = {}) {
 /** The plan in force for a day: this week's published plan, else the frozen month plan. { doc, inputs, source } or null. */
 async function planInForce(db, companyId, today) {
   const week = weekOfDay(today);
-  const [[w]] = await db.query("SELECT * FROM cf_wplans WHERE company_id = ? AND week_start <= ? AND status IN ('published') AND deleted_at IS NULL ORDER BY week_start DESC LIMIT 1", [companyId, today]);
+  // The id first: the row carries the plan document and is not sorted in SQL.
+  const [[head]] = await db.query("SELECT id FROM cf_wplans WHERE company_id = ? AND week_start <= ? AND status IN ('published') AND deleted_at IS NULL ORDER BY week_start DESC LIMIT 1", [companyId, today]);
+  const [[w]] = head ? await db.query('SELECT * FROM cf_wplans WHERE id = ?', [head.id]) : [[null]];
   if (w && dateS(w.week_start).slice(0, 7) === week.month) return { doc: json(w.result_json), inputs: json(w.inputs_json), source: `the plan of the week of ${dateS(w.week_start)}`, month: week.month };
   const f = await frozenPlan(db, companyId, week.month);
   return f ? { doc: f.result, inputs: f.inputs, source: `the frozen plan of ${week.month}`, month: week.month } : null;
@@ -587,7 +589,7 @@ export async function reviewMonth(db, companyId, q = {}) {
   const month = blank(q.month) ? today.slice(0, 7) : String(q.month);
   const { first, last } = monthBounds(month);
   const frozen = await frozenPlan(db, companyId, month);
-  const [rows] = await db.query('SELECT * FROM cf_wplans WHERE company_id = ? AND week_start BETWEEN ? AND ? AND deleted_at IS NULL ORDER BY week_start', [companyId, first, last]);
+  const [rows] = await db.query('SELECT * FROM cf_wplans WHERE company_id = ? AND week_start BETWEEN ? AND ? AND deleted_at IS NULL', [companyId, first, last]);
   const byStart = new Map(rows.map((r) => [dateS(r.week_start), shapeWeek(r)]));
   const weeks = [];
   for (const w of weeksOf(month)) {
