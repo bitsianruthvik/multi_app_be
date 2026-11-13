@@ -9,7 +9,7 @@ import { purchaseCounts } from './purchaseService.js';
 
 const blank = (v) => v == null || String(v).trim() === '';
 const OPEN = "('draft','inquiry','quoted','confirmed')";
-const QUEUE_ORDER = { accept: 0, machineApprove: 0.5, machineReview: 0.6, machineCondemn: 0.55, machineRegister: 0.7, machineOverdue: 0.8, overdue: 1, onhold: 2, ready: 3, material: 4, buy: 5, deliveries: 6, delivered: 7, release: 8, inquiries: 9, quoted: 10, selections: 11, drafts: 12, flows: 13, shifts: 14, untimed: 15, held: 16 };
+const QUEUE_ORDER = { accept: 0, machineApprove: 0.5, machineReview: 0.6, machineCondemn: 0.55, monthPlan: 0.3, weekPlan: 0.9, planAlerts: 0.4, machineRegister: 0.7, machineOverdue: 0.8, overdue: 1, onhold: 2, ready: 3, material: 4, buy: 5, deliveries: 6, delivered: 7, release: 8, inquiries: 9, quoted: 10, selections: 11, drafts: 12, flows: 13, shifts: 14, untimed: 15, held: 16 };
 
 async function one(db, sql, params) {
   const [[row]] = await db.query(sql, params);
@@ -39,7 +39,9 @@ export async function navCounts(db, companyId) {
     one(db, "SELECT COUNT(*) FROM cf_stocking_areas WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
   ]);
   const [t, b] = await Promise.all([tP, bP]);
-  return { counts: { openOrders, customers, items, definitions, machines, operations, draftFlows, stockLines, heldBatches, areas, readySteps: t.readySteps, toBuy: b.toBuy, openPurchases: b.draftOrders + b.awaitingDelivery } };
+  // §105: what changed against the plan and still waits for the planner.
+  const planAlerts = await one(db, "SELECT COUNT(*) FROM cf_plan_alerts WHERE company_id = ? AND status = 'open' AND severity <> 'info'", c).catch(() => 0);
+  return { counts: { openOrders, customers, items, definitions, machines, operations, draftFlows, stockLines, heldBatches, areas, readySteps: t.readySteps, toBuy: b.toBuy, openPurchases: b.draftOrders + b.awaitingDelivery, planAlerts } };
 }
 
 /**
@@ -118,6 +120,12 @@ export async function cockpit(db, companyId) {
     one(db, "SELECT COUNT(*) FROM cf_approvals WHERE company_id = ? AND status = 'pending' AND approval_type = 'machine_condemn'", c).catch(() => 0),
     one(db, 'SELECT COUNT(*) FROM cf_machine_checkouts WHERE company_id = ? AND in_at IS NULL AND due_on < CURDATE()', c).catch(() => 0),
   ]);
+  // §105: the month plan waiting for the MD; a week plan published in the last 7 days (the MD is told); alerts for the planner.
+  const planP = Promise.all([
+    one(db, "SELECT COUNT(*) FROM cf_approvals WHERE company_id = ? AND status = 'pending' AND approval_type = 'month_plan'", c).catch(() => 0),
+    one(db, "SELECT COUNT(*) FROM cf_wplans WHERE company_id = ? AND status = 'published' AND deleted_at IS NULL AND published_at >= NOW() - INTERVAL 7 DAY", c).catch(() => 0),
+    one(db, "SELECT COUNT(*) FROM cf_plan_alerts WHERE company_id = ? AND status = 'open' AND severity <> 'info'", c).catch(() => 0),
+  ]);
   for (const p of [tP, bP, releaseP, deliveredP]) p.catch(() => {});   // awaited below; never an unhandled rejection meanwhile
   const [inquiries, quoted, confirmed, overdue, selections, itemDrafts, defDrafts, draftFlows, idleMachines, heldBatches, untimedOps, openOrders, machines, stockLines] = await Promise.all([
     one(db, "SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status = 'inquiry'", c),
@@ -147,7 +155,7 @@ export async function cockpit(db, companyId) {
     one(db, 'SELECT COUNT(*) FROM cf_stock_balances WHERE company_id = ? AND quantity <> 0', c),
   ]);
   const plural = (n, one1, many) => (n === 1 ? one1 : many);
-  const [t, toRelease, delivered, b, toAccept, mach, [toRegisterN, condemnN, overdueOutN]] = await Promise.all([tP, releaseP, deliveredP, bP, acceptP, machinesP, lifeP]);
+  const [t, toRelease, delivered, b, toAccept, mach, [toRegisterN, condemnN, overdueOutN], [monthPlanN, weekPlanN, planAlertN]] = await Promise.all([tP, releaseP, deliveredP, bP, acceptP, machinesP, lifeP, planP]);
   const machReview = mach.machine_pr_maintenance ?? 0;
   const machApprove = mach.machine_pr_md ?? 0;
   const queues = [
@@ -163,6 +171,12 @@ export async function cockpit(db, companyId) {
       description: 'Maintenance asks to condemn these. Approve, and their disposal is recorded next.', actionLabel: 'Open Approvals', path: 'approvals?type=machine_condemn' },
     { key: 'machineOverdue', title: 'Machines and tools overdue', count: overdueOutN, unit: plural(overdueOutN, 'item', 'items'), tone: 'danger', perm: ['cf_erp_stores', 'cf_erp_inventory_manage'],
       description: 'Checked out and past the date they were due back.', actionLabel: 'Open check-in / out', path: 'machine-custody' },
+    { key: 'monthPlan', title: 'Month plan to approve', count: monthPlanN, unit: plural(monthPlanN, 'plan', 'plans'), tone: 'warning', perm: ['cf_erp_approve_month_plan'],
+      description: 'Planning sent the month plan. Approve it and it is frozen — the weeks are planned from it.', actionLabel: 'Open Approvals', path: 'approvals?type=month_plan' },
+    { key: 'weekPlan', title: 'The week plan is published', count: weekPlanN, unit: plural(weekPlanN, 'plan', 'plans'), tone: 'info', perm: ['cf_erp_approve_month_plan'],
+      description: 'Planning re-made the week from where things stand: orders, operations, and the tonnes the month now finishes.', actionLabel: 'See the week plan', path: 'planning-week' },
+    { key: 'planAlerts', title: 'Changes against the plan', count: planAlertN, unit: plural(planAlertN, 'alert', 'alerts'), tone: 'danger', perm: ['cf_erp_production_manage'],
+      description: 'Machines, material dates, contractors or orders moved against the plan in force.', actionLabel: 'Open Planning', path: 'planning' },
     { key: 'buy', title: 'Material to buy', count: b.toBuy, unit: plural(b.toBuy, 'item', 'items'), tone: 'danger',
       description: 'Short after what is held and what is already on order — nobody has this steel.', actionLabel: 'Open material requests', path: 'material-requests' },
     { key: 'approve', title: 'Purchase orders to approve', count: b.pendingApproval, unit: plural(b.pendingApproval, 'order', 'orders'), tone: 'warning',
