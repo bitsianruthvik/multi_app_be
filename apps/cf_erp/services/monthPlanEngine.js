@@ -52,6 +52,61 @@ function rng(seed) {
  * wanted minutes the pool did not have), load: Map fn → Float64Array(D) }. `keepAlloc` also returns alloc[u] =
  * [{ step, day, minutes }] (only asked for the final plan — the search does not need it).
  */
+/** The input in the decoder's own form (typed arrays, machine types by index) — made once per input. */
+const compiled = new WeakMap();
+function compile(input) {
+  let c = compiled.get(input);
+  if (c) return c;
+  const fns = Object.keys(input.pools);
+  const idx = new Map(fns.map((fn, i) => [fn, i]));
+  const base = fns.map((fn) => Float64Array.from(input.pools[fn]));
+  const unlimited = input.unlimited ?? {};
+  const units = input.units.map((u) => ({
+    earliest: Math.max(0, u.earliest ?? 0),
+    fi: Int32Array.from(u.steps.map((s) => (unlimited[s.fn] != null ? -1 : idx.has(s.fn) ? idx.get(s.fn) : -2))),
+    rate: Float64Array.from(u.steps.map((s) => (unlimited[s.fn] != null ? unlimited[s.fn] : 0))),
+    minutes: Float64Array.from(u.steps.map((s) => s.minutes)),
+  }));
+  c = { fns, base, units };
+  compiled.set(input, c);
+  return c;
+}
+
+/** The search's decoder: finishes only (no bookkeeping), on the compiled input. */
+function decodeFast(input, order) {
+  const C = compile(input);
+  const D = input.days;
+  const left = C.base.map((a) => Float64Array.from(a));
+  const finish = new Array(input.units.length).fill(D);
+  for (const u of order) {
+    const unit = C.units[u];
+    const S = unit.minutes.length;
+    if (!S) { finish[u] = unit.earliest; continue; }
+    const done = new Float64Array(S);
+    let first = 0;                                 // the first step not yet complete
+    for (let d = unit.earliest; d < D; d += 1) {
+      let prevShare = 1;
+      for (let j = first; j < S; j += 1) {
+        const m = unit.minutes[j];
+        const want = prevShare * m - done[j];
+        if (want > EPS) {
+          const f = unit.fi[j];
+          let got;
+          if (f === -1) got = Math.min(want, unit.rate[j]);
+          else if (f < 0) got = 0;
+          else { const pool = left[f]; got = Math.min(want, pool[d]); if (got > 0) pool[d] -= got; }
+          if (got > EPS) done[j] += got;
+        }
+        prevShare = m > EPS ? done[j] / m : 1;
+        if (j === first && prevShare >= 1 - 1e-9) first += 1;
+        if (prevShare <= EPS) break;               // nothing further down can move today
+      }
+      if (first >= S) { finish[u] = d; break; }
+    }
+  }
+  return finish;
+}
+
 export function decode(input, order, { keepAlloc = false } = {}) {
   const D = input.days;
   const left = new Map();
@@ -172,17 +227,17 @@ export function optimise(input, { iterations: wanted = 400, budgetMs = 20000, se
   const t0 = Date.now();
   const n = input.units.length;
   const basePerm = priorityOrder(input);
-  const baseSched = decode(input, basePerm);
-  const baseFinish = orderFinishes(input, baseSched.finish);
-  const baseScore = score(input, baseSched.finish, null);
+  const baseFin = decodeFast(input, basePerm);
+  const baseFinish = orderFinishes(input, baseFin);
+  const baseScore = score(input, baseFin, null);
   let best = basePerm.slice();
-  let bestScore = score(input, baseSched.finish, baseFinish);
+  let bestScore = score(input, baseFin, baseFinish);
   // A warm start (the order of a plan already found — a what-if, a re-plan): taken when it is better than plain priority.
   if (startOrder && startOrder.length === n) {
     const idx = new Map(input.units.map((u, i) => [u.key, i]));
     const perm = startOrder.map((k) => idx.get(k)).filter((i) => i != null);
     if (perm.length === n) {
-      const sc = score(input, decode(input, perm).finish, baseFinish);
+      const sc = score(input, decodeFast(input, perm), baseFinish);
       if (sc.value > bestScore.value) { best = perm; bestScore = sc; }
     }
   }
@@ -191,7 +246,7 @@ export function optimise(input, { iterations: wanted = 400, budgetMs = 20000, se
   let iterations = 0;
   if (n > 2) {
     const k = Math.max(1, Math.min(4, Math.round(n / 12)));
-    const sample = Math.min(n, 14);
+    const sample = Math.min(n, 10);
     while (Date.now() - t0 < budgetMs && iterations < maxIterations) {
       iterations += 1;
       const perm = cur.slice();
@@ -205,13 +260,13 @@ export function optimise(input, { iterations: wanted = 400, budgetMs = 20000, se
           if (tried.has(pos)) continue;
           tried.add(pos);
           perm.splice(pos, 0, u);
-          const v = score(input, decode(input, perm).finish, baseFinish).value;
+          const v = score(input, decodeFast(input, perm), baseFinish).value;
           perm.splice(pos, 1);
           if (v > bv) { bv = v; bp = pos; }
         }
         perm.splice(bp, 0, u);
       }
-      const sc = score(input, decode(input, perm).finish, baseFinish);
+      const sc = score(input, decodeFast(input, perm), baseFinish);
       const temp = Math.max(1e-9, (1 - iterations / maxIterations)) * 0.002 * Math.max(1, Math.abs(curScore.value));
       if (sc.value > curScore.value || rand() < Math.exp((sc.value - curScore.value) / temp)) { cur = perm; curScore = sc; }
       if (sc.value > bestScore.value + EPS) { best = perm.slice(); bestScore = sc; }

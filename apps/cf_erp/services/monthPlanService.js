@@ -61,7 +61,11 @@ export function monthBounds(month) {
   return { first, last };
 }
 
-/** The weeks of a month as the plan speaks of them: the 1st to the first Sunday, then Monday–Sunday, the last one cut at month end. */
+/**
+ * The weeks of a month as the plan speaks of them: Monday–Sunday, the first from the 1st and the last to the month's end.
+ * A stub shorter than MIN_WEEK days joins its neighbour (Nov 2026 starts on a Sunday: its weeks are 1–8, 9–15, 16–22, 23–30).
+ */
+const MIN_WEEK = 4;
 export function weeksOf(month) {
   const { first, last } = monthBounds(month);
   const out = [];
@@ -70,10 +74,13 @@ export function weeksOf(month) {
     const dow = new Date(`${s}T00:00:00Z`).getUTCDay();          // 0 = Sunday
     let e = addDays(s, dow === 0 ? 0 : 7 - dow);
     if (e > last) e = last;
-    out.push({ no: out.length + 1, start: s, end: e });
+    out.push({ start: s, end: e });
     s = addDays(e, 1);
   }
-  return out;
+  if (out.length > 1 && daysBetween(out[0].start, out[0].end) + 1 < MIN_WEEK) { out[1].start = out[0].start; out.shift(); }
+  const n = out.length;
+  if (n > 1 && daysBetween(out[n - 1].start, out[n - 1].end) + 1 < MIN_WEEK) { out[n - 2].end = out[n - 1].end; out.pop(); }
+  return out.map((w, i) => ({ no: i + 1, ...w }));
 }
 
 /* ── The facts a plan is made from ─────────────────────────────────────────────────────────────────── */
