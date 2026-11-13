@@ -221,7 +221,7 @@ export function upperBound(input) {
  * Iterated greedy over the order of the units: start from the priority order; take a few units out, put each back at the
  * best of a sample of places; keep what is better (and, now and then, what is a little worse — to leave a local best).
  */
-export function optimise(input, { iterations: wanted = 400, budgetMs = 20000, seed = 20261113, startOrder = null } = {}) {
+export function optimise(input, { iterations: wanted = 400, budgetMs = 20000, seed = 20261113, startOrder = null, decodeBudget = DECODE_BUDGET, minIterations = 30 } = {}) {
   // A fixed number of search rounds (not a time budget) so the same input always gives the same plan; budgetMs only
   // stops a run-away on a very large month.
   let maxIterations = wanted;
@@ -249,7 +249,7 @@ export function optimise(input, { iterations: wanted = 400, budgetMs = 20000, se
     const k = Math.max(1, Math.min(4, Math.round(n / 12)));
     const sample = Math.min(n, 10);
     // A large month: the rounds are cut so the whole search stays near DECODE_BUDGET schedule builds (seconds, not minutes).
-    maxIterations = Math.max(30, Math.min(wanted, Math.round(DECODE_BUDGET / ((k * sample + 1) * Math.max(1, n / 300)))));
+    maxIterations = Math.max(minIterations, Math.min(wanted, Math.round(decodeBudget / ((k * sample + 1) * Math.max(1, n / 300)))));
     while (Date.now() - t0 < budgetMs && iterations < maxIterations) {
       iterations += 1;
       const perm = cur.slice();
@@ -343,7 +343,7 @@ function summariseAlloc(unit, alloc) {
  * WHAT IF more machines joined: each option = { key, label, add: { fn: [minutes per day] } } is laid over the pools and
  * optimised (a shorter budget each). Returns the options with their tonnes and gain, the best first.
  */
-export function whatIf(input, options, { iterations = 120, seed = 7, basePlan = null } = {}) {
+export function whatIf(input, options, { iterations = 120, seed = 7, basePlan = null, decodeBudget = DECODE_BUDGET, minIterations = 30 } = {}) {
   const plan = basePlan ?? optimise(input, { iterations, seed });
   const base = plan.tonnes;
   const out = [];
@@ -353,7 +353,7 @@ export function whatIf(input, options, { iterations = 120, seed = 7, basePlan = 
       const have = pools[fn] ?? new Array(input.days).fill(0);
       pools[fn] = have.map((x, d) => x + (arr[d] ?? 0));
     }
-    const r = optimise({ ...input, pools }, { iterations, seed, startOrder: plan.order });
+    const r = optimise({ ...input, pools }, { iterations, seed, startOrder: plan.order, decodeBudget, minIterations });
     out.push({ ...o, add: undefined, tonnes: r.tonnes, gain: Math.round((r.tonnes - base) * 1000) / 1000 });
   }
   return out.sort((a, b) => b.gain - a.gain);

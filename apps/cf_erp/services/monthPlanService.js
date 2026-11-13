@@ -31,7 +31,7 @@ import { invalid, notFound, conflict } from '../lib/errors.js';
 import { getPlanner, CONTRACTOR, UNASSIGNED } from './plannerService.js';
 import { productionMachineIds } from './operationService.js';
 import { machinesCalendar } from './shiftService.js';
-import { optimise, whatIf } from './monthPlanEngine.js';
+import { runPlanJob } from './monthPlanWorker.js';
 import { requestApproval } from './approvalService.js';
 
 export const ASSUMED_DAYS = 14;
@@ -133,7 +133,7 @@ export async function loadFacts(db, companyId, opts = {}) {
   if (hit && Date.now() - hit.at < FACTS_TTL_MS && !opts.fresh) return structuredClone(hit.facts);
   const facts = await loadFactsNow(db, companyId, opts);
   factsCache.set(key, { at: Date.now(), facts: structuredClone(facts) });
-  if (factsCache.size > 40) factsCache.delete(factsCache.keys().next().value);
+  if (factsCache.size > 6) factsCache.delete(factsCache.keys().next().value);
   return facts;
 }
 const FACTS_TTL_MS = 45_000;
@@ -241,55 +241,6 @@ export function engineInput(facts, { machineIds, ranks = null, toleranceDays = 3
   };
 }
 
-/**
- * MORE MACHINES: the options, the best first. One option = the best set (machines added one at a time while each adds
- * tonnes, up to MAX_SET), then single machines of the types the plan waits for. [{ key, label, machineIds, tonnes, gain }]
- */
-const MAX_SET = 6;
-function suggestMachines(facts, input, plan, machineIds) {
-  const inPlan = new Set(machineIds.map(Number));
-  const minutesOf = (m) => (facts.calendars.get(m.id)?.days ?? []).slice(0, facts.monthEndDay + 1).reduce((t, d) => t + Number(d.minutes ?? 0), 0);
-  // The machine types units waited for, most days first.
-  const waited = new Map();
-  for (const u of plan.units) if (u.reason?.kind === 'capacity' && u.reason.fn) waited.set(u.reason.fn, (waited.get(u.reason.fn) ?? 0) + u.tonnes);
-  // Also the types the plan loads to the brim in the month.
-  for (const [fn, arr] of Object.entries(plan.load)) {
-    const cap = (input.pools[fn] ?? []).slice(0, facts.monthEndDay + 1).reduce((t, x) => t + x, 0);
-    const used = arr.slice(0, facts.monthEndDay + 1).reduce((t, x) => t + x, 0);
-    if (cap > 0 && used / cap > 0.9 && !waited.has(fn)) waited.set(fn, 0.001);
-  }
-  const spare = facts.machines.filter((m) => !inPlan.has(m.id) && minutesOf(m) > 0);
-  const bestOfType = (fn, skip) => spare.filter((m) => m.typeId === fn && !skip.has(m.id)).sort((a, b) => minutesOf(b) - minutesOf(a))[0] ?? null;
-  const addOf = (ms) => {
-    const add = {};
-    for (const m of ms) {
-      const days = facts.calendars.get(m.id)?.days ?? [];
-      if (!add[m.typeId]) add[m.typeId] = new Array(facts.days).fill(0);
-      days.forEach((d, i) => { if (i < facts.days) add[m.typeId][i] += Number(d.minutes ?? 0); });
-    }
-    return add;
-  };
-  const fnsToTry = [...waited].sort((a, b) => b[1] - a[1]).map(([fn]) => fn).slice(0, 8);
-  const singles = fnsToTry.map((fn) => bestOfType(fn, new Set())).filter(Boolean);
-  if (!singles.length) return { options: [], noSpare: fnsToTry.filter((fn) => !bestOfType(fn, new Set())).map((fn) => facts.fns[fn]?.name ?? fn) };
-  const single = whatIf(input, singles.map((m) => ({ key: `m${m.id}`, label: `${m.code} · ${m.name}`, machineIds: [m.id], add: addOf([m]) })), { basePlan: plan, iterations: 80 });
-  // The best set: greedy, the best next machine each round.
-  const set = []; const taken = new Set(); let cur = plan.tonnes;
-  for (let round = 0; round < MAX_SET; round += 1) {
-    const cands = fnsToTry.map((fn) => bestOfType(fn, taken)).filter(Boolean).slice(0, 4);
-    if (!cands.length) break;
-    const res = whatIf(input, cands.map((m) => ({ key: `m${m.id}`, machine: m, add: addOf([...set, m]) })), { basePlan: plan, iterations: 60 });
-    const top = res[0];
-    if (!top || top.tonnes <= cur + 0.0005) break;
-    set.push(top.machine); taken.add(top.machine.id); cur = top.tonnes;
-  }
-  const options = [];
-  if (set.length > 1) options.push({ key: `set${set.map((m) => m.id).join('.')}`, label: `${set.length} machines: ${set.map((m) => m.code).join(', ')}`, machineIds: set.map((m) => m.id), tonnes: r3(cur), gain: r3(cur - plan.tonnes), best: true });
-  for (const o of single) if (o.gain > 0.0005) options.push({ key: o.key, label: o.label, machineIds: o.machineIds, tonnes: o.tonnes, gain: o.gain });
-  options.sort((a, b) => b.gain - a.gain);
-  return { options: options.slice(0, 6), noSpare: fnsToTry.filter((fn) => !bestOfType(fn, new Set())).map((fn) => facts.fns[fn]?.name ?? fn) };
-}
-
 /** The optimiser's answer in the screen's words: dates, names, weeks, the load against capacity. */
 export function describePlan(facts, input, plan, machineIds) {
   const date = (d) => (d == null ? null : addDays(facts.from, d));
@@ -377,9 +328,19 @@ export async function planMonth(db, companyId, { month, machineIds = null, ranks
   const ids = (machineIds ?? facts.machines.filter((m) => m.on).map((m) => m.id)).map(Number).filter((id) => facts.machines.some((m) => m.id === id));
   const tol = Math.max(0, Math.min(60, Number.isFinite(Number(toleranceDays)) ? Math.round(Number(toleranceDays)) : 3));
   const input = engineInput(facts, { machineIds: ids, ranks, toleranceDays: tol });
-  const plan = optimise(input, { iterations, startOrder });
+  // The search runs in a worker thread (monthPlanWorker): the server keeps answering everyone else meanwhile.
+  const inPlan = new Set(ids);
+  const job = {
+    input: { days: input.days, monthEndDay: input.monthEndDay, toleranceDays: input.toleranceDays, pools: input.pools, unlimited: input.unlimited, units: input.units },
+    opts: { iterations, startOrder },
+    suggest: suggest ? {
+      monthEndDay: facts.monthEndDay, fnNames: Object.fromEntries(Object.values(facts.fns).map((f) => [f.key, f.name])),
+      spare: facts.machines.filter((m) => !inPlan.has(m.id)).map((m) => ({ id: m.id, code: m.code, name: m.name, fn: m.typeId, minutes: (facts.calendars.get(m.id)?.days ?? []).slice(0, facts.days).map((d) => Number(d.minutes ?? 0)) })),
+    } : null,
+  };
+  const { plan, suggestions } = await runPlanJob(job);
   const result = describePlan(facts, input, plan, ids);
-  result.suggestions = suggest ? suggestMachines(facts, input, plan, ids) : { options: [], noSpare: [] };
+  result.suggestions = suggestions ?? { options: [], noSpare: [] };
   return { facts, input, plan, result, machineIds: ids, toleranceDays: tol, ranks: input.ranked };
 }
 
@@ -438,7 +399,7 @@ export async function getMonth(db, companyId, q = {}) {
   let doc; let inputs;
   if (shown) { doc = json(shown.result_json); inputs = json(shown.inputs_json) ?? {}; }
   else {
-    const run = await planMonth(db, companyId, { month, iterations: 250 });
+    const run = await planMonth(db, companyId, { month, iterations: 250, suggest: false });
     doc = run.result; inputs = { machineIds: run.machineIds, ranks: run.ranks, toleranceDays: run.toleranceDays };
   }
   const machineIds = (inputs.machineIds ?? []).map(Number);

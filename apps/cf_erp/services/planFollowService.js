@@ -236,7 +236,7 @@ export async function runWeek(db, c, input = {}, sim = null) {
   const base = frozen?.inputs ?? {};
   const run = await planMonth(db, c.companyId, {
     month: week.month, machineIds: input.machineIds ?? base.machineIds ?? null, ranks: input.ranks ?? base.ranks ?? null,
-    toleranceDays: input.toleranceDays ?? base.toleranceDays ?? 3, startOrder: frozen?.result?.order ?? null,
+    toleranceDays: input.toleranceDays ?? base.toleranceDays ?? 3, startOrder: frozen?.result?.order ?? null, suggest: false,
     from: sim?.from ?? null, materialAsKnown: sim?.materialAsKnown ?? null,
   });
   const doc = run.result;
@@ -251,7 +251,7 @@ export async function runWeek(db, c, input = {}, sim = null) {
     week, month: week.month, from: doc.from, tonnesWeek: slice.tonnes, doneTonnes, planTonnes: doc.tonnes, tonnesMonth: r3(doneTonnes + doc.tonnes),
     frozenTonnes: frozen?.tonnes ?? null, against: againstFrozen(doc, frozen),
     finishing: slice.finishing, pivot: slice.pivot, load: slice.load, orders: doc.orders, units: doc.units, weeks: doc.weeks,
-    suggestions: doc.suggestions, contractors, consumables, order: doc.order, assumedMaterial: doc.assumedMaterial,
+    suggestions: frozen?.result?.suggestions ?? doc.suggestions, contractors, consumables, order: doc.order, assumedMaterial: doc.assumedMaterial,
   };
   const inputs = { machineIds: run.machineIds, ranks: run.ranks, toleranceDays: run.toleranceDays, mplanId: frozen?.id ?? null, asOf: today };
   const [[have]] = await db.query('SELECT id, status FROM cf_wplans WHERE company_id = ? AND week_start = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, week.start]);
@@ -384,21 +384,37 @@ export async function getWeek(db, companyId, q = {}) {
 /* ── The daily roster ──────────────────────────────────────────────────────────────────────────────── */
 
 /** Tomorrow's work from a fresh plan: one task per unit × machine type with hours that day, each on a machine of the type. */
-async function suggestDay(db, companyId, day) {
+async function suggestDay(db, companyId, day, { fresh = false } = {}) {
   const week = weekOfDay(day);
   const [[wrow]] = await db.query("SELECT * FROM cf_wplans WHERE company_id = ? AND week_start = ? AND deleted_at IS NULL", [companyId, week.start]);
   const frozen = await frozenPlan(db, companyId, week.month);
   const base = (wrow ? json(wrow.inputs_json) : null) ?? frozen?.inputs ?? {};
-  const startOrder = (wrow ? json(wrow.result_json)?.order : null) ?? frozen?.result?.order ?? null;
-  const { today } = await plantToday(db, companyId);
-  const run = await planMonth(db, companyId, { month: week.month, machineIds: base.machineIds ?? null, ranks: base.ranks ?? null, toleranceDays: base.toleranceDays ?? 3, startOrder, suggest: false, iterations: 150, from: day > today ? day : null });
-  const machines = run.facts.machines.filter((m) => run.machineIds.includes(m.id));
-  const idx = daysBetween(run.facts.from, day);
-  const left = new Map(machines.map((m) => [m.id, Number(run.facts.calendars.get(m.id)?.days?.[idx]?.minutes ?? 0)]));
+  const weekDoc = wrow ? json(wrow.result_json) : null;
+  let units; let orders; let machines; let minutesOf;
+  // The week's plan already says what runs on each day: the roster is its slice of that day (no search). Only "Suggest
+  // again" plans afresh from now — in the worker thread.
+  const docHasDay = !!weekDoc?.units?.some((u) => u.steps.some((s) => s.byDay?.[day] > 0));
+  if (!fresh && docHasDay) {
+    const ids = (base.machineIds ?? []).map(Number);
+    machines = (await fabricationMachines(db, companyId)).filter((m) => ids.includes(m.id));
+    const { machinesCalendar } = await import('./shiftService.js');
+    const cal = machines.length ? await machinesCalendar(db, companyId, { from: day, to: day, machineIds: machines.map((m) => m.id) }) : new Map();
+    minutesOf = (id) => Number(cal.get(id)?.days?.[0]?.minutes ?? 0);
+    units = weekDoc.units; orders = weekDoc.orders;
+  } else {
+    const startOrder = weekDoc?.order ?? frozen?.result?.order ?? null;
+    const { today } = await plantToday(db, companyId);
+    const run = await planMonth(db, companyId, { month: week.month, machineIds: base.machineIds ?? null, ranks: base.ranks ?? null, toleranceDays: base.toleranceDays ?? 3, startOrder, suggest: false, iterations: 150, from: day > today ? day : null });
+    machines = run.facts.machines.filter((m) => run.machineIds.includes(m.id));
+    const idx = daysBetween(run.facts.from, day);
+    minutesOf = (id) => Number(run.facts.calendars.get(id)?.days?.[idx]?.minutes ?? 0);
+    units = run.result.units; orders = run.result.orders;
+  }
+  const left = new Map(machines.map((m) => [m.id, minutesOf(m.id)]));
   const tasks = [];
-  const rank = new Map(run.result.orders.map((o) => [o.id, o.rank]));
+  const rank = new Map(orders.map((o) => [o.id, o.rank]));
   const todo = [];
-  for (const u of run.result.units) for (const s of u.steps) { const m = s.byDay[day]; if (m > 0) todo.push({ u, s, minutes: m }); }
+  for (const u of units) for (const s of u.steps) { const m = s.byDay[day]; if (m > 0) todo.push({ u, s, minutes: m }); }
   todo.sort((a, b) => (rank.get(a.u.orderId) ?? 99) - (rank.get(b.u.orderId) ?? 99) || String(a.u.finish ?? '9').localeCompare(String(b.u.finish ?? '9')));
   for (const t of todo) {
     let rest = t.minutes;
@@ -416,7 +432,7 @@ async function suggestDay(db, companyId, day) {
   }
   return {
     day, tasks,
-    machines: machines.map((m) => ({ id: m.id, code: m.code, name: m.name, typeId: m.typeId, typeName: m.typeName, area: m.areaName, minutes: Number(run.facts.calendars.get(m.id)?.days?.[idx]?.minutes ?? 0), contractor: m.contractor })),
+    machines: machines.map((m) => ({ id: m.id, code: m.code, name: m.name, typeId: m.typeId, typeName: m.typeName, area: m.areaName, minutes: minutesOf(m.id), contractor: m.contractor })),
   };
 }
 const taskOf = (t, m, minutes, n) => ({
@@ -432,7 +448,7 @@ export async function getDay(db, companyId, q = {}) {
   const { today } = await plantToday(db, companyId);
   const day = !blank(q.date) && DATE_RE.test(String(q.date)) ? String(q.date) : addDays(today, 1);
   const [[row]] = await db.query('SELECT * FROM cf_dplans WHERE company_id = ? AND plan_date = ?', [companyId, day]);
-  const sug = row && q.fresh !== '1' ? null : await suggestDay(db, companyId, day);
+  const sug = row && q.fresh !== '1' ? null : await suggestDay(db, companyId, day, { fresh: q.fresh === '1' });
   const saved = row ? json(row.tasks_json) : null;
   const machines = sug?.machines ?? saved?.machines ?? [];
   return {
