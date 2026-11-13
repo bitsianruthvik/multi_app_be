@@ -312,8 +312,10 @@ export async function weekActual(db, companyId, w) {
     if (u.gone) { cause = 'The order\'s structure changed — the unit is not in the plan any more'; kind = 'changed'; }
     else if (u.materialDate && o?.materialDate !== u.materialDate && u.materialDate > (o?.start ?? week.start)) { cause = `Material now due ${u.materialDate}${o?.materialDate ? ` (planned on ${o.materialDate})` : ''}`; kind = 'material'; }
     else {
-      const worst = (o?.steps ?? []).map((s) => ({ s, l: load.find((x) => x.fn === s.fn) })).filter((x) => x.l && x.l.plannedHours > 0)
-        .sort((a, b) => (a.l.runHours / a.l.plannedHours) - (b.l.runHours / b.l.plannedHours))[0];
+      // The operation that held it: one whose machines stood stopped first, else the one furthest behind its hours.
+      const behind = (o?.steps ?? []).map((s) => ({ s, l: load.find((x) => x.fn === s.fn) })).filter((x) => x.l && x.l.plannedHours > 0 && x.l.runHours < x.l.plannedHours * 0.9);
+      const worst = behind.filter((x) => x.l.stopHours > 0).sort((a, b) => b.l.stopHours - a.l.stopHours)[0]
+        ?? behind.sort((a, b) => (a.l.runHours / a.l.plannedHours) - (b.l.runHours / b.l.plannedHours))[0];
       if (worst && worst.l.stopHours > 0 && worst.l.runHours < worst.l.plannedHours * 0.9) { cause = `${worst.l.name}: ${worst.l.stopHours} h stopped, ${worst.l.runHours} of ${worst.l.plannedHours} planned hours run`; kind = 'machine'; }
       else if (worst && worst.l.runHours < worst.l.plannedHours * 0.9) { cause = `${worst.l.name}: ${worst.l.runHours} of ${worst.l.plannedHours} planned hours run`; kind = 'hours'; }
     }
