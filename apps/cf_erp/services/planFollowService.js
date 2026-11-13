@@ -226,8 +226,10 @@ const shapeWeek = (w) => ({
  * week tomorrow falls in), from today's facts and the frozen month plan's choices. Kept as the week's draft; a
  * published week is planned again only while it has not been closed.
  */
-export async function runWeek(db, c, input = {}) {
-  const { today, wall } = await plantToday(db, c.companyId);
+export async function runWeek(db, c, input = {}, sim = null) {
+  // sim { from, wall, materialAsKnown, publish } — the demo's history only (planning-demo.mjs): a week planned AS OF a day.
+  const clock = await plantToday(db, c.companyId);
+  const today = sim?.from ?? clock.today; const wall = sim?.wall ?? clock.wall;
   const day = !blank(input.weekStart) && DATE_RE.test(String(input.weekStart)) ? String(input.weekStart) : addDays(today, 1);
   const week = weekOfDay(day);
   const frozen = await frozenPlan(db, c.companyId, week.month);
@@ -235,6 +237,7 @@ export async function runWeek(db, c, input = {}) {
   const run = await planMonth(db, c.companyId, {
     month: week.month, machineIds: input.machineIds ?? base.machineIds ?? null, ranks: input.ranks ?? base.ranks ?? null,
     toleranceDays: input.toleranceDays ?? base.toleranceDays ?? 3, startOrder: frozen?.result?.order ?? null,
+    from: sim?.from ?? null, materialAsKnown: sim?.materialAsKnown ?? null,
   });
   const doc = run.result;
   const slice = weekSlice(doc, week);
@@ -264,6 +267,7 @@ export async function runWeek(db, c, input = {}) {
       [c.companyId, frozen?.id ?? null, week.start, week.end, JSON.stringify(inputs), JSON.stringify(result), result.tonnesWeek, result.tonnesMonth, wall, note, c.userId ?? null]);
     id = ins.insertId;
   }
+  if (sim?.publish) await db.query("UPDATE cf_wplans SET status = 'published', published_at = ?, published_by = ? WHERE company_id = ? AND id = ?", [wall, c.userId ?? null, c.companyId, id]);
   return getWeek(db, c.companyId, { id });
 }
 

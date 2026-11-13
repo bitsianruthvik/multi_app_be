@@ -348,8 +348,18 @@ export function describePlan(facts, input, plan, machineIds) {
 }
 
 /** Optimise a month from the planner's choices (nothing is written). */
-export async function planMonth(db, companyId, { month, machineIds = null, ranks = null, toleranceDays = 3, from = null, suggest = true, iterations = 400, startOrder = null } = {}) {
+export async function planMonth(db, companyId, { month, machineIds = null, ranks = null, toleranceDays = 3, from = null, suggest = true, iterations = 400, startOrder = null, materialAsKnown = null } = {}) {
   const facts = await loadFacts(db, companyId, { month, from });
+  // materialAsKnown { orderId: 'YYYY-MM-DD' } — a plan made AS OF an earlier day (the demo's history, scripts/cf_kepl/
+  // planning-demo.mjs): the date that order's material was promised for then. Never set from a request.
+  if (materialAsKnown) {
+    for (const u of facts.units) {
+      const d = materialAsKnown[u.orderId];
+      if (!d || u.done || u.materialState === 'ready') continue;
+      u.materialDate = d; u.materialAssumed = false; u.earliest = Math.max(0, daysBetween(facts.from, d));
+    }
+    facts.assumed = facts.units.filter((u) => u.materialAssumed).length;
+  }
   const ids = (machineIds ?? facts.machines.filter((m) => m.on).map((m) => m.id)).map(Number).filter((id) => facts.machines.some((m) => m.id === id));
   const tol = Math.max(0, Math.min(60, Number.isFinite(Number(toleranceDays)) ? Math.round(Number(toleranceDays)) : 3));
   const input = engineInput(facts, { machineIds: ids, ranks, toleranceDays: tol });

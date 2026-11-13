@@ -41,7 +41,8 @@ const QTY = Number(arg('qty') ?? bom.order?.spans ?? 1);
 
 const db = await pool.getConnection();
 try {
-  const [[admin]] = await db.query("SELECT id FROM users WHERE company_id = ? AND email LIKE 'admin@%' ORDER BY id LIMIT 1", [COMPANY]);
+  // The company's admin@ login, else its first user (the sandbox has md@, ppc@ … and no admin@).
+  const [[admin]] = await db.query("SELECT id FROM users WHERE company_id = ? AND deleted_at IS NULL ORDER BY (email LIKE 'admin@%') DESC, id LIMIT 1", [COMPANY]);
   const c = { companyId: COMPANY, userId: admin.id };
   const where = process.env.DB_HOST && !/^(localhost|127\.0\.0\.1)$/.test(process.env.DB_HOST) ? 'PRODUCTION' : 'local';
   console.log(`${where} — company ${COMPANY} — ${SET} — ${APPLY ? 'APPLY' : 'DRY RUN (rolled back)'}`);

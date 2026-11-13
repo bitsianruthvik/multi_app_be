@@ -35,6 +35,7 @@
  */
 
 const EPS = 1e-6;
+const DECODE_BUDGET = 9000;
 
 /** A small seeded generator (mulberry32) — the same input gives the same plan. */
 function rng(seed) {
@@ -223,7 +224,7 @@ export function upperBound(input) {
 export function optimise(input, { iterations: wanted = 400, budgetMs = 20000, seed = 20261113, startOrder = null } = {}) {
   // A fixed number of search rounds (not a time budget) so the same input always gives the same plan; budgetMs only
   // stops a run-away on a very large month.
-  const maxIterations = wanted;
+  let maxIterations = wanted;
   const t0 = Date.now();
   const n = input.units.length;
   const basePerm = priorityOrder(input);
@@ -247,6 +248,8 @@ export function optimise(input, { iterations: wanted = 400, budgetMs = 20000, se
   if (n > 2) {
     const k = Math.max(1, Math.min(4, Math.round(n / 12)));
     const sample = Math.min(n, 10);
+    // A large month: the rounds are cut so the whole search stays near DECODE_BUDGET schedule builds (seconds, not minutes).
+    maxIterations = Math.max(30, Math.min(wanted, Math.round(DECODE_BUDGET / ((k * sample + 1) * Math.max(1, n / 300)))));
     while (Date.now() - t0 < budgetMs && iterations < maxIterations) {
       iterations += 1;
       const perm = cur.slice();
