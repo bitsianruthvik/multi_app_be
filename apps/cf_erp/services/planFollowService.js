@@ -520,15 +520,23 @@ export async function detectAlerts(db, c) {
   }
 
   // 2. Material: a date that moved later than the plan assumed (or the unit's planned start).
+  // One alert per order and new date (a late purchase order moves many units at once).
+  const moved = new Map();
   for (const u of facts.units) {
     const p = planned.get(u.key);
     if (!p || u.done) continue;
     if (u.materialDate && !u.materialAssumed && (p.materialDate ?? '') < u.materialDate && u.materialDate > (p.start ?? today)) {
-      const slip = daysBetween(p.start ?? p.materialDate ?? today, u.materialDate);
-      add(`material:${u.key}`, 'material_date', p.inMonth ? 'danger' : 'warning', `Material for ${p.order} · ${u.code} now comes ${u.materialDate}`,
-        `The plan ${p.materialDate ? `had it on ${p.materialDate}` : 'had it in stock'} and starts the unit on ${p.start ?? '—'}: about ${slip} day${slip === 1 ? '' : 's'} later.${u.materialText ? ` ${u.materialText}` : ''}`,
-        { subjectType: 'order', subjectId: u.orderId, link: `orders/${u.orderId}`, impactTonnes: p.inMonth ? u.tonnes : 0 });
+      const k = `${u.orderId}:${u.materialDate}`;
+      const e = moved.get(k) ?? { orderId: u.orderId, order: p.order, date: u.materialDate, was: new Set(), units: 0, tonnes: 0, first: p.start ?? today, text: u.materialText ?? null };
+      e.units += 1; if (p.inMonth) e.tonnes += u.tonnes; e.was.add(p.materialDate ?? 'in stock'); if ((p.start ?? today) < e.first) e.first = p.start ?? today;
+      moved.set(k, e);
     }
+  }
+  for (const [k, e] of moved) {
+    const slip = Math.max(1, daysBetween(e.first, e.date));
+    add(`material:${k}`, 'material_date', e.tonnes > 0 ? 'danger' : 'warning', `Material for ${e.order} now comes ${e.date}`,
+      `The plan had it ${[...e.was].map((d) => (d === 'in stock' ? d : `on ${d}`)).join(' / ')}. ${e.units} unit${e.units === 1 ? '' : 's'} start up to ${slip} day${slip === 1 ? '' : 's'} later than planned.${e.text ? ` ${e.text}` : ''} Plan the week again to place them.`,
+      { subjectType: 'order', subjectId: e.orderId, link: `orders/${e.orderId}`, impactTonnes: r3(e.tonnes) });
   }
   // 3. Behind the plan: a unit whose planned finish has passed and is not done.
   const late = (doc.units ?? []).filter((p) => p.finish && p.finish < today && p.inMonth).map((p) => ({ p, u: facts.units.find((x) => x.key === p.key) })).filter((x) => x.u && !x.u.done);

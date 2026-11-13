@@ -125,7 +125,21 @@ function stepsOf(u) {
  * Everything a plan of `month` is made from, as of `from` (the plan's first day: the month's 1st, or today when the
  * month has begun). { month, from, last, days, orders, units, machines, calendars, fns, assumed }.
  */
-export async function loadFacts(db, companyId, { month, from = null } = {}) {
+export async function loadFacts(db, companyId, opts = {}) {
+  // One screen asks for the same facts several times (the overview: the week, its progress, the alerts). They are kept
+  // FACTS_TTL_MS per company, month and first day; a plan run inside a transaction reads them fresh.
+  const key = `${companyId}|${opts.month}|${opts.from ?? ''}`;
+  const hit = factsCache.get(key);
+  if (hit && Date.now() - hit.at < FACTS_TTL_MS && !opts.fresh) return structuredClone(hit.facts);
+  const facts = await loadFactsNow(db, companyId, opts);
+  factsCache.set(key, { at: Date.now(), facts: structuredClone(facts) });
+  if (factsCache.size > 40) factsCache.delete(factsCache.keys().next().value);
+  return facts;
+}
+const FACTS_TTL_MS = 45_000;
+const factsCache = new Map();
+
+async function loadFactsNow(db, companyId, { month, from = null } = {}) {
   const { first, last } = monthBounds(month);
   const { today } = await plantToday(db, companyId);
   const start = from ?? (today > first ? (today > last ? last : today) : first);
