@@ -8,7 +8,7 @@ import { pool } from '../../../db.js';
 const CACHE_MS = 5 * 60 * 1000;
 const cache = new Map();
 const fail = (status, message) => Object.assign(new Error(message), { status });
-const DATASETS = ['meta', 'customers', 'parts', 'sales', 'disp', 'lines', 'rej', 'control', 'flow', 'workDays', 'dieMelt', 'wip', 'heats', 'charge', 'energy', 'vendors', 'machPo', 'purchases', 'grn', 'stepParts', 'stepGap', 'stepWait', 'stepBreak', 'shipLots', 'clearedNow', 'journey', 'batchFacts', 'rhythm', 'salesOrders'];
+const DATASETS = ['meta', 'customers', 'parts', 'sales', 'disp', 'lines', 'rej', 'control', 'flow', 'workDays', 'dieMelt', 'wip', 'heats', 'charge', 'energy', 'vendors', 'machPo', 'purchases', 'grn', 'stepParts', 'stepGap', 'stepWait', 'stepBreak', 'shipLots', 'clearedNow', 'journey', 'batchFacts', 'rhythm', 'salesOrders', 'dailyFlow', 'stock', 'custRej'];
 
 async function load(companyId) {
   const hit = cache.get(companyId);
@@ -463,4 +463,184 @@ export async function summary(companyId, q) {
     vendors: { sentT: ven.kpis.tonnes, medianDays: ven.kpis.medianDays, notBackT: ven.kpis.openTonnes, oldNotBackT: ven.kpis.oldOpenTonnes, purchases: mat.kpis.value, suppliers: mat.kpis.suppliers },
     months, asOf: d.m.asOf,
   };
+}
+
+// ══ Second dashboard: the same facts, arranged by what the reader wants to do ══
+// Alerts (is something going wrong), Today (day-to-day), This month (monthly plan), Long term, Decisions.
+// Every rule that raises an alert is returned with it, so the screen can print it. No forecasts, no estimates:
+// "usual" always means the plant's own figures in the months before.
+
+const addDays = (iso, n) => new Date(Date.parse(iso) + n * 86400000).toISOString().slice(0, 10);
+const lastCompleteMonth = (d) => addMonths(d.m.asOf.slice(0, 7), -1);
+const monthsBack = (last, n) => Array.from({ length: n }, (_, i) => addMonths(last, i - n + 1));
+const monthRange = (mo) => ({ from: `${mo}-01`, to: `${mo}-31` });
+
+/** One figure per complete month, for each measure the alerts and the long-term screen follow. */
+function monthSeries(d, months) {
+  const shippedBy = groupBy(d.journey.filter((j) => j.full), (j) => j.full.slice(0, 7));
+  const dueBy = groupBy(d.lines.filter((l) => !l.sc && l.dd && l.dd <= d.m.asOf), (l) => l.dd.slice(0, 7));
+  const intake = groupBy(d.salesOrders, (s) => s.od.slice(0, 7)); const crej = groupBy(d.custRej, (r) => r.dt.slice(0, 7));
+  return months.map((mo) => {
+    const q = monthRange(mo); const sales = d.sales.filter((s) => inDates(s.dt, q)); const am = sum(sales, (s) => s.am); const kg = sum(sales, (s) => s.kg);
+    const poured = sum(d.flow.filter((r) => r.stage === 'Melting' && r.mo === mo), (r) => r.kg); const rej = sum(d.rej.filter((r) => r.mo === mo), (r) => r.kg);
+    const due = dueBy.get(mo) || []; const sh = shippedBy.get(mo) || []; const wd = sum(d.workDays.filter((w) => w.stage === 'Melting' && w.mo === mo), (w) => w.days);
+    const byC = [...groupBy(sales, (s) => s.c).values()].map((a) => sum(a, (s) => s.am)).sort((a, b) => b - a);
+    return { mo, sales: Math.round(am), soldT: tonnes(kg), pricePerKg: round(kg ? am / kg : null, 0), pouredT: tonnes(poured), dispatchedT: tonnes(sum(d.disp.filter((r) => inDates(r.dt, q)), (r) => r.kg)), orderedT: tonnes(sum(intake.get(mo) || [], (s) => s.kg)),
+      onTimePct: round(pct(due.filter((l) => !isLate(l, d.m.asOf)).length, due.length), 0), dueLines: due.length, rejectionPct: round(pct(rej, poured), 1), pourToPass: median(sh.map((j) => j.legs.pour2ins)), orderToShip: median(sh.map((j) => days(j.od, j.full))),
+      kgPerPourDay: wd ? Math.round(poured / wd) : null, customers: byC.length, topShare: round(pct(byC[0] || 0, am), 0), top5Share: round(pct(sum(byC.slice(0, 5), (x) => x), am), 0), exportShare: round(pct(sum(sales.filter((s) => s.x === 'Export'), (s) => s.am), am), 0),
+      customerRejPcs: sum(crej.get(mo) || [], (r) => r.q) };
+  });
+}
+const MEASURES = [
+  ['onTimePct', 'Order lines shipped on time', (v) => `${v}%`, 'low', 'journey'], ['rejectionPct', 'Rejected, of metal poured', (v) => `${v}%`, 'high', 'quality'], ['pourToPass', 'Days from pouring to passing inspection', (v) => `${v} days`, 'high', 'time-spent'],
+  ['orderToShip', 'Days from order to shipment', (v) => `${v} days`, 'high', 'time-spent'], ['pouredT', 'Tonnes poured', (v) => `${v} t`, 'low', 'production'], ['dispatchedT', 'Tonnes dispatched', (v) => `${v} t`, 'low', 'step-dispatch'],
+  ['orderedT', 'Tonnes ordered', (v) => `${v} t`, 'low', 'journey'], ['sales', 'Sales', (v) => `₹${(v / 1e7).toFixed(2)} Cr`, 'low', 'customers'], ['customerRejPcs', 'Pieces rejected by customers', (v) => `${v} pcs`, 'high', 'x-decisions'],
+];
+
+/** Materials: stock the store holds against what the issue slips took out in the last 90 days. */
+function stockCover(d) {
+  return d.stock.filter((s) => s.used90 > 0).map((s) => { const perDay = s.used90 / 90; const cover = perDay ? s.stock / perDay : null;
+    return { id: s.id, item: s.item, group: s.group, unit: s.unit, stock: s.stock, perDay: round(perDay, 1), used90: s.used90, coverDays: cover == null ? null : Math.round(cover), leadDays: s.lead || null, short: s.lead > 0 && cover != null && cover < s.lead, lastBuy: s.lastBuy, lastVendor: s.lastVendor, lastIssue: s.lastIssue }; })
+    .sort((a, b) => (a.coverDays ?? 1e9) - (b.coverDays ?? 1e9));
+}
+const vendorOpenRows = (d) => d.vendors.filter((r) => r.openKg > 0).map((r) => ({ vendor: r.v, process: r.p, no: r.no, part: d.partName.get(r.die) || r.part || '', sent: r.dt, days: days(r.dt, d.m.asOf), kg: Math.round(r.openKg), sentPcs: r.q, backPcs: r.got })).sort((a, b) => b.days - a.days);
+
+// ── Alerts ──
+export async function intentAlerts(companyId) {
+  const d = await load(companyId); const asOf = d.m.asOf; const all = {};
+  const [act, ready, ven, mach, rhythm] = await Promise.all([actions(companyId, all), readyWaiting(companyId, all), vendors(companyId, all), machiningOrders(companyId, all), shippingRhythm(companyId, all)]);
+  const groups = []; const add = (group, items) => { const a = items.filter(Boolean); if (a.length) groups.push({ group, items: a }); };
+  const item = (title, value, detail, rule, to, rows) => ({ title, value, detail, rule, to, rows: rows || [] });
+  const lineRow = (r) => ({ a: r.part, b: r.customer, c: `${r.tonnes} t`, d: r.daysOverdue ? `${r.daysOverdue} days late` : r.due ? `due ${r.due}` : '' });
+
+  add('Orders', [
+    act.pastDue.lines && item('Order lines past their due date', `${act.pastDue.lines} lines`, `${act.pastDue.tonnes} t still to ship`, 'Open order lines whose delivery date is before the data date.', 'actions', act.pastDue.rows.slice(0, 5).map(lineRow)),
+    act.dueNotPoured.lines && item('Due within 30 days and not yet poured', `${act.dueNotPoured.lines} lines`, `${act.dueNotPoured.tonnes} t · pouring to inspection alone takes a median ${(await timeSpent(companyId, all)).legs.find((l) => l.key === 'pour2ins')?.days ?? '—'} days`, 'Open lines due in the next 30 days where less than the ordered quantity has been poured.', 'actions', act.dueNotPoured.rows.slice(0, 5).map(lineRow)),
+  ]);
+  add('Production', [
+    act.waitingAfterPour.lines && item('Poured over 60 days ago, still not inspected', `${act.waitingAfterPour.lines} lines`, `${act.waitingAfterPour.tonnes} t`, 'Open lines whose biggest pile is poured-not-inspected and whose last pour is 60 or more days before the data date.', 'step-inspection', act.waitingAfterPour.rows.slice(0, 5).map(lineRow)),
+  ]);
+  const overdueCust = ready.rows.filter((r) => r.daysToNext != null && r.daysToNext < 0);
+  add('Shipping', [
+    overdueCust.length && item('Castings ready for customers past their usual shipment', `${overdueCust.length} customer${overdueCust.length > 1 ? 's' : ''}`, `${round(sum(overdueCust, (r) => r.tonnes), 1)} t ready`, 'Cleared, unshipped castings for a customer whose usual gap between shipments has already passed.', 'ready-waiting', overdueCust.slice(0, 5).map((r) => ({ a: r.customer, b: r.rhythm, c: `${r.tonnes} t`, d: `${-r.daysToNext} days past` }))),
+    ready.kpis.pastDue > 0 && item('Ready castings on lines already past due', `${ready.kpis.pastDue} t`, `of ${ready.kpis.tonnes} t ready and not shipped`, 'Cleared, unshipped castings on open lines whose delivery date has passed.', 'ready-waiting'),
+  ]);
+  const old = vendorOpenRows(d).filter((r) => r.days > 60);
+  add('Vendors', [
+    old.length && item('Castings at job-work vendors for over 60 days', `${round(sum(old, (r) => r.kg) / 1000, 1)} t`, `${old.length} outward lines`, 'Outward lines not fully returned, sent more than 60 days before the data date.', 'vendors', old.slice(0, 5).map((r) => ({ a: r.vendor, b: `${r.process} · ${r.part}`, c: `${r.kg} kg`, d: `${r.days} days out` }))),
+    mach.kpis.pastPlanLines > 0 && item('Machining order lines past their planned date', `${mach.kpis.pastPlanLines} lines`, `${num0(mach.kpis.openPcs)} pieces open in all`, 'Machining PO lines with pieces still to come whose completion date has passed.', 'machining-orders', mach.openList.filter((r) => r.daysPastPlan > 0).slice(0, 5).map((r) => ({ a: r.vendor, b: r.part, c: `${r.open} pcs`, d: `${r.daysPastPlan} days past` }))),
+  ]);
+  const cover = stockCover(d); const short = cover.filter((s) => s.short); const badRates = d.purchases.filter((p) => p.bad && p.dt >= addDays(asOf, -90));
+  add('Materials', [
+    short.length && item('Materials with less stock than they use in their lead time', `${short.length} items`, `${short.filter((s) => s.stock === 0).length} show no stock at all`, 'Store stock divided by the average daily issue of the last 90 days is fewer days than the item\'s purchase lead time in the item master.', 'x-today', short.slice(0, 6).map((s) => ({ a: s.item, b: `${s.stock} ${s.unit} in stock`, c: `${s.coverDays} days of use`, d: `lead time ${s.leadDays} days` }))),
+    badRates.length && item('Purchase entries with a rate far above the usual', `${badRates.length} lines`, `₹${(sum(badRates, (p) => p.val) / 1e7).toFixed(2)} Cr in the last 90 days`, 'Inward lines in the last 90 days whose rate is over 100 times the item\'s usual rate.', 'material-suppliers'),
+  ]);
+  const cr90 = d.custRej.filter((r) => r.dt >= addDays(asOf, -90)); const crPrev = d.custRej.filter((r) => r.dt >= addDays(asOf, -180) && r.dt < addDays(asOf, -90));
+  add('Quality', [
+    cr90.length && item('Rejected by customers in the last 90 days', `${sum(cr90, (r) => r.q)} pieces`, `${cr90.length} entries · ${sum(crPrev, (r) => r.q)} pieces in the 90 days before`, 'Customer rejection entries dated in the last 90 days.', 'x-decisions',
+      [...groupBy(cr90, (r) => r.reason).entries()].map(([k, a]) => ({ a: k, b: [...new Set(a.map((r) => d.custName.get(r.c)))].slice(0, 2).join(', '), c: `${sum(a, (r) => r.q)} pcs`, d: `${a.length} entries` })).sort((x, y) => parseInt(y.c, 10) - parseInt(x.c, 10)).slice(0, 5)),
+  ]);
+
+  // The last complete month against the twelve before it: flagged only when it falls outside everything seen in those months.
+  const last = lastCompleteMonth(d); const series = monthSeries(d, monthsBack(last, 13)).filter((m) => m.mo >= d.m.from.slice(0, 7)); const now = series.at(-1); const before = series.slice(0, -1);
+  const checks = MEASURES.map(([key, label, fmt, bad, to]) => {
+    const prev = before.map((m) => m[key]).filter((v) => v != null); if (now[key] == null || prev.length < 6) return null; const lo = Math.min(...prev), hi = Math.max(...prev);
+    const out = now[key] < lo ? 'low' : now[key] > hi ? 'high' : null;
+    return { key, label, value: fmt(now[key]), usual: `${fmt(median(prev))} usual · ${fmt(lo)} to ${fmt(hi)}`, outside: out, worse: out != null && out === bad, to, series: series.map((m) => ({ mo: m.mo, v: m[key] })) };
+  }).filter(Boolean);
+  return { asOf, groups, month: last, checks, counts: { alerts: sum(groups, (g) => g.items.length), outside: checks.filter((c) => c.outside).length, worse: checks.filter((c) => c.worse).length }, regularCustomers: rhythm.rows.length, openVendorTonnes: ven.kpis.openTonnes };
+}
+const num0 = (v) => new Intl.NumberFormat('en-IN').format(Math.round(v || 0));
+
+// ── Today: what is on the floor and what to do next ──
+export async function intentToday(companyId) {
+  const d = await load(companyId); const asOf = d.m.asOf; const all = {};
+  const [act, ready, mach] = await Promise.all([actions(companyId, all), readyWaiting(companyId, all), machiningOrders(companyId, all)]);
+  const stages = [...STAGE_ORDER].map((stage) => { const a = d.dailyFlow.filter((r) => r.stage === stage).sort((x, y) => (x.dt < y.dt ? -1 : 1)); if (!a.length) return null; const lastRow = a.at(-1);
+    return { stage, lastDate: lastRow.dt, lastKg: Math.round(lastRow.kg), usualKg: Math.round(median(a.map((r) => r.kg))), days: a.slice(-14).map((r) => ({ dt: r.dt, kg: Math.round(r.kg) })), workedDays: a.length }; }).filter(Boolean);
+  const waiting = [...groupBy(d.stepWait, (r) => r.stage).entries()].map(([stage, a]) => ({ stage, tonnes: round(sum(a, (r) => r.kg) / 1000, 1), lines: a.length, oldestDays: Math.max(...a.map((r) => (r.since ? days(r.since, asOf) : 0))), over30: round(sum(a.filter((r) => r.since && days(r.since, asOf) > 30), (r) => r.kg) / 1000, 1) }))
+    .sort((a, b) => STAGE_ORDER.indexOf(a.stage) - STAGE_ORDER.indexOf(b.stage));
+  const toInspect = d.stepWait.filter((r) => r.stage === 'Inspection').map((r, i) => ({ key: i, part: d.partName.get(r.die) || '', customer: d.custName.get(r.c) || '', kg: Math.round(r.kg), pieces: r.pcs, days: r.since ? days(r.since, asOf) : null, due: r.due })).sort((a, b) => b.kg - a.kg);
+  const slim = (r) => ({ id: r.id, orderNo: r.orderNo, customer: r.customer, part: r.part, due: r.due, tonnes: r.tonnes, pending: r.pending, daysOverdue: r.daysOverdue, at: r.at });
+  return { asOf, stages, waiting,
+    toPour: { lines: act.dueNotPoured.lines, tonnes: act.dueNotPoured.tonnes, rows: act.dueNotPoured.rows.slice(0, 40).map(slim) },
+    pastDue: { lines: act.pastDue.lines, tonnes: act.pastDue.tonnes, rows: act.pastDue.rows.slice(0, 40).map(slim) },
+    toInspect: { lines: toInspect.length, tonnes: round(sum(toInspect, (r) => r.kg) / 1000, 1), rows: toInspect.slice(0, 40) },
+    toShip: { tonnes: ready.kpis.tonnes, rows: ready.rows },
+    atVendors: { tonnes: round(sum(vendorOpenRows(d), (r) => r.kg) / 1000, 1), rows: vendorOpenRows(d).slice(0, 40).map((r, i) => ({ key: i, ...r })) },
+    machining: { lines: mach.kpis.pastPlanLines, rows: mach.openList.filter((r) => r.daysPastPlan > 0).slice(0, 40) },
+    materials: stockCover(d).filter((s) => s.short || (s.coverDays != null && s.coverDays <= 14)).slice(0, 40) };
+}
+
+// ── This month: what is due, how far along it is, and what the plant usually manages ──
+const STAGE_BUCKETS = ['Not started', 'In wax, not poured', 'Poured, not inspected', 'Inspected, not cleared', 'Cleared, not shipped'];
+function stageSplit(l) {
+  let left = Math.max(0, l.q - l.shipQty); const kgPer = l.q ? l.tn / l.q : 0; const take = (n) => { const t = Math.min(left, Math.max(0, n)); left -= t; return t * kgPer; };
+  const cleared = take((l.qc || 0) - l.shipQty); const inspected = take((l.qn || 0) - (l.qc || 0)); const poured = take((l.qp || 0) - (l.qn || 0)); const wax = take((l.qi || 0) - (l.qp || 0));
+  return [left * kgPer, wax, poured, inspected, cleared];
+}
+export async function intentMonth(companyId, q) {
+  const d = await load(companyId); const asOf = d.m.asOf; const f = dimFilter(q); const open = d.lines.filter((l) => !l.sc && !l.full && f(l)); const thisMo = asOf.slice(0, 7);
+  const bucketOf = (l) => (!l.dd ? 'No due date' : l.dd < asOf ? 'Past due' : l.dd.slice(0, 7) > addMonths(thisMo, 4) ? 'Later' : l.dd.slice(0, 7));
+  const order = ['Past due', ...Array.from({ length: 5 }, (_, i) => addMonths(thisMo, i)), 'Later', 'No due date'];
+  const dueLoad = order.map((key) => { const a = open.filter((l) => bucketOf(l) === key); const parts = [0, 0, 0, 0, 0]; for (const l of a) stageSplit(l).forEach((kg, i) => { parts[i] += kg; });
+    return { key, lines: a.length, customers: new Set(a.map((l) => l.c)).size, tonnes: round(sum(parts, (x) => x) / 1000, 1), stages: Object.fromEntries(STAGE_BUCKETS.map((s, i) => [s, round(parts[i] / 1000, 1)])) }; }).filter((b) => b.lines);
+  const last = lastCompleteMonth(d); const series = monthSeries(d, monthsBack(last, 12)).filter((m) => m.mo >= d.m.from.slice(0, 7));
+  const range = (k) => { const v = series.map((m) => m[k]).filter((x) => x != null); return { low: Math.min(...v), usual: median(v), high: Math.max(...v) }; };
+  const horizon = addDays(asOf, 30);
+  const shipments = d.rhythm.map((r) => { const lines = open.filter((l) => l.c === r.c); const dueSoon = lines.filter((l) => l.dd && l.dd <= horizon); const ready = d.clearedNow.filter((n) => n.c === r.c);
+    return { id: r.c, customer: d.custName.get(r.c) || '', usualGap: r.median, last: r.last, next: r.next, daysToNext: days(asOf, r.next), readyTonnes: round(sum(ready, (n) => n.kg) / 1000, 1), dueTonnes: round(sum(dueSoon, pendingKg) / 1000, 1), dueLines: dueSoon.length, openTonnes: round(sum(lines, pendingKg) / 1000, 1) }; })
+    .filter((r) => r.next <= horizon && r.last >= addDays(asOf, -3 * r.usualGap) && (r.openTonnes > 0 || r.readyTonnes > 0)).sort((a, b) => (a.next < b.next ? -1 : 1));
+  const byCustomer = [...groupBy(open.filter((l) => l.dd && l.dd <= addDays(asOf, 60)), (l) => l.c).entries()].map(([c, a]) => { const parts = [0, 0, 0, 0, 0]; for (const l of a) stageSplit(l).forEach((kg, i) => { parts[i] += kg; });
+    return { id: c, customer: d.custName.get(c) || '', lines: a.length, tonnes: round(sum(parts, (x) => x) / 1000, 1), pastDue: round(sum(a.filter((l) => l.dd < asOf), pendingKg) / 1000, 1), notPoured: round((parts[0] + parts[1]) / 1000, 1), poured: round(parts[2] / 1000, 1), ready: round((parts[3] + parts[4]) / 1000, 1) }; }).sort((a, b) => b.tonnes - a.tonnes);
+  const materials = stockCover(d).slice().sort((a, b) => b.used90 - a.used90).slice(0, 25).map((s) => ({ ...s, perMonth: round(s.used90 / 3, 0) }));
+  return { asOf, load: dueLoad, stageBuckets: STAGE_BUCKETS, months: series.map((m) => ({ mo: m.mo, orderedT: m.orderedT, pouredT: m.pouredT, dispatchedT: m.dispatchedT })), poured: range('pouredT'), dispatched: range('dispatchedT'), ordered: range('orderedT'), shipments, byCustomer, materials };
+}
+
+// ── Long term: quarter by quarter, and this year against the year before ──
+export async function intentLongTerm(companyId) {
+  const d = await load(companyId); const last = lastCompleteMonth(d); const from = d.m.from.slice(0, 7); const months = []; for (let m = addMonths(from, 1); m <= last; m = addMonths(m, 1)) months.push(m);
+  const s = monthSeries(d, months); const w = compareWindows(d, 12);
+  const side = (win) => { const sales = d.sales.filter((x) => inDates(x.dt, win)); const due = d.lines.filter((l) => !l.sc && l.dd && l.dd <= d.m.asOf && inDates(l.dd, win)); return { sales, due }; };
+  const A = side(w.now), B = side(w.prev);
+  const cmp = (key, name) => { const keys = new Set([...A.sales, ...B.sales].map((x) => x[key])); return [...keys].map((k) => { const a = sales1(A.sales.filter((x) => x[key] === k)); const b = sales1(B.sales.filter((x) => x[key] === k));
+    const dueA = A.due.filter((l) => l[key] === k); const dueB = B.due.filter((l) => l[key] === k);
+    return { key: String(k), name: name(k), now: a.sales, prev: b.sales, change: a.sales - b.sales, changePct: b.sales ? round(pct(a.sales - b.sales, b.sales), 0) : null, nowT: tonnes(a.kg), prevT: tonnes(b.kg), nowPrice: a.pricePerKg, prevPrice: b.pricePerKg,
+      nowOnTime: round(pct(dueA.filter((l) => !isLate(l, d.m.asOf)).length, dueA.length), 0), prevOnTime: round(pct(dueB.filter((l) => !isLate(l, d.m.asOf)).length, dueB.length), 0) }; }).sort((x, y) => y.now - x.now); };
+  const tot = (side_) => { const e = sales1(side_.sales); const byC = [...groupBy(side_.sales, (x) => x.c).values()].map((a) => sum(a, (x) => x.am)).sort((a, b) => b - a);
+    return { ...e, tonnes: tonnes(e.kg), customers: byC.length, topShare: round(pct(byC[0] || 0, e.sales), 0), top5Share: round(pct(sum(byC.slice(0, 5), (x) => x), e.sales), 0), onTimePct: round(pct(side_.due.filter((l) => !isLate(l, d.m.asOf)).length, side_.due.length), 0) }; };
+  const newParts = (win) => { const lines = d.lines.filter((l) => inDates(l.od, win)); return { lines: lines.length, newLines: lines.filter((l) => l.n === 'First order for part').length, newTonnes: tonnes(sum(lines.filter((l) => l.n === 'First order for part'), (l) => l.tn)), tonnes: tonnes(sum(lines, (l) => l.tn)) }; };
+  return { asOf: d.m.asOf, months: s, now: { ...w.now, ...tot(A), parts: newParts(w.now) }, prev: { ...w.prev, ...tot(B), parts: newParts(w.prev) }, prevPartial: w.prevPartial,
+    customers: cmp('c', (k) => d.custName.get(k) || `Customer ${k}`).slice(0, 40), metals: cmp('m', (k) => k), markets: cmp('x', (k) => k), finishes: cmp('f', (k) => k) };
+}
+
+// ── Decisions: side-by-side figures for choices the plant makes ──
+export async function intentDecisions(companyId, q) {
+  const d = await load(companyId); const w = compareWindows(d, 12); const win = { from: q.from || w.now.from, to: q.to || w.now.to };
+  // 1. Which vendor for a process: speed and what came back rejected.
+  const v = d.vendors.filter((r) => inDates(r.dt, win));
+  const vendorChoice = [...groupBy(v, (r) => r.p).entries()].map(([process, a]) => ({ process, tonnes: round(sum(a, (r) => r.t) / 1000, 0),
+    vendors: [...groupBy(a, (r) => r.v).entries()].map(([vendor, b]) => ({ vendor, tonnes: round(sum(b, (r) => r.t) / 1000, 1), share: round(pct(sum(b, (r) => r.t), sum(a, (r) => r.t)), 0), lines: b.length, medianDays: median(b.map((r) => r.days)), slowDays: pctl(b.map((r) => r.days), 0.9), rejectedPct: round(pct(sum(b, (r) => r.rj), sum(b, (r) => r.got)), 2), openTonnes: round(sum(b, (r) => r.openKg) / 1000, 1) }))
+      .filter((x) => x.tonnes >= 1).sort((x, y) => y.tonnes - x.tonnes).slice(0, 8) })).filter((p) => p.vendors.length > 1).sort((a, b) => b.tonnes - a.tonnes);
+  // 2. Which supplier for a material: the rate each charged.
+  const buy = d.purchases.filter((p) => inDates(p.dt, win) && !p.bad && p.q > 0);
+  const supplierChoice = [...groupBy(buy, (p) => p.item).entries()].map(([item, a]) => ({ item, group: a[0].group, value: Math.round(sum(a, (p) => p.val)),
+    suppliers: [...groupBy(a, (p) => p.v).entries()].map(([supplier, b]) => { const sorted = [...b].sort((x, y) => (x.dt < y.dt ? -1 : 1)); return { supplier, qty: round(sum(b, (p) => p.q), 0), value: Math.round(sum(b, (p) => p.val)), rate: round(sum(b, (p) => p.val) / sum(b, (p) => p.q), 2), lastRate: round(sorted.at(-1).val / sorted.at(-1).q, 2), lastDate: sorted.at(-1).dt, receipts: b.length }; }).sort((x, y) => y.value - x.value) }))
+    .filter((i) => i.suppliers.length > 1).sort((a, b) => b.value - a.value).slice(0, 20);
+  // 3. How much extra to start: what was put into production against what was actually lost, per part.
+  const jr = d.journey.filter((j) => inDates(j.od, win) && j.planned != null); const melt = groupBy(d.dieMelt.filter((r) => inMonths(r.mo, win)), (r) => r.die); const rej = groupBy(d.rej.filter((r) => inMonths(r.mo, win)), (r) => r.die);
+  const extraVsLoss = [...groupBy(jr, (j) => j.die).entries()].map(([die, a]) => { const poured = sum(melt.get(die) || [], (r) => r.kg); const lost = sum(rej.get(die) || [], (r) => r.kg); const extra = round((median(a.map((j) => j.planned)) - 1) * 100, 0); const loss = poured ? round(pct(lost, poured), 1) : null;
+    return { die, part: d.partName.get(die) || `Part ${die}`, customer: d.custName.get(a[0].c) || '', lines: a.length, tonnes: round(sum(a, (j) => j.tn) / 1000, 1), extraPct: extra, lossPct: loss, gap: loss == null ? null : round(loss - extra, 1), secondBatches: a.filter((j) => j.later > 0 || j.rework > 0).length, late: a.filter((j) => j.full && j.full > j.dd).length, pouredTonnes: round(poured / 1000, 1) }; })
+    .filter((r) => r.lines >= 3 && r.pouredTonnes >= 1 && r.lossPct != null).sort((a, b) => (b.gap ?? -99) - (a.gap ?? -99));
+  // 4. Which customers: money, price, delivery, losses and their own rejections in one row.
+  const custRows = customerRows(d, win); const jc = groupBy(d.journey.filter((j) => inDates(j.od, win)), (j) => j.c); const meltC = groupBy(d.dieMelt.filter((r) => inMonths(r.mo, win)), (r) => r.c); const rejC = groupBy(d.rej.filter((r) => inMonths(r.mo, win)), (r) => r.c); const crC = groupBy(d.custRej.filter((r) => inDates(r.dt, win)), (r) => r.c);
+  const dueC = groupBy(d.lines.filter((l) => !l.sc && l.dd && l.dd <= d.m.asOf && inDates(l.dd, win)), (l) => l.c);
+  const customers_ = custRows.slice(0, 30).map((c) => { const j = jc.get(c.id) || []; const sh = j.filter((x) => x.full); const due = dueC.get(c.id) || []; const poured = sum(meltC.get(c.id) || [], (r) => r.kg);
+    const cls = (name) => round(sum(j.filter((x) => x.cls === name), (x) => x.tn) / 1000, 1);
+    return { id: c.id, customer: c.name, sales: c.sales, share: c.share, pricePerKg: c.pricePerKg, onTimePct: round(pct(due.filter((l) => !isLate(l, d.m.asOf)).length, due.length), 0), orderToShip: median(sh.map((x) => days(x.od, x.full))), promised: median(sh.filter((x) => x.dd).map((x) => days(x.od, x.dd))),
+      rejectionPct: poured ? round(pct(sum(rejC.get(c.id) || [], (r) => r.kg), poured), 1) : null, customerRejPcs: sum(crC.get(c.id) || [], (r) => r.q), readyLateT: cls('Ready on time, shipped late'), finishedLateT: round(cls('Poured on time, finished late') + cls('Poured late'), 1) }; });
+  // 5. Customer rejections by part and reason.
+  const cr = d.custRej.filter((r) => inDates(r.dt, win));
+  const customerRejections = [...groupBy(cr, (r) => `${r.die}|${r.reason}`).values()].map((a) => ({ key: `${a[0].die}|${a[0].reason}`, part: d.partName.get(a[0].die) || `Part ${a[0].die}`, customer: d.custName.get(a[0].c) || '', reason: a[0].reason, pieces: sum(a, (r) => r.q), kg: Math.round(sum(a, (r) => r.kg)), entries: a.length, last: a.map((r) => r.dt).sort().at(-1) })).sort((a, b) => b.pieces - a.pieces).slice(0, 60);
+  return { asOf: d.m.asOf, window: win, vendorChoice, supplierChoice, extraVsLoss, customers: customers_, customerRejections };
 }

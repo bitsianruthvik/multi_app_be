@@ -84,7 +84,7 @@ const lines = rawLines.map((l) => {
   const shipQty = sum(s, (e) => e.q);
   const injN = qtySum(inj, ids, 'qn'); const pourI = qtySum(melt, ids, 'qi'); const pourN = qtySum(melt, ids, 'qn'); const insI = qtySum(ins, ids, 'qi'); const insN = qtySum(ins, ids, 'qn'); const authQ = qtySum(auth, ids, 'qi');
   const piles = { 'Not injected': Math.max(0, l.q - injN), 'Injected, not poured': Math.max(0, injN - pourI), 'Poured, not inspected': Math.max(0, pourN - insI), 'Inspected, not cleared': Math.max(0, insN - authQ), 'Cleared, not shipped': Math.max(0, authQ - shipQty) };
-  return { id: l.id, ono: l.ono, die: l.die, ...dimsOfLine(l.id), c: l.c, od, dd: d10(l.dd), q: l.q, tn: round(l.tn, 1), sc: l.sc ? 1 : 0, shipQty, full, sh: s.map((e) => [e.dt, e.q]), legs, bq: sum(ids.map((id) => bi.get(id)), (b) => b.bq), pour: pourI, ok: insN, castDue: d10(wi?.cd) || null, lastPour: lMelt, firstIns: minD(ins, ids), lastIns: lIns, at: Object.entries(piles).sort((a, b) => b[1] - a[1])[0][0] };
+  return { id: l.id, ono: l.ono, die: l.die, ...dimsOfLine(l.id), c: l.c, od, dd: d10(l.dd), q: l.q, tn: round(l.tn, 1), sc: l.sc ? 1 : 0, shipQty, full, sh: s.map((e) => [e.dt, e.q]), legs, bq: sum(ids.map((id) => bi.get(id)), (b) => b.bq), pour: pourI, ok: insN, castDue: d10(wi?.cd) || null, lastPour: lMelt, firstIns: minD(ins, ids), lastIns: lIns, qi: injN, qp: pourN, qn: insN, qc: authQ, at: Object.entries(piles).sort((a, b) => b[1] - a[1])[0][0] };
 }).filter((l) => (l.dd && l.dd >= W0) || l.od >= W0);
 
 // ── Invoices and dispatches ──
@@ -244,6 +244,31 @@ const shipLots = []; const clearedNow = [];
     for (const a of [...qu].reverse()) { if (left <= 0) break; const t = Math.min(a.q, left); left -= t; if (t > 0) clearedNow.push({ c: l.c, oi: ol.id, kg: round(t * (l.w || 0), 1), days: days(a.dt, AS_OF), due: d10(l.dd) }); } }
 }
 
+// ── Daily output per step: the last 60 days, for the day-to-day screen ──
+const DAY0 = new Date(Date.parse(AS_OF) - 59 * 86400000).toISOString().slice(0, 10);
+const dailyFlow = aggregate(flowRows.filter((r) => r.e.dt >= DAY0), (r) => ({ stage: r.stage, dt: r.e.dt }), (a, r) => { a.kg = round(a.kg + r.e.qi * r.b.w, 1); a.pcs += r.e.qi; });
+for (const a of aggregate(dispRaw.filter((r) => d10(r.dt) >= DAY0), (r) => ({ stage: 'Dispatched', dt: d10(r.dt) }), (x, r) => { x.kg = round(x.kg + r.q * (r.w || 0), 1); x.pcs += r.q; })) dailyFlow.push(a);
+
+// ── Material stock against use: store stock, what the issue slips took out, and the item's purchase lead time ──
+const issueSince = (n) => new Date(Date.parse(AS_OF) - (n - 1) * 86400000).toISOString().slice(0, 10);
+const stock = (() => {
+  const use = new Map();
+  for (const r of all('select x.item_id it, m.slip_date dt, x.issue_quantity q from tbl_material_issue_slip_detail x join tbl_material_issue_slip_master m using(slip_id) where m.slip_date>=? and m.slip_date<=?', issueSince(365), AS_OF + ' 23:59')) {
+    const a = use.get(r.it) || { u90: 0, u365: 0, last: null }; const dt = d10(r.dt); a.u365 += r.q || 0; if (dt >= issueSince(90)) a.u90 += r.q || 0; if (!a.last || dt > a.last) a.last = dt; use.set(r.it, a);
+  }
+  const lastBuy = new Map();
+  for (const p of all('select x.item_id it, m.inward_date dt, x.unit_rate rate, s.supplier_name v from tbl_inward_detail x join tbl_inward_master m using(inward_id) left join tbl_supplier_master s on s.supplier_id=m.supplier_id where m.inward_date<=? order by m.inward_date', AS_OF + ' 23:59')) lastBuy.set(p.it, { dt: d10(p.dt), rate: p.rate, v: p.v });
+  const units = new Map(all('select unit_id k, unit_short_name v from tbl_unit_master').map((r) => [r.k, r.v]));
+  return all('select i.item_id id, i.item_name n, g.item_group_name g, i.unit_id u, i.current_stock st, i.purchase_lead_time lead from tbl_item_master i left join tbl_item_group_master g using(item_group_id)').map((i) => {
+    const u = use.get(i.id); const b = lastBuy.get(i.id);
+    return { id: i.id, item: String(i.n || '').trim(), group: i.g || 'Not set', unit: units.get(i.u) || '', stock: round(i.st || 0, 1), used90: round(u?.u90 || 0, 1), used365: round(u?.u365 || 0, 1), lastIssue: u?.last || null, lead: i.lead || 0, lastBuy: b?.dt || null, lastRate: b?.rate ?? null, lastVendor: b?.v || null };
+  }).filter((r) => r.stock > 0 || r.used365 > 0);
+})();
+
+// ── Customer rejections: castings a customer rejected, as entered ──
+const custRej = all('select customer_reject_date dt, customer_id c, die_id die, reject_quantity q, raw_casting_weight w, rejection_reason reason, heat_no heat from tbl_customer_rejection where customer_reject_date>=? and customer_reject_date<=?', W0, AS_OF + ' 23:59')
+  .map((r) => ({ dt: d10(r.dt), c: r.c, die: r.die, q: r.q, kg: round((r.q || 0) * (r.w || 0), 1), reason: String(r.reason || '').trim() || 'Not set', heat: r.heat }));
+
 // ── Order journey, planning and sub-batches ──
 // "Done" at a stage is the date the line's cumulative good pieces there first reach the ordered quantity.
 const reachQ = (m, ids, q, f) => { const ev = []; for (const id of ids) for (const e of m.get(id) || []) ev.push(e); ev.sort((a, b) => (a.dt < b.dt ? -1 : 1)); let c = 0; for (const e of ev) { c += e[f] || 0; if (c >= q) return e.dt; } return null; };
@@ -301,7 +326,7 @@ const mach = all("select d.machining_completion_date plan, d.actual_completion_d
 
 const facts = {
   meta: [{ asOf: AS_OF, from: W0, machPlan: { lines: mach.length, planned: mach.filter((r) => r.plan).length, actual: mach.filter((r) => r.plan && r.act).length } }],
-  customers: customers.filter((c) => usedCust.has(c.id)), parts, sales, disp, lines, rej, control, flow, workDays: workDayRows, dieMelt, wip, heats: heatRows, charge: [...chargeMap.values()], energy, vendors, machPo, purchases, grn, stepParts, stepGap: [...gapMap.values()], stepWait, stepBreak, shipLots, clearedNow, journey, batchFacts, rhythm, salesOrders,
+  customers: customers.filter((c) => usedCust.has(c.id)), parts, sales, disp, lines, rej, control, flow, workDays: workDayRows, dieMelt, wip, heats: heatRows, charge: [...chargeMap.values()], energy, vendors, machPo, purchases, grn, stepParts, stepGap: [...gapMap.values()], stepWait, stepBreak, shipLots, clearedNow, journey, batchFacts, rhythm, salesOrders, dailyFlow, stock, custRej,
 };
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, JSON.stringify(facts));

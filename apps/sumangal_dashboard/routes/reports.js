@@ -22,6 +22,11 @@ const report = (path, fn) => router.get(path, protect, wrap((req) => fn(cid(req)
 
 report('/meta', reports.meta);
 report('/summary', reports.summary);
+report('/intent/alerts', reports.intentAlerts);
+report('/intent/today', reports.intentToday);
+report('/intent/month', reports.intentMonth);
+report('/intent/long-term', reports.intentLongTerm);
+report('/intent/decisions', reports.intentDecisions);
 report('/what-changed', reports.whatChanged);
 report('/actions', reports.actions);
 report('/problem-parts', reports.problemParts);
