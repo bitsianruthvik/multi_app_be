@@ -8493,8 +8493,11 @@ SET @sql = IF(@col = 0, "ALTER TABLE cf_machines
   ADD COLUMN disposal VARCHAR(10) NULL,
   ADD COLUMN disposal_on DATE NULL,
   ADD COLUMN disposal_amount DECIMAL(18,2) NULL,
-  ADD COLUMN disposal_note VARCHAR(500) NULL,
-  ADD KEY idx_cmc_stage (company_id, stage, kind)", 'SELECT 1');
+  ADD COLUMN disposal_note VARCHAR(500) NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- The index on its own: TiDB refuses an index on a column added in the same ALTER.
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machines' AND INDEX_NAME = 'idx_cmc_stage');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_machines ADD KEY idx_cmc_stage (company_id, stage, kind)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 CREATE TABLE IF NOT EXISTS cf_machine_events (
