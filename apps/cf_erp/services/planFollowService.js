@@ -441,6 +441,37 @@ const taskOf = (t, m, minutes, n) => ({
 });
 
 /**
+ * Which roster tasks are DONE: ticked on the roster itself (task.done), or — "if it gets marked elsewhere, it should show
+ * up here" — the work is recorded on the floor (Machine log / Tracker): the unit is finished, or it has nothing left on
+ * that operation. Each task gets { doneNow, doneBy: 'roster' | 'floor' | null }. One facts read (kept 45 s).
+ */
+async function withProgress(db, companyId, day, tasks) {
+  if (!tasks.length) return tasks;
+  let byKey = new Map();
+  try { byKey = new Map((await loadFacts(db, companyId, { month: day.slice(0, 7) })).units.map((u) => [u.key, u])); } catch { /* the roster still shows, without the floor's progress */ }
+  return tasks.map((t) => {
+    const u = t.unitKey ? byKey.get(t.unitKey) : null;
+    const floor = !!u && (u.done || (t.fn != null && !u.steps.some((s) => s.fn === String(t.fn) && s.minutes > 0.5)));
+    return { ...t, doneNow: !!t.done || floor, doneBy: t.done ? 'roster' : floor ? 'floor' : null };
+  });
+}
+
+/** POST /planning/roster/task { date, id, done } — production ticks a task of the published roster (or unticks it). */
+export async function markRosterTask(db, c, input = {}) {
+  const day = String(input.date ?? '');
+  if (!DATE_RE.test(day)) throw invalid('INVALID', 'Which day?');
+  const [[row]] = await db.query("SELECT * FROM cf_dplans WHERE company_id = ? AND plan_date = ? FOR UPDATE", [c.companyId, day]);
+  if (!row) throw notFound('Roster');
+  const doc = json(row.tasks_json) ?? { tasks: [] };
+  const t = doc.tasks.find((x) => String(x.id) === String(input.id));
+  if (!t) throw notFound('Task');
+  const { wall } = await plantToday(db, c.companyId);
+  t.done = !!input.done; t.doneAt = t.done ? wall : null; t.doneByUser = t.done ? c.userId ?? null : null;
+  await db.query('UPDATE cf_dplans SET tasks_json = ? WHERE company_id = ? AND id = ?', [JSON.stringify(doc), c.companyId, row.id]);
+  return publishedRoster(db, c.companyId, { date: day });
+}
+
+/**
  * GET /planning/day?date= — the roster of a day (default tomorrow): the saved one, else a suggestion (not saved).
  * `fresh` = the suggestion from now, beside a saved roster, so the planner can see what changed.
  */
@@ -453,7 +484,7 @@ export async function getDay(db, companyId, q = {}) {
   const machines = sug?.machines ?? saved?.machines ?? [];
   return {
     today, day, status: row?.status ?? null, publishedAt: row?.published_at ?? null, note: row?.note ?? null,
-    tasks: (q.fresh === '1' ? sug.tasks : saved?.tasks ?? sug.tasks), machines, saved: !!row, suggestion: q.fresh === '1',
+    tasks: await withProgress(db, companyId, day, (q.fresh === '1' ? sug.tasks : saved?.tasks ?? sug.tasks)), machines, saved: !!row, suggestion: q.fresh === '1',
   };
 }
 
@@ -465,6 +496,7 @@ export async function saveDay(db, c, input = {}) {
     id: String(t.id ?? `t${i + 1}`), unitKey: t.unitKey ?? null, unit: String(t.unit ?? '').slice(0, 200), order: t.order ?? null, orderId: t.orderId ?? null,
     fn: t.fn == null ? null : String(t.fn), fnName: t.fnName ?? null, minutes: Math.max(0, Math.round(Number(t.minutes) || 0)), machineId: t.machineId == null ? null : Number(t.machineId),
     tonnes: t.tonnes ?? null, finish: t.finish ?? null, source: t.source === 'manual' ? 'manual' : 'auto', note: blank(t.note) ? null : String(t.note).slice(0, 300), done: !!t.done,
+    doneAt: t.doneAt ?? null, doneByUser: t.doneByUser ?? null,
   }));
   const [[row]] = await db.query('SELECT * FROM cf_dplans WHERE company_id = ? AND plan_date = ? FOR UPDATE', [c.companyId, day]);
   const machines = Array.isArray(input.machines) && input.machines.length ? input.machines : (row ? json(row.tasks_json)?.machines : null) ?? (await suggestDay(db, c.companyId, day)).machines;
@@ -488,7 +520,7 @@ export async function publishedRoster(db, companyId, q = {}) {
   const day = !blank(q.date) && DATE_RE.test(String(q.date)) ? String(q.date) : today;
   const [[row]] = await db.query("SELECT * FROM cf_dplans WHERE company_id = ? AND plan_date = ? AND status = 'published'", [companyId, day]);
   const doc = row ? json(row.tasks_json) : null;
-  return { today, day, published: !!row, publishedAt: row?.published_at ?? null, note: row?.note ?? null, tasks: doc?.tasks ?? [], machines: doc?.machines ?? [] };
+  return { today, day, published: !!row, publishedAt: row?.published_at ?? null, note: row?.note ?? null, tasks: await withProgress(db, companyId, day, doc?.tasks ?? []), machines: doc?.machines ?? [] };
 }
 
 /* ── Alerts ────────────────────────────────────────────────────────────────────────────────────────── */
@@ -594,6 +626,28 @@ export async function detectAlerts(db, c) {
   return { alerts: await openAlerts(db, c.companyId), source: force.source };
 }
 
+const ALERT_TTL_MS = 120_000;
+const alertRuns = new Map();        // company → { at, source, running }
+/**
+ * The alerts for a screen that must open at once (the overview): what was found last, and — when that is older than
+ * ALERT_TTL_MS — a fresh comparison started behind the answer (the next read has it). The first read of a company waits.
+ */
+async function alertsFast(db, c) {
+  const e = alertRuns.get(c.companyId);
+  const stale = !e || Date.now() - e.at > ALERT_TTL_MS;
+  if (!e) {
+    const out = await detectAlerts(db, c).catch(() => ({ alerts: [], source: null }));
+    alertRuns.set(c.companyId, { at: Date.now(), source: out.source, running: false });
+    return out;
+  }
+  if (stale && !e.running) {
+    e.running = true;
+    const { pool } = await import('../lib/db.js');
+    detectAlerts(pool, c).then((out) => alertRuns.set(c.companyId, { at: Date.now(), source: out.source, running: false })).catch(() => { e.running = false; });
+  }
+  return { alerts: await openAlerts(db, c.companyId), source: e.source };
+}
+
 const SEV = { danger: 0, warning: 1, info: 2 };
 export async function openAlerts(db, companyId, { all = false } = {}) {
   const [rows] = await db.query(`SELECT * FROM cf_plan_alerts WHERE company_id = ?${all ? '' : " AND status = 'open'"} ORDER BY id DESC LIMIT 300`, [companyId]);
@@ -656,7 +710,7 @@ export async function planningHome(db, c) {
   const [frozen, week, alerts, [[day]], [[draft]]] = await Promise.all([
     frozenPlan(db, c.companyId, month),
     getWeek(db, c.companyId, {}),
-    detectAlerts(db, c).catch(() => ({ alerts: [], source: null })),
+    alertsFast(db, c),
     db.query('SELECT plan_date, status FROM cf_dplans WHERE company_id = ? AND plan_date = ?', [c.companyId, addDays(today, 1)]),
     db.query("SELECT id, status, version, tonnes FROM cf_mplans WHERE company_id = ? AND month = ? AND status IN ('draft', 'pending') AND deleted_at IS NULL ORDER BY version DESC LIMIT 1", [c.companyId, `${month}-01`]),
   ]);

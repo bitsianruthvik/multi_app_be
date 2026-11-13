@@ -53,6 +53,8 @@ router.put('/planning/week/:id/notes', manage, handle((req) => tx(req, (db, c) =
 router.get('/planning/day', view, handle((req) => F.getDay(pool, company(req), req.query)));
 router.put('/planning/day', manage, handle((req) => tx(req, (db, c) => F.saveDay(db, c, body(req)))));
 router.get('/planning/roster', floor, handle((req) => F.publishedRoster(pool, company(req), req.query)));
+// Production ticks a roster task done (work recorded on the Machine log / Tracker shows as done by itself).
+router.post('/planning/roster/task', floor, handle((req) => tx(req, (db, c) => F.markRosterTask(db, c, body(req)))));
 
 router.get('/planning/alerts', view, handle(async (req) => (req.query.all === '1' ? { alerts: await F.openAlerts(pool, company(req), { all: true }), source: null } : F.detectAlerts(pool, ctx(req)))));
 router.post('/planning/alerts/:id/dismiss', manage, handle((req) => tx(req, (db, c) => F.dismissAlert(db, c, id(req)))));
