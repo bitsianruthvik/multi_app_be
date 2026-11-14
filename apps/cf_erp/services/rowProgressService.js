@@ -25,6 +25,7 @@
 import { evaluatedTracker } from './releaseService.js';
 import { rowsOfLine } from './partDrawingService.js';
 import { notFound } from '../lib/errors.js';
+import { operationOrder } from './trackerTreeService.js';
 
 export async function lineRowProgress(db, companyId, orderId, lineId, { productionOrderId = null } = {}) {
   const [[line]] = await db.query(
@@ -75,6 +76,11 @@ export async function lineRowProgress(db, companyId, orderId, lineId, { producti
 
   const ops = new Map();
   for (const s of data.steps ?? []) if (!ops.has(s.op_code)) ops.set(s.op_code, { code: s.op_code, name: s.op_name, seq: Number(s.sequence) });
+  // 2026-11-14 (user: colours from red for the first operations to green for the last, from the flows themselves):
+  // seq = the operation's place in the line's flow order (each piece's flow orders its own operations; a part's come
+  // before its assembly's) — trackerTreeService.operationOrder, the order the Tracker uses too.
+  const codeOfOp = new Map((data.steps ?? []).map((s) => [s.operation_id, s.op_code]));
+  operationOrder(items, stepsOf).forEach((opId, i) => { const o = ops.get(codeOfOp.get(opId)); if (o) o.seq = i; });
   const out = rows.map((r) => {
     const units = shell('waiting');
     const its = byRow.get(r.id) ?? [];

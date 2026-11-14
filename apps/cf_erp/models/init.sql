@@ -8746,3 +8746,54 @@ SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
 SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
             AND TABLE_NAME IN ('cf_mplans', 'cf_wplans', 'cf_dplans', 'cf_plan_alerts', 'cf_operation_consumables')) = 5
           AND EXISTS (SELECT 1 FROM features WHERE feature_tag = 'cf_erp_approve_month_plan'), 'S105-OK', 'S105-MISSING') AS result;
+
+-- ============================================================================
+-- §110 ALERTS (user, 2026-11-14): "alerts for different sorts of delays, like delays in procurement, delays in start
+-- of an activity and start of unplanned activity, delays in completion on previous activities … filtered alerts and
+-- right departments should get the notifications"; and a procurement date moved on a vendor's word goes to Stores,
+-- Planning and the MD.
+--   cf_alerts   one row per open matter, found again on every check by its dedupe_key (so a check run twice, or on
+--               two servers, never doubles it). departments = the comma list it is addressed to:
+--               md · planning · stores · purchase · floor. A person sees those of the departments their tags put
+--               them in (alertService.DEPARTMENTS). Status open → acknowledged (someone has it) → resolved (the check
+--               no longer finds it, or a person closed it).
+--   cf_purchase_date_changes.note   the vendor's word behind a moved expected date.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS cf_alerts (
+  id              INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT           NOT NULL,
+  dedupe_key      VARCHAR(160)  NOT NULL,
+  kind            VARCHAR(32)   NOT NULL,          -- po_late · po_date_moved · start_late · unplanned_start · finish_late
+  severity        VARCHAR(8)    NOT NULL DEFAULT 'warning',   -- info · warning · danger
+  title           VARCHAR(300)  NOT NULL,
+  detail          VARCHAR(1000) NULL,
+  departments     VARCHAR(80)   NOT NULL,
+  order_id        INT           NULL,
+  order_code      VARCHAR(60)   NULL,
+  production_order_id INT       NULL,
+  operation_id    INT           NULL,
+  operation_name  VARCHAR(120)  NULL,
+  subject_type    VARCHAR(40)   NULL,
+  subject_id      INT           NULL,
+  link            VARCHAR(300)  NULL,
+  days_late       DECIMAL(8,2)  NULL,
+  count_n         INT           NULL,
+  status          VARCHAR(12)   NOT NULL DEFAULT 'open',
+  first_at        DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_at         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  acked_by        INT           NULL,
+  acked_at        DATETIME      NULL,
+  resolved_at     DATETIME      NULL,
+  resolved_by     INT           NULL,
+  UNIQUE KEY uq_cal_key (company_id, dedupe_key),
+  KEY idx_cal_status (company_id, status),
+  CONSTRAINT fk_cal_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_date_changes' AND COLUMN_NAME = 'note');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_purchase_date_changes ADD COLUMN note VARCHAR(500) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_alerts') = 1
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_date_changes' AND COLUMN_NAME = 'note') = 1,
+          'S110-OK', 'S110-MISSING') AS result;

@@ -13,6 +13,7 @@ import productionRoutes from './production.js';
 import inventoryRoutes from './inventory.js';
 import stockMoneyRoutes from './stockMoney.js';
 import overviewRoutes from './overview.js';
+import alertRoutes from './alerts.js';
 import trackerRoutes from './tracker.js';
 import purchaseRoutes from './purchase.js';
 // The MR of a sales order and material-ready (§56/§66). The §39 RFQ routes and the §46 PO-stage routes went in §71.
@@ -146,6 +147,7 @@ router.use(productionRoutes);
 router.use(inventoryRoutes);
 router.use(stockMoneyRoutes);
 router.use(overviewRoutes);
+router.use(alertRoutes);
 router.use(trackerRoutes);
 router.use(purchaseRoutes);
 router.use(purchaseFlowRoutes);

@@ -494,11 +494,29 @@ async function plannedUnitsAfter(db, companyId, orderIds, change, stamp) {
  */
 async function recordDateChanges(db, c, rows) {
   const real = rows.filter((r) => (r.from ?? null) !== (r.to ?? null));
-  if (!real.length) return;
-  await db.query(
-    `INSERT INTO cf_purchase_date_changes (company_id, purchase_order_id, purchase_line_id, from_date, to_date, changed_by) VALUES ${real.map(() => '(?, ?, ?, ?, ?, ?)').join(', ')}`,
-    real.flatMap((r) => [c.companyId, r.poId, r.lineId ?? null, r.from ?? null, r.to ?? null, c.userId ?? null]),
+  if (!real.length) return null;
+  // §110: the vendor's word behind the move (note), kept with the change.
+  const [res] = await db.query(
+    `INSERT INTO cf_purchase_date_changes (company_id, purchase_order_id, purchase_line_id, from_date, to_date, changed_by, note) VALUES ${real.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')}`,
+    real.flatMap((r) => [c.companyId, r.poId, r.lineId ?? null, r.from ?? null, r.to ?? null, c.userId ?? null, r.note ? String(r.note).slice(0, 500) : null]),
   );
+  return res?.insertId ?? null;
+}
+
+/**
+ * §110 (user, 2026-11-14): a procurement date moved on the vendor's word → an alert to Stores, Planning, the MD and
+ * Purchase, saying what it does to the plan. Never fails the edit: the date is saved whatever the alert does.
+ */
+async function alertDateMoved(db, c, po, { lineId = null, from, to, note, changeId, late = 0, orderIds = [] }) {
+  try {
+    const { raiseDateMoved } = await import('./alertService.js');
+    const line = lineId ? po.lines.find((x) => x.id === lineId) : null;
+    const orderId = po.forOrder?.id ?? orderIds?.[0] ?? null;
+    await raiseDateMoved(db, c.companyId, {
+      poId: po.id, poCode: po.code, supplier: po.supplier?.name ?? null, lineId, item: line ? (line.item?.code ?? line.item?.name ?? null) : null,
+      from, to, note, changeId, late, orderId, orderCode: po.forOrder?.id === orderId ? po.forOrder.code : null,
+    });
+  } catch (e) { console.error('[cf_erp] date-moved alert:', e?.message ?? e); }
 }
 
 /** A cancelled or fully received order is history. */
@@ -563,7 +581,7 @@ export async function getPurchaseOrder(db, companyId, id) {
   ),
   // Every change of the PO's or a line's expected date, newest first (§71). Tolerates a database without the table.
   db.query(
-    `SELECT d.id, d.purchase_line_id, d.from_date, d.to_date, d.changed_at, d.changed_by, u.name AS changed_by_name
+    `SELECT d.id, d.purchase_line_id, d.from_date, d.to_date, d.changed_at, d.changed_by, d.note, u.name AS changed_by_name
        FROM cf_purchase_date_changes d LEFT JOIN users u ON u.id = d.changed_by
       WHERE d.company_id = ? AND d.purchase_order_id = ? AND d.deleted_at IS NULL ORDER BY d.id DESC LIMIT 100`,
     [companyId, poId],
@@ -609,7 +627,7 @@ export async function getPurchaseOrder(db, companyId, id) {
     expectedDate: p.expected_date,
     dateChanges: dateRows.map((d) => ({
       id: d.id, lineId: d.purchase_line_id ?? null, from: planDate(d.from_date), to: planDate(d.to_date),
-      by: d.changed_by ? { id: d.changed_by, name: d.changed_by_name ?? null } : null, at: d.changed_at,
+      by: d.changed_by ? { id: d.changed_by, name: d.changed_by_name ?? null } : null, at: d.changed_at, note: d.note ?? null,
     })),
     orderedAt: p.ordered_at,
     notes: p.notes,
@@ -834,7 +852,14 @@ export async function updatePurchaseOrder(db, c, id, input = {}) {
     await db.query(`UPDATE cf_purchase_orders SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, p.id]);
   }
-  if (sets.expected_date !== undefined) await recordDateChanges(db, c, [{ poId: p.id, lineId: null, from: planDate(p.expected_date), to: sets.expected_date ?? null }]);
+  if (sets.expected_date !== undefined) {
+    const change = { from: planDate(p.expected_date), to: sets.expected_date ?? null, note: blank(input.dateNote) ? null : String(input.dateNote) };
+    const changeId = await recordDateChanges(db, c, [{ poId: p.id, lineId: null, ...change }]);
+    const po = await getPurchaseOrder(db, c.companyId, p.id);
+    // §110: the PO's own date moves every line that has none of its own — Stores, Planning and the MD are told.
+    if ((change.from ?? null) !== (change.to ?? null)) await alertDateMoved(db, c, po, { ...change, changeId });
+    return po;
+  }
   return getPurchaseOrder(db, c.companyId, p.id);
 }
 
@@ -928,7 +953,10 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
     await db.query(`UPDATE cf_purchase_order_lines SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, l.id]);
   }
-  if (sets.expected_date !== undefined) await recordDateChanges(db, c, [{ poId: l.purchase_order_id, lineId: l.id, from: planDate(l.expected_date), to: sets.expected_date ?? null }]);
+  const dateChange = sets.expected_date !== undefined
+    ? { from: planDate(l.expected_date), to: sets.expected_date ?? null, note: blank(input.dateNote) ? null : String(input.dateNote) }
+    : null;
+  if (dateChange) dateChange.changeId = await recordDateChanges(db, c, [{ poId: l.purchase_order_id, lineId: l.id, ...dateChange }]);
   let po = await getPurchaseOrder(db, c.companyId, l.purchase_order_id);
   // The order's status follows its lines — only a quantity can move it, and the lines were just read for the answer.
   if (sets.quantity !== undefined && !PRE_ORDER_STATUSES.includes(po.status) && po.status !== 'cancelled') {
@@ -942,15 +970,18 @@ export async function updatePurchaseLine(db, c, lineId, input = {}) {
   }
   // Only a date or a quantity can move the plan; a price or a note does not ask.
   const moved = (sets.expected_date !== undefined && (sets.expected_date ?? null) !== (planDate(l.expected_date) ?? null)) || (sets.quantity !== undefined && sets.quantity < Number(l.quantity) - EPS);
-  if (!boughtFor || !moved) return po;
-  return {
-    ...po,
-    plannedUnits: await plannedUnitsAfter(db, c.companyId, boughtFor, {
-      purchaseLineId: l.id, purchaseOrder: { id: po.id, code: po.code },
-      ...(sets.expected_date !== undefined ? { date: { from: planDate(l.expected_date), to: sets.expected_date ?? null } } : {}),
-      ...(sets.quantity !== undefined ? { quantity: { from: Number(l.quantity), to: sets.quantity } } : {}),
-    }, planStamp),
-  };
+  const dateMoved = dateChange && (dateChange.from ?? null) !== (dateChange.to ?? null);
+  if (!boughtFor || !moved) {
+    if (dateMoved) await alertDateMoved(db, c, po, { lineId: l.id, ...dateChange, orderIds: boughtFor ?? [] });
+    return po;
+  }
+  const plannedUnits = await plannedUnitsAfter(db, c.companyId, boughtFor, {
+    purchaseLineId: l.id, purchaseOrder: { id: po.id, code: po.code },
+    ...(sets.expected_date !== undefined ? { date: { from: planDate(l.expected_date), to: sets.expected_date ?? null } } : {}),
+    ...(sets.quantity !== undefined ? { quantity: { from: Number(l.quantity), to: sets.quantity } } : {}),
+  }, planStamp);
+  if (dateMoved) await alertDateMoved(db, c, po, { lineId: l.id, ...dateChange, late: Number(plannedUnits?.late ?? 0), orderIds: boughtFor });
+  return { ...po, plannedUnits };
 }
 
 const planDate = (d) => (d == null ? null : d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : String(d).slice(0, 10));

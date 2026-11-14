@@ -13,16 +13,19 @@ import { isPermitted } from '../../../core/middleware/requirePerm.js';
 import { navCounts, search, cockpit } from '../services/overviewService.js';
 import { pendingCount } from '../services/approvalService.js';
 import { billingDueCount } from '../services/billingService.js';
+import { alertCount } from '../services/alertService.js';
 
 const router = Router();
 router.get('/nav-counts', guard(PERM.view), handle(async (req) => {
   const companyId = ctx(req).companyId;
   const seesAccounts = isPermitted(req.user, PERM.accountsView);
-  const [counts, pendingApprovals, billingDue] = await Promise.all([
+  const [counts, pendingApprovals, billingDue, alerts] = await Promise.all([
     navCounts(pool, companyId), pendingCount(pool, companyId, (tag) => isPermitted(req.user, tag)),
     seesAccounts ? billingDueCount(pool, companyId).catch(() => 0) : 0,
+    // §110: the bell — open alerts addressed to this person's departments.
+    alertCount(pool, companyId, (tag) => isPermitted(req.user, tag)),
   ]);
-  return { ...counts, counts: { ...counts.counts, pendingApprovals, ...(seesAccounts ? { billingDue } : {}) } };
+  return { ...counts, counts: { ...counts.counts, pendingApprovals, alerts, ...(seesAccounts ? { billingDue } : {}) } };
 }));
 router.get('/search', guard(PERM.view), handle((req) => search(pool, ctx(req).companyId, req.query.q)));
 router.get('/cockpit', guard(PERM.view), handle((req) => cockpit(pool, ctx(req).companyId)));

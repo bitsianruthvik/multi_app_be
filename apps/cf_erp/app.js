@@ -67,6 +67,9 @@ export default {
      * to wake delays nothing. In production only (or CF_NEST_RESUME_AT_BOOT=1); never when it is 0:
      * a test that mounts this app must not start working whatever a developer's database holds.
      */
+    // §110: the delay checks every 10 minutes (production only, or CF_ALERT_CHECKS=1).
+    import('./services/alertService.js').then((m) => import('./lib/db.js').then((d) => m.startAlertChecks(d.pool))).catch((e) => console.error('[cf_erp] alert checks not started:', e?.message ?? e));
+
     const bootResume = process.env.CF_NEST_RESUME_AT_BOOT === '1' || (process.env.NODE_ENV === 'production' && process.env.CF_NEST_RESUME_AT_BOOT !== '0');
     if (bootResume) {
       const t = setTimeout(() => {
