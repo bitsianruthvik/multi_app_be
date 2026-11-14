@@ -191,21 +191,111 @@ export async function flowDispatch(companyId, q, mode) {
   const from = mode === 'asis' ? addDays(asOf, -89) : (q.from || d.m.from);
   const to = mode === 'asis' ? asOf : (q.to || asOf);
   const inWin = (dt) => dt >= from && dt <= to;
-  const rev = new Map(); for (const s of d.sales) if (inWin(s.dt)) rev.set(s.c, (rev.get(s.c) || 0) + s.am);
+  const keep = dimFilter(q);
+  const rev = new Map(); for (const s of d.sales) if (inWin(s.dt) && keep(s)) rev.set(s.c, (rev.get(s.c) || 0) + s.am);
   const top = [...rev.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
   const ids = new Set(top.map(([c]) => c));
+  const dispIn = d.disp.filter((r) => ids.has(r.c) && inWin(r.dt) && keep(r));
   const perDay = new Map();
-  for (const r of d.disp) if (ids.has(r.c) && inWin(r.dt)) { const k = `${r.c}|${r.dt}`; perDay.set(k, (perDay.get(k) || 0) + (r.kg || 0)); }
+  for (const r of dispIn) { const k = `${r.c}|${r.dt}`; perDay.set(k, (perDay.get(k) || 0) + (r.kg || 0)); }
   const ships = new Map(top.map(([c]) => [c, []]));
   for (const [k, kg] of perDay) { const [c, dt] = k.split('|'); ships.get(Number(c)).push([dt, kg / 1000]); }
+  // Pieces per dispatch day, and the weight band and finish that carry most of each customer's kilograms.
+  const pcsDay = new Map();
+  for (const r of dispIn) { const k = `${r.c}|${r.dt}`; pcsDay.set(k, (pcsDay.get(k) || 0) + (r.pcs || 0)); }
+  const pcsOf = new Map(top.map(([c]) => [c, []]));
+  for (const [k, p] of pcsDay) pcsOf.get(Number(k.split('|')[0])).push(p);
+  const byCust = groupBy(dispIn, (r) => r.c);
+  const mostKg = (rs, key) => { const m = new Map(); for (const r of rs) m.set(r[key], (m.get(r[key]) || 0) + (r.kg || 0)); const best = [...m].sort((a, b) => b[1] - a[1])[0]; return best ? best[0] : null; };
   const rows = top.map(([c, am]) => {
     const s = (ships.get(c) || []).sort((a, b) => (a[0] < b[0] ? -1 : 1));
     const gaps = s.slice(1).map((x, i) => days(s[i][0], x[0]));
     const kgs = s.map((x) => x[1]);
-    return { id: c, name: d.custName.get(c) || `Customer ${c}`, revenue: round(am, 0), dispatches: s.length, totalT: round(sum(s, (x) => x[1]), 1), medianT: round(median(kgs), 2), p25T: round(pctl(kgs, 0.25), 2), p75T: round(pctl(kgs, 0.75), 2), medianGapDays: round(median(gaps), 0), p25GapDays: round(pctl(gaps, 0.25), 0), p75GapDays: round(pctl(gaps, 0.75), 0), ships: s.map(([dt, t]) => [dt, round(t, 2)]) };
+    const mine = byCust.get(c) || [];
+    return { id: c, name: d.custName.get(c) || `Customer ${c}`, revenue: round(am, 0), dispatches: s.length, totalT: round(sum(s, (x) => x[1]), 1), medianT: round(median(kgs), 2), p25T: round(pctl(kgs, 0.25), 2), p75T: round(pctl(kgs, 0.75), 2), medianGapDays: round(median(gaps), 0), p25GapDays: round(pctl(gaps, 0.25), 0), p75GapDays: round(pctl(gaps, 0.75), 0), pcsMedian: round(median(pcsOf.get(c) || []), 0), mainWeight: mostKg(mine, 'w'), mainFinish: mostKg(mine, 'f'), ships: s.map(([dt, t]) => [dt, round(t, 2)]) };
   });
   const all = rows.flatMap((r) => r.ships.map((x) => x[1]));
   const bins = [['Under 1 t', 0, 1], ['1 to 3 t', 1, 3], ['3 to 6 t', 3, 6], ['6 to 10 t', 6, 10], ['10 t and over', 10, Infinity]].map(([label, a, z]) => ({ label, dispatches: all.filter((t) => t >= a && t < z).length }));
   const months = [...groupBy(rows.flatMap((r) => r.ships.map((x) => ({ mo: x[0].slice(0, 7), c: r.id }))), (x) => x.mo).entries()].map(([mo, a]) => ({ mo, dispatches: a.length, customers: new Set(a.map((x) => x.c)).size })).sort((a, b) => (a.mo < b.mo ? -1 : 1));
-  return { asOf, mode, from, to, rows, bins, months };
+  return { asOf, mode, from, to, rows, bins, months, insights: dispatchInsights(d, q, inWin) };
+}
+
+// ── Dispatch: what drives the cycle, worked out from the shipment, line and customer-rhythm history ──
+const LOT_BANDS = [['Under 100 kg', 0, 100], ['100–500 kg', 100, 500], ['0.5–2 t', 500, 2000], ['2 t and over', 2000, Infinity]];
+const LEAD_BANDS = [['Under 60 days', 0, 60], ['60–120 days', 60, 120], ['120–200 days', 120, 200], ['200 days and over', 200, Infinity]];
+
+/** The wait that half of the kilograms were under, from [days, kg] pairs. */
+function weightedMedian(pairs) {
+  const tot = sum(pairs, (x) => x[1]); if (!tot) return null;
+  let c = 0; for (const [dd, kg] of [...pairs].sort((a, b) => a[0] - b[0])) { c += kg; if (c >= tot / 2) return dd; }
+  return null;
+}
+/** Waiting after clearance for one group of shipments: the median wait, and the share of kilograms that waited over two weeks. */
+function waitOf(lots, kgAll) {
+  const pairs = lots.flatMap((s) => s.waits || []);
+  const kg = sum(pairs, (x) => x[1]);
+  const lotKg = sum(lots, (s) => s.kg);
+  return {
+    lots: lots.length,
+    kgT: round(lotKg / 1000, 1),
+    kgShare: kgAll ? round(lotKg / kgAll, 2) : null,
+    waitMedDays: weightedMedian(pairs),
+    overTwoWeeks: kg ? round(sum(pairs.filter((x) => x[0] > 14), (x) => x[1]) / kg, 2) : null,
+  };
+}
+
+function dispatchInsights(d, q, inWin) {
+  const keepLine = dimFilter(q);
+  // Shipments and skipped shipments carry market and customer only (no finish or metal on the shipment record).
+  const lotKeep = (s) => (!q.market || s.x === String(q.market)) && (!q.customer || s.c === Number(q.customer));
+  const lots = d.shipLots.filter((s) => inWin(s.dt) && lotKeep(s));
+  const kgAll = sum(lots, (s) => s.kg);
+
+  // 1. Late dispatch: was the kilogram already cleared when it fell due?
+  const lateLots = lots.filter((s) => s.lateKg > 0);
+  const lateKg = sum(lateLots, (s) => s.lateKg);
+  const clearedByDue = sum(lateLots.filter((s) => s.lastClr && s.firstDue && s.lastClr <= s.firstDue), (s) => s.lateKg);
+  const toShip = (arr) => median(arr.map((s) => days(s.lastClr, s.dt)));
+  const lateDrivers = {
+    lateT: round(lateKg / 1000, 1),
+    lateShare: kgAll ? round(lateKg / kgAll, 2) : null,
+    exportShare: lateKg ? round(sum(lateLots.filter((s) => s.x === 'Export'), (s) => s.lateKg) / lateKg, 2) : null,
+    clearedByDueT: round(clearedByDue / 1000, 1),
+    clearedAfterDueT: round((lateKg - clearedByDue) / 1000, 1),
+    clearToShipLateDays: round(toShip(lateLots), 0),
+    clearToShipOnTimeDays: round(toShip(lots.filter((s) => !(s.lateKg > 0))), 0),
+  };
+
+  // 2. Consolidation: how long cleared kilograms wait for the rest of their shipment.
+  const consolidation = {
+    bands: LOT_BANDS.map(([label, a, z]) => ({ label, ...waitOf(lots.filter((s) => s.kg >= a && s.kg < z), kgAll) })),
+    single: waitOf(lots.filter((s) => s.sos === 1), kgAll),
+    multi: waitOf(lots.filter((s) => s.sos > 1), kgAll),
+  };
+
+  // 3. Quoted lead time against the number of dispatches per order line (lines that shipped in the window).
+  const lines = d.lines.filter((l) => l.full && l.dd && l.od && l.sh && l.sh.length && keepLine(l) && l.sh.some((x) => inWin(x[0])));
+  const leadSplit = LEAD_BANDS.map(([label, a, z]) => {
+    const g = lines.filter((l) => { const n = days(l.od, l.dd); return n >= a && n < z; });
+    return {
+      label,
+      lines: g.length,
+      splitShare: g.length ? round(g.filter((l) => l.sh.length > 1).length / g.length, 2) : null,
+      overrunDays: round(median(g.map((l) => days(l.dd, l.full))), 0),
+      lateShare: g.length ? round(g.filter((l) => l.full > l.dd).length / g.length, 2) : null,
+    };
+  });
+
+  // 4. Expected customer shipments that did not come: was anything cleared for them?
+  const keepRhythm = (r) => (!q.market || r.x === String(q.market)) && (!q.customer || r.c === Number(q.customer));
+  const missed = d.rhythm.filter(keepRhythm).flatMap((r) => r.skips.map((s) => ({ exp: s[0], ready: s[1] }))).filter((s) => inWin(s.exp));
+  const nothing = missed.filter((s) => !(s.ready > 0)).length;
+  const cadence = {
+    missed: missed.length,
+    nothingReady: nothing,
+    nothingReadyShare: missed.length ? round(nothing / missed.length, 2) : null,
+    readyTonsMedian: round(median(missed.filter((s) => s.ready > 0).map((s) => s.ready)), 1),
+  };
+
+  return { lots: lots.length, lines: lines.length, lateDrivers, consolidation, leadSplit, cadence };
 }
