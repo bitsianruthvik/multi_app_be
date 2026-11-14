@@ -113,7 +113,8 @@ try {
   const allOpen = await timed('tree (all released lines)', conn, (db) => TREE.trackerTree(db, COMPANY, {}));
   ok(`one tree read takes at most ${MAX_TRIPS} round trips (took ${def.trips})`, def.trips <= MAX_TRIPS, def.sql.join(' | '));
   ok('the full read costs the same round trips as the default (pruning is in memory)', full.trips === def.trips);
-  ok('the default read is small (under 200 KB) and well under the full one', bytes(def.out) < 200 * 1024 && bytes(def.out) * 10 < bytes(full.out), `${kb(def.out)} vs ${kb(full.out)}`);
+  // 240 KB (was 200, 2026-11-14): each operation now carries its planned minutes, for the Tracker's route widths.
+  ok('the default read is small (under 240 KB) and well under the full one', bytes(def.out) < 240 * 1024 && bytes(def.out) * 10 < bytes(full.out), `${kb(def.out)} vs ${kb(full.out)}`);
   ok('all released lines include this one', allOpen.out.nodes.some((n) => n.id === `l${LINE}`));
 
   // --- 2. shape -----------------------------------------------------------------

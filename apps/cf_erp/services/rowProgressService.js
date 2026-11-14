@@ -15,7 +15,10 @@
  *   - 'joined': every piece of the row has gone into its parent (the parent's first step has started) — the 3D view
  *     then paints it with its parent, so a sub-assembly at assembly level is one colour, at any depth;
  *   - cut: the row's cut pieces (cut plate / blank nodes under it) and how many are cut (their first step done);
- *   - inOrder: false when a production order was asked for and this unit's pieces of the row are not in it.
+ *   - inOrder: false when a production order was asked for and this unit's pieces of the row are not in it;
+ *   - now / last (2026-11-14): { code, name } of the operation being worked on the row's pieces right now, and of
+ *     the furthest one done (its cut pieces' when none of its own is) — the 3D view glows the first and paints the
+ *     second.
  * Rows come from partDrawingService.rowsOfLine (marks = DRAWING_MARK, the model's `mark` / `in`). One tracker read
  * (releaseService.evaluatedTracker), so a step is never "ready" here and "waiting" on the tracker.
  */
@@ -33,7 +36,7 @@ export async function lineRowProgress(db, companyId, orderId, lineId, { producti
   const qty = Math.max(1, Math.round(Number(line.quantity) || 1));
   const rows = await rowsOfLine(db, companyId, line);
   const [[rel]] = await db.query('SELECT id FROM cf_production_releases WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL', [companyId, line.id]);
-  const shell = (state) => Array.from({ length: qty }, () => ({ state, op: null, inProgress: false, pieces: 0, done: 0, cut: null, inOrder: true }));
+  const shell = (state) => Array.from({ length: qty }, () => ({ state, op: null, inProgress: false, now: null, last: null, pieces: 0, done: 0, cut: null, inOrder: true }));
   const head = { lineId: Number(line.id), orderId: Number(line.order_id), orderCode: line.order_code, quantity: qty };
   if (!rel) {
     return { ...head, released: false, operations: [], rows: rows.map((r) => ({ ...rowHead(r), units: shell('not_released') })) };
@@ -86,6 +89,16 @@ export async function lineRowProgress(db, companyId, orderId, lineId, { producti
         const cutDone = (it) => { const first = (stepsOf.get(Number(it.id)) ?? [])[0]; return !first || first.state === 'done'; };
         st.cut = { done: cuts.filter(cutDone).reduce((a, it) => a + (Number(it.quantity) || 1), 0), total: cuts.reduce((a, it) => a + (Number(it.quantity) || 1), 0) };
       }
+      // 2026-11-14 (user: "which part is in which step right now"): the operation being worked now, and else the
+      // last one done — over the row's own pieces and, before any of them has a step done, its cut pieces.
+      const stepsHere = mine.flatMap((it) => stepsOf.get(Number(it.id)) ?? []);
+      const cutSteps = cuts.flatMap((it) => stepsOf.get(Number(it.id)) ?? []);
+      const latest = (ss, pred) => ss.filter(pred).sort((a, b) => Number(b.sequence) - Number(a.sequence)
+        || String(b.finished_at ?? b.started_at ?? '').localeCompare(String(a.finished_at ?? a.started_at ?? '')))[0] ?? null;
+      const working = latest(stepsHere, (s) => s.state === 'in_progress') ?? latest(cutSteps, (s) => s.state === 'in_progress');
+      const lastDone = latest(stepsHere, (s) => s.state === 'done') ?? latest(cutSteps, (s) => s.state === 'done');
+      st.now = working ? { code: working.op_code, name: working.op_name } : null;
+      st.last = lastDone ? { code: lastDone.op_code, name: lastDone.op_name } : null;
       if (!mine.length) { st.state = 'waiting'; continue; }
       const joined = mine.every((it) => { const p = it.parent_id != null ? byId.get(Number(it.parent_id)) : null; return p && rowIds.has(Number(p.item_id)) && started(p); });
       if (joined) { st.state = 'joined'; continue; }

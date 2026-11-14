@@ -50,6 +50,8 @@ const round6 = (n) => Number(Number(n).toFixed(6));
 const fmt = (n) => String(round6(n));
 const blank = (v) => v == null || String(v).trim() === '';
 const short = (text, max = 90) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+/** A DATETIME as the read sends it: ISO, or null. */
+const isoOf = (v) => { if (v == null) return null; const d = v instanceof Date ? v : new Date(String(v).replace(' ', 'T')); return Number.isNaN(d.getTime()) ? null : d.toISOString(); };
 
 /**
  * Levels returned by default: order, line, the top piece and the level under it
@@ -167,6 +169,12 @@ function operationOf(s, ctx) {
   if (label !== s.op_name) op.name = label;
   if (state === 'todo' && s._status === 'ready') op.ready = true;
   if (reason) op.reason = reason;
+  // 2026-11-14 (the Tracker's timeline): when the floor started and finished it.
+  // Sent only when there is one: most steps of a big line have not started, and the default read stays small.
+  const startedAt = isoOf(s.started_at);
+  const finishedAt = s._status === 'done' ? isoOf(s.finished_at) : null;
+  if (startedAt) op.startedAt = startedAt;
+  if (finishedAt) op.finishedAt = finishedAt;
   return op;
 }
 
@@ -261,7 +269,7 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
   const byId = new Map();
   const childrenOf = new Map();
   const root = emptyAgg();
-  if (!data) return { nodes, byId, childrenOf, data, root, operations: {} };
+  if (!data) return { nodes, byId, childrenOf, data, root, operations: {}, opOrder: [] };
 
   const inProgress = data.steps.filter((s) => s._status === 'in_progress').map((s) => s.id);
   const onHold = data.steps.filter((s) => s._status === 'on_hold').map((s) => s.id);
@@ -373,7 +381,9 @@ async function buildTreeFresh(db, companyId, lines, opts = {}) {
   // Operation names once per read: byOperation carries ids only (it is on every parent).
   const operations = {};
   for (const s of data.steps) if (!operations[s.operation_id]) operations[s.operation_id] = { code: s.op_code, name: s.op_name };
-  return { nodes, byId, childrenOf, data, root, operations };
+  // The operations in flow order over everything read (2026-11-14): the order a roll-up of a subtree is drawn in.
+  const opOrder = operationOrder(data.items, data.stepsOf);
+  return { nodes, byId, childrenOf, data, root, operations, opOrder };
 }
 
 // --- pruning -----------------------------------------------------------------------
@@ -387,11 +397,75 @@ const wantsFigures = (q) => String(q?.figures ?? '') === '1';
 function leanNode(n) {
   const { own, minutes, minutesDone, ...rest } = n;
   void own; void minutes; void minutesDone;
-  rest.ops = n.ops.map(({ minutes: m, ...o }) => { void m; return o; });
+  // An operation keeps its planned minutes (2026-11-14): the Tracker sizes each operation of a row by them.
+  rest.ops = n.ops;
   if (n.byOperation) rest.byOperation = n.byOperation.map(({ minutes: m, minutesDone: d, ...b }) => { void m; void d; return b; });
   return rest;
 }
-const shapeFor = (q) => (wantsFigures(q) ? (n) => n : leanNode);
+/** Each operation's planned start and end from the planner (cf_plan3_steps), when it has planned the step. */
+function withPlan(n, plan) {
+  if (!plan?.size || !n.ops.length) return n;
+  return { ...n, ops: n.ops.map((o) => { const p = plan.get(o.stepId); return p ? { ...o, plannedStart: p.start, plannedEnd: p.end } : o; }) };
+}
+const shapeFor = (q, plan = null) => {
+  const base = wantsFigures(q) ? (n) => n : leanNode;
+  return (n) => withPlan(base(n), plan);
+};
+
+/**
+ * The planner's dates for the steps of some releases (2026-11-14, the Tracker's timeline): stepId -> { start, end }.
+ * Read on every call, outside the tree's cache: a re-plan does not change the tracker's stamp. Empty when the
+ * planner has not run or its table is not there.
+ */
+export async function planOf(db, companyId, releaseIds) {
+  const plan = new Map();
+  if (!releaseIds.length) return plan;
+  try {
+    const [rows] = await db.query(
+      `SELECT p.step_id, p.planned_start, p.planned_end FROM cf_plan3_steps p
+         JOIN cf_production_steps s ON s.id = p.step_id AND s.company_id = p.company_id AND s.deleted_at IS NULL
+         JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
+        WHERE p.company_id = ? AND pi.release_id IN (?) AND p.planned_start IS NOT NULL`,
+      [companyId, releaseIds],
+    );
+    for (const r of rows) plan.set(Number(r.step_id), { start: isoOf(r.planned_start), end: isoOf(r.planned_end ?? r.planned_start) });
+  } catch { /* no planner table here: no dates */ }
+  return plan;
+}
+
+/**
+ * What each level of the tree holds (2026-11-14: the level picker names its levels, "Girder segment / Splice set"
+ * rather than "level 3"): per tree level, the piece count and the two commonest names.
+ */
+export function levelsOf(nodes) {
+  const by = new Map();
+  for (const n of nodes) {
+    if (n.kind !== 'piece') continue;
+    const e = by.get(n.level) ?? { level: n.level, count: 0, names: new Map() };
+    e.count += 1;
+    // "Cut plate 16 × 150 × 475 E350" counts as "Cut plate": sizes would split one kind into hundreds.
+    const name = String(n.name ?? n.code).replace(/\s+\d[\s\S]*$/, '').trim() || String(n.name ?? n.code);
+    e.names.set(name, (e.names.get(name) ?? 0) + 1);
+    by.set(n.level, e);
+  }
+  return [...by.values()].sort((a, b) => a.level - b.level)
+    .map((e) => ({ level: e.level, count: e.count, names: [...e.names.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2).map(([x]) => x) }));
+}
+
+/** Production orders with nothing released yet (2026-11-14): the Tracker's empty page lists them. */
+async function unreleasedProductionOrders(db, companyId) {
+  try {
+    const [rows] = await db.query(
+      `SELECT p.id, p.code, p.label, p.status, p.order_id, o.code AS order_code FROM cf_production_orders p
+         JOIN cf_sales_orders o ON o.id = p.order_id AND o.deleted_at IS NULL
+        WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status NOT IN ('closed', 'cancelled')
+          AND NOT EXISTS (SELECT 1 FROM cf_production_items i WHERE i.production_order_id = p.id AND i.deleted_at IS NULL)
+        ORDER BY p.id DESC LIMIT 20`,
+      [companyId],
+    );
+    return rows.map((r) => ({ id: Number(r.id), code: r.code, label: r.label ?? null, status: r.status, orderId: Number(r.order_id), orderCode: r.order_code }));
+  } catch { return []; }
+}
 
 /** Marks whether each returned node's children all came with it. */
 function finish(list, childrenOf) {
@@ -424,6 +498,12 @@ const intOr = (v, d) => (blank(v) ? d : Math.max(1, Math.min(50, Math.floor(Numb
  */
 export async function trackerTree(db, companyId, q = {}) {
   const [all, pos] = await Promise.all([releasedLines(db, companyId), releasedProductionOrders(db, companyId)]);
+  // orderId=latest (2026-11-14, the Tracker opens on one order): the open order released last.
+  if (String(q.orderId ?? '') === 'latest') {
+    const open = all.filter((l) => l.order_status === 'confirmed');
+    const last = open.reduce((b, l) => (!b || Number(l.release_id) > Number(b.release_id) ? l : b), null);
+    q = { ...q, orderId: last ? String(last.order_id) : '' };
+  }
   const orderId = blank(q.orderId) ? null : Number(q.orderId);
   const lineId = blank(q.lineId) ? null : Number(q.lineId);
   const productionOrderId = blank(q.productionOrderId) ? null : Number(q.productionOrderId);
@@ -488,8 +568,10 @@ export async function trackerTree(db, companyId, q = {}) {
     if (list.length > FILTER_CAP) { list = list.slice(0, FILTER_CAP); truncated = true; }
   }
   const matchSet = new Set(matches ?? []);
-  const shape = shapeFor(q);
+  const plan = await planOf(db, companyId, lines.map((l) => l.release_id));
+  const shape = shapeFor(q, plan);
   const out = finish(list.map(shape), tree.childrenOf).map((n) => (matchSet.has(n.id) ? { ...n, match: true } : n));
+  const unreleased = lines.length ? [] : await unreleasedProductionOrders(db, companyId);
   return {
     scope: { orderId, lineId, productionOrderId, includeClosed },
     productionOrder: po ? { id: po.id, code: po.code, label: po.label } : null,
@@ -503,6 +585,10 @@ export async function trackerTree(db, companyId, q = {}) {
     truncated,
     basisNote: BASIS_NOTE,
     operations: tree.operations,
+    opOrder: tree.opOrder ?? [],
+    levels: levelsOf(poKeep ? tree.nodes.filter((n) => poKeep.has(n.id)) : tree.nodes),
+    planned: plan.size,
+    unreleased,
     nodes: out,
   };
 }
@@ -533,8 +619,8 @@ export async function trackerTreeChildren(db, companyId, q = {}) {
     list.push(n);
     if (n.level - node.level < depth) stack.push(...[...(tree.childrenOf.get(n.id) ?? [])].reverse());
   }
-  const shape = shapeFor(q);
-  return { node: finish([shape(node)], tree.childrenOf)[0], operations: tree.operations, nodes: finish(list.map(shape), tree.childrenOf) };
+  const shape = shapeFor(q, await planOf(db, companyId, lines.map((l) => l.release_id)));
+  return { node: finish([shape(node)], tree.childrenOf)[0], operations: tree.operations, opOrder: tree.opOrder ?? [], nodes: finish(list.map(shape), tree.childrenOf) };
 }
 
 // --- the order line's grid -------------------------------------------------------------

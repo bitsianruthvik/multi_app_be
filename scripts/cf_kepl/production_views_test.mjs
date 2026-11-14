@@ -168,8 +168,10 @@ try {
   ok(`tree reads take the same queries for one line and a whole order (${cnt1.tally.n} / ${cntAll.tally.n})`, cnt1.tally.n === cntAll.tally.n && cnt1.tally.n <= 16);
   const lean = await TREE.trackerTree(conn, COMPANY, { lineId: L1, depth: 50 });
   const leanP2 = lean.nodes.find((n) => n.id === `p${P2}`);
-  ok('without figures=1 the read is as before (no own, no minutes) — the Tracker page\'s payload', leanP2.own === undefined && leanP2.minutes === undefined
-    && leanP2.ops.every((o) => o.minutes === undefined) && leanP2.byOperation.every((b) => b.minutes === undefined) && near(leanP2.completion, 0.6, 0.0001));
+  // 2026-11-14: each operation keeps its own planned minutes (the Tracker's route sizes a row's operations by them);
+  // the node's own / subtree minutes still come only with figures=1.
+  ok('without figures=1 the read carries no own and no node minutes, but each operation its minutes — the Tracker page\'s payload', leanP2.own === undefined && leanP2.minutes === undefined
+    && leanP2.ops.every((o) => o.minutes !== undefined) && leanP2.byOperation.every((b) => b.minutes === undefined) && near(leanP2.completion, 0.6, 0.0001));
   const kids = await TREE.trackerTreeChildren(conn, COMPANY, { nodeId: `l${L1}`, depth: 1, figures: '1' });
   ok('a branch read with figures=1 carries them (node and children)', kids.node.own?.minutes === 60 && kids.nodes.every((n) => n.own !== undefined));
   const grid = await TREE.lineGrid(conn, COMPANY, { lineId: L1, depth: 50 });
