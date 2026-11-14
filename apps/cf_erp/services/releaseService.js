@@ -2120,6 +2120,22 @@ export async function listTrackerSteps(db, companyId, q = {}) {
     const term = String(q.search).trim().toLowerCase();
     rows = rows.filter((s) => contains(term, s.piece.label, s.order.code, s.operation.code, s.operation.name, s.machine?.code, s.workOrder?.code, s.workOrder?.contractorName));
   }
+  // 2026-11-14 (Steps by machine): where the planner put each step — its machine and slot — so a step not on a
+  // machine yet still groups under the one it is planned on. One read; nothing when the planner has not run.
+  if (rows.length) {
+    try {
+      const [plan] = await db.query(
+        `SELECT p.step_id, p.machine_id, p.planned_start, p.planned_end, m.code, m.name FROM cf_plan3_steps p
+           LEFT JOIN cf_machines m ON m.id = p.machine_id WHERE p.company_id = ? AND p.step_id IN (?)`,
+        [companyId, rows.map((s) => s.id)],
+      );
+      const by = new Map(plan.map((p) => [Number(p.step_id), p]));
+      rows = rows.map((s) => {
+        const p = by.get(Number(s.id));
+        return p ? { ...s, planned: { machine: p.machine_id ? { id: Number(p.machine_id), code: p.code, name: p.name } : null, start: p.planned_start, end: p.planned_end } } : s;
+      });
+    } catch { /* no planner table: no planned machines */ }
+  }
   return rows;
 }
 
