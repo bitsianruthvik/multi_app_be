@@ -545,7 +545,7 @@ export async function detectAlerts(db, c) {
   const force = await planInForce(db, c.companyId, today);
   if (!force?.doc) return { alerts: await openAlerts(db, c.companyId), source: null };
   const { doc, inputs } = force;
-  const facts = await loadFacts(db, c.companyId, { month: force.month });
+  const facts = await loadFacts(db, c.companyId, { month: force.month, allowStale: true });
   const found = [];
   const add = (key, kind, severity, title, detail, extra = {}) => found.push({ key, kind, severity, title, detail, ...extra });
   const planned = new Map((doc.units ?? []).map((u) => [u.key, u]));
@@ -635,17 +635,16 @@ const alertRuns = new Map();        // company → { at, source, running }
 async function alertsFast(db, c) {
   const e = alertRuns.get(c.companyId);
   const stale = !e || Date.now() - e.at > ALERT_TTL_MS;
-  if (!e) {
-    const out = await detectAlerts(db, c).catch(() => ({ alerts: [], source: null }));
-    alertRuns.set(c.companyId, { at: Date.now(), source: out.source, running: false });
-    return out;
+  if (stale && !(e && e.running)) {
+    // Nothing waits for the check: the first read of a company answers from the alerts stored; the check fills them in.
+    alertRuns.set(c.companyId, { at: e ? e.at : 0, source: e ? e.source : null, running: true });
+    import('../lib/db.js')
+      .then(({ pool }) => detectAlerts(pool, c))
+      .then((out) => alertRuns.set(c.companyId, { at: Date.now(), source: out.source, running: false }))
+      .catch(() => { const prev = alertRuns.get(c.companyId) ?? {}; alertRuns.set(c.companyId, { ...prev, running: false }); });
   }
-  if (stale && !e.running) {
-    e.running = true;
-    const { pool } = await import('../lib/db.js');
-    detectAlerts(pool, c).then((out) => alertRuns.set(c.companyId, { at: Date.now(), source: out.source, running: false })).catch(() => { e.running = false; });
-  }
-  return { alerts: await openAlerts(db, c.companyId), source: e.source };
+  const cur = alertRuns.get(c.companyId) ?? { source: null };
+  return { alerts: await openAlerts(db, c.companyId), source: cur.source };
 }
 
 const SEV = { danger: 0, warning: 1, info: 2 };
