@@ -126,18 +126,44 @@ function stepsOf(u) {
  * month has begun). { month, from, last, days, orders, units, machines, calendars, fns, assumed }.
  */
 export async function loadFacts(db, companyId, opts = {}) {
-  // One screen asks for the same facts several times (the overview: the week, its progress, the alerts). They are kept
-  // FACTS_TTL_MS per company, month and first day; a plan run inside a transaction reads them fresh.
+  // One screen asks for the same facts several times (the overview: the week, its progress, the alerts), and a cold load
+  // of a busy company takes tens of seconds. A read screen (allowStale) is answered at once from the last load, kept up
+  // to FACTS_STALE_MS, and that load is refreshed behind the answer; with no load yet it waits for one (shared by every
+  // screen that asks meanwhile). A plan that writes reads them fresh, on its own connection.
   const key = `${companyId}|${opts.month}|${opts.from ?? ''}`;
   const hit = factsCache.get(key);
-  if (hit && Date.now() - hit.at < FACTS_TTL_MS && !opts.fresh) return structuredClone(hit.facts);
+  const age = hit ? Date.now() - hit.at : Infinity;
+  if (hit && age < FACTS_TTL_MS && !opts.fresh) return structuredClone(hit.facts);
+  if (opts.allowStale && !opts.fresh) {
+    if (hit && age < FACTS_STALE_MS) { reloadFacts(key, companyId, opts).catch(() => {}); return structuredClone(hit.facts); }
+    return structuredClone(await reloadFacts(key, companyId, opts));
+  }
   const facts = await loadFactsNow(db, companyId, opts);
-  factsCache.set(key, { at: Date.now(), facts: structuredClone(facts) });
-  if (factsCache.size > 6) factsCache.delete(factsCache.keys().next().value);
+  storeFacts(key, facts);
   return facts;
 }
-const FACTS_TTL_MS = 45_000;
+const FACTS_TTL_MS = 45_000;          // answered as they are
+const FACTS_STALE_MS = 10 * 60_000;   // answered as they are while a reload runs behind them
 const factsCache = new Map();
+const factsLoading = new Map();       // key → the load in progress: one per key
+
+function storeFacts(key, facts) {
+  factsCache.set(key, { at: Date.now(), facts: structuredClone(facts) });
+  if (factsCache.size > 6) factsCache.delete(factsCache.keys().next().value);
+}
+
+/** One load per key at a time, on the pool: the read that asked may have answered and gone before it ends. */
+function reloadFacts(key, companyId, opts) {
+  if (factsLoading.has(key)) return factsLoading.get(key);
+  const p = (async () => {
+    const { pool } = await import('../lib/db.js');
+    const facts = await loadFactsNow(pool, companyId, opts);
+    storeFacts(key, facts);
+    return facts;
+  })().finally(() => factsLoading.delete(key));
+  factsLoading.set(key, p);
+  return p;
+}
 
 async function loadFactsNow(db, companyId, { month, from = null } = {}) {
   const { first, last } = monthBounds(month);
@@ -395,7 +421,7 @@ export async function getMonth(db, companyId, q = {}) {
   const working = rows.find((r) => ['draft', 'pending'].includes(r.status)) ?? null;
   const frozen = rows.find((r) => r.status === 'frozen') ?? null;
   const shown = working ?? frozen;
-  const facts = await loadFacts(db, companyId, { month });
+  const facts = await loadFacts(db, companyId, { month, allowStale: true });
   let doc; let inputs;
   if (shown) { doc = json(shown.result_json); inputs = json(shown.inputs_json) ?? {}; }
   else {

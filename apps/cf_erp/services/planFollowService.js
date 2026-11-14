@@ -285,7 +285,7 @@ export async function weekActual(db, companyId, w) {
   const plan = json(w.result_json) ?? {};
   const week = plan.week ?? { start: dateS(w.week_start), end: dateS(w.week_end), month: dateS(w.week_start).slice(0, 7) };
   const [facts, hrs, contractors] = await Promise.all([
-    loadFacts(db, companyId, { month: week.month }),
+    loadFacts(db, companyId, { month: week.month, allowStale: true }),
     hoursBetween(db, companyId, week.start, week.end),
     contractorStanding(db, companyId, { from: week.start, to: week.end }),
   ]);
@@ -448,7 +448,7 @@ const taskOf = (t, m, minutes, n) => ({
 async function withProgress(db, companyId, day, tasks) {
   if (!tasks.length) return tasks;
   let byKey = new Map();
-  try { byKey = new Map((await loadFacts(db, companyId, { month: day.slice(0, 7) })).units.map((u) => [u.key, u])); } catch { /* the roster still shows, without the floor's progress */ }
+  try { byKey = new Map((await loadFacts(db, companyId, { month: day.slice(0, 7), allowStale: true })).units.map((u) => [u.key, u])); } catch { /* the roster still shows, without the floor's progress */ }
   return tasks.map((t) => {
     const u = t.unitKey ? byKey.get(t.unitKey) : null;
     const floor = !!u && (u.done || (t.fn != null && !u.steps.some((s) => s.fn === String(t.fn) && s.minutes > 0.5)));
