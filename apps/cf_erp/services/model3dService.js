@@ -23,21 +23,30 @@
 import { invalid, notFound } from '../lib/errors.js';
 import { applyLineEdits, withPlaced } from '../lib/lineModelEdits.js';
 import { rowsOfLine } from './partDrawingService.js';
+import { withTopAlias } from '../lib/modelLevels.js';
 
 /** GET /orders/:orderId/lines/:lineId/model3d → the model, or 404 NO_MODEL when the line's standard has none. */
 export async function lineModel3d(db, companyId, orderId, lineId) {
   const [[line]] = await db.query('SELECT l.*, o.code AS order_code FROM cf_sales_order_lines l JOIN cf_sales_orders o ON o.id = l.order_id WHERE l.company_id = ? AND l.order_id = ? AND l.id = ? AND l.deleted_at IS NULL', [companyId, Number(orderId), Number(lineId)]);
   if (!line) throw notFound('Order line');
-  const [[f]] = line.standard_id ? await db.query(
-    "SELECT id, file_name, file_text, created_at FROM cf_standard_drawing_files WHERE company_id = ? AND standard_id = ? AND kind = 'model' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
-    [companyId, Number(line.standard_id)],
-  ) : [[null]];
+  // The model file, the line's rows and its part DXFs (without their geometry) read side by side (2026-11-14: the tub
+  // girder's model took 7.5 s on production, one read after another and 6 MB of DXF geometry it did not use).
+  const [[[f]], rows, [dxfs]] = await Promise.all([
+    line.standard_id ? db.query(
+      "SELECT id, file_name, file_text, created_at FROM cf_standard_drawing_files WHERE company_id = ? AND standard_id = ? AND kind = 'model' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+      [companyId, Number(line.standard_id)],
+    ) : Promise.resolve([[null]]),
+    rowsOfLine(db, companyId, line),
+    db.query(
+      "SELECT id, mark, mark_norm, file_name, created_at FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf' AND geometry_json IS NOT NULL ORDER BY created_at, id",
+      [companyId, line.id],
+    ),
+  ]);
   if (!f) throw notFound('3D model');
   let model;
   try { model = JSON.parse(f.file_text); } catch { throw notFound('3D model'); }
   // Each mark's code on this line, without the order's prefix ("STS(1,2,3)-MTA1-JL2A") — the 3D view's Codes labels (user, 2026-11-01).
   const codes = {};
-  const rows = await rowsOfLine(db, companyId, line);
   for (const r of rows) {
     if (!r.markNorm || !r.code || codes[r.markNorm]) continue;
     const pre = `${line.order_code}-`;
@@ -45,16 +54,20 @@ export async function lineModel3d(db, companyId, orderId, lineId) {
   }
   // The line's own BOM edits on the standard's model (lib/lineModelEdits.js, user 2026-11-12): removed rows hidden, new
   // rows as boxes, part DXFs uploaded since the model was saved drawn in their place. The standard's file never changes.
+  // The top row is the whole model even when its mark is not one the model uses (lib/modelLevels.withTopAlias).
+  model = withTopAlias(model, rows.find((r) => r.parentId == null)?.mark ?? null);
   const parents = new Set(rows.map((r) => r.parentId).filter((x) => x != null).map(Number));
-  const [dxfs] = await db.query(
-    "SELECT id, mark, mark_norm, file_name, geometry_json, created_at FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf' AND geometry_json IS NOT NULL ORDER BY created_at, id",
-    [companyId, line.id],
-  );
   // A part's first DXF on the line is the line's own drawing from its import (the outline it was built from), not a change.
   // Only a later DXF for the same mark is a replacement (user, 2026-11-14: 145 import drawings were counted as changes).
   const seen = new Set();
   const revised = dxfs.filter((d) => { const k = d.mark_norm ?? d.mark; if (seen.has(k)) return true; seen.add(k); return false; });
-  const drawings = revised.map((d) => {
+  // Only the replacements' geometry is read — usually none.
+  const geom = new Map();
+  if (revised.length) {
+    const [gs] = await db.query('SELECT id, geometry_json FROM cf_part_drawings WHERE company_id = ? AND id IN (?)', [companyId, revised.map((d) => d.id)]);
+    for (const g of gs) geom.set(Number(g.id), g.geometry_json);
+  }
+  const drawings = revised.map((d) => ({ ...d, geometry_json: geom.get(Number(d.id)) ?? null })).map((d) => {
     let g = null;
     try { g = JSON.parse(d.geometry_json); } catch { g = null; }
     return { id: Number(d.id), mark: d.mark, markNorm: d.mark_norm, fileName: d.file_name, createdAt: d.created_at, geometry: g };

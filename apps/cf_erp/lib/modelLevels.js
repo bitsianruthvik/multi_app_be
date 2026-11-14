@@ -107,3 +107,26 @@ export async function modelDrawsOfStandard(db, companyId, standardId) {
 
 /** Does the model draw this row? Its mark is one of the model's levels. */
 export const drawnByModel = (levels, mark) => !!mark && levels.has(up(mark));
+
+/**
+ * PURE. THE TOP ROW IS THE WHOLE MODEL (user, 2026-11-14: "one of the top two orders doesn't have diagram at the top line
+ * level"): a line's top row may carry a mark its model does not use — the BOM's "RDSO" where the model's top level is
+ * "SPAN" (SO260026, RDSO/B-17186). The top row is the whole structure all the same, so the model is handed over with
+ * that mark added after its one top level in every element's `in`: every screen (2D levels, 3D, progress) then finds it.
+ * The model as it was when the mark is already a level, or the model has no single top level.
+ */
+export function withTopAlias(model, topMark) {
+  if (!model?.elements?.length || topMark == null || String(topMark).trim() === '') return model;
+  if (levelsOfModel(model).has(up(topMark))) return model;
+  const { tops } = levelParents(model);
+  if (tops.size !== 1) return model;
+  const top = [...tops.keys()][0];
+  const alias = String(topMark);
+  return {
+    ...model,
+    elements: model.elements.map((e) => {
+      const chain = e.in ?? [];
+      return chain.length && up(chain.at(-1)) === top ? { ...e, in: [...chain, alias] } : e;
+    }),
+  };
+}

@@ -410,7 +410,8 @@ function viewOf(line, rows, drawings, refs = new Map(), levels = new Set()) {
   }).sort((a, b) => String(a.drawing.number).localeCompare(String(b.drawing.number)));
   // A level the line's ONE model draws has a drawing without a file (lib/modelLevels.js; user, 2026-11-06).
   // A register sheet waiting for a file does not stop it: the model draws the level meanwhile.
-  const modelRows = rows.filter((p) => !hasFile.has(p.id) && drawnByModel(levels, p.mark)).map((p) => p.id);
+  // The top row is the whole model, whatever mark it carries (lib/modelLevels.withTopAlias).
+  const modelRows = rows.filter((p) => !hasFile.has(p.id) && (drawnByModel(levels, p.mark) || (p.parentId == null && levels.size > 0))).map((p) => p.id);
   for (const id of modelRows) covered.add(id);
   const parts = rows.filter((p) => p.isPlatePart);
   const shaped = measured;
@@ -459,7 +460,7 @@ export async function drawingTree(db, companyId, orderId, lineId) {
         rowId: p.id, parentId: p.parentId, code: p.code, name: p.name, level: p.level, depth: p.depth, seq: p.seq, mark: p.mark,
         hasDrawing: !!d, drawingId: d ? Number(d.id) : null,
         // The line's one model draws this level (no file needed: the screen draws it from the model).
-        inModel: drawnByModel(levels, p.mark), fileKind: d ? d.file_kind ?? 'dxf' : null, fileName: d?.file_name ?? null,
+        inModel: drawnByModel(levels, p.mark) || (p.parentId == null && levels.size > 0), fileKind: d ? d.file_kind ?? 'dxf' : null, fileName: d?.file_name ?? null,
         number: ref?.number ?? null, revision: ref?.revision ?? null, status: ref?.status ?? null,
         // No file on the line: the register drawing that covers the row (opens by its file, or by its link), else null.
         sheet: d ? null : sheetOf(p),
