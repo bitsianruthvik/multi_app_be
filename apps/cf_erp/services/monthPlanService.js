@@ -147,6 +147,23 @@ const FACTS_STALE_MS = 10 * 60_000;   // answered as they are while a reload run
 const factsCache = new Map();
 const factsLoading = new Map();       // key → the load in progress: one per key
 
+/**
+ * Loads the current month's planning facts for every company that has plans, so the first screen a planner opens is
+ * not the one that waits for a cold load. Companies are done one after another (one Node thread serves them all).
+ */
+export async function warmPlanning(pool) {
+  const [rows] = await pool.query(
+    'SELECT DISTINCT company_id FROM cf_mplans WHERE deleted_at IS NULL UNION SELECT DISTINCT company_id FROM cf_wplans WHERE deleted_at IS NULL');
+  for (const r of rows) {
+    try {
+      const { today } = await plantToday(pool, r.company_id);
+      await loadFacts(pool, r.company_id, { month: today.slice(0, 7), allowStale: true });
+    } catch (e) {
+      console.warn('[planning] warm-up skipped for company', r.company_id, e.message);
+    }
+  }
+}
+
 function storeFacts(key, facts) {
   factsCache.set(key, { at: Date.now(), facts: structuredClone(facts) });
   if (factsCache.size > 6) factsCache.delete(factsCache.keys().next().value);

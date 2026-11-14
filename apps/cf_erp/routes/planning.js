@@ -29,6 +29,19 @@ import * as M from '../services/monthPlanService.js';
 import * as F from '../services/planFollowService.js';
 
 const router = Router();
+
+// The planning facts are loaded in the background shortly after the server starts and every 8 minutes, so a planner's
+// first screen does not wait for a cold load.
+if (process.env.NODE_ENV !== 'test') {
+  let warming = false;
+  const warm = () => {
+    if (warming) return;
+    warming = true;
+    M.warmPlanning(pool).catch((e) => console.warn('[planning] warm-up failed', e.message)).finally(() => { warming = false; });
+  };
+  setTimeout(warm, 30_000).unref();
+  setInterval(warm, 8 * 60_000).unref();
+}
 const id = (req) => intParam(req.params.id);
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 const company = (req) => ctx(req).companyId;
