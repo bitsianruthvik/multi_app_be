@@ -24,9 +24,11 @@
  *              LENGTH, WIDTH and THICKNESS: a box of those sizes (length along x, width along y, thickness along z), beside
  *              its parent's pieces (stacked when several) or where `placed` puts it. A row still lacking a size is listed
  *              in `waiting`.
- *   replaced   a part DXF uploaded for a mark after the model was saved, read as one plate (cf_part_drawings.geometry_json):
- *              the mark's pieces take its outline, cut-outs and holes, in the same place (the new outline's corner on the
- *              old one's; turned a quarter when it is drawn the other way round). The old part stays for other marks.
+ *   replaced   a later part DXF for a mark that already had one on this line (the caller passes only those), read as one
+ *              plate (cf_part_drawings.geometry_json): the mark's pieces take its outline, cut-outs and holes, in the same place
+ *              (the new outline's corner on the old one's; turned a quarter when it is drawn the other way round). When its size
+ *              does not match the placed part (a curved or bent part's flat outline), the piece keeps its model shape and is
+ *              only marked changed (kept). The old part stays for other marks.
  */
 
 const up = (s) => String(s ?? '').replace(/\.(dxf|pdf)$/i, '').trim().replace(/[\s_-]+/g, '-').toUpperCase();
@@ -120,6 +122,13 @@ function boxOf2(pts) {
   return { x0: Math.min(...xs), y0: Math.min(...ys), dx: Math.max(...xs) - Math.min(...xs), dy: Math.max(...ys) - Math.min(...ys) };
 }
 
+/** The flat outline's two sides (sorted) match the placed part's within 1 % (5 mm at least). */
+export function sameSize(next, old) {
+  const dims = (pts) => { const b = boxOf2(pts); return [b.dx, b.dy].sort((p, q) => p - q); };
+  const a = dims(old.pts); const b = dims(next.pts);
+  return a.every((v, i) => Math.abs(v - b[i]) <= Math.max(5, 0.01 * v));
+}
+
 /**
  * The new part laid over the old one: the same corner, and a quarter turn when the new drawing's length runs the other way
  * (its x/y swapped). Thickness: the old part's when the new one says none.
@@ -173,12 +182,12 @@ export function applyLineEdits(model, { savedAt = null, rows = [], edits = null,
   const replaced = [];
   const newest = new Map();
   for (const d of drawings) {
-    if (!d.geometry || !d.markNorm || !after(d.createdAt) || !modelMarks.has(d.markNorm) || gone.has(d.markNorm)) continue;
+    if (!d.geometry || !d.markNorm || !modelMarks.has(d.markNorm) || gone.has(d.markNorm)) continue;
     const was = newest.get(d.markNorm);
     if (!was || new Date(d.createdAt) > new Date(was.createdAt) || (String(d.createdAt) === String(was.createdAt) && d.id > was.id)) newest.set(d.markNorm, d);
   }
   for (const [mark, d] of newest) {
-    let pieces = 0; let swapped = false;
+    let pieces = 0; let swapped = false; let kept = false;
     const shapes = new Map();
     elements = elements.map((el) => {
       if (!el.mark || up(el.mark) !== mark) return el;
@@ -186,6 +195,7 @@ export function applyLineEdits(model, { savedAt = null, rows = [], edits = null,
       if (!old?.pts?.length) return el;
       const next = partFromGeometry(d.geometry, old.t);
       if (!next) return el;
+      if (!sameSize(next, old)) { pieces += 1; kept = true; return { ...el, replaced: true }; }
       const key = el.part ?? `inline${el.id}`;
       let fit = shapes.get(key);
       if (!fit) { fit = fitPart(next, old); shapes.set(key, fit); }
@@ -197,7 +207,7 @@ export function applyLineEdits(model, { savedAt = null, rows = [], edits = null,
       parts[id] = shape;
       return { ...el, part: id, replaced: true };
     });
-    if (pieces) replaced.push({ mark: d.mark ?? mark, drawingId: Number(d.id), fileName: d.fileName ?? null, pieces, swapped });
+    if (pieces) replaced.push({ mark: d.mark ?? mark, drawingId: Number(d.id), fileName: d.fileName ?? null, pieces, swapped, kept });
   }
 
   // 3. New rows with sizes: a box each, beside its parent's pieces.

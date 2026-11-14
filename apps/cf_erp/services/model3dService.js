@@ -47,10 +47,14 @@ export async function lineModel3d(db, companyId, orderId, lineId) {
   // rows as boxes, part DXFs uploaded since the model was saved drawn in their place. The standard's file never changes.
   const parents = new Set(rows.map((r) => r.parentId).filter((x) => x != null).map(Number));
   const [dxfs] = await db.query(
-    "SELECT id, mark, mark_norm, file_name, geometry_json, created_at FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf' AND geometry_json IS NOT NULL AND created_at > ?",
-    [companyId, line.id, f.created_at],
+    "SELECT id, mark, mark_norm, file_name, geometry_json, created_at FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf' AND geometry_json IS NOT NULL ORDER BY created_at, id",
+    [companyId, line.id],
   );
-  const drawings = dxfs.map((d) => {
+  // A part's first DXF on the line is the line's own drawing from its import (the outline it was built from), not a change.
+  // Only a later DXF for the same mark is a replacement (user, 2026-11-14: 145 import drawings were counted as changes).
+  const seen = new Set();
+  const revised = dxfs.filter((d) => { const k = d.mark_norm ?? d.mark; if (seen.has(k)) return true; seen.add(k); return false; });
+  const drawings = revised.map((d) => {
     let g = null;
     try { g = JSON.parse(d.geometry_json); } catch { g = null; }
     return { id: Number(d.id), mark: d.mark, markNorm: d.mark_norm, fileName: d.file_name, createdAt: d.created_at, geometry: g };
