@@ -72,6 +72,9 @@ const dimsOfLine = (oi, fb = {}) => {
 const dimsOfBatch = (b) => dimsOfLine(b.oi, { cm: b.cm, die: b.die, w: b.w, c: b.c });
 const aggregate = (rows, keyOf, add) => { const m = new Map(); for (const r of rows) { const row = keyOf(r); const k = JSON.stringify(row); let a = m.get(k); if (!a) { a = { ...row, kg: 0, pcs: 0 }; m.set(k, a); } add(a, r); } return [...m.values()]; };
 
+// ── Invoiced so far, per order line (ERP invoice amount and weight in the same window as sales) ──
+const invByOI = new Map(all(`select x.order_item_id oi, sum(x.amount) am, sum(x.total_weight) kg from tbl_invoice_domestic_detail x join tbl_invoice_domestic i using(invoice_id) where i.invoice_date>='${W0}' and i.invoice_date<='${AS_OF} 23:59' and i.die_invoice_type in (1,4) group by x.order_item_id`).map((r) => [r.oi, { am: Number(r.am), kg: Number(r.kg) }]));
+
 // ── Order lines ──
 const rawLines = all("select d.order_item_id id, m.order_no ono, m.order_date od, d.delivery_date dd, d.order_quantity q, d.total_weight tn, m.customer_id c, d.is_short_close sc, d.die_id die from tbl_order_acceptance_detail d join tbl_order_acceptance_master m using(order_id) where m.order_date>='2024-04-01' and d.die_invoice_type=1 and d.order_quantity>0");
 const lines = rawLines.map((l) => {
@@ -84,7 +87,7 @@ const lines = rawLines.map((l) => {
   const shipQty = sum(s, (e) => e.q);
   const injN = qtySum(inj, ids, 'qn'); const pourI = qtySum(melt, ids, 'qi'); const pourN = qtySum(melt, ids, 'qn'); const insI = qtySum(ins, ids, 'qi'); const insN = qtySum(ins, ids, 'qn'); const authQ = qtySum(auth, ids, 'qi');
   const piles = { 'Not injected': Math.max(0, l.q - injN), 'Injected, not poured': Math.max(0, injN - pourI), 'Poured, not inspected': Math.max(0, pourN - insI), 'Inspected, not cleared': Math.max(0, insN - authQ), 'Cleared, not shipped': Math.max(0, authQ - shipQty) };
-  return { id: l.id, ono: l.ono, die: l.die, ...dimsOfLine(l.id), c: l.c, od, dd: d10(l.dd), q: l.q, tn: round(l.tn, 1), sc: l.sc ? 1 : 0, shipQty, full, sh: s.map((e) => [e.dt, e.q]), legs, bq: sum(ids.map((id) => bi.get(id)), (b) => b.bq), pour: pourI, ok: insN, castDue: d10(wi?.cd) || null, lastPour: lMelt, firstIns: minD(ins, ids), lastIns: lIns, qi: injN, qp: pourN, qn: insN, qc: authQ, at: Object.entries(piles).sort((a, b) => b[1] - a[1])[0][0] };
+  return { id: l.id, ono: l.ono, die: l.die, ...dimsOfLine(l.id), c: l.c, od, dd: d10(l.dd), q: l.q, tn: round(l.tn, 1), inv: round(invByOI.get(l.id)?.am ?? 0, 0), invKg: round(invByOI.get(l.id)?.kg ?? 0, 1), sc: l.sc ? 1 : 0, shipQty, full, sh: s.map((e) => [e.dt, e.q]), legs, bq: sum(ids.map((id) => bi.get(id)), (b) => b.bq), pour: pourI, ok: insN, castDue: d10(wi?.cd) || null, lastPour: lMelt, firstIns: minD(ins, ids), lastIns: lIns, qi: injN, qp: pourN, qn: insN, qc: authQ, at: Object.entries(piles).sort((a, b) => b[1] - a[1])[0][0], piles: Object.fromEntries(Object.entries(piles).map(([k, v]) => [k, Math.round(v)])) };
 }).filter((l) => (l.dd && l.dd >= W0) || l.od >= W0);
 
 // ── Invoices and dispatches ──
@@ -245,7 +248,7 @@ const shipLots = []; const clearedNow = [];
 }
 
 // ── Daily output per step: the last 60 days, for the day-to-day screen ──
-const DAY0 = new Date(Date.parse(AS_OF) - 59 * 86400000).toISOString().slice(0, 10);
+const DAY0 = new Date(Date.parse(AS_OF) - 179 * 86400000).toISOString().slice(0, 10);
 const dailyFlow = aggregate(flowRows.filter((r) => r.e.dt >= DAY0), (r) => ({ stage: r.stage, dt: r.e.dt }), (a, r) => { a.kg = round(a.kg + r.e.qi * r.b.w, 1); a.pcs += r.e.qi; });
 for (const a of aggregate(dispRaw.filter((r) => d10(r.dt) >= DAY0), (r) => ({ stage: 'Dispatched', dt: d10(r.dt) }), (x, r) => { x.kg = round(x.kg + r.q * (r.w || 0), 1); x.pcs += r.q; })) dailyFlow.push(a);
 

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import * as reports from '../services/reportService.js';
+import * as flow from '../services/flowService.js';
 
 /**
  * The screens' side: a platform login with access to this app (protect checks
@@ -55,3 +56,9 @@ router.get('/parts/:id', protect, wrap((req) => reports.partDetail(cid(req), req
 router.get('/lines/:id', protect, wrap((req) => reports.lineDetail(cid(req), req.params.id)));
 
 export default router;
+
+// By flow dashboard: mode=asis|historic; production also takes g=day|week|month|year and stage.
+router.get('/flow/customers', protect, wrap((req) => flow.flowCustomers(cid(req), req.query, req.query.mode)));
+router.get('/flow/planning', protect, wrap((req) => flow.flowPlanning(cid(req), req.query, req.query.mode)));
+router.get('/flow/production', protect, wrap((req) => flow.flowProduction(cid(req), req.query, req.query.mode, { g: req.query.g, stage: req.query.stage })));
+router.get('/flow/dispatch', protect, wrap((req) => flow.flowDispatch(cid(req), req.query, req.query.mode)));

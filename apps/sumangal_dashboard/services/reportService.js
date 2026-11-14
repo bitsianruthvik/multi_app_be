@@ -368,7 +368,19 @@ export async function step(companyId, slug, q) {
 }
 
 // ── Comparing periods: complete calendar months only, so both sides are whole ──
-function compareWindows(d, months) {
+/** A chosen date range is "now"; the same number of days just before it is "before". Used when the reader picks a range. */
+function rangeWindows(d, q) {
+  const to = q.to || d.m.asOf; const from = q.from || d.m.from;
+  const day = (t) => new Date(t + 'T00:00:00Z');
+  const iso = (dt) => dt.toISOString().slice(0, 10);
+  const days = Math.round((day(to) - day(from)) / 86400000) + 1;
+  const prevTo = iso(new Date(day(from) - 86400000));
+  const prevFrom = iso(new Date(day(prevTo) - (days - 1) * 86400000));
+  const n = Math.max(1, Math.round(days / 30.4));
+  return { n, custom: true, now: { from, to, first: from.slice(0, 7), last: to.slice(0, 7) }, prev: { from: prevFrom, to: prevTo, first: prevFrom.slice(0, 7), last: prevTo.slice(0, 7) }, prevPartial: prevFrom < d.m.from };
+}
+function compareWindows(d, months, q) {
+  if (q && (q.from || q.to)) return rangeWindows(d, q);
   const n = [3, 6, 12].includes(Number(months)) ? Number(months) : 6;
   const last = addMonths(d.m.asOf.slice(0, 7), -1); const nowFrom = addMonths(last, 1 - n); const prevTo = addMonths(nowFrom, -1); const prevFrom = addMonths(prevTo, 1 - n);
   return { n, now: { from: `${nowFrom}-01`, to: `${last}-31`, first: nowFrom, last }, prev: { from: `${prevFrom}-01`, to: `${prevTo}-31`, first: prevFrom, last: prevTo }, prevPartial: prevFrom <= d.m.from.slice(0, 7) };
@@ -381,7 +393,7 @@ const totalsBy = (rows, key, value) => { const m = new Map(); for (const r of ro
 
 // ── What changed ──
 export async function whatChanged(companyId, q) {
-  const d = await load(companyId); const w = compareWindows(d, q.months); const qp = { ...q, from: w.prev.from, to: w.prev.to }; const qn = { ...q, from: w.now.from, to: w.now.to }; const f = dimFilter(q);
+  const d = await load(companyId); const w = compareWindows(d, q.months, q); const qp = { ...q, from: w.prev.from, to: w.prev.to }; const qn = { ...q, from: w.now.from, to: w.now.to }; const f = dimFilter(q);
   const fig = (x) => { const s = sales1(salesOf(d, x)); const poured = pouredKg(d, x); const rk = sum(rejOf(d, x), (r) => r.kg); const dl = delivery(d, dueLinesOf(d, x)); return { sales: s.sales, soldT: tonnes(s.kg), price: s.pricePerKg, orderedT: tonnes(sum(d.lines.filter((l) => f(l) && inDates(l.od, x)), (l) => l.tn)), pouredT: tonnes(poured), dispatchedT: tonnes(sum(dispOf(d, x), (r) => r.kg)), rejectionPct: round(pct(rk, poured)), onTimePct: dl.onTimePct, medianDelay: dl.medianDelay }; };
   const now = fig(qn); const prev = fig(qp);
   const metric = (key, label, unit, better) => ({ key, label, unit, better, prev: prev[key], now: now[key], changePct: prev[key] ? round(((now[key] - prev[key]) / prev[key]) * 100, 0) : null });
@@ -419,7 +431,7 @@ export async function actions(companyId, q) {
 // ── Problem parts ──
 const MIN_PART_POURED_KG = 2000;
 export async function problemParts(companyId, q) {
-  const d = await load(companyId); const w = compareWindows(d, q.months); const f = dimFilter(q); const qp = { ...q, ...w.prev }; const qn = { ...q, ...w.now };
+  const d = await load(companyId); const w = compareWindows(d, q.months, q); const f = dimFilter(q); const qp = { ...q, ...w.prev }; const qn = { ...q, ...w.now };
   const poured = (x) => totalsBy(d.dieMelt.filter((r) => f(r) && inMonths(r.mo, x)), 'die', (r) => r.kg); const rejected = (x) => totalsBy(rejOf(d, x), 'die', (r) => r.kg);
   const pn = poured(qn); const pp = poured(qp); const rn = rejected(qn); const rp = rejected(qp);
   const custOf = new Map(); for (const r of d.dieMelt) if (!custOf.has(r.die)) custOf.set(r.die, r.c);
@@ -644,3 +656,6 @@ export async function intentDecisions(companyId, q) {
   const customerRejections = [...groupBy(cr, (r) => `${r.die}|${r.reason}`).values()].map((a) => ({ key: `${a[0].die}|${a[0].reason}`, part: d.partName.get(a[0].die) || `Part ${a[0].die}`, customer: d.custName.get(a[0].c) || '', reason: a[0].reason, pieces: sum(a, (r) => r.q), kg: Math.round(sum(a, (r) => r.kg)), entries: a.length, last: a.map((r) => r.dt).sort().at(-1) })).sort((a, b) => b.pieces - a.pieces).slice(0, 60);
   return { asOf: d.m.asOf, window: win, vendorChoice, supplierChoice, extraVsLoss, customers: customers_, customerRejections };
 }
+
+// Shared with flowService.js (the By flow dashboard).
+export { load, sum, median, pctl, pct, days, round, groupBy, dimFilter, inDates };
