@@ -8,7 +8,7 @@ import { pool } from '../../../db.js';
 const CACHE_MS = 5 * 60 * 1000;
 const cache = new Map();
 const fail = (status, message) => Object.assign(new Error(message), { status });
-const DATASETS = ['meta', 'customers', 'parts', 'sales', 'disp', 'lines', 'rej', 'control', 'flow', 'workDays', 'dieMelt', 'wip', 'heats', 'charge', 'energy', 'vendors', 'machPo', 'purchases', 'grn', 'stepParts', 'stepGap', 'stepWait', 'stepBreak', 'shipLots', 'clearedNow', 'journey', 'batchFacts', 'rhythm', 'salesOrders', 'dailyFlow', 'stock', 'custRej'];
+const DATASETS = ['meta', 'customers', 'parts', 'sales', 'disp', 'lines', 'rej', 'control', 'flow', 'workDays', 'dieMelt', 'wip', 'stepWip', 'heats', 'charge', 'energy', 'vendors', 'machPo', 'purchases', 'grn', 'stepParts', 'stepGap', 'stepWait', 'stepBreak', 'shipLots', 'clearedNow', 'journey', 'batchFacts', 'rhythm', 'salesOrders', 'dailyFlow', 'stock', 'custRej'];
 
 async function load(companyId) {
   const hit = cache.get(companyId);

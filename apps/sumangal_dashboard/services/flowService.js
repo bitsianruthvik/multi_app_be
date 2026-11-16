@@ -126,6 +126,28 @@ function ageOfPile(l, jr, stage, asOf) {
 
 const WORK_STAGES = ['Injection', 'Assembly', 'Coating', 'Dewaxing', 'Melting', 'Fettling', 'Heat treatment', 'Inspection', 'Machining inspection', 'Dispatched'];
 
+// Per-step WIP: pieces that have cleared one step and not yet the next, per batch item (built in build-facts.mjs).
+// Each label reads "cleared A, not yet B". Heat treatment and machining inspection are used only for batch items that record them.
+const GAP_ORDER = ['Injection → Assembly', 'Assembly → Coating', 'Coating → Dewaxing', 'Dewaxing → Melting', 'Melting → Fettling', 'Fettling → Heat treatment', 'Fettling → Inspection', 'Heat treatment → Inspection', 'Inspection → Machining inspection', 'Inspection → Cleared', 'Machining inspection → Cleared'];
+const gapTonnes = (rows) => round(sum(rows, (r) => r.kg) / 1000, 1);
+
+/** Open WIP between steps as of the last data day, pieces and tonnes per gap. */
+function stepWipAsis(d, f, asOf) {
+  const rows = (d.stepWip || []).filter((r) => r.me === asOf && f(r));
+  const gaps = GAP_ORDER.map((gap) => { const g = rows.filter((r) => r.gap === gap); return { gap, pcs: sum(g, (r) => r.pcs), tonnes: gapTonnes(g) }; }).filter((x) => x.pcs);
+  return { gaps, totalPcs: sum(gaps, (x) => x.pcs), totalTonnes: round(sum(gaps, (x) => x.tonnes), 1) };
+}
+
+/** Month-end snapshots of per-step WIP in the range, tonnes per gap, and each gap's average across them. */
+function stepWipHistoric(d, f, from, to) {
+  const rows = (d.stepWip || []).filter((r) => r.me >= from && r.me <= to && f(r));
+  const gaps = GAP_ORDER.filter((gap) => rows.some((r) => r.gap === gap));
+  const dates = [...new Set(rows.map((r) => r.me))].sort();
+  const months = dates.map((date) => { const a = rows.filter((r) => r.me === date); return { date, tonnes: Object.fromEntries(gaps.map((g) => [g, gapTonnes(a.filter((r) => r.gap === g))])) }; });
+  const avgTonnes = Object.fromEntries(gaps.map((g) => [g, round(sum(months, (m) => m.tonnes[g]) / (months.length || 1), 1)]));
+  return { gaps, months, avgTonnes };
+}
+
 export async function flowProduction(companyId, q, mode, opts = {}) {
   const d = await load(companyId); const f = dimFilter(q); const j = jrMap(d); const asOf = d.m.asOf;
   if (mode === 'asis') {
@@ -154,7 +176,7 @@ export async function flowProduction(companyId, q, mode, opts = {}) {
       const avg = days90 ? sum(w, (r) => r.kg) / days90 : null;
       return { stage, todayKg: round(today, 0), avg90Kg: round(avg, 0), vsAvgPct: avg ? round(pct(today, avg) - 100, 0) : null };
     }).filter((r) => r.todayKg || r.avg90Kg);
-    return { asOf, mode, lastDay: last, wip, work, ageBuckets: [...BUCKETS.map(([b]) => b), 'No date'] };
+    return { asOf, mode, lastDay: last, wip, work, stepWip: stepWipAsis(d, f, asOf), ageBuckets: [...BUCKETS.map(([b]) => b), 'No date'] };
   }
   // Historic: WIP over the range, sampled at period ends.
   const from = q.from || d.m.from; const to = q.to || asOf;
@@ -181,7 +203,7 @@ export async function flowProduction(companyId, q, mode, opts = {}) {
   const timeline = series.map((t) => { const p = point(t); return { date: t, tonnes: p.tonnes }; });
   const sel = STAGES.includes(opts.stage) ? opts.stage : STAGES[1];
   const aging = monthly.map((p) => { const a = p.age[sel]; const b = Object.fromEntries([...BUCKETS.map(([x]) => x), 'No date'].map((x) => [x, 0])); for (const [n, t] of a) b[bucketOf(n)] += t; return { date: p.date, buckets: Object.fromEntries(Object.entries(b).map(([k, v]) => [k, round(v)])) }; });
-  return { asOf, mode, from, to, g, stages: STAGES, avgWip, avgAge, timeline, stage: sel, aging, ageBuckets: [...BUCKETS.map(([b]) => b), 'No date'] };
+  return { asOf, mode, from, to, g, stages: STAGES, avgWip, avgAge, timeline, stage: sel, aging, stepWip: stepWipHistoric(d, f, from, to), ageBuckets: [...BUCKETS.map(([b]) => b), 'No date'] };
 }
 
 // ── 4. Dispatch ──────────────────────────────────────────────────────────────
@@ -298,4 +320,75 @@ function dispatchInsights(d, q, inWin) {
   };
 
   return { lots: lots.length, lines: lines.length, lateDrivers, consolidation, leadSplit, cadence };
+}
+
+// ── Vendors: outside job work, by vendor, process and part type ──────────────────────
+// A part type is the part name, as the Customer screen uses it. Turnaround is measured only on outward lines
+// that have come fully back (no weight still out), from the day sent to the day the last piece came back.
+// As-is is the last six calendar months; Historic is the chosen dates.
+const VENDOR_MONTHS_ASIS = 6;
+const TOP_VENDORS = 6;
+
+/** Calendar months from one YYYY-MM to another, inclusive. */
+function monthsBetween(fromMo, toMo) {
+  const out = []; let [y, m] = fromMo.split('-').map(Number);
+  for (;;) {
+    const mo = `${y}-${String(m).padStart(2, '0')}`;
+    if (mo > toMo) break;
+    out.push(mo); m += 1; if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
+
+/** Volume and turnaround for a set of outward lines. Tonnes are the slip weight, as the Sent figure on Vendors uses. */
+function vendorStats(rs, monthsN) {
+  const t = sum(rs, (r) => r.t) / 1000;
+  const back = rs.filter((r) => r.openKg === 0 && r.days != null && r.days >= 0).map((r) => r.days);
+  return {
+    lines: rs.length,
+    tonnes: round(t, 1),
+    perMonth: round(t / monthsN, 1),
+    backLines: back.length,
+    medianTat: median(back),
+    p90Tat: pctl(back, 0.9),
+    outT: round(sum(rs, (r) => r.openKg || 0) / 1000, 1),
+    lastSent: rs.reduce((m, r) => (r.dt > m ? r.dt : m), ''),
+  };
+}
+
+export async function flowVendors(companyId, q, mode) {
+  const d = await load(companyId); const asOf = d.m.asOf;
+  const [ay, am] = asOf.slice(0, 7).split('-').map(Number);
+  const asisFrom = new Date(Date.UTC(ay, am - VENDOR_MONTHS_ASIS, 1)).toISOString().slice(0, 10);
+  const from = mode === 'asis' ? asisFrom : (q.from || d.m.from);
+  const to = mode === 'asis' ? asOf : (q.to || asOf);
+  const a = d.vendors.filter((r) => r.dt >= from && r.dt <= to);
+  const monthList = monthsBetween(from.slice(0, 7), to.slice(0, 7));
+  const monthsN = monthList.length || 1;
+
+  const vendors = [...groupBy(a, (r) => r.v).entries()].map(([vendor, rs]) => ({
+    vendor,
+    processes: [...new Set(rs.map((r) => r.p))].sort(),
+    parts: new Set(rs.map((r) => r.die)).size,
+    ...vendorStats(rs, monthsN),
+  })).sort((x, y) => y.tonnes - x.tonnes);
+
+  const rows = [...groupBy(a, (r) => [r.v, r.p, r.die].join('\u0001')).entries()].map(([k, rs]) => {
+    const [vendor, process, die] = k.split('\u0001');
+    return { key: k, vendor, process, part: d.partName.get(Number(die)) || `Part ${die}`, ...vendorStats(rs, monthsN) };
+  }).sort((x, y) => y.tonnes - x.tonnes);
+
+  const top = vendors.slice(0, TOP_VENDORS).map((v) => v.vendor);
+  const monthly = monthList.map((mo) => {
+    const rs = a.filter((r) => r.dt.slice(0, 7) === mo); const tonnesBy = {};
+    for (const n of top) tonnesBy[n] = round(sum(rs.filter((r) => r.v === n), (r) => r.t) / 1000, 1);
+    tonnesBy.Other = round(sum(rs.filter((r) => !top.includes(r.v)), (r) => r.t) / 1000, 1);
+    return { mo, tonnes: tonnesBy };
+  });
+
+  return {
+    asOf, mode, from, to, months: monthsN,
+    kpis: { vendors: vendors.length, parts: new Set(a.map((r) => r.die)).size, ...vendorStats(a, monthsN) },
+    topVendors: top, monthly, vendors, rows,
+  };
 }

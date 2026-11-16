@@ -134,6 +134,34 @@ for (const me of monthEnds) for (const b of recent) {
 }
 const wip = [...wipMap.values()];
 
+// ── Work in process between consecutive steps, at month ends (per batch item) ──
+// Pieces that have cleared one step and not yet cleared the next. Heat treatment and machining inspection
+// are optional in the ERP (many items never record them), so each item uses only the optional steps it
+// has a record for, at any date. Required steps are used for every item.
+const hasRec = (stage, id) => (STAGES[stage].get(id) || []).length > 0;
+const stepWipMap = new Map();
+for (const me of monthEnds) for (const b of recent) {
+  const chain = ['Injection', 'Assembly', 'Coating', 'Dewaxing', 'Melting', 'Fettling'];
+  if (hasRec('Heat treatment', b.id)) chain.push('Heat treatment');
+  chain.push('Inspection');
+  if (hasRec('Machining inspection', b.id)) chain.push('Machining inspection');
+  chain.push('Cleared');
+  // Processed quantity (good and rejected both left the step). A step cannot have passed more pieces than the
+  // step before it, so each step's count is capped at the one before; the gaps are then never negative.
+  let prevName = chain[0]; let prevDone = upTo(STAGES[prevName], b.id, 'qi', me);
+  for (let i = 1; i < chain.length; i += 1) {
+    const next = chain[i];
+    const done = Math.min(upTo(STAGES[next], b.id, 'qi', me), prevDone);
+    const pcs = prevDone - done;
+    if (pcs > 0) {
+      const row = { me, gap: `${prevName} → ${next}`, ...dimsOfBatch(b) }; const k = JSON.stringify(row);
+      const a = stepWipMap.get(k) || { ...row, kg: 0, pcs: 0 }; a.kg = round(a.kg + pcs * b.w, 1); a.pcs += pcs; stepWipMap.set(k, a);
+    }
+    prevName = next; prevDone = done;
+  }
+}
+const stepWip = [...stepWipMap.values()];
+
 // ── Heats and charge ──
 const itemName = new Map(all('select item_id id, item_name n from tbl_item_master').map((r) => [r.id, r.n]));
 const heats = all(`select * from tbl_melting_production_master where melting_date>='${W0}' and melting_date<='${AS_OF} 23:59'`);
@@ -329,7 +357,7 @@ const mach = all("select d.machining_completion_date plan, d.actual_completion_d
 
 const facts = {
   meta: [{ asOf: AS_OF, from: W0, machPlan: { lines: mach.length, planned: mach.filter((r) => r.plan).length, actual: mach.filter((r) => r.plan && r.act).length } }],
-  customers: customers.filter((c) => usedCust.has(c.id)), parts, sales, disp, lines, rej, control, flow, workDays: workDayRows, dieMelt, wip, heats: heatRows, charge: [...chargeMap.values()], energy, vendors, machPo, purchases, grn, stepParts, stepGap: [...gapMap.values()], stepWait, stepBreak, shipLots, clearedNow, journey, batchFacts, rhythm, salesOrders, dailyFlow, stock, custRej,
+  customers: customers.filter((c) => usedCust.has(c.id)), parts, sales, disp, lines, rej, control, flow, workDays: workDayRows, dieMelt, wip, stepWip, heats: heatRows, charge: [...chargeMap.values()], energy, vendors, machPo, purchases, grn, stepParts, stepGap: [...gapMap.values()], stepWait, stepBreak, shipLots, clearedNow, journey, batchFacts, rhythm, salesOrders, dailyFlow, stock, custRej,
 };
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, JSON.stringify(facts));
