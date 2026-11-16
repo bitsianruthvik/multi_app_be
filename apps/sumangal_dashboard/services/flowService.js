@@ -373,11 +373,6 @@ export async function flowVendors(companyId, q, mode) {
     ...vendorStats(rs, monthsN),
   })).sort((x, y) => y.tonnes - x.tonnes);
 
-  const rows = [...groupBy(a, (r) => [r.v, r.p, r.die].join('\u0001')).entries()].map(([k, rs]) => {
-    const [vendor, process, die] = k.split('\u0001');
-    return { key: k, vendor, process, part: d.partName.get(Number(die)) || `Part ${die}`, ...vendorStats(rs, monthsN) };
-  }).sort((x, y) => y.tonnes - x.tonnes);
-
   const top = vendors.slice(0, TOP_VENDORS).map((v) => v.vendor);
   const monthly = monthList.map((mo) => {
     const rs = a.filter((r) => r.dt.slice(0, 7) === mo); const tonnesBy = {};
@@ -386,17 +381,20 @@ export async function flowVendors(companyId, q, mode) {
     return { mo, tonnes: tonnesBy };
   });
 
-  // Part types grouped on one axis ('family' by default, or 'component'). Names not yet classified show as Unclassified.
-  const axis = q.group === 'component' ? 'component' : 'family';
-  const groupOf = (die) => d.partGroupByName.get(d.partName.get(Number(die)) || '')?.[axis] || 'Unclassified';
-  const groupRows = [...groupBy(a, (r) => [groupOf(r.die), r.v, r.p].join('\u0001')).entries()].map(([k, rs]) => {
-    const [group, vendor, process] = k.split('\u0001');
-    return { key: k, group, vendor, process, partNames: new Set(rs.map((r) => r.die)).size, ...vendorStats(rs, monthsN) };
+  // Pivot: the lines grouped by any mix of vendor, process, product line (family) and casting (component), in the order
+  // asked with ?by=a,b,c (up to three). Product line and casting come from the reviewed part-group file; a name not on it is Unclassified.
+  const groupOf = (die, axis) => d.partGroupByName.get(d.partName.get(Number(die)) || '')?.[axis] || 'Unclassified';
+  const DIM = { vendor: (r) => r.v, process: (r) => r.p, family: (r) => groupOf(r.die, 'family'), component: (r) => groupOf(r.die, 'component') };
+  const dims = String(q.by || 'vendor').split(',').filter((k, i, all) => DIM[k] && all.indexOf(k) === i).slice(0, 3);
+  const pivot = [...groupBy(a, (r) => dims.map((k) => DIM[k](r)).join('\u0001')).entries()].map(([k, rs]) => {
+    const row = { key: k, partNames: new Set(rs.map((r) => r.die)).size, ...vendorStats(rs, monthsN) };
+    k.split('\u0001').forEach((v, i) => { row[dims[i]] = v; });
+    return row;
   }).sort((x, y) => y.tonnes - x.tonnes);
 
   return {
-    asOf, mode, from, to, months: monthsN, axis,
-    kpis: { vendors: vendors.length, parts: new Set(a.map((r) => r.die)).size, groups: new Set(groupRows.map((g) => g.group)).size, ...vendorStats(a, monthsN) },
-    topVendors: top, monthly, vendors, rows, groupRows,
+    asOf, mode, from, to, months: monthsN, dims,
+    kpis: { vendors: vendors.length, parts: new Set(a.map((r) => r.die)).size, ...vendorStats(a, monthsN) },
+    topVendors: top, monthly, vendors, pivot,
   };
 }
