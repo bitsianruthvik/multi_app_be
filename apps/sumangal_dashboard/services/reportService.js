@@ -8,7 +8,7 @@ import { pool } from '../../../db.js';
 const CACHE_MS = 5 * 60 * 1000;
 const cache = new Map();
 const fail = (status, message) => Object.assign(new Error(message), { status });
-const DATASETS = ['meta', 'customers', 'parts', 'sales', 'disp', 'lines', 'rej', 'control', 'flow', 'workDays', 'dieMelt', 'wip', 'stepWip', 'heats', 'charge', 'energy', 'vendors', 'machPo', 'purchases', 'grn', 'stepParts', 'stepGap', 'stepWait', 'stepBreak', 'shipLots', 'clearedNow', 'journey', 'batchFacts', 'rhythm', 'salesOrders', 'dailyFlow', 'stock', 'custRej'];
+const DATASETS = ['meta', 'customers', 'parts', 'sales', 'disp', 'lines', 'rej', 'control', 'flow', 'workDays', 'dieMelt', 'wip', 'stepWip', 'heats', 'charge', 'energy', 'vendors', 'machPo', 'purchases', 'grn', 'stepParts', 'stepGap', 'stepWait', 'stepBreak', 'shipLots', 'clearedNow', 'journey', 'batchFacts', 'rhythm', 'salesOrders', 'dailyFlow', 'stock', 'custRej', 'partGroup'];
 
 async function load(companyId) {
   const hit = cache.get(companyId);
@@ -20,6 +20,7 @@ async function load(companyId) {
   d.m = d.meta[0];
   d.custName = new Map(d.customers.map((c) => [c.id, c.name]));
   d.partName = new Map(d.parts.map((p) => [p.id, p.name]));
+  d.partGroupByName = new Map(d.partGroup.map((g) => [g.name, g]));
   cache.set(companyId, { until: Date.now() + CACHE_MS, data: d });
   return d;
 }

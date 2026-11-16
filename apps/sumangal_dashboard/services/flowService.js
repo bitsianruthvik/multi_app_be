@@ -386,9 +386,17 @@ export async function flowVendors(companyId, q, mode) {
     return { mo, tonnes: tonnesBy };
   });
 
+  // Part types grouped on one axis ('family' by default, or 'component'). Names not yet classified show as Unclassified.
+  const axis = q.group === 'component' ? 'component' : 'family';
+  const groupOf = (die) => d.partGroupByName.get(d.partName.get(Number(die)) || '')?.[axis] || 'Unclassified';
+  const groupRows = [...groupBy(a, (r) => [groupOf(r.die), r.v, r.p].join('\u0001')).entries()].map(([k, rs]) => {
+    const [group, vendor, process] = k.split('\u0001');
+    return { key: k, group, vendor, process, partNames: new Set(rs.map((r) => r.die)).size, ...vendorStats(rs, monthsN) };
+  }).sort((x, y) => y.tonnes - x.tonnes);
+
   return {
-    asOf, mode, from, to, months: monthsN,
-    kpis: { vendors: vendors.length, parts: new Set(a.map((r) => r.die)).size, ...vendorStats(a, monthsN) },
-    topVendors: top, monthly, vendors, rows,
+    asOf, mode, from, to, months: monthsN, axis,
+    kpis: { vendors: vendors.length, parts: new Set(a.map((r) => r.die)).size, groups: new Set(groupRows.map((g) => g.group)).size, ...vendorStats(a, monthsN) },
+    topVendors: top, monthly, vendors, rows, groupRows,
   };
 }

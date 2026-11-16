@@ -1,0 +1,2870 @@
+{
+ "_note": "Part-name groups. Reviewed by a person; new names are added by classify-parts.mjs. Edit a row to change its group.",
+ "legend": {
+  "component": [
+   "Body",
+   "Bonnet, cover or cap",
+   "Cage, plug or trim",
+   "Gland or packing",
+   "Impeller or casing",
+   "Lever, stem or actuator part",
+   "Other part"
+  ],
+  "family": [
+   "Ball valve",
+   "Gate or globe valve",
+   "Control valve",
+   "Safety valve",
+   "Pump",
+   "Knife valve",
+   "Unclear"
+  ]
+ },
+ "groups": {
+  "1 1/2\" 800# GTV WEDGE": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "1 1/4\" VALVE BODY-G": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "1\" CVS EZ RETAINER CF8M No. BUSHING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "1\" EQUAL PERCENT CAGE": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "1\"x2\"-3\"x4\" CAPPELLO VALVOLA SERIE 3000 A-B-W-P": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "1-1/2\" CAGE": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "1.125 DISP GLAND (RJS090)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "1.5 B EQ PCT Cage Casting": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "1.5\" LG1, CAGE, SG, UB, TN 1.50": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "1/2\" & 3/4\" BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "1/2\" 3/4\" 1\"x1\" COROP FILETTATO": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "100MM 150# GTV WEDGE": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "132_CORPO_INFERIOR_DN2_17_13_X_X_X": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "150MM 150# GATE VALE WEDGE": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "2\" 150-600# GTV WEDGE (SWAGING)": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "2\" 300# GTV WEDGE": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "2\" 600# GTV WEDGE": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "2\" 800# GTV WEDGE": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "2\" SERIES E - LINEAR CAGE": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "2\" SERIES E CAGE CASTING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "2-1/2\" EQUAL PERCENT": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "2.0 DCC Handle 2-1/2 & 3 Inch": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "2.0 DDC Handle 4 Inch": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "2.5 E EQ PCT Cage Casting": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "2.875 TO 3.125 DISP GLAND (RJS240)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "283_CORPO SUPERIORE_DN2x2_17_13_x_11_x": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "2E EQ PCT Cage": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "2E EQ PCT Cage Casting": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "3 FL- GEHAUSE DN15 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "3\" 150# GTV WEDGE": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "3\" 150/300/600# DISC CARRIER": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "3\" EZ SEAT RING RETAINER": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "3\" LG1, CAGE, SG, UB, TN 3.00": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "3\" SERIES E CAGE CASTING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "3\" SERIES YD - BALANCED PLUG": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "3\" SERIES YD - LOWER CAGE": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "3\" SERIES YD - UPPER CAGE": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "3E EQ PCT Cage": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "4\" 150/300/600# DISC CARRIER": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "4\" 300# GTV WEDGE": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "4\" A-100 CAGE CASTING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "4\" EZ SEAT RING RETAINER": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "40-160 IMPELLER 504162A (X504162A)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "4E Cage Casting": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "6\" 150-300-600# DISC CARRIER": {
+   "component": "Cage, plug or trim",
+   "family": "Gate or globe valve",
+   "by": "initial"
+  },
+  "6\" A-100 CAGE, 6X4 EQUAL PCT": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "6\" LG1, CAGE, BLANK CASTING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "6\" SERIES E- CAGE, EQUAL %, 2\" TRAVEL": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "6E EQ PCT CAGE": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "8\" A-100 CAGE CASTING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "8\" LG1, CAGE LOAD RING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "8\" LG1, CAGE, BLANK CASTING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "808 Valve Body With flange DN 25": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "824 Valve Body with flange DN 40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "8E EQ PCT CAGE": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "ADJUSTING RING": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "ANVIL ST4-1": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Adjusting Ring H": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Adjusting Ring K": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Adjusting Ring M": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Adjusting Ring Q": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Adjusting Ring R": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BAFFLE": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BALL VALVE 3PF BODY 1 DN25 PN40": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE 3PF BODY 1 DN32 PN40": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE 3PF BODY 1 DN40 PN40": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE 3PF BODY 1 DN50 PN40": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE 3PF BODY 1 DN65 PN40": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE 3PF BODY 1 DN80 PN40": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 1\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 1\" 300Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 1/2\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 2\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 2\" 300Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 3\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 4\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 6\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN100 PN16 F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN125 PN 16": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN125 PN 40": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN15 PN(16-40) F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN150 PN16": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN20 PN(16-40) F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN200 PN16": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN25 PN(16-40) F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN32 PN(16-40) F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN40 PN(16-40) F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN50 PN(16-40) F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN65 PN16 F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN65 PN40 F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN80 PN 40 F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 1 DN80 PN16 F4+F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 1\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 1\" 300Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 1/2\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 2\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 2\" 300Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 3\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 4\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 6\" 150Lbs": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN100 PN16 F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN100 PN16 F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN125 PN 16": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN125 PN 40 F5": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN15 PN(16-40) F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN15 PN(16-40) F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN150 PN16": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN20 PN(16-40) F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN20 PN(16-40) F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN200 PN16": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN25 PN(16-40) F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN25 PN(16-40) F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN32 PN(16-40) F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN40 PN(16-40) F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN50 PN(16-40) F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN50 PN(16-40) F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN65 PN16 F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN65 PN40 F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN80 PN 40 F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN80 PN16 F4": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE BODY 2 DN80 PN40 F1": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE EXTENSION CASING 250mm F05/1": {
+   "component": "Lever, stem or actuator part",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE EXTENSION CASING 250mm F05/2": {
+   "component": "Lever, stem or actuator part",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE EXTENSION CASING 250mm F07": {
+   "component": "Lever, stem or actuator part",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE EXTENSION CASING 250mm F10": {
+   "component": "Lever, stem or actuator part",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE TANK BOTTOM DIN 28140 BODY 2 DN200/250 PN10": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BALL VALVE TANK BOTTOM DIN28140 BODY 1 DN200 PN10": {
+   "component": "Body",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "BEARING BRACKET": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BEARING CARRIER": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BEARING FLANGE": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BEARING FLANGE PART NO.12 9": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY - 510ARN - DN 08/10/15": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY - 510IRN - DN 08/10/15": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 1\"X1\" 150X150": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 110 AR - ND 25": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 110 AR - ND 32 - PN 40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 110 AR - ND 65": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 110 AR ND 20 - PN 40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 130 IR - DN 20 - PN 40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 130 IR - ND 32": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 130 IRN ND 25": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 130 IRN ND 65": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 1xD-Ex2 150÷600x150÷300": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 1xD-Ex2 300x150": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 2\"X3\" 150 X 150": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 203 SS CF8 RGH": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 22LD RGH SS CF8M": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 3xK-Lx4 150 ÷ 300x150": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 510 IRN - ND 20/25/32/CF8M": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 510ARN-ND20/25/32-A216 WCC": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 (1\" x 1 ½  150#)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 (DN-100xDN-150)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 (DN-25xDN-40)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 (DN-32xDN-50)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 (DN-40xDN-65)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 (DN-50xDN-80)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 4\" x 6\" 150 x 150 FF": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 DN-100 x DN-150 PN-16 / #150": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 DN-100 x DN-150 PN-25 ? PN-40 / #300": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 DN-20xDN-32 PN-16/PN-40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 DN-65xDN-100 PN-16/PN-40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 5500 DN-80xDN-125 PN-16/PN-40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 971 RGH CS WCB/LCB": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 973 RGH BW CS WCB/LCB": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY 973 RGH CS WCB/LCB": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY ACBR 2 RGH SS CF8M IBR": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY ACBR 3 RGH SS CF8M IBR": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY ACBR 4 RGH SS CF8M IBR": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY ACBR 6 RGH SS CF8M IBR": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY ACBR 8 RGH SS CF8M SPCL": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY ACCELABAR 1 RGH SS CF8M": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY CASTING": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY CASTING  (IB971)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY CASTING IS4 R/L": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY CASTING SH2500": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN15 (105 65 20)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN15 (105 67 20)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN15xDN25 PN16÷40/16": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN20 (109 54 30)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN20xDN25 PN16÷40/16": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN25 (105 08 40)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN25 (109 02 40)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN25 (123 55 30)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN32 (105 11 20)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY DN32 (105 11 40)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY F - ½÷¾ x 1\" 900÷1500x150÷300": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY F 3/4\"X 1 300÷600/150": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY F ½÷ 1 x 1 150÷600x150÷300": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY IS2 L/R 1/2 3/4 RGH SS CF8": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY IS2 R/L 1/2 3/4 RGH CTSS T304 IBR": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY IS4 R/L RGH SS CF8M": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY MACHINING": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY RF-FF 2\"X3\" 150 X 150": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY SH4000 RGH SS IBR T316": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY SH900 RGH SS CF8M": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY T. ½÷¾÷1xC-D-Ex1 NPT": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY T.ENTRY 150/300BW10/80 3\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY T.ENTRY 150/600BW10/80 1 1/2\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY T.ENTRY 150/600BW10/80 1\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY T.ENTRY 150/600BW10/80 2\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BODY ½÷¾÷1xC-D-Ex1 BSPP": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BOLZ LAUFROLLE DRS 112": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BOLZ LAUFROLLE DRS 125": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BOLZ LAUFROLLE DRS 160": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BOLZ LAUFROLLE DRS 200": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET (MACHINING) 110 AR - ND 40/50": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET (MACHINING) 130 IRN ND 40/50": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 1xD-Ex2 150÷600x150": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 2xH-Jx3 150÷600x150": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 5500 (DN100-xDN-150)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 5500 (DN25-xDN-40)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 5500 (DN32-xDN-50)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 5500 (DN40-xDN-65)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 5500 (DN50-xDN-80)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 5500 (DN80-xDN-125)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 5500 DN-20xDN-32 PN-16/PN-40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET 5500 DN-65xDN-100 PN-16/PN-40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET CLOSED V20 (141 06 40)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET CLOSED V50 (141 85 30)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET CV1500 RGH 4 CTS": {
+   "component": "Bonnet, cover or cap",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "BONNET OPEN SPRING FL = 130mm": {
+   "component": "Bonnet, cover or cap",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "BONNET OPEN SPRING FL = 160mm": {
+   "component": "Bonnet, cover or cap",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "BONNET OPEN SPRING FL = 80mm": {
+   "component": "Bonnet, cover or cap",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "BONNET SPRING FL = 130mm": {
+   "component": "Bonnet, cover or cap",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "BONNET SPRING FL = 160mm": {
+   "component": "Bonnet, cover or cap",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "BONNET SPRING FL = 80mm": {
+   "component": "Bonnet, cover or cap",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "BONNET TVS4000 RGH": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "BONNET XS": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Baffle High Flow SSFR 1/4\" & 1/2\"": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Base Plate type 9": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Blades (BL-248)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Blades (BL-900)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bock Steckbuchse B1 F 10 Hub / Stroke -": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body - ½\"÷1\"x1\" / DN15÷25xDN25": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body - ½÷¾÷1\" X 1\"DN15÷20÷25 X DN25": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body AB DN100": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body AB DN200 PN16 (6 HOLE)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body AB DN250": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body AB DN300": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body AB DN50": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body AB DN65": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body AB DN80": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body API NPS 3 x NPS 4 / CL 300 x CL150 (1399872)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body API NPS 3 x NPS 4 / CL 300 x CL150 (1451138)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body API NPS 3 x NPS 4 / CL 300 x CL150 (1463821)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body API NPS 3 x NPS 4 / CL 300 x CL150 (1485720)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body API NPS 3 x NPS 4 / CL150xCL150 (930298)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body API NPS 3 x NPS 4 / CL150xCL150 (972362)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body API NPS 3 x NPS 4 / CL150xCL150 (987285)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body API NPS 3 x NPS 4 / CL150xCL150 (987329)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body Casting": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body DN 20 (105 05 40)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body DN 25 (105 60 40)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body DN125 PN16": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body DN125 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body DN150 PN16": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body DN150 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body High Flow SSFR 1/4\" & 1/2\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body Lower Part Flanged Ends": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body Upper Part Flanged Ends": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body Valve DN15 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Body Valve DN20 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet CLOSED V40 (141 83 40)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Close V50 (141 85 40)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Closed PN160(142 96 30)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Closed PN160(142 96 40)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Closed V50 (BVT) (142 63 30)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet DN 2\" (19-19p-19v)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet High Flow SSFR 1/4\" & 1/2\"": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Valve ND 15-20": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Valve ND 25-32 PN40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Valves ND 40-50 PN 40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Valves ND 65-80 PN 40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bonnet Valves ND100 PN40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bottom cap 01 (Part No. 1147)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Bowl High Flow SSFR 1/4\" & 1/2\"": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAM DISC": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP 22LD RGH SS CF8M": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP 2xGHJx3 150÷2500x150÷300": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP 971 RGH": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP 973 RGH SS": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP CASTING": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP CASTING (IB971)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP CASTING SH2500": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP CONVENTIONAL": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP DN100 x DN150": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP EXTN A/C RGH SS CB7CU-1 H900": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP EXTN M/MS K/KD RGH CTSS CB7CU-1": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP ICS L/R 1 300RF RGH CS (BODY)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP ICS L/R 1 RGH": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP ICS L/R 3/4 RGH": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP ICS L/R 3/4 RGH CS WCB/LCB": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP ICS L/R DN20 PN40RF RGH CS WCB/LCB": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP ICS VERT 1/2 3/4 RGH CS WCB/LCB": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP SH4000 RGH CTSS IBR T316": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP SH900 RGH SS CF8M": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP STD 1xD-Ex2": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAP STD F.E.T. 1xD-Ex2": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CAPPELLO LEVA": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CASING COVER": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CASING F/M RAW CC40X32-160 (XV04161A)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "CASINGV06201B_65-200 (XV06201B)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "CASINGV08161A_80-160 (XV08161A)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "CASINGV08201B_80-200 (XV08201B)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "CHAIN ANCHORAGE 2/1": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CHAIN INLET KETTE 10.5 (DC25)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CHAIN INLET KETTE 8.7 (DC16)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CLAMP PART NO.02 16": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CLAMPING PLATE PART NO.02 23 9 A1": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COPERCHIO N 1": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COPERCHIO N° 5": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CORPO 3/4\" 150X 150 (Small Flange)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CORPO 3/4\" 300-600 X 150 (Big Flange)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CORPO PER SOFEIRTTO  VALVOLA SERIR 3000 1\"X2\" ASME 300-600 X 150 RF (Big Flange)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CORPO PER SOFFIETTO Valvola serir 3000 1\"X2\" ASME 150 x 150 RF (Small Flange)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COVER (2008) DN 125-150": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COVER (2008) DN 15-20": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COVER (2008) DN 200-300": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COVER (2008) DN 25-32": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COVER (2008) DN 40-65": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COVER (2008) DN 80-100": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COVER CASTING NF-SOLENOID": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "COVER DN 2\" (2-2a)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CUERPO ROSCADO OUTLET 1\" - BSPP": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CUERPO ROSCADO OUTLET 1\" - NPT": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CUERPO ROSCADO OUTLET ¾\" BSPP": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "CVS 2\" EZ RETAINER CF8M No. BUSHING": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "Cap Casting": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Cavalletto Valvola DN300 PN16-25(RAW CASTING)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Cavalletto valvola a V.E. DN65-80 PN16-25": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Cavallettovalvola a V.E. DN25-32 PN16-25": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Cavallrtto valvola a V.E. DN40-50 PN16-25": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Chemical Test": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Clamp": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Connector Female": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Connector Male": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Connector male": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Control Cage  (CC 900)": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "Control Cage (CC-248)": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "Cover (Tapa) DN 15-20": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Cover DN 2\" (2v-2p)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DISCHARGE COVER": {
+   "component": "Bonnet, cover or cap",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "DN15 150RF L/R CAP ICS F&T": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN15 PN40 RF L/R CAP ICS F&T": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN20 ANSI 150 RF CAP ICS F&T": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN20 ANSI 300 RF CAP ICS F&T (BODY)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN20 PN40 L/R CAP ICS F&T": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN20/15 RGH BODY ICS F&T": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN25 150RF L/R CAP ICS F&T": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN25 150RF L/R CAP ICS F&T (BODY)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN25 300RF L/R CAP ICS F&T": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN25 PN40 DECKEL/BONNET (P4057)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN25 PN40RF RGH L/R CAP ICS F&T": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN25 RGH BODY ICS F&T": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DN50 PN40 DECKEL/BONNET (P4059)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DRUCKSTUCK-C MD168": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "DUFFUSER CASTING DRV-B14": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Deckel/Bonnet (PN40/160  DN15-32)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Deckel/Bonnet(PN40/160 DN40;DN65;DN50)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Deckel/Bonnet-DN15 PN40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Deckel/Bonnet-DN25 PN40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Deckel/Bonnet-DN50 PN40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Deckel/Bonnet-DN80 PN40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Diffuser 8 DRV-Z": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "EBE-TYPE, EFK-QR Quick Release": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "EFG-F ASA 1½\"  #300 B16.5 Lrg Ins (Part No.1477)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "EFG-F ASA 2\" #300 B16.5 Lrg Ins (Part No.1487)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "END-CAP, FINISHED, IC, HP-PUMP, AL6XN": {
+   "component": "Bonnet, cover or cap",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "FEED THROAT MOUNTING PLATE": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Fixing Part K16-D39L30 - D168839-A": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Fixing Part K25-D47.5L40 - D168719-A": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Flange Loose Plate V(S)F 25/40": {
+   "component": "Other part",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "G0560S 6\"E5100 Knife Valve Bonnet": {
+   "component": "Bonnet, cover or cap",
+   "family": "Knife valve",
+   "by": "initial"
+  },
+  "GLAND FOLLOWER": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "GLAND FOLLOWER UNMACHINED": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "GUIDASTELO": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "GUIDE": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "GUIDE STD-XS": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "GUIDE XS": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "Gland (DN 40-65 PN40)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Gland (PN40 DN100,125)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Gland (PN40 DN15-32)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Gland (PN40 DN150)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Gland (PN40 DN200)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Gland (PN40 DN40;DN65;DN50)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Gland (PN40 DN80)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Gland flange, Globe DN25": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HINGE": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING CASTING WSNF": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING EXT. ZE 100mm F07": {
+   "component": "Lever, stem or actuator part",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "HOUSING EXT. ZE 100mm F10": {
+   "component": "Lever, stem or actuator part",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "HOUSING EXT. ZE 150mm F12": {
+   "component": "Lever, stem or actuator part",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "HOUSING EXT. ZE 150mm F14": {
+   "component": "Lever, stem or actuator part",
+   "family": "Ball valve",
+   "by": "initial"
+  },
+  "HOUSING TOP ENTRY CRI. 600 1 1/2\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING TOP ENTRY CRI. 600 1\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING TOP ENTRY CRI. F16": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING TOP ENTRY CRY. F12": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING TOP ENTRY CRY. F14": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING TOP ENTRY CRY. F16-1": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING TOP ENTRY CRY. F25": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "HOUSING, SUCTION, IC, HP-PUMP, AL6XN": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Hub/Stroke": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "I.S. Bonnet DN250 PN16 \"RAW CASTING\"": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "IMPELLER": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER 125-200": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER 16GHE6 VANES": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER 16GLE5 VANES": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER 6MM SERIES - 8 VANES": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER BODY": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER CLOSED CC40X32-160 (X504161A)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER S/O-606202B_65-200 (X606202B)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER S/O-608202B_80-200 (X608202B)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER606161A_65-160 (X606161A)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER606201B_65-200 (X606201B)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER608201B_80-200 (X608201B)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLER708161A_80-160 (X708161A)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "IMPELLR S/O-708162A_80-160 (X708162A)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "INSERT ICS 1 CTS WCB/LCB": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "INSERT ICS 1/2 3/4 CTS WCB/LCB": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Impact Test": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Impeller (IM 248-900)": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Impeller V(S)F 85": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Inlet Ring V(C/S) 10/15": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "KUPPLUNGSELEMENT DR 10": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Kolnierz/Brucke DN150 PN40": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Lever DN 200": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Lifting Aid Do 29 (342 66 40)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Lifting cap H4 Gr. 1 (155 16 40)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Luftehaube H4 Gr.3 (155 37 40)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Luftehebel H4 Gr.3": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "MECHANISM SPRT DD12 CTSS T316": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "MOTOR HOUSING": {
+   "component": "Other part",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "MOTOR HOUSING ICP DS132-222S/G": {
+   "component": "Other part",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Mechanized closed bonnet S1415 2 x 3 J": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Middle Liner (ML 900)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "NOZZLE 4 M 6 (207 44 40)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "NOZZLE 4 P 6 (207 46 40)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Nozzle 1.5 F 2 (207 23 40)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Nozzle 2 H 3 (207 29 40)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Nozzle 3L 4 (207 34 40)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "OPEN BONNET 5500 DN-65xDN-100 PN-16 / PN-40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "OPEN BONNET 5500 DN-80xDN-125 PN-16 / PN-40": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "OPEN LEVER CAP 5500 (DN-25 / DN-32)": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Outlet Body DN 15 (PN100) (123 90 40)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Outlet Body DN 20 (PN100) (123 87 30)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PILOT BODY STAINLESS STEEL 15/16": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLATE PART NO.02 01": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLATE PART NO.9 02 02": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLATE PART NO.9 02 02 (R)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLUG 120 AR - ND 20/25": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLUG 120 AR - ND 40/50/65": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLUG 120 AR - ND 80//150": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLUG 140 IR ND 20/25": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLUG 140 IR ND 40/50/65": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PLUG 550 IR ND 08/.../32": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "PORT, END, 1-1/2\", 4 SERIES , IC, AL6XN": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "PUMP CASING": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "PUMP HOUSING MACHINING - TYPR 180X25": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Packing Gland AB DN100": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Packing Gland AB DN200": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Packing Gland AB DN250": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Packing Gland AB DN65": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "RING, LOCK, SEGMENT, 10.5IN": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "ROTARY TORQUE RECEPTACLE - CLASS 1-4": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Raised top cap DN40/50 (Part No. 1607)": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Rebound Liner Left (RL-L900)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Rebound Liner Right (RL-R900)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Rohteil V200": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "S1415 DN-1\" D 1\" & DN-1\" E 1\" CLASS 300RF/150RF (CPF1648)": {
+   "component": "Body",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "S1415 DN-2\" H 3\"-2\" J 3\" 150#RF/150RF VALVULA DE SEGURIDAD (CP1658)": {
+   "component": "Body",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "S1415 DN-2\" H 3\"-2\" J 3\" 300#RF/150RF VALVULA DE SEGURIDAD (CP1658)": {
+   "component": "Body",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "S1472 DN-80X125 PN-16/25/40 VALVULA DE SEGURIDAD (CP1434)": {
+   "component": "Body",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "S1490 DN-100x 150": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SEAT RING HOLDER": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SERIE 1415 DN-1 1/2\"X3\" CLASE 150Y300 # SERIE 1415 DN-2\"X3\" CLASE 150Y300(CI14130)": {
+   "component": "Body",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "SERIE 1461F DN 65/100 ?60 VALVULA DE SEGURIDAD (CI14130)": {
+   "component": "Body",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "SERIES 630 REGULATOR - 2\" BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHAFT PROTECTING SLEEVE": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHAFT SLEEVE": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK (MACHINING) API - ND 1\" STANDARD": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK 110 AR - ND 20/25": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK 110 AR - ND 65": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK 110 AR - ND 80": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK 110 AR ND 32": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK 130 IRN ND 20/25": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK 130 IRN ND 32": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK 130 IRN ND 65": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SHANK 130 IRN ND 80": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SICCA 150-600 2 & 2 1/2 SCC": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SPLINED SHAFT PART NO.02 06 M6": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SPLINED SHAFT PART NO.02 06 M9": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SPRING-LOADED RING HOLDER": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SS 1 EQ PCT Cage": {
+   "component": "Cage, plug or trim",
+   "family": "Control valve",
+   "by": "initial"
+  },
+  "ST. BOX COVER CC05-160 (XS0516A)": {
+   "component": "Gland or packing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "ST3-9 DRIVE ROD": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "ST6-9 DOUBLE DRIVER": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "STOPFBUCHSBRILLE (P3564)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "STOPFBUCHSBRILLE (P3565)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "STOPFBUCHSBRILLE (P3846)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "STOPFBUCHSBRILLE DN25 PN400  (P3853)": {
+   "component": "Gland or packing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "STUFFING BOX COVER S0616A_06-160 (XS0616A)": {
+   "component": "Gland or packing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "STUFFING BOX NOR. CC06-200 (XS0620A)": {
+   "component": "Gland or packing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "SUSPENSION PLATE A12/A16": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SUSPENSION PLATE A18/A22": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SUSPENSION PLATE SIDE MEMBER KBK I": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SUSPENSION PLATE SIDE MEMBER KBK II": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "SV11 DIFFUSION HEAD (2500003)": {
+   "component": "Impeller or casing",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Seal Cover": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Seal Cover V(C/S) 10/15": {
+   "component": "Bonnet, cover or cap",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Serie 1216 DN-1/2\"X2\"-DN2\"X2\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Sideliner": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stage Casing V(C/S) 85": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Stainless Steel Body Valve DN40 PN40 (FINISHED  WITH UNDRILLED FLANGES)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stainless Steel Body Valve ND 25 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stainless Steel Body Valve ND 32": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stainless Steel Body Valve ND 65": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stainless Steel Body Valve ND100 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stainless Steel Body Valve ND80 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stainless steel body valve ND40 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stainless steel body valve ND50 (Hole Packed)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stainless steel body valve ND50 PN40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Stop Guard Type 8": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "TAPPET": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "THREADED BODY OUTLET ¾\" NPT": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "TOOL COST COVER SS WSNF (4 cavity-Auto)": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "TRAY MOUNTING PLATE": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "TVS4000 L/R RGH BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "TVS4000 R/L IBR BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "TYPE B, DN25, PN40 (Part no. 1060)": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Tensile Test": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Test Bar": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Typ 550 DN 25 PN 10/40": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Type-B DN40/DN50-PN40 (Large insert)": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V26015 001R2 CF8M BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V26015 002 CF8M BTCOVER": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V26020-001 CF8M BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V26020-002 CF8M BT COVER": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V26025-001 CF8M BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V26025-002 CF8M BT COVER": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V28015-001R2 CF8M BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V28015-002 CF8M BTCOVER": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V28020-001 CF8M BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V28020-002 CF8M BT COVER": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V28025-001 CF8M BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V28025-002 CF8M BT COVER": {
+   "component": "Bonnet, cover or cap",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "V300/V400": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "VALVE BODY": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "VALVE BODY 710/750 IR - DN 80/.../15": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "VALVE HOUSING-MACHINING": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "VALVULA DE SEGURIDAD S1418 DN-15X25 & DN-20X25 PN40/PN25/PN16XPN16 (CP1400)": {
+   "component": "Body",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "VOLUTE CASING DN25": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "VOLUTE CASING DN30": {
+   "component": "Impeller or casing",
+   "family": "Pump",
+   "by": "initial"
+  },
+  "Valve Housing High Flow SSFR 1/4\" & 1/2\"": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with flanges DN 25, Class 2500 Model 948": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with flanges DN 50, Class 2500 Model 950": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with flanges DN32, PN40 Model:946": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with flanges DN50, PN40 Model:810": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with welding ends DN 25 PN40 Model 807": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with welding ends DN 25, Class 2500 Model 949": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with welding ends DN 50, Class 2500 Model 951": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with welding ends DN25 PN250 Model 763": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valve-body with welding ends DN50 PN40 Model 814": {
+   "component": "Body",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Valvula de Seguridad S1415 DN-1\" D 2\" & 1\" E 2\" CLASS 150 RF": {
+   "component": "Body",
+   "family": "Safety valve",
+   "by": "initial"
+  },
+  "Wall Bearing Lower Half 6 Long 6 Holes": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Wall Bearing Upper Half 5.75 Long 4 Holes": {
+   "component": "Other part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "YOKE DN150 PN16-25": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "YOKE DN200 PN16-25": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "Yoke DN100 PN16-25": {
+   "component": "Lever, stem or actuator part",
+   "family": "Unclear",
+   "by": "initial"
+  },
+  "plug": {
+   "component": "Cage, plug or trim",
+   "family": "Unclear",
+   "by": "initial"
+  }
+ }
+}

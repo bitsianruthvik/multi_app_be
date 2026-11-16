@@ -352,12 +352,16 @@ const salesOrders = all(`select m.order_id id, m.order_no no, m.customer_id c, m
 
 const usedDies = new Set([...lines.map((l) => l.die), ...sales.map((s) => s.die), ...rej.map((r) => r.die), ...dieMelt.map((r) => r.die)]);
 const parts = [...usedDies].filter(Boolean).map((id) => ({ id, name: dieM.get(id)?.de || `Part ${id}` }));
+// Part-name groups: a reviewed data file (see data/part-groups.json and scripts/classify-parts.mjs), not code.
+// A name not in the file is 'Unclassified' until classify-parts.mjs adds it.
+const partGroupFile = JSON.parse(fs.readFileSync(new URL('../data/part-groups.json', import.meta.url), 'utf8')).groups || {};
+const partGroup = parts.map((p) => { const name = String(p.name).trim(); const g = partGroupFile[name]; return { name, component: g?.component || 'Unclassified', family: g?.family || 'Unclassified' }; });
 const usedCust = new Set([...lines.map((l) => l.c), ...sales.map((s) => s.c), ...rej.map((r) => r.c), ...dieMelt.map((r) => r.c)]);
 const mach = all("select d.machining_completion_date plan, d.actual_completion_date act, m.machining_po_date dt from tbl_machining_po_detail d join tbl_machining_po_master m using(machining_po_id) where m.machining_po_date>=?", W0);
 
 const facts = {
   meta: [{ asOf: AS_OF, from: W0, machPlan: { lines: mach.length, planned: mach.filter((r) => r.plan).length, actual: mach.filter((r) => r.plan && r.act).length } }],
-  customers: customers.filter((c) => usedCust.has(c.id)), parts, sales, disp, lines, rej, control, flow, workDays: workDayRows, dieMelt, wip, stepWip, heats: heatRows, charge: [...chargeMap.values()], energy, vendors, machPo, purchases, grn, stepParts, stepGap: [...gapMap.values()], stepWait, stepBreak, shipLots, clearedNow, journey, batchFacts, rhythm, salesOrders, dailyFlow, stock, custRej,
+  customers: customers.filter((c) => usedCust.has(c.id)), parts, partGroup, sales, disp, lines, rej, control, flow, workDays: workDayRows, dieMelt, wip, stepWip, heats: heatRows, charge: [...chargeMap.values()], energy, vendors, machPo, purchases, grn, stepParts, stepGap: [...gapMap.values()], stepWait, stepBreak, shipLots, clearedNow, journey, batchFacts, rhythm, salesOrders, dailyFlow, stock, custRej,
 };
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, JSON.stringify(facts));
