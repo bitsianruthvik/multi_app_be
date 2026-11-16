@@ -163,7 +163,7 @@ try {
 
   // ---- B. create -------------------------------------------------------------------------
   section('B. Create production orders from the execution plan');
-  const SOQ = await order('Q', 'quoted');
+  const SOQ = await order('Q', 'inquiry');
   await line(SOQ, 1, A, 1);
   await plan(SOQ, 'line');
   // 2026-11-12: made as soon as the execution plan is set — no confirmed order needed (release still needs one).

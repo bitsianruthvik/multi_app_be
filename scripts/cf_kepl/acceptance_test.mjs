@@ -225,7 +225,7 @@ try {
   ok('the status route refuses to confirm a customer order', viaRoute?.code === 'ACCEPTANCE_FIRST', viaRoute?.message);
   // (2026-11-12: the acceptance is no process stage any more; a script may still confirm directly — fixtures do. People only reach the route.)
   const o1 = await SO.getOrder(db, COMPANY, O1.id);
-  ok('the order offers no Confirm move', !o1.allowedTransitions.includes('confirmed') && o1.allowedTransitions.includes('quoted'), j(o1.allowedTransitions));
+  ok('the order offers no Confirm move', !o1.allowedTransitions.includes('confirmed') && o1.allowedTransitions.includes('lost'), j(o1.allowedTransitions));
 
   /* ════════════════════ 6. save → pending ════════════════════ */
   section('6. Save the acceptance → pending approval');
@@ -449,11 +449,11 @@ try {
   ok('approved, MR raised: the customer\'s ₹0 PO, placed, dated as they promised', cpo.length === 1 && Number(cpo[0].supplied_by_customer) === 1 && cpo[0].status === 'ordered' && String(cpo[0].expected_date instanceof Date ? `${cpo[0].expected_date.getFullYear()}-${String(cpo[0].expected_date.getMonth() + 1).padStart(2, '0')}-${String(cpo[0].expected_date.getDate()).padStart(2, '0')}` : cpo[0].expected_date).slice(0, 10) === '2026-11-05', j(cpo));
 
   /* ════════════════════ 13. a stock order; a revision ════════════════════ */
-  section('13. A stock order confirms with its button; a revision carries the acceptance');
-  const so = await SO.createOrder(db, c, { orderType: 'stock', code: `${tag}-STK` });
-  await SO.addOrderLine(db, c, so.id, { recordId: S.FG, quantity: 1 });
-  const stk = await SO.setOrderStatus(db, c, so.id, 'confirmed', { fromRoute: true });
-  ok('a stock order: draft → confirmed by its button', stk.status === 'confirmed');
+  section('13. Stock orders are no longer made (2026-11-16); a revision carries the acceptance');
+  const noStock = await SO.createOrder(db, c, { orderType: 'stock', code: `${tag}-STK` }).then(() => null, (e) => e);
+  ok('a new stock order is refused', /no longer made/.test(JSON.stringify([noStock?.message, noStock?.problems])), noStock?.message);
+  const noQuote = await SO.setOrderStatus(db, c, O1.id, 'quoted', { fromRoute: true }).then(() => null, (e) => e);
+  ok('and an inquiry cannot be marked quoted', noQuote?.code === 'BAD_TRANSITION', noQuote?.message);
   const rev = await REV.reviseOrder(db, c, O2.id);
   const Arev = await ACC.getAcceptance(db, COMPANY, rev.id);
   ok('the revision is confirmed and its acceptance came with it, locked', rev.status === 'confirmed' && Arev.locked && Arev.approved.version === 1 && Arev.postStages.length === 2, j([rev.status, Arev.state, Arev.postStages.length]));

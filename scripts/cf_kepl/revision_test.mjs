@@ -577,7 +577,7 @@ try {
   const a40Part = (await partsOf(conn, f, a40.id))[0].id;
   refusedRev1('the header', await refusal(() => SO.updateOrder(conn, c, A.order.id, { title: 'Renamed' })), 422);
   says((await refusal(() => SO.updateOrder(conn, c, A.order.id, { title: 'Renamed' }))).message);
-  refusedRev1('its status', await refusal(() => SO.setOrderStatus(conn, c, A.order.id, 'quoted')), 422);
+  refusedRev1('its status', await refusal(() => SO.setOrderStatus(conn, c, A.order.id, 'lost')), 422);
   refusedRev1('a new line', await refusal(() => SO.addOrderLine(conn, c, A.order.id, { recordId: f.GR.id, quantity: 1 })), 422);
   refusedRev1('a line\'s wording', await refusal(() => SO.updateOrderLine(conn, c, a10.id, { description: 'Span 1' })), 422);
   refusedRev1('removing its open line', await refusal(() => SO.removeOrderLine(conn, c, a40.id)), 422);
@@ -757,9 +757,12 @@ try {
   await SO.setOrderStatus(conn, c, Fq.order.id, 'lost');
   const lost = await refusal(() => REV.reviseOrder(conn, c, Fq.order.id));
   ok('a lost order is not revised', lost?.code === 'NOT_REVISABLE' && /is lost — only an open order/.test(lost.message), lost?.message);
-  const stock = await SO.createOrder(conn, c, { orderType: 'stock', code: `${tag}-STK` });
-  const stockErr = await refusal(() => REV.reviseOrder(conn, c, stock.id));
-  ok('nor is a stock order', stockErr?.code === 'NOT_REVISABLE' && /is a stock order/.test(stockErr.message), stockErr?.message);
+  // 2026-11-16: stock orders are no longer made; one made before is still read, and still not revised.
+  const noStock = await refusal(() => SO.createOrder(conn, c, { orderType: 'stock', code: `${tag}-STK` }));
+  ok('a new stock order is refused', /no longer made/.test(JSON.stringify([noStock?.message, noStock?.problems])), noStock?.message);
+  const [stockRow] = await conn.query("INSERT INTO cf_sales_orders (company_id, code, order_type, status) VALUES (?, ?, 'stock', 'confirmed')", [COMPANY, `${tag}-STK`]);
+  const stockErr = await refusal(() => REV.reviseOrder(conn, c, stockRow.insertId));
+  ok('nor is a stock order made before', stockErr?.code === 'NOT_REVISABLE' && /is a stock order/.test(stockErr.message), stockErr?.message);
   eq('a revision cannot be renumbered', (await refusal(() => SO.updateOrder(conn, c, D2b.id, { code: `${tag}-OTHER` })))?.problems?.[0], `A revision keeps its order's number — this is rev 2 of ${Dq.code}.`);
   eq('an order that does not exist is a 404', (await refusal(() => REV.reviseOrder(conn, c, 999999999)))?.status, 404);
   eq('nor can another company revise it', (await refusal(() => REV.reviseOrder(conn, { companyId: COMPANY + 1000000, userId: null }, D2b.id)))?.status, 404);

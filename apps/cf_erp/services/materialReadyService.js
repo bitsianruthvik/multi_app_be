@@ -60,7 +60,7 @@ const pad = (n) => String(n).padStart(2, '0');
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 /** Orders whose lines can still need material: the planner's set (not draft, lost, cancelled, closed or revised). */
-export const OPEN_ORDER_STATUSES = ['inquiry', 'quoted', 'confirmed'];
+export const OPEN_ORDER_STATUSES = ['inquiry', 'confirmed'];
 /** A purchase order that can still deliver. The first two give a DATE; the rest are only asked for. */
 export const DATED_PO_STATUSES = ['ordered', 'partially_received'];
 export const ASKED_PO_STATUSES = ['requested', 'quoting', 'draft'];

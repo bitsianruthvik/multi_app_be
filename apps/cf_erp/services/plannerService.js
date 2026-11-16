@@ -94,7 +94,7 @@ const MONTH_RE = /^(\d{4})-(0[1-9]|1[0-2])$/;
 const UNIT_RE = /^(?:([pl])([1-9]\d*)(?:#([1-9]\d*))?|(g)([1-9]\d*)\.([1-9]\d*))$/;
 const MAX_ENTRIES = 5000;
 const MAX_DEPTH_LEVEL = 15;
-const OPEN_ORDER_STATUSES = ['inquiry', 'quoted', 'confirmed'];
+const OPEN_ORDER_STATUSES = ['inquiry', 'confirmed'];
 // One status set for "a purchase order that gives a date" — the material-ready engine's own (§56).
 const OPEN_PO_STATUSES = DATED_PO_STATUSES;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];

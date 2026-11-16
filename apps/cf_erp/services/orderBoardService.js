@@ -18,7 +18,7 @@ import { readRequisitions } from './requisitionService.js';
 import { acceptanceStates, postStagesOf, recordOrderEvent } from './acceptanceService.js';
 
 export const LANES = [
-  { key: 'inquiry', label: 'Inquiry / draft' },
+  { key: 'inquiry', label: 'Inquiry' },
   { key: 'pending_approval', label: 'Pending approval' },
   { key: 'material', label: 'Material' },
   { key: 'in_production', label: 'In production' },
@@ -48,7 +48,7 @@ export function laneOf(f) {
  */
 export async function orderBoard(db, companyId, q = {}) {
   const where = ["o.company_id = ?", 'o.deleted_at IS NULL', "o.order_type = 'customer'",
-    "(o.status IN ('inquiry','quoted','confirmed') OR (o.status = 'closed' AND o.updated_at >= NOW() - INTERVAL 90 DAY))"];
+    "(o.status IN ('inquiry','confirmed') OR (o.status = 'closed' AND o.updated_at >= NOW() - INTERVAL 90 DAY))"];
   const args = [companyId];
   if (!blank(q.search)) { where.push('(o.code LIKE ? OR o.title LIKE ? OR p.name LIKE ?)'); const like = `%${String(q.search).trim()}%`; args.push(like, like, like); }
   const [orders] = await db.query(

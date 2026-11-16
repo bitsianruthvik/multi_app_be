@@ -57,7 +57,7 @@ const fmt = (n) => String(Number(Number(n).toFixed(3)));
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 /** Orders a purchase can still be made for (purchaseLinkService.LINKABLE). */
-const BUYABLE_ORDER_STATUSES = ['draft', 'inquiry', 'quoted', 'confirmed'];
+const BUYABLE_ORDER_STATUSES = ['inquiry', 'confirmed'];
 
 /*
  * CUSTOMER ACCEPTANCE GATES THE MR (§73, user 2026-10-18). A customer's order raises its MR before the customer has
@@ -469,7 +469,7 @@ export async function orderRequisitions(db, companyId, orderId, { R: given = nul
   return {
     order: { id: o.id, code: o.code, status: o.status, open, materialSupply: supplyOf(o.material_supply), materialSupplyLabel: SUPPLY_LABEL[supplyOf(o.material_supply)] },
     today: R.today,
-    reason: open ? null : `${o.code} is ${o.status} — a material request is raised for an inquiry, a quoted or a confirmed order.`,
+    reason: open ? null : `${o.code} is ${o.status} — a material request is raised for an inquiry or a confirmed order.`,
     requisitions,
     linesWithout,
   };
@@ -638,7 +638,7 @@ export async function syncLines(db, c, prs, needs) {
 export async function raiseRequisitions(db, c, orderId, input = {}) {
   const o = await requireOrderRow(db, c.companyId, orderId, { lock: true });
   if (!OPEN_ORDER_STATUSES.includes(o.status)) {
-    throw invalid('NOT_OPEN', `${o.code} is ${o.status} — a material request is raised for an inquiry, a quoted or a confirmed order.`);
+    throw invalid('NOT_OPEN', `${o.code} is ${o.status} — a material request is raised for an inquiry or a confirmed order.`);
   }
   // 2026-11-12 (user): a customer's order raises its MR only once the customer has accepted and the MD has accepted the
   // order (it is confirmed). The §73 "raise and share before the acceptance" is gone; MRs raised that way stay held.

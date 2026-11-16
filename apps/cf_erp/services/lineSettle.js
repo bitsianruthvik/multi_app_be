@@ -12,6 +12,10 @@
  * nothing changes for it — and otherwise answers with the structure as it stands and `settling: true`; the screen reads
  * again until it is done. All of a line's choices and values commit together or not at all, so a restart mid-way leaves the
  * line as it was and the next open starts again.
+ *
+ * Since the same day refreshValues works a wave of records at a time (valueService, valueWaveReads.js): all the values of
+ * that 362-row line from nothing are 80 round trips and 12 s, so a first open normally ends inside the read's wait. The
+ * run outside the request stays: it is what keeps a read from ever waiting on a line larger than any seen so far.
  */
 import { withTransaction } from '../lib/db.js';
 import { autofillLineSelections } from './selectionService.js';

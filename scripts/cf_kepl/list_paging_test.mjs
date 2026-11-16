@@ -119,16 +119,16 @@ try {
 
   section('3. orders: 540 rows with revisions');
   const [[cust1]] = await conn.query('SELECT id FROM cf_parties WHERE company_id = ? AND code = ?', [COMPANY, `${TAG}-0001`]);
-  const STATUSES = ['inquiry', 'quoted', 'confirmed', 'draft', 'closed', 'lost', 'cancelled'];
+  const STATUSES = ['inquiry', 'confirmed', 'closed', 'lost', 'cancelled'];
   const orders = [];
   const past = '2020-01-01';
   for (let i = 0; i < 520; i++) {
     const status = STATUSES[i % STATUSES.length];
     orders.push([COMPANY, `${TAG}-SO-${String(i).padStart(4, '0')}`, i % 5 === 0 ? 'stock' : 'customer', `${TAG} order ${i}`, i % 5 === 0 ? null : cust1.id, status, i % 6 === 0 ? past : null, i < 20 ? 2 : 1, null]);
   }
-  // 20 earlier revisions: rev 1 'revised' (was quoted), the order above is rev 2.
+  // 20 earlier revisions: rev 1 'revised' (was an inquiry), the order above is rev 2.
   for (let i = 0; i < 20; i++) {
-    orders.push([COMPANY, `${TAG}-SO-${String(i).padStart(4, '0')}`, i % 5 === 0 ? 'stock' : 'customer', `${TAG} order ${i} r1`, i % 5 === 0 ? null : cust1.id, 'revised', null, 1, 'quoted']);
+    orders.push([COMPANY, `${TAG}-SO-${String(i).padStart(4, '0')}`, i % 5 === 0 ? 'stock' : 'customer', `${TAG} order ${i} r1`, i % 5 === 0 ? null : cust1.id, 'revised', null, 1, 'inquiry']);
   }
   await conn.query(
     'INSERT INTO cf_sales_orders (company_id, code, order_type, title, customer_id, status, committed_date, revision, status_before_revised) VALUES ?',
@@ -141,7 +141,7 @@ try {
     [COMPANY, `${TAG}-SO-%`],
   );
   const want = Object.fromEntries(byStatus.map((r) => [r.status, Number(r.n)]));
-  const wantOpen = ['draft', 'inquiry', 'quoted', 'confirmed'].reduce((t, s) => t + (want[s] ?? 0), 0);
+  const wantOpen = ['inquiry', 'confirmed'].reduce((t, s) => t + (want[s] ?? 0), 0);
   const wantOverdue = byStatus.reduce((t, r) => t + Number(r.overdue || 0), 0);
   const o1 = await O({ paged: 1, search: `${TAG}-SO`, chip: 'open', limit: 100, sort: 'code', dir: 'desc' });
   eq('chip=open total = every open order', o1.total, wantOpen);
@@ -152,7 +152,7 @@ try {
   eq('chips.overdue', o1.counts.chips.overdue, wantOverdue);
   const allOpen = await readAll(O, { search: `${TAG}-SO`, chip: 'open', sort: 'code', dir: 'desc' }, 100);
   eq('paging reaches every open order', allOpen.rows.length, wantOpen);
-  ok('every row is open', allOpen.rows.every((o) => ['draft', 'inquiry', 'quoted', 'confirmed'].includes(o.status)));
+  ok('every row is open', allOpen.rows.every((o) => ['inquiry', 'confirmed'].includes(o.status)));
   const oc = allOpen.rows.map((o) => o.code);
   eq('code desc is in order across pages', oc.join(), [...oc].sort().reverse().join());
   const overdue = await O({ paged: 1, search: `${TAG}-SO`, chip: 'overdue', limit: 500 });
@@ -160,8 +160,8 @@ try {
   ok('every overdue row is overdue', overdue.rows.every((o) => o.overdue));
   const withRev = await O({ paged: 1, search: `${TAG}-SO`, chip: 'confirmed', revisions: 'all', limit: 500 });
   const confRevised = withRev.rows.filter((o) => o.status === 'revised');
-  // codes 0..19 at rev 2: i % 7 === 2 → confirmed → i = 2, 9, 16
-  eq('an earlier revision is filed under its replacement (confirmed)', confRevised.map((o) => o.code).sort(), [2, 9, 16].map((i) => `${TAG}-SO-${String(i).padStart(4, '0')}`));
+  // codes 0..19 at rev 2: i % 5 === 1 → confirmed → i = 1, 6, 11, 16
+  eq('an earlier revision is filed under its replacement (confirmed)', confRevised.map((o) => o.code).sort(), [1, 6, 11, 16].map((i) => `${TAG}-SO-${String(i).padStart(4, '0')}`));
   eq('… and the chip counts still count each order once', withRev.counts.chips.confirmed, want.confirmed);
   const stock = await O({ paged: 1, search: `${TAG}-SO`, orderType: 'stock', chip: 'all', limit: 10 });
   eq('orderType=stock total', stock.total, 104);

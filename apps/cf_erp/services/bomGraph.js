@@ -249,28 +249,22 @@ export async function rollupChildren(db, companyId, parentId, specCodes) {
   if (!lines.length) return [];
   const itemIds = lines.filter((l) => l.child_record_kind === 'item').map((l) => l.child_id);
   const childIds = [...new Set(lines.map((l) => l.child_id))];
-  const values = new Map(itemIds.map((id) => [id, new Map()]));
-  const words = new Map(itemIds.map((id) => [id, new Map()]));
-  if (itemIds.length && specCodes.length) {
-    const [rows] = await db.query(
-      `SELECT v.subject_id, s.code, v.value_number, v.value_text, o.value AS option_value, o.label AS option_label
+  const rows = itemIds.length && specCodes.length
+    ? (await db.query(`${ROLLUP_VALUE_SELECT} AND s.code IN (?)`, [companyId, itemIds, specCodes]))[0] : [];
+  // What each child IS, for a formula that tells children apart (formulaEngine: children.name / .variant …).
+  const [kin] = await db.query(ROLLUP_KIN_SELECT, [companyId, childIds]);
+  return rollupLines(lines, rows, new Map(kin.map((k) => [k.id, k])));
+}
+
+/** The children's own values a roll-up reads (params: company, child item ids). Shared with the many-records read (valueWaveReads.js). */
+export const ROLLUP_VALUE_SELECT = `SELECT v.subject_id, s.code, v.value_number, v.value_text, o.value AS option_value, o.label AS option_label
          FROM cf_spec_values v
          JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
          LEFT JOIN cf_spec_options o ON o.id = v.option_id
-        WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND v.deleted_at IS NULL
-          AND s.code IN (?)`,
-      [companyId, itemIds, specCodes],
-    );
-    for (const r of rows) {
-      const code = r.code.toUpperCase();
-      if (r.value_number != null) values.get(r.subject_id).set(code, Number(r.value_number));
-      const w = valueWord({ optionValue: r.option_value, optionLabel: r.option_label, text: r.value_text });
-      if (w != null) words.get(r.subject_id).set(code, w);
-    }
-  }
-  // What each child IS, for a formula that tells children apart (formulaEngine: children.name / .variant …).
-  const [kin] = await db.query(
-    `SELECT m.id, d.code AS def_code, d.short_name AS def_short_name, d.name AS def_name,
+        WHERE v.company_id = ? AND v.subject_type = 'master' AND v.subject_id IN (?) AND v.deleted_at IS NULL`;
+
+/** What each child of a BOM is: its template and its place in the tree (params: company, child ids). */
+export const ROLLUP_KIN_SELECT = `SELECT m.id, d.code AS def_code, d.short_name AS def_short_name, d.name AS def_name,
             n1.depth AS d1, n1.code AS c1, n1.name AS n1, n2.depth AS d2, n2.code AS c2, n2.name AS n2, n3.depth AS d3, n3.code AS c3, n3.name AS n3
        FROM cf_master_records m
        LEFT JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
@@ -278,10 +272,23 @@ export async function rollupChildren(db, companyId, parentId, specCodes) {
        LEFT JOIN cf_classification_nodes n1 ON n1.company_id = m.company_id AND n1.id = m.classification_id AND n1.deleted_at IS NULL
        LEFT JOIN cf_classification_nodes n2 ON n2.company_id = m.company_id AND n2.id = n1.parent_id AND n2.deleted_at IS NULL
        LEFT JOIN cf_classification_nodes n3 ON n3.company_id = m.company_id AND n3.id = n2.parent_id AND n3.deleted_at IS NULL
-      WHERE m.company_id = ? AND m.id IN (?)`,
-    [companyId, childIds],
-  );
-  const kinOf = new Map(kin.map((k) => [k.id, k]));
+      WHERE m.company_id = ? AND m.id IN (?)`;
+
+/**
+ * rollupChildren's answer from rows already read: a BOM's `lines`, the children's value `rows` (ROLLUP_VALUE_SELECT,
+ * only the codes wanted) and `kinOf` (Map child id → ROLLUP_KIN_SELECT row). No read.
+ */
+export function rollupLines(lines, rows, kinOf) {
+  const itemIds = lines.filter((l) => l.child_record_kind === 'item').map((l) => l.child_id);
+  const values = new Map(itemIds.map((id) => [id, new Map()]));
+  const words = new Map(itemIds.map((id) => [id, new Map()]));
+  for (const r of rows) {
+    if (!values.has(r.subject_id)) continue;
+    const code = r.code.toUpperCase();
+    if (r.value_number != null) values.get(r.subject_id).set(code, Number(r.value_number));
+    const w = valueWord({ optionValue: r.option_value, optionLabel: r.option_label, text: r.value_text });
+    if (w != null) words.get(r.subject_id).set(code, w);
+  }
   return lines.map((l) => {
     const isItem = l.child_record_kind === 'item';
     const own = values.get(l.child_id);

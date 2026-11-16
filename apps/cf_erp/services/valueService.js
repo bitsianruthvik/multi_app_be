@@ -28,6 +28,7 @@ import { loadMaster, requireMaster, frozenBy, assertNotFrozen, loadMachine, requ
 import { resolve, dateText, tableSummary, isWorkedDefault, sameAsCalculated } from './resolutionService.js';
 import { checkListValue, listSummary } from '../lib/listSpec.js';
 import { parentsOf, tempChildrenOf } from './bomGraph.js';
+import { waveReader } from './valueWaveReads.js';
 import { STEEL_FROM_STOCK_SET } from '../lib/cutFrom.js';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -395,7 +396,7 @@ async function insertRows(db, c, subjectType, subjectId, rows) {
   for (const part of chunk(rows, INSERT_CHUNK)) {
     const params = [];
     for (const r of part) {
-      params.push(c.companyId, r.spec.id, subjectType, subjectId, r.typed.value_number, r.typed.value_text,
+      params.push(c.companyId, r.spec.id, subjectType, r.subjectId ?? subjectId, r.typed.value_number, r.typed.value_text,
         r.typed.value_bool, r.typed.value_date, r.typed.option_id,
         r.typed.value_json == null ? null : JSON.stringify(r.typed.value_json), r.uom, r.source, c.userId);
     }
@@ -412,7 +413,7 @@ async function insertHistory(db, c, subjectType, subjectId, rows) {
   for (const part of chunk(rows, INSERT_CHUNK)) {
     const params = [];
     for (const h of part) {
-      params.push(c.companyId, h.valueId, h.specId, subjectType, subjectId, h.changeType,
+      params.push(c.companyId, h.valueId, h.specId, subjectType, h.subjectId ?? subjectId, h.changeType,
         h.before ? JSON.stringify(h.before) : null, h.after ? JSON.stringify(h.after) : null, c.userId);
     }
     await db.query(
@@ -629,6 +630,11 @@ function answerOf(entry) {
 }
 
 async function storeDerived(db, c, subjectType, subjectId, r) {
+  return upsertValues(db, c, subjectType, subjectId, derivedWrites(r));
+}
+
+/** What a resolution says is to be stored on its record: [{ spec, typed (null clears), source }]. No read, no write. */
+function derivedWrites(r) {
   const { ownRows, effectiveRows } = r.internal;
   // Nothing in either loop reads a value back, so the writes are collected and
   // sent as one batch at the end; the list keeps the order they were decided in.
@@ -690,7 +696,76 @@ async function storeDerived(db, c, subjectType, subjectId, r) {
       writes.push({ spec: { id: own.specification_id, code: own.spec_code, default_uom: own.uom }, typed: null, source: own.source });
     }
   }
-  return upsertValues(db, c, subjectType, subjectId, writes);
+  return writes;
+}
+
+/**
+ * storeDerived for MANY records in a fixed number of statements (refreshValues' waves). jobs: [{ subjectId, writes
+ * (derivedWrites), own (the record's live value rows by specification id, as resolve() read them) }]. The same decisions
+ * as applyPass, record by record in the order given; then every cleared row in one statement, every changed row, every
+ * new row, their ids read back, and every history row — where one record at a time was four or five round trips each.
+ * → Map subjectId → how many of its values changed (records with none are absent).
+ */
+async function storeDerivedMany(db, c, jobs) {
+  const counts = new Map();
+  const cleared = [];
+  const changed = [];
+  const created = [];
+  const history = [];
+  const alone = [];
+  for (const job of jobs) {
+    // A specification named twice needs the second write to see the first (applyWrites' passes): that record goes alone.
+    if (new Set(job.writes.map((w) => w.spec.id)).size !== job.writes.length) { alone.push(job); continue; }
+    let n = 0;
+    for (const w of job.writes) {
+      const row = job.own.get(w.spec.id) ?? null;
+      const h = { subjectId: job.subjectId, specId: w.spec.id };
+      if (!w.typed) {
+        if (!row) continue;
+        cleared.push(row.id);
+        history.push({ ...h, valueId: row.id, changeType: 'delete', before: snapshot(row), after: null });
+      } else {
+        const uom = w.spec.default_uom ?? null;
+        if (!row) {
+          created.push({ subjectId: job.subjectId, spec: w.spec, typed: w.typed, uom, source: w.source });
+          history.push({ ...h, valueId: null, changeType: 'create', before: null, after: snapshot(w.typed, w.source, uom) });
+        } else if (sameValue(row, w.typed) && row.source === w.source) continue;
+        else {
+          changed.push({ id: row.id, typed: w.typed, uom, source: w.source });
+          history.push({ ...h, valueId: row.id, changeType: 'update', before: snapshot(row), after: snapshot(w.typed, w.source, uom) });
+        }
+      }
+      n += 1;
+    }
+    if (n) counts.set(job.subjectId, n);
+  }
+  if (cleared.length) await clearRows(db, cleared);
+  if (changed.length) await updateRows(db, changed);
+  if (created.length) {
+    await insertRows(db, c, 'master', null, created);
+    // The new rows' ids, by their natural key (see the note above INSERT_CHUNK: never counted forward from insertId).
+    const idOf = new Map();
+    const specIds = [...new Set(created.map((r) => r.spec.id))];
+    for (const part of chunk([...new Set(created.map((r) => r.subjectId))], READ_CHUNK)) {
+      const [rows] = await db.query(
+        `SELECT id, subject_id, specification_id FROM cf_spec_values
+          WHERE company_id = ? AND subject_type = 'master' AND subject_id IN (?) AND specification_id IN (?) AND deleted_at IS NULL`,
+        [c.companyId, part, specIds],
+      );
+      for (const r of rows) idOf.set(`${r.subject_id}:${r.specification_id}`, r.id);
+    }
+    for (const h of history) {
+      if (h.changeType !== 'create') continue;
+      h.valueId = idOf.get(`${h.subjectId}:${h.specId}`);
+      if (!h.valueId) throw new Error(`cf_erp: value row for specification ${h.specId} on master ${h.subjectId} vanished between insert and read-back.`);
+    }
+  }
+  if (history.length) await insertHistory(db, c, 'master', null, history);
+  for (const job of alone) {
+    const n = (await upsertValues(db, c, 'master', job.subjectId, job.writes)).length;
+    if (n) counts.set(job.subjectId, n);
+  }
+  return counts;
 }
 
 /** Item ids a setup change on a definition or a classification subtree reaches. */
@@ -727,10 +802,82 @@ const MAX_VISITS = 20;
  * the BOM — a roll-up over an inherited value of the same spec, say — and that
  * is reported instead of spinning.
  *
- * Runs inline in the caller's transaction; if structures grow large this is
- * the loop to move onto the job queue.
+ * A WAVE AT A TIME (2026-11-16). Record after record this was about a dozen round trips a record: 2,987 round trips and
+ * 434 s for one 362-row order line on TiDB. Now each turn takes every waiting record that is not a BOM parent or child
+ * of one already taken — those are the only records that read each other's values (a roll-up its children, an inherited
+ * value its parent) — loads what they all read in a fixed number of reads (valueWaveReads.js), works each out in memory
+ * and stores them together (storeDerivedMany). A record left out waits for the next wave, where it reads what this one
+ * stored. Any order of working reaches the same values: each record is worked out again whenever something it reads
+ * changed, until nothing does.
+ *
+ * Runs in the caller's transaction, and lets other requests in between records: production is one small instance, and
+ * hundreds of records in one go held its only thread for seconds at a time.
  */
+const WAVE_MAX = 400;      // records in one wave: bounds the IN lists and what is held in memory
+const YIELD_MS = 12;       // how long the wave works before letting the event loop turn
+const breathe = () => new Promise((resolve) => { setImmediate(resolve); });
+
 export async function refreshValues(db, c, ids, { startWithNeighbours = false } = {}) {
+  if (process.env.CF_VALUE_WALK === 'one') return refreshValuesOneByOne(db, c, ids, { startWithNeighbours });
+  const reader = waveReader(db, c.companyId);
+  let queue = [];
+  const queued = new Set();
+  const visits = new Map();
+  const push = (id) => { const n = Number(id); if (!queued.has(n)) { queued.add(n); queue.push(n); } };
+  const pushNeighbours = (id) => {
+    for (const p of reader.parentsOf(id)) push(p);
+    for (const k of reader.tempChildrenOf(id)) push(k);
+  };
+  if (startWithNeighbours) {
+    await reader.loadParents(ids);
+    await reader.loadTempChildren(ids);
+    for (const id of ids) pushNeighbours(id);
+  } else ids.forEach(push);
+
+  let records = 0;
+  let changes = 0;
+  while (queue.length) {
+    await reader.loadParents(queue);
+    const wave = [];
+    const taken = new Set();
+    const parentsOfTaken = new Set();
+    const later = [];
+    for (const id of queue) {
+      const ps = reader.parentsOf(id);
+      if (wave.length >= WAVE_MAX || parentsOfTaken.has(id) || ps.some((p) => taken.has(p))) { later.push(id); continue; }
+      wave.push(id); taken.add(id);
+      for (const p of ps) parentsOfTaken.add(p);
+    }
+    queue = later;
+    for (const id of wave) {
+      queued.delete(id);
+      const n = (visits.get(id) ?? 0) + 1;
+      visits.set(id, n);
+      if (n > MAX_VISITS) {
+        const m = await loadMaster(db, c.companyId, id);
+        throw invalid('VALUE_LOOP', `Values on ${m?.code ?? m?.name ?? id} keep changing each other through the BOM — a roll-up and an inherited rule probably feed each other. Check the rules on this structure.`);
+      }
+    }
+    const live = await reader.prepare(wave);
+    records += wave.length;
+    const jobs = [];
+    let since = Date.now();
+    for (const master of live) {
+      const r = await resolve(db, c.companyId, { master, reads: reader.reads });
+      jobs.push({ subjectId: master.id, writes: derivedWrites(r), own: r.internal.ownRows });
+      if (Date.now() - since >= YIELD_MS) { await breathe(); since = Date.now(); }
+    }
+    const counts = await storeDerivedMany(db, c, jobs);
+    const moved = wave.filter((id) => counts.has(id));
+    for (const id of moved) changes += counts.get(id);
+    await reader.loadTempChildren(moved);
+    for (const id of moved) pushNeighbours(id);
+  }
+  return { records, changes };
+}
+
+/** refreshValues as it was until 2026-11-16: one record at a time. Kept to compare against (value_walk_test) and as a way back (CF_VALUE_WALK=one). */
+export async function refreshValuesOneByOne(db, c, ids, { startWithNeighbours = false } = {}) {
   const queue = [];
   const queued = new Set();
   const visits = new Map();

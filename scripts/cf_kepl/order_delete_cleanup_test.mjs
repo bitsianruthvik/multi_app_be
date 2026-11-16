@@ -128,10 +128,10 @@ async function buildCatalog(db, tag) {
   return { plate, size, spec };
 }
 
-/** A draft order with ONE frozen template line: root > cut plates CP1, CP2, CP3 (CP3 gets excluded). */
+/** An inquiry with ONE frozen template line: root > cut plates CP1, CP2, CP3 (CP3 gets excluded). */
 async function buildOrder(db, cat, tag, label) {
   const cutNode = await nodeByCode(db, 'CUT_PLATE');
-  const [o] = await db.query("INSERT INTO cf_sales_orders (company_id, code, order_type, title, status) VALUES (?, ?, 'customer', ?, 'draft')", [COMPANY, `${tag}-${label}`, `Delete cleanup ${label}`]);
+  const [o] = await db.query("INSERT INTO cf_sales_orders (company_id, code, order_type, title, status) VALUES (?, ?, 'customer', ?, 'inquiry')", [COMPANY, `${tag}-${label}`, `Delete cleanup ${label}`]);
   const orderId = o.insertId;
   const root = await makeMaster(db, { code: `${tag}-${label}-ROOT`, name: `Fixture assembly ${label}`, classificationId: cutNode, itemType: 'temporary' });
   const [l] = await db.query(

@@ -91,13 +91,13 @@ export function tableSummary(tableConfig, raw) {
 }
 
 /** The subjects whose rules reach a master record, broadest first. A draft (no id) has no own level. */
-export async function chainForMaster(db, companyId, master) {
-  const nodes = await ancestors(db, companyId, master.classification_id);
+export async function chainForMaster(db, companyId, master, reads = DEFAULT_READS) {
+  const nodes = await reads.ancestors(db, companyId, master.classification_id);
   const chain = nodes.map((n) => ({
     subjectType: 'classification', subjectId: n.id, level: levelName(n.depth), code: n.code, name: n.name, self: false,
   }));
   if (master.record_kind === 'item' && master.item_type === 'temporary' && master.source_definition_id) {
-    const def = await loadMaster(db, companyId, master.source_definition_id);
+    const def = await reads.loadMaster(db, companyId, master.source_definition_id);
     if (def) {
       chain.push({ subjectType: 'master', subjectId: def.id, level: 'Template definition', code: def.code, name: def.name, self: false });
     }
@@ -136,40 +136,46 @@ function subjectFilter(chain, alias) {
   };
 }
 
-async function loadRules(db, companyId, chain) {
-  if (!chain.length) return [];
-  const f = subjectFilter(chain, 'a');
-  const [rows] = await db.query(
-    `SELECT a.id, a.specification_id, a.subject_type, a.subject_id, a.capture_at, a.is_required, a.is_applicable,
+/** The rule rows of some subjects (the caller's WHERE names them). Shared with the many-records read (valueWaveReads.js). */
+export const RULE_SELECT = `SELECT a.id, a.specification_id, a.subject_type, a.subject_id, a.capture_at, a.is_required, a.is_applicable,
             a.value_rule, a.formula_id, a.sort_order, a.origin,
             s.code AS spec_code, s.name AS spec_name, s.data_type, s.default_uom, s.decimals, s.table_config,
             f.code AS formula_code, f.name AS formula_name, f.expression AS formula_expression, f.version AS formula_version
        FROM cf_spec_assignments a
        JOIN cf_specifications s ON s.id = a.specification_id AND s.deleted_at IS NULL
        LEFT JOIN cf_formulas f  ON f.id = a.formula_id AND f.deleted_at IS NULL
-      WHERE a.company_id = ? AND a.deleted_at IS NULL AND (${f.sql})`,
-    [companyId, ...f.params],
-  );
-  // A flow-made rule belongs to the record whose flow reads the value: it never reaches the items
-  // made from a definition (each row has its own, from its own flow — flowSpecService).
+      WHERE a.company_id = ? AND a.deleted_at IS NULL`;
+
+/**
+ * A flow-made rule belongs to the record whose flow reads the value: it never reaches the items
+ * made from a definition (each row has its own, from its own flow — flowSpecService).
+ */
+export function rulesReaching(chain, rows) {
   const self = chain.find((s) => s.self);
   return rows.filter((r) => r.origin !== 'flow' || (self && r.subject_type === self.subjectType && Number(r.subject_id) === Number(self.subjectId)));
 }
 
+async function loadRules(db, companyId, chain) {
+  if (!chain.length) return [];
+  const f = subjectFilter(chain, 'a');
+  const [rows] = await db.query(`${RULE_SELECT} AND (${f.sql})`, [companyId, ...f.params]);
+  return rulesReaching(chain, rows);
+}
+
+/** The value rows of some subjects (the caller's WHERE names them). Shared with the many-records read. */
+export const VALUE_SELECT = `SELECT v.*, s.code AS spec_code, s.name AS spec_name, s.data_type, s.decimals
+       FROM cf_spec_values v
+       JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
+      WHERE v.company_id = ? AND v.deleted_at IS NULL`;
+
 async function loadValues(db, companyId, chain) {
   if (!chain.length) return [];
   const f = subjectFilter(chain, 'v');
-  const [rows] = await db.query(
-    `SELECT v.*, s.code AS spec_code, s.name AS spec_name, s.data_type, s.decimals
-       FROM cf_spec_values v
-       JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
-      WHERE v.company_id = ? AND v.deleted_at IS NULL AND (${f.sql})`,
-    [companyId, ...f.params],
-  );
+  const [rows] = await db.query(`${VALUE_SELECT} AND (${f.sql})`, [companyId, ...f.params]);
   return rows;
 }
 
-async function loadOptions(db, companyId, specIds, assignmentIds) {
+export async function loadOptions(db, companyId, specIds, assignmentIds) {
   const options = specIds.length
     ? (await db.query(
       `SELECT id, specification_id, value, label, status, sort_order FROM cf_spec_options
@@ -186,6 +192,14 @@ async function loadOptions(db, companyId, specIds, assignmentIds) {
 }
 
 /** The raw value of a value row, as its data type. Options resolve to the option id; a table resolves to its whole { x, v } / { x, y, v } object. */
+/**
+ * WHAT resolve() READS, AS ONE SET (2026-11-16). One record at a time each of these is its own round trip, about a dozen a
+ * record. valueService.refreshValues works many records out together and hands resolve() a set answered from what it
+ * loaded for all of them at once (valueWaveReads.js); every other caller gets these, the reads as they always were.
+ * `parse` (optional): a formula parser that remembers what it parsed.
+ */
+export const DEFAULT_READS = { ancestors, loadMaster, loadRules, loadOptions, loadValues, loadOrderDefaultRows, placementOf, storedValues, rollupChildren, parse: null };
+
 export function rawOf(row, dataType) {
   if (!row) return null;
   switch (dataType) {
@@ -418,16 +432,16 @@ export function workOutFormulas(specs, { parse, children = null, isMachine = fal
  * A machine resolves like an item (its own values, required ones reported
  * missing) along its machine type's branch; it has no batches, units or BOM.
  */
-export async function resolve(db, companyId, { master = null, machine = null, nodeId = null, draftValues = null } = {}) {
+export async function resolve(db, companyId, { master = null, machine = null, nodeId = null, draftValues = null, reads = DEFAULT_READS } = {}) {
   const isMachine = !!machine;
   const chain = isMachine ? await chainForMachine(db, companyId, machine)
-    : master ? await chainForMaster(db, companyId, master) : await chainForNode(db, companyId, nodeId);
+    : master ? await chainForMaster(db, companyId, master, reads) : await chainForNode(db, companyId, nodeId);
   const mode = isMachine || (master && master.record_kind === 'item') ? 'item' : 'setup';
   const levelOf = new Map(chain.map((s, i) => [`${s.subjectType}:${s.subjectId}`, i]));
   const selfIndex = chain.findIndex((s) => s.self);
   const aboveTop = selfIndex >= 0 ? selfIndex - 1 : chain.length - 1;
 
-  const rules = (await loadRules(db, companyId, chain))
+  const rules = (await reads.loadRules(db, companyId, chain))
     .map((r) => ({ ...r, levelIndex: levelOf.get(`${r.subject_type}:${r.subject_id}`) }))
     .sort((a, b) => a.levelIndex - b.levelIndex || a.sort_order - b.sort_order || a.id - b.id);
 
@@ -440,10 +454,10 @@ export async function resolve(db, companyId, { master = null, machine = null, no
 
   const specIds = [...new Set(rules.map((r) => r.specification_id))];
   const winning = [...merged.values()].map((m) => m.rule);
-  const { options, narrowed } = await loadOptions(db, companyId, specIds, winning.map((r) => r.id));
+  const { options, narrowed } = await reads.loadOptions(db, companyId, specIds, winning.map((r) => r.id));
   const optionById = new Map(options.map((o) => [o.id, o]));
 
-  const values = await loadValues(db, companyId, chain);
+  const values = await reads.loadValues(db, companyId, chain);
   const valueAt = new Map(values.map((v) => [`${levelOf.get(`${v.subject_type}:${v.subject_id}`)}:${v.specification_id}`, v]));
   const ownRow = (specId) => (draftValues ? draftValues.get(specId) ?? null : (selfIndex >= 0 ? valueAt.get(`${selfIndex}:${specId}`) ?? null : null));
   const aboveRow = (specId) => {
@@ -464,7 +478,7 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   if (mode === 'item' && !isMachine && !frozen && !draftValues && master?.item_type === 'temporary'
       && master.owner_order_id != null && master.owner_order_line_id != null
       && winning.some((r) => r.is_applicable && r.capture_at === 'item' && ['entered', 'defaulted'].includes(r.value_rule))) {
-    orderDefaults = defaultsForLine(await loadOrderDefaultRows(db, companyId, master.owner_order_id, [master.owner_order_line_id]), master.owner_order_line_id);
+    orderDefaults = defaultsForLine(await reads.loadOrderDefaultRows(db, companyId, master.owner_order_id, [master.owner_order_line_id]), master.owner_order_line_id);
   }
 
   // Inherited values come from the BOM parent (Q7). Only looked up when a rule needs it.
@@ -474,8 +488,8 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   let parentPlace = null;
   let parentRows = new Map();
   if (inheritedSpecIds.length && master.id != null && master.item_type === 'temporary') {
-    parentPlace = await placementOf(db, companyId, master.id);
-    if (parentPlace) parentRows = await storedValues(db, companyId, parentPlace.parent_id, inheritedSpecIds);
+    parentPlace = await reads.placementOf(db, companyId, master.id);
+    if (parentPlace) parentRows = await reads.storedValues(db, companyId, parentPlace.parent_id, inheritedSpecIds);
   }
 
   const specs = [];
@@ -607,10 +621,10 @@ export async function resolve(db, companyId, { master = null, machine = null, no
   // is still waiting when nothing moves is a cycle. Roll-ups read the BOM
   // children's stored values — other records, so they never wait inside here.
   if (mode === 'item' && !frozen) {
-    const parse = (expression) => { try { return parseFormula(expression); } catch (e) { return e; } };
+    const parse = reads.parse ?? ((expression) => { try { return parseFormula(expression); } catch (e) { return e; } });
     const needs = rollupNeeds(specs, parse);
     let children = null;
-    if (!isMachine && master.id != null && needs.any) children = await rollupChildren(db, companyId, master.id, needs.terms);
+    if (!isMachine && master.id != null && needs.any) children = await reads.rollupChildren(db, companyId, master.id, needs.terms);
     const mine = draftValues || selfIndex < 0 ? [] : values.filter((v) => levelOf.get(`${v.subject_type}:${v.subject_id}`) === selfIndex);
     workOutFormulas(specs, { parse, children, isMachine, optionById, effectiveRows, fallbacks, facts: drawingFactsOf(mine) });
   }

@@ -8,8 +8,8 @@ import { trackerCounts } from './releaseService.js';
 import { purchaseCounts } from './purchaseService.js';
 
 const blank = (v) => v == null || String(v).trim() === '';
-const OPEN = "('draft','inquiry','quoted','confirmed')";
-const QUEUE_ORDER = { accept: 0, machineApprove: 0.5, machineReview: 0.6, machineCondemn: 0.55, monthPlan: 0.3, weekPlan: 0.9, planAlerts: 0.4, machineRegister: 0.7, machineOverdue: 0.8, overdue: 1, onhold: 2, ready: 3, material: 4, buy: 5, deliveries: 6, delivered: 7, release: 8, inquiries: 9, quoted: 10, selections: 11, drafts: 12, flows: 13, shifts: 14, untimed: 15, held: 16 };
+const OPEN = "('inquiry','confirmed')";
+const QUEUE_ORDER = { accept: 0, machineApprove: 0.5, machineReview: 0.6, machineCondemn: 0.55, monthPlan: 0.3, weekPlan: 0.9, planAlerts: 0.4, machineRegister: 0.7, machineOverdue: 0.8, overdue: 1, onhold: 2, ready: 3, material: 4, buy: 5, deliveries: 6, delivered: 7, release: 8, inquiries: 9, selections: 11, drafts: 12, flows: 13, shifts: 14, untimed: 15, held: 16 };
 
 async function one(db, sql, params) {
   const [[row]] = await db.query(sql, params);
@@ -23,24 +23,28 @@ export async function navCounts(db, companyId) {
   const tP = trackerCounts(db, companyId);
   const bP = purchaseCounts(db, companyId);
   tP.catch(() => {}); bP.catch(() => {});
-  const [openOrders, customers, items, definitions, machines, operations, draftFlows, stockLines, heldBatches, areas] = await Promise.all([
-    one(db, `SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status IN ${OPEN}`, c),
-    one(db, 'SELECT COUNT(*) FROM cf_parties WHERE company_id = ? AND deleted_at IS NULL AND is_customer = 1', c),
+  // The plain counts in ONE statement (2026-11-16): ten statements at once took every connection of the pool (10) on
+  // each screen's first load, and whatever the screen itself asked for waited behind them.
+  const plain = [
+    ['openOrders', `SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status IN ${OPEN}`],
+    ['customers', 'SELECT COUNT(*) FROM cf_parties WHERE company_id = ? AND deleted_at IS NULL AND is_customer = 1'],
     // An order's rows live on the order, not in the catalog (user, 2026-09-26).
-    one(db, `SELECT COUNT(*) FROM cf_master_records m LEFT JOIN cf_item_details i ON i.master_id = m.id
-              WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.record_kind = 'item' AND (i.item_type IS NULL OR i.item_type <> 'temporary')`, c),
-    one(db, "SELECT COUNT(*) FROM cf_master_records WHERE company_id = ? AND deleted_at IS NULL AND record_kind = 'definition'", c),
-    one(db, "SELECT COUNT(*) FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
-    one(db, "SELECT COUNT(*) FROM cf_operations WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
-    one(db, "SELECT COUNT(*) FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND owner_order_line_id IS NULL AND status = 'draft'", c),
-    one(db, 'SELECT COUNT(*) FROM cf_stock_balances WHERE company_id = ? AND quantity <> 0', c),
-    one(db, `SELECT COUNT(*) FROM cf_stock_batches b WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.status <> 'available'
-              AND EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = b.company_id AND k.batch_id = b.id AND k.quantity <> 0)`, c),
-    one(db, "SELECT COUNT(*) FROM cf_stocking_areas WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'", c),
-  ]);
-  const [t, b] = await Promise.all([tP, bP]);
-  // §105: what changed against the plan and still waits for the planner.
-  const planAlerts = await one(db, "SELECT COUNT(*) FROM cf_plan_alerts WHERE company_id = ? AND status = 'open' AND severity <> 'info'", c).catch(() => 0);
+    ['items', `SELECT COUNT(*) FROM cf_master_records m LEFT JOIN cf_item_details i ON i.master_id = m.id
+              WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.record_kind = 'item' AND (i.item_type IS NULL OR i.item_type <> 'temporary')`],
+    ['definitions', "SELECT COUNT(*) FROM cf_master_records WHERE company_id = ? AND deleted_at IS NULL AND record_kind = 'definition'"],
+    ['machines', "SELECT COUNT(*) FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'"],
+    ['operations', "SELECT COUNT(*) FROM cf_operations WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'"],
+    ['draftFlows', "SELECT COUNT(*) FROM cf_operation_flows WHERE company_id = ? AND deleted_at IS NULL AND owner_order_line_id IS NULL AND status = 'draft'"],
+    ['stockLines', 'SELECT COUNT(*) FROM cf_stock_balances WHERE company_id = ? AND quantity <> 0'],
+    ['heldBatches', `SELECT COUNT(*) FROM cf_stock_batches b WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.status <> 'available'
+              AND EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = b.company_id AND k.batch_id = b.id AND k.quantity <> 0)`],
+    ['areas', "SELECT COUNT(*) FROM cf_stocking_areas WHERE company_id = ? AND deleted_at IS NULL AND status = 'active'"],
+  ];
+  // §105: what changed against the plan and still waits for the planner (its table may not exist yet: read apart).
+  const planAlertsP = one(db, "SELECT COUNT(*) FROM cf_plan_alerts WHERE company_id = ? AND status = 'open' AND severity <> 'info'", c).catch(() => 0);
+  const [[row]] = await db.query(`SELECT ${plain.map(([k, sql]) => `(${sql}) AS ${k}`).join(', ')}`, plain.map(() => companyId));
+  const { openOrders, customers, items, definitions, machines, operations, draftFlows, stockLines, heldBatches, areas } = Object.fromEntries(plain.map(([k]) => [k, Number(row[k]) || 0]));
+  const [t, b, planAlerts] = await Promise.all([tP, bP, planAlertsP]);
   return { counts: { openOrders, customers, items, definitions, machines, operations, draftFlows, stockLines, heldBatches, areas, readySteps: t.readySteps, toBuy: b.toBuy, openPurchases: b.draftOrders + b.awaitingDelivery, planAlerts } };
 }
 
@@ -127,9 +131,8 @@ export async function cockpit(db, companyId) {
     one(db, "SELECT COUNT(*) FROM cf_plan_alerts WHERE company_id = ? AND status = 'open' AND severity <> 'info'", c).catch(() => 0),
   ]);
   for (const p of [tP, bP, releaseP, deliveredP]) p.catch(() => {});   // awaited below; never an unhandled rejection meanwhile
-  const [inquiries, quoted, confirmed, overdue, selections, itemDrafts, defDrafts, draftFlows, idleMachines, heldBatches, untimedOps, openOrders, machines, stockLines] = await Promise.all([
+  const [inquiries, confirmed, overdue, selections, itemDrafts, defDrafts, draftFlows, idleMachines, heldBatches, untimedOps, openOrders, machines, stockLines] = await Promise.all([
     one(db, "SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status = 'inquiry'", c),
-    one(db, "SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status = 'quoted'", c),
     one(db, "SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status = 'confirmed'", c),
     one(db, `SELECT COUNT(*) FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status IN ${OPEN} AND committed_date < CURDATE()`, c),
     one(db, `SELECT COUNT(*) FROM cf_bom_lines l
@@ -195,10 +198,8 @@ export async function cockpit(db, companyId) {
       description: 'Lines of confirmed orders not released to production yet.', actionLabel: 'Open orders', path: 'orders?status=confirmed' },
     { key: 'overdue', title: 'Orders past their date', count: overdue, unit: plural(overdue, 'order', 'orders'), tone: 'danger',
       description: 'Open orders whose committed date has passed.', actionLabel: 'Review them', path: 'orders?status=overdue' },
-    { key: 'inquiries', title: 'Inquiries to quote', count: inquiries, unit: plural(inquiries, 'inquiry', 'inquiries'), tone: 'info',
-      description: 'Design the structure, then send the quotation.', actionLabel: 'Open inquiries', path: 'orders?status=inquiry' },
-    { key: 'quoted', title: 'Quotes awaiting the customer', count: quoted, unit: plural(quoted, 'quote', 'quotes'), tone: 'primary',
-      description: 'Confirm or close them when the customer answers.', actionLabel: 'Follow up', path: 'orders?status=quoted' },
+    { key: 'inquiries', title: 'Inquiries in hand', count: inquiries, unit: plural(inquiries, 'inquiry', 'inquiries'), tone: 'info',
+      description: 'Design the structure; the order is confirmed by its customer acceptance.', actionLabel: 'Open inquiries', path: 'orders?status=inquiry' },
     { key: 'selections', title: 'Items still to choose', count: selections, unit: plural(selections, 'selection', 'selections'), tone: 'warning',
       description: 'Selection lines on open orders without a catalog item yet.', actionLabel: 'Open orders', path: 'orders' },
     { key: 'drafts', title: 'Drafts to finish', count: itemDrafts + defDrafts, unit: plural(itemDrafts + defDrafts, 'record', 'records'), tone: 'warning',

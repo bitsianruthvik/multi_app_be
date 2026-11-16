@@ -54,7 +54,7 @@ import { copyExecutionPlan, retirePlanRowsOfOrder } from './executionPlanService
 import { copyAcceptance, retireAcceptance } from './acceptanceService.js';
 
 /** The commercial stages a customer order may be revised in. */
-const REVISABLE = new Set(['inquiry', 'quoted', 'confirmed']);
+const REVISABLE = new Set(['inquiry', 'confirmed']);
 /** Rows per multi-row INSERT for a revision's copy: an order's values run to thousands. */
 const COPY_CHUNK = 1000;
 const ID_CHUNK = 500;
@@ -95,7 +95,7 @@ async function linesOf(db, companyId, orderId) {
 /**
  * POST /orders/:id/revise — the next revision of an order, as a copy of this
  * one. Allowed on the LATEST revision of an open customer order (an inquiry,
- * quoted or confirmed) with at least one locked line and no line released to
+ * or confirmed) with at least one locked line and no line released to
  * production. Needs a transaction. Returns the new revision (getOrder) with
  * `cutPieces`: what refreshCutPieces said for each of its custom lines.
  */
@@ -112,7 +112,7 @@ export async function reviseOrder(db, c, orderId) {
     throw invalid('NOT_REVISABLE', `${label} is a stock order — it makes standard products and has nothing locked to revise. Only a customer order is revised.`);
   }
   if (!REVISABLE.has(o.status)) {
-    throw invalid('NOT_REVISABLE', `${label} is ${o.status} — only an open order (an inquiry, quoted or confirmed) is revised.`);
+    throw invalid('NOT_REVISABLE', `${label} is ${o.status} — only an open order (an inquiry or a confirmed one) is revised.`);
   }
   const lines = await linesOf(db, companyId, o.id);
   if (!lines.some((l) => l.locked_at)) {

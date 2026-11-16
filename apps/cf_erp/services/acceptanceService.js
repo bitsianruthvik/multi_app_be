@@ -68,7 +68,7 @@ export const TRIGGER_KEYS = Object.keys(TRIGGERS);
 const AFTER_KEYS = TRIGGER_KEYS.filter((k) => !['days_after', 'fixed_date', 'retention'].includes(k));
 export const DISPATCH_MODES = { each: 'Each dispatch separately (pro-rata per dispatch unit)', all: 'When everything is dispatched' };
 export const TEMPLATE_KINDS = ['charges', 'milestones', 'stages'];
-const OPEN_FOR_TERMS = ['draft', 'inquiry', 'quoted', 'confirmed'];
+const OPEN_FOR_TERMS = ['inquiry', 'confirmed'];
 const EPS = 1e-6;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 

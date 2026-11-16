@@ -92,24 +92,29 @@ function readLinePrice(input, problems, sets) {
   if (input.currency !== undefined) readCurrency(input.currency, problems);
 }
 
-export const ORDER_TYPES = ['customer', 'stock'];
+/*
+ * THE STATUSES AN ORDER CAN REACH (user, 2026-11-16: the ones never reached were taken out).
+ *   Quoted is gone: an inquiry goes to confirmed by its Customer acceptance, and nothing read "quoted".
+ *   Draft is gone with stock orders: a new order is always a customer's and starts as an inquiry. A stock order made
+ *   before this (none on production) is still read everywhere and can be closed or cancelled, nothing else.
+ * The status column's ENUM still lists 'draft' and 'quoted' (no schema change); nothing writes them.
+ */
+export const ORDER_TYPES = ['customer'];
 export const TRANSITIONS = {
   customer: {
-    inquiry: ['quoted', 'confirmed', 'lost', 'cancelled'],
-    quoted: ['inquiry', 'confirmed', 'lost', 'cancelled'],
+    inquiry: ['confirmed', 'lost', 'cancelled'],
     confirmed: ['closed', 'cancelled'],
     lost: ['inquiry'],
     closed: [],
     cancelled: [],
   },
   stock: {
-    draft: ['confirmed', 'cancelled'],
     confirmed: ['closed', 'cancelled'],
     closed: [],
     cancelled: [],
   },
 };
-const FIRST_STATUS = { customer: 'inquiry', stock: 'draft' };
+const FIRST_STATUS = 'inquiry';
 /**
  * The moves a person may make with the status buttons. A CUSTOMER's order is confirmed only by the approval of its
  * Customer acceptance (§73, acceptanceService) — never by a button, so 'confirmed' is not offered.
@@ -117,7 +122,7 @@ const FIRST_STATUS = { customer: 'inquiry', stock: 'draft' };
 export const allowedTransitionsOf = (orderType, status) => (TRANSITIONS[orderType]?.[status] ?? []).filter((t) => !(orderType === 'customer' && t === 'confirmed'));
 /** Said when a customer's order is asked to become confirmed any other way. */
 export const ACCEPTANCE_FIRST = "A customer's order is confirmed by its Customer acceptance: save the terms there, and it is confirmed when Management approves them.";
-const DELETABLE = new Set(['draft', 'inquiry', 'lost', 'cancelled']);
+const DELETABLE = new Set(['inquiry', 'lost', 'cancelled']);
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -179,8 +184,8 @@ function assertOpen(order) {
  * `revisions=all` lists them too, and so does asking for status=revised.
  */
 /** The status chips of the Orders screen, answered by the server (lib/listing.js). */
-export const ORDER_CHIPS = ['open', 'overdue', 'inquiry', 'quoted', 'confirmed', 'draft', 'closed', 'lost', 'cancelled', 'all'];
-const OPEN_ORDER_STATUSES = ['draft', 'inquiry', 'quoted', 'confirmed'];
+export const ORDER_CHIPS = ['open', 'overdue', 'inquiry', 'confirmed', 'closed', 'lost', 'cancelled', 'all'];
+const OPEN_ORDER_STATUSES = ['inquiry', 'confirmed'];
 const ORDER_SORT = {
   code: 'o.code', project: 'COALESCE(o.title, p.name)', type: 'o.order_type', lines: 'line_count',
   committed: 'o.committed_date', received: 'o.received_on', status: 'o.status', created: 'o.created_at',
@@ -215,11 +220,18 @@ export async function listOrders(db, companyId, q = {}) {
   const todayS = today();
   if (!blank(q.chip) && q.chip !== 'all') {
     if (!ORDER_CHIPS.includes(q.chip)) throw invalid('INVALID', `chip is one of ${ORDER_CHIPS.join(', ')}.`);
-    if (q.chip === 'open') where.push(`${FILED_STATUS} IN ('draft','inquiry','quoted','confirmed')`);
+    if (q.chip === 'open') where.push(`${FILED_STATUS} IN ('inquiry','confirmed')`);
     else if (q.chip === 'overdue') { where.push(`o.committed_date < ? AND ${FILED_STATUS} NOT IN ('closed','lost','cancelled','revised')`); rowParams.push(todayS); }
     else { where.push(`${FILED_STATUS} = ?`); rowParams.push(q.chip); }
   }
   const paged = wantsPage(q);
+  /*
+   * THE ORDERS SCREEN'S READ (2026-11-16): `lean=1` leaves the estimated GST out (three reads; the screen shows the order
+   * value, not its tax), and a page's total comes from the chip counts wherever they say it (every order once at its
+   * latest revision — the same rows the page lists unless earlier revisions are asked for). Nine reads became four.
+   */
+  const lean = q.lean === '1' || q.lean === 1 || q.lean === true;
+  const totalFromChips = paged && q.revisions !== 'all' && q.status !== 'revised';
   const page = paged ? pageArgs(q, { def: 100 }) : { limit: Math.min(Math.max(Number(q.limit) || 200, 1), 500), offset: 0 };
   const order = orderBy(q, ORDER_SORT, 'o.created_at DESC, o.id DESC', q.sort === 'code' ? `o.revision ${String(q.dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC'}, o.id` : 'o.id');
   const from = `FROM cf_sales_orders o LEFT JOIN cf_parties p ON p.id = o.customer_id`;
@@ -236,7 +248,7 @@ export async function listOrders(db, companyId, q = {}) {
     // The total (rows' filters) and the chip counts (every filter but the chip,
     // each order once at its latest revision) — two reads beside the rows.
     paged ? Promise.all([
-      db.query(`SELECT COUNT(*) AS n ${from} WHERE ${where.join(' AND ')}`, rowParams),
+      totalFromChips ? null : db.query(`SELECT COUNT(*) AS n ${from} WHERE ${where.join(' AND ')}`, rowParams),
       db.query(
         `SELECT o.status AS k, COUNT(*) AS n, SUM(o.committed_date < ? AND o.status NOT IN ('closed','lost','cancelled','revised')) AS overdue
            ${from} WHERE ${base.join(' AND ')} AND o.status <> 'revised' GROUP BY o.status`,
@@ -258,7 +270,7 @@ export async function listOrders(db, companyId, q = {}) {
     const amountsP = lineAmounts(db, companyId, lines);
     amountsP.catch(() => {});   // awaited below
     // Estimated GST on each order (init.sql §37) — three more reads for the whole list.
-    const [amounts, { orderTax }] = await Promise.all([amountsP, salesOrderTax(db, companyId, rows, lines, amountsP)]);
+    const [amounts, { orderTax }] = await Promise.all([amountsP, lean ? { orderTax: new Map() } : salesOrderTax(db, companyId, rows, lines, amountsP)]);
     const byOrder = new Map();
     for (const l of lines) { if (!byOrder.has(l.order_id)) byOrder.set(l.order_id, []); byOrder.get(l.order_id).push(l); }
     for (const [orderId, ls] of byOrder) totals.set(orderId, orderTotal(ls, amounts));
@@ -269,7 +281,7 @@ export async function listOrders(db, companyId, q = {}) {
     return { ...shapeOrder(o), total, value: orderValueOf(total, termsOf.get(Number(o.id)), { lineCount: Number(o.line_count ?? 0) }) };
   });
   if (!paged) return shaped;
-  const [[[{ n: total }]], [byStatus]] = counted;
+  const [counted0, [byStatus]] = counted;
   const chips = Object.fromEntries(ORDER_CHIPS.map((k) => [k, 0]));
   for (const r of byStatus) {
     const n = Number(r.n) || 0;
@@ -278,6 +290,7 @@ export async function listOrders(db, companyId, q = {}) {
     chips.overdue += Number(r.overdue) || 0;
     chips.all += n;
   }
+  const total = totalFromChips ? chips[blank(q.chip) ? 'all' : q.chip] : counted0[0][0].n;
   return pageOf(shaped, total, page, { counts: { chips } });
 }
 
@@ -503,14 +516,10 @@ async function releaseOfLine(db, companyId, lineId) {
 export async function createOrder(db, c, input = {}) {
   const problems = [];
   const orderType = input.orderType ?? 'customer';
-  if (!ORDER_TYPES.includes(orderType)) problems.push('An order is a customer order or a stock order.');
+  if (!ORDER_TYPES.includes(orderType)) problems.push(orderType === 'stock' ? 'Stock orders are no longer made: every order is a customer\'s.' : 'An order is a customer order.');
   let customerId = null;
-  if (orderType === 'customer') {
-    if (blank(input.customerId)) problems.push('A customer order needs a customer.');
-    else if (await requireCustomer(db, c.companyId, Number(input.customerId), problems)) customerId = Number(input.customerId);
-  } else if (!blank(input.customerId)) {
-    problems.push('A stock order has no customer.');
-  }
+  if (blank(input.customerId)) problems.push('A customer order needs a customer.');
+  else if (await requireCustomer(db, c.companyId, Number(input.customerId), problems)) customerId = Number(input.customerId);
   const body = {
     title: readText(input.title, 'Title', 255, problems),
     customer_reference: readText(input.customerReference, 'Customer reference', 100, problems),
@@ -538,7 +547,7 @@ export async function createOrder(db, c, input = {}) {
     `INSERT INTO cf_sales_orders
        (company_id, code, order_type, title, customer_id, customer_reference, status, received_on, committed_date, delivery_address, notes, process_id, material_supply, created_by)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, code, orderType, body.title, customerId, body.customer_reference, FIRST_STATUS[orderType],
+    [c.companyId, code, orderType, body.title, customerId, body.customer_reference, FIRST_STATUS,
       body.received_on, body.committed_date, body.delivery_address, body.notes, processId, body.material_supply, c.userId],
   );
   // The order values given in the New order dialog (§65 values, saved with the order — drawingLineService, 2026-10-18).

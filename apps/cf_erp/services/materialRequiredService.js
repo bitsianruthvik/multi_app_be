@@ -26,7 +26,7 @@ const supplyOf = (v) => (v === 'customer' ? 'customer' : 'we_buy');
 
 /** Whether the order may raise its MR, and in words why not. Pure. acceptance: 'none' | 'pending' | 'accepted'. */
 export function requestGate(order, acceptance) {
-  if (!['inquiry', 'quoted', 'confirmed', 'draft'].includes(order.status)) return { canRequest: false, requestWhy: `${order.code} is ${order.status}.` };
+  if (!['inquiry', 'confirmed'].includes(order.status)) return { canRequest: false, requestWhy: `${order.code} is ${order.status}.` };
   if (order.order_type !== 'customer') {
     return order.status === 'confirmed' ? { canRequest: true, requestWhy: null } : { canRequest: false, requestWhy: 'Confirm the order first.' };
   }
