@@ -38,6 +38,7 @@ import {
   addOrderLine, updateOrderLine, removeOrderLine, lineStructure, reorderLines, orderStructure,
 } from '../services/salesOrderService.js';
 import { applyOrderStructureChanges } from '../services/orderStructureService.js';
+import { settleLines } from '../services/lineSettle.js';
 import { getExecutionPlan, saveExecutionPlan } from '../services/executionPlanService.js';
 import { deriveCutPlates, getCutPlates, setCutPlateFlows } from '../services/cutPlateService.js';
 import { assertLineUnlocked } from '../services/lockService.js';
@@ -62,7 +63,12 @@ router.delete('/orders/:id/revision', guard(PERM.orders), handle((req) => tx(req
 
 router.put('/orders/:id/line-order', guard(PERM.orders), handle((req) => tx(req, (db, c) => reorderLines(db, c, id(req), req.body ?? {}))));
 // The whole order's structure — every line — for the one Structure & values screen. A read that may write (selections), so in a transaction.
-router.get('/orders/:id/structure', guard(PERM.ordersView), handle((req) => tx(req, (db, c) => orderStructure(db, c.companyId, id(req), { c }))));
+// (2026-11-16) The choices and their values are worked out BEFORE the read, each line in a transaction of its own that the
+// read waits a few seconds for (services/lineSettle.js): a large line took minutes inside the request and timed out.
+router.get('/orders/:id/structure', guard(PERM.ordersView), handle((req) => {
+  const c = ctx(req);
+  return orderStructure(pool, c.companyId, id(req), { settle: (lineIds) => settleLines(c, lineIds) });
+}));
 // Several lines' structure changes in ONE transaction: a refusal on any line leaves every line as it was.
 router.post('/orders/:id/structure/changes', guard(PERM.orders), handle((req) => tx(req, (db, c) => applyOrderStructureChanges(db, c, id(req), req.body ?? {}, {
   allow: (bomType) => assertPerm(req, bomType === 'custom' ? PERM.orders : PERM.catalog),
@@ -75,7 +81,13 @@ router.post('/orders/:id/lines', guard(PERM.orders), handle((req) => tx(req, (db
 router.put('/order-lines/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => updateOrderLine(db, c, id(req), req.body ?? {}))));
 router.delete('/order-lines/:id', guard(PERM.orders), handle((req) => tx(req, (db, c) => removeOrderLine(db, c, id(req)))));
 // A read that may write: an editable line's selection rows the system can answer (a default, or one candidate) are chosen first — so it runs in a transaction.
-router.get('/order-lines/:id/structure', guard(PERM.ordersView), handle((req) => tx(req, (db, c) => lineStructure(db, c.companyId, id(req), { c }))));
+// The choosing runs first, in its own transaction (services/lineSettle.js); this read then only reads, and says `settling`
+// when a large line is still being worked out.
+router.get('/order-lines/:id/structure', guard(PERM.ordersView), handle(async (req) => {
+  const c = ctx(req);
+  const settled = (await settleLines(c, [id(req)])).get(id(req));
+  return lineStructure(pool, c.companyId, id(req), { settled });
+}));
 
 // Cut plates change the line's structure, so they sit behind the same grant as
 // the rest of it: seeing them is a read, working them out is managing the order.

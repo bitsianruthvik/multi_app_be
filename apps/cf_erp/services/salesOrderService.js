@@ -976,7 +976,7 @@ export async function reorderLines(db, c, orderId, input = {}) {
  * line stay GET /order-lines/:id/values). A read that may write (an editable line's
  * selections the system can answer are chosen first), so it runs in a transaction when `c` is given.
  */
-export async function orderStructure(db, companyId, orderId, { c = null } = {}) {
+export async function orderStructure(db, companyId, orderId, { c = null, settle = null } = {}) {
   const o = await requireOrder(db, companyId, orderId);
   const [lines] = await db.query(
     `SELECT l.id, l.line_no, l.line_type, l.item_id, l.quantity, l.locked_at
@@ -984,11 +984,13 @@ export async function orderStructure(db, companyId, orderId, { c = null } = {}) 
     [companyId, orderId],
   );
   const out = [];
-  // One after another inside a transaction (one connection); a structure read may write selections.
+  // `settle(lineIds)` (the route): every line's choices and values worked out first, each in its own transaction, waited
+  // for together (services/lineSettle.js); then the lines are only read. Without it (`c`): one after another here.
+  const settled = settle ? await settle(lines.filter((l) => l.item_id).map((l) => l.id)) : null;
   for (const l of lines) {
     out.push({
       lineId: l.id, lineNo: l.line_no, lineType: l.line_type, quantity: Number(l.quantity), frozen: !!l.locked_at,
-      structure: l.item_id ? await lineStructure(db, companyId, l.id, { c }) : null,
+      structure: l.item_id ? await lineStructure(db, companyId, l.id, settled ? { settled: settled.get(Number(l.id)) } : { c }) : null,
     });
   }
   return { order: { id: o.id, code: o.code, status: o.status }, lines: out };
@@ -1000,11 +1002,14 @@ export async function orderStructure(db, companyId, orderId, { c = null } = {}) 
  * answer on its own are chosen first (selectionService.autofillLineSelections —
  * the default, or the only candidate; never a cut plate's raw plate).
  */
-export async function lineStructure(db, companyId, lineId, { c = null } = {}) {
+export async function lineStructure(db, companyId, lineId, { c = null, settled = null } = {}) {
   const line = await requireOrderLine(db, companyId, lineId);
   const o = await requireOrder(db, companyId, line.order_id);
   if (!line.item_id) throw invalid('NO_ITEM', 'This line has no item yet.');
-  const filled = c ? await autofillLineSelections(db, c, line.id, { refresh: (ids) => refreshValues(db, c, ids) }) : null;
+  // `settled` (the routes, 2026-11-16): the choices and their values were worked out BEFORE this read, in a transaction of
+  // their own (services/lineSettle.js), because on a large line that is minutes of round trips — never inside a request.
+  // `c` alone (scripts: scripts/cf_kepl/line-settle.mjs, tests) still does it here, in the caller's transaction.
+  const filled = settled ? { filled: settled.filled } : c ? await autofillLineSelections(db, c, line.id, { refresh: (ids) => refreshValues(db, c, ids) }) : null;
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity), withCut: true });
   const released = !!(await releaseOfLine(db, companyId, line.id));
   return {
@@ -1024,6 +1029,10 @@ export async function lineStructure(db, companyId, lineId, { c = null } = {}) {
     // How many selections this read chose (and values it refreshed): a screen that read the line's values beside the
     // structure reads them again when this is above 0 (2026-11-09).
     autofilled: Number(filled?.filled ?? 0),
+    // The line's choices and values are still being worked out (a large line, first opened): the structure is as it
+    // stands now, and the screen reads again until this is false. `settlingSeconds` = how long that has been running.
+    settling: !!settled?.settling,
+    ...(settled?.settling ? { settlingSeconds: settled.seconds } : {}),
   };
 }
 
