@@ -1,6 +1,8 @@
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import { requirePerm, fail, isPermitted } from '../../../core/middleware/requirePerm.js';
 import { CfError, translateDbError } from './errors.js';
+import { pool } from './db.js';
+import { isStandIn, MD_STANDIN_TAGS } from '../services/settingsService.js';
 
 /**
  * Permission tags. Seeded by models/seed.sql; admins bypass them on the
@@ -47,14 +49,31 @@ export function assertPerm(req, tag) {
   if (!isPermitted(req.user, tag)) throw new CfError(403, 'FORBIDDEN', `Permission required: ${tag}`);
 }
 
+/**
+ * §113 THE MD'S STAND-IN. While the company's switch is on (settings md_standin_user + md_standin_on), that one person
+ * holds the MD's tags for the request: every guard below then lets them through exactly as it would the MD. Nothing is
+ * written to their role, so switching it off takes effect at once (the settings are cached 30 s). req.standIn says so.
+ */
+export async function standIn(req, res, next) {
+  try {
+    const companyId = Number(req.user?.companyId ?? req.user?.company_id);
+    const userId = Number(req.user?.id);
+    if (companyId && userId && await isStandIn(pool, companyId, userId)) {
+      req.standIn = true;
+      req.user = { ...req.user, uiPermissions: [...new Set([...(Array.isArray(req.user.uiPermissions) ? req.user.uiPermissions : []), ...MD_STANDIN_TAGS])] };
+    }
+  } catch { /* a stand-in that cannot be read is no stand-in */ }
+  next();
+}
+
 /** protect + permission, as one middleware list. */
-export const guard = (perm) => [protect, requirePerm(perm)];
+export const guard = (perm) => [protect, standIn, requirePerm(perm)];
 
 /**
  * protect + ANY ONE of several permissions. The floor screens take cf_erp_floor
  * (a shared tablet has only that) or production manage (a manager records too).
  */
-export const guardAny = (...perms) => [protect, (req, res, next) => (perms.some((p) => isPermitted(req.user, p))
+export const guardAny = (...perms) => [protect, standIn, (req, res, next) => (perms.some((p) => isPermitted(req.user, p))
   ? next()
   : res.status(403).json({ error: 'FORBIDDEN', message: `Permission required: ${perms.join(' or ')}` }))];
 

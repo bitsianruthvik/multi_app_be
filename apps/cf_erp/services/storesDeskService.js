@@ -19,6 +19,7 @@ import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { likeOf, pageArgs, pageOf } from '../lib/listing.js';
 import { postMovement } from './stockService.js';
 import { requestApproval } from './approvalService.js';
+import { getSettings } from './settingsService.js';
 
 const blank = (v) => v == null || String(v).trim() === '';
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -451,20 +452,25 @@ function shapeCustody(r, longDays = 90) {
   };
 }
 
-/** How long a thing has been out: the three buckets of the Out with screen (days since it was given). */
-export const AGE_BUCKETS = { d30: 'DATEDIFF(CURDATE(), c.issued_on) <= 30', d90: 'DATEDIFF(CURDATE(), c.issued_on) BETWEEN 31 AND 90', over: 'DATEDIFF(CURDATE(), c.issued_on) > 90' };
+/** How long a thing has been out: the three bands of the Out with screen (days since it was given; settings out_bucket_*). */
+export const ageBuckets = (b1, b2) => {
+  const a = Math.trunc(Number(b1)) || 30; const b = Math.max(Math.trunc(Number(b2)) || 90, a + 1);
+  return { d30: `DATEDIFF(CURDATE(), c.issued_on) <= ${a}`, d90: `DATEDIFF(CURDATE(), c.issued_on) BETWEEN ${a + 1} AND ${b}`, over: `DATEDIFF(CURDATE(), c.issued_on) > ${b}`, bands: [a, b] };
+};
 /** Out too long: past its due date, or — with none — out longer than the company's limit (cf_company_settings.tools_out_days). */
 const LONG_OUT = '((c.due_on IS NOT NULL AND c.due_on < CURDATE()) OR (c.due_on IS NULL AND DATEDIFF(CURDATE(), c.issued_on) > ?))';
 
 /** GET /stores-desk/out-with?holder=person|department|vendor&overdue=1&age=d30|d90|over&search=&status=open|closed — and the chip counts. */
 export async function outWith(db, companyId, q = {}) {
   const { toolsOutDays } = await deskSettings(db, companyId);
+  const S = await getSettings(db, companyId);
+  const AGE_BUCKETS = ageBuckets(S.out_bucket_1_days, S.out_bucket_2_days);
   const status = q.status === 'closed' ? 'closed' : 'open';
   const where = ['c.company_id = ?', 'c.deleted_at IS NULL', 'c.status = ?'];
   const params = [companyId, status];
   if (['person', 'department', 'vendor'].includes(q.holder)) { where.push('c.holder_type = ?'); params.push(q.holder); }
   if (q.overdue === '1' || q.overdue === 1) { where.push(LONG_OUT); params.push(toolsOutDays); }
-  if (AGE_BUCKETS[q.age]) where.push(AGE_BUCKETS[q.age]);
+  if (['d30', 'd90', 'over'].includes(q.age)) where.push(AGE_BUCKETS[q.age]);
   const like = likeOf(q.search);
   if (like) { where.push('(m.name LIKE ? OR pe.name LIKE ? OR dp.name LIKE ? OR pa.name LIKE ?)'); params.push(like, like, like, like); }
   const [[rows], [chips]] = await Promise.all([
@@ -479,7 +485,7 @@ export async function outWith(db, companyId, q = {}) {
     counts[r.k] = Number(r.n); counts.all += Number(r.n); counts.overdue += Number(r.overdue) || 0;
     counts.d30 += Number(r.d30) || 0; counts.d90 += Number(r.d90) || 0; counts.over += Number(r.over_n) || 0;
   }
-  return { rows: rows.map((r) => shapeCustody(r, toolsOutDays)), counts, longDays: toolsOutDays };
+  return { rows: rows.map((r) => shapeCustody(r, toolsOutDays)), counts, longDays: toolsOutDays, bands: AGE_BUCKETS.bands };
 }
 
 /**
@@ -548,6 +554,7 @@ export async function countList(db, companyId, q = {}) {
   const areaId = blank(q.areaId) ? areas.all.find((a) => a.purpose === 'storage')?.id ?? areas.all[0]?.id : Number(q.areaId);
   if (!areaId || !areas.all.some((a) => Number(a.id) === Number(areaId))) throw invalid('INVALID', 'Choose one of the store areas to count.');
   const kind = q.kind === 'weekly' ? 'weekly' : 'daily';
+  const S = await getSettings(db, companyId);
   const [[last]] = await db.query('SELECT MAX(count_date) AS d FROM cf_stock_counts WHERE company_id = ? AND area_id = ? AND deleted_at IS NULL', [companyId, areaId]);
   const since = dateText(last?.d) ?? dateText(new Date(Date.now() - 2 * 86400000));
   let itemIds = [];
@@ -555,7 +562,7 @@ export async function countList(db, companyId, q = {}) {
     const [moved] = await db.query(
       `SELECT l.item_id, COUNT(*) AS n FROM cf_stock_ledger l JOIN cf_stock_movements mm ON mm.id = l.movement_id
         WHERE l.company_id = ? AND l.stocking_area_id = ? AND l.deleted_at IS NULL AND mm.movement_date >= ? AND mm.movement_type <> 'adjustment'
-        GROUP BY l.item_id ORDER BY n DESC, l.item_id LIMIT 40`, [companyId, areaId, since]);
+        GROUP BY l.item_id ORDER BY n DESC, l.item_id LIMIT ?`, [companyId, areaId, since, Number(S.count_daily_max_lines)]);
     itemIds = moved.map((r) => Number(r.item_id));
   } else {
     if (blank(q.subfamilyId)) throw invalid('INVALID', 'Choose the group to count this week.');
@@ -564,8 +571,8 @@ export async function countList(db, companyId, q = {}) {
          JOIN cf_classification_nodes v ON v.id = m.classification_id
         WHERE m.company_id = ? AND m.deleted_at IS NULL AND v.parent_id = ?
           AND (EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = m.company_id AND k.item_id = m.id AND k.stocking_area_id = ? AND k.quantity <> 0)
-            OR EXISTS (SELECT 1 FROM cf_stock_ledger l WHERE l.company_id = m.company_id AND l.item_id = m.id AND l.stocking_area_id = ? AND l.created_at >= NOW() - INTERVAL 90 DAY))
-        ORDER BY m.name LIMIT 500`, [companyId, Number(q.subfamilyId), areaId, areaId]);
+            OR EXISTS (SELECT 1 FROM cf_stock_ledger l WHERE l.company_id = m.company_id AND l.item_id = m.id AND l.stocking_area_id = ? AND l.created_at >= NOW() - INTERVAL ? DAY))
+        ORDER BY m.name LIMIT 500`, [companyId, Number(q.subfamilyId), areaId, areaId, Number(S.count_weekly_lookback_days)]);
     itemIds = inGroup.map((r) => Number(r.id));
   }
   let lines = [];

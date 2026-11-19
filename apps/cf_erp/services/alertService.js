@@ -29,23 +29,30 @@
  * the last check is older than STALE_MS — so a screen never shows an hour-old picture.
  */
 import { invalid, notFound } from '../lib/errors.js';
+import { getSettings } from './settingsService.js';
+import { findDepartmentAlerts, DEPARTMENT_KINDS, DEPARTMENT_KIND_LABEL } from './departmentAlerts.js';
 
 export const DEPARTMENTS = {
-  md: ['cf_erp_plate_change_approve', 'cf_erp_approve_month_plan', 'cf_erp_approve_purchase_order'],
+  // §113: cf_erp_md_dashboard is "the MD" (granted to every role that approves purchase orders); the three older tags
+  // still open it, so nobody loses the screen before the migration has run.
+  md: ['cf_erp_md_dashboard', 'cf_erp_plate_change_approve', 'cf_erp_approve_month_plan', 'cf_erp_approve_purchase_order'],
   planning: ['cf_erp_production_manage'],
   stores: ['cf_erp_stores', 'cf_erp_inventory_manage'],
   purchase: ['cf_erp_purchase'],
   floor: ['cf_erp_floor'],
+  maintenance: ['cf_erp_maintenance'],
+  engineering: ['cf_erp_orders_manage'],
+  accounts: ['cf_erp_accounts_manage'],
 };
-export const DEPARTMENT_LABEL = { md: 'MD', planning: 'Planning', stores: 'Stores', purchase: 'Purchase', floor: 'Shop floor' };
+export const DEPARTMENT_LABEL = { md: 'MD', planning: 'Planning', stores: 'Stores', purchase: 'Purchase', floor: 'Shop floor', maintenance: 'Maintenance', engineering: 'Engineering', accounts: 'Accounts' };
 export const KIND_LABEL = {
   po_date_moved: 'Delivery date moved', po_late: 'Procurement late', start_late: 'Start late', unplanned_start: 'Unplanned start', finish_late: 'Finish late',
+  ...DEPARTMENT_KIND_LABEL,
 };
 /** The kinds the check finds (and resolves); po_date_moved is raised by the change and closed by a person. */
 const CHECKED = ['po_late', 'start_late', 'unplanned_start', 'finish_late'];
 
-const GRACE_MIN = 60;          // a step an hour behind its slot is not yet an alert
-const PO_LATE_MD_DAYS = 3;
+// How late is late, and when it reaches the MD: settingsService (groups "Alerts: when one is raised" / "… reaches the MD").
 const CHECK_MS = 10 * 60 * 1000;
 const STALE_MS = 3 * 60 * 1000;
 const lastCheck = new Map();   // companyId -> ms
@@ -88,7 +95,8 @@ export async function raise(db, companyId, a) {
 // --- the checks --------------------------------------------------------------------------
 
 /** PO lines past their expected date with something still to come, one alert per purchase order. */
-async function findPoLate(db, companyId) {
+async function findPoLate(db, companyId, S) {
+  const PO_LATE_MD_DAYS = Number(S.md_po_late_days);
   const [rows] = await db.query(
     `SELECT p.id, p.code, s.name AS supplier, COUNT(*) AS n,
             MIN(COALESCE(l.expected_date, p.expected_date)) AS due, DATEDIFF(CURDATE(), MIN(COALESCE(l.expected_date, p.expected_date))) AS days,
@@ -117,7 +125,9 @@ async function findPoLate(db, companyId) {
 }
 
 /** Steps of planned orders against their slots: late starts, late finishes and unplanned starts, per PO × operation. */
-async function findStepDelays(db, companyId) {
+async function findStepDelays(db, companyId, S) {
+  const GRACE_MIN = Math.trunc(Number(S.alert_grace_min)) || 0;
+  const MD_DAYS = Number(S.md_step_late_days);
   const [late] = await db.query(
     `SELECT s.production_order_id AS po_id, po.code AS po_code, r.order_id, so.code AS order_code, s.operation_id, o.name AS op_name,
             SUM(s.state = 'pending' AND p.planned_start < NOW() - INTERVAL ${GRACE_MIN} MINUTE) AS start_n,
@@ -144,18 +154,18 @@ async function findStepDelays(db, companyId) {
     if (Number(g.finish_n) > 0) {
       const d = r2(hours(g.finish_from) / 24);
       out.push({
-        ...base, key: `finish_late:${g.po_id ?? `o${g.order_id}`}:${g.operation_id}`, kind: 'finish_late', severity: d >= 1 ? 'danger' : 'warning',
+        ...base, key: `finish_late:${g.po_id ?? `o${g.order_id}`}:${g.operation_id}`, kind: 'finish_late', severity: d >= MD_DAYS ? 'danger' : 'warning',
         title: `${where}: ${g.finish_n} ${g.op_name} step${Number(g.finish_n) === 1 ? '' : 's'} not finished — due by ${when(g.finish_from)}`,
         detail: 'Planned to be done by now. The steps after them wait; check what holds them, or re-run the plan.',
-        departments: ['planning', 'floor', ...(d >= 1 ? ['md'] : [])], daysLate: d, count: Number(g.finish_n),
+        departments: ['planning', 'floor', ...(d >= MD_DAYS ? ['md'] : [])], daysLate: d, count: Number(g.finish_n),
       });
     } else if (Number(g.start_n) > 0) {
       const d = r2(hours(g.start_from) / 24);
       out.push({
-        ...base, key: `start_late:${g.po_id ?? `o${g.order_id}`}:${g.operation_id}`, kind: 'start_late', severity: d >= 1 ? 'danger' : 'warning',
+        ...base, key: `start_late:${g.po_id ?? `o${g.order_id}`}:${g.operation_id}`, kind: 'start_late', severity: d >= MD_DAYS ? 'danger' : 'warning',
         title: `${where}: ${g.start_n} ${g.op_name} step${Number(g.start_n) === 1 ? '' : 's'} not started — planned from ${when(g.start_from)}`,
         detail: 'Planned to have started by now. Start them on the floor, or see in Steps what they wait for.',
-        departments: ['planning', 'floor', ...(d >= 1 ? ['md'] : [])], daysLate: d, count: Number(g.start_n),
+        departments: ['planning', 'floor', ...(d >= MD_DAYS ? ['md'] : [])], daysLate: d, count: Number(g.start_n),
       });
     }
   }
@@ -192,12 +202,16 @@ async function findStepDelays(db, companyId) {
 export async function checkCompany(db, companyId) {
   const found = [];
   let planOk = true;
-  try { found.push(...(await findPoLate(db, companyId))); } catch (e) { console.error('[cf_erp alerts] po_late:', e?.message ?? e); }
-  try { found.push(...(await findStepDelays(db, companyId))); } catch (e) { planOk = false; console.error('[cf_erp alerts] steps:', e?.message ?? e); }
+  const S = await getSettings(db, companyId);
+  try { found.push(...(await findPoLate(db, companyId, S))); } catch (e) { console.error('[cf_erp alerts] po_late:', e?.message ?? e); }
+  try { found.push(...(await findStepDelays(db, companyId, S))); } catch (e) { planOk = false; console.error('[cf_erp alerts] steps:', e?.message ?? e); }
+  // §113: maintenance, engineering, stores and accounts (departmentAlerts.js).
+  const dept = await findDepartmentAlerts(db, companyId, S).catch((e) => { console.error('[cf_erp alerts] departments:', e?.message ?? e); return { found: [], ok: [] }; });
+  found.push(...dept.found);
   for (const a of found) await raise(db, companyId, a);
   const keys = found.map((a) => a.key);
   // A check that failed resolves nothing it would have found.
-  const kinds = planOk ? CHECKED : ['po_late'];
+  const kinds = [...(planOk ? CHECKED : ['po_late']), ...dept.ok.filter((k) => DEPARTMENT_KINDS.includes(k))];
   await db.query(
     `UPDATE cf_alerts SET status = 'resolved', resolved_at = NOW() WHERE company_id = ? AND status <> 'resolved' AND kind IN (?)
        ${keys.length ? 'AND dedupe_key NOT IN (?)' : ''}`,
@@ -303,7 +317,7 @@ export async function raiseDateMoved(db, companyId, ch) {
   const days = ch.from && ch.to ? Math.round((new Date(ch.to) - new Date(ch.from)) / 86400000) : null;
   await raise(db, companyId, {
     key: `po_date_moved:${ch.changeId ?? `${ch.poId}:${ch.lineId ?? 'po'}:${ch.to}`}`, kind: 'po_date_moved',
-    severity: later && (ch.late > 0 || (days ?? 0) > PO_LATE_MD_DAYS) ? 'danger' : later ? 'warning' : 'info',
+    severity: later && (ch.late > 0 || (days ?? 0) > Number((await getSettings(db, companyId)).md_po_late_days)) ? 'danger' : later ? 'warning' : 'info',
     title: `${what}: delivery ${dateText(ch.from)} → ${dateText(ch.to)}${days ? ` (${days > 0 ? '+' : ''}${days} d)` : ''}`,
     detail: [ch.note ? `Vendor: ${String(ch.note).trim().replace(/[.!?]?$/, '.')}` : null, ch.supplier ? `Supplier ${ch.supplier}.` : null,
       ch.late > 0 ? `${ch.late} planned unit${ch.late === 1 ? '' : 's'} now late — re-run the plan.` : later ? 'The plan uses the new date when it is run next.' : null].filter(Boolean).join(' '),

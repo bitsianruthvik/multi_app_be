@@ -9013,3 +9013,63 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
           AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machines' AND COLUMN_NAME = 'owner_name') = 1
           AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_store_night_checks') = 1,
           'S112-OK', 'S112-MISSING') AS result;
+
+-- ============================================================================
+-- §113 COMPANY SETTINGS, THE MD'S PAGE, WEEKLY REPORTS (user, 2026-11-19)
+--   "make all the hard codings a setting in the setting page with meaningful grouping. That way we can change it for
+--    other clients."
+--   cf_settings        one row a setting a company has changed (key → value as text). What a key means, its group,
+--                      type, limits and default live in code: services/settingsService.js SETTINGS. No row = the default.
+--                      (The stores settings of §111–§112 stay in their cf_company_settings columns; the same page edits them.)
+--   cf_md_reports      one row a weekly report (stores, plan, maintenance, purchase) for one week: the figures as they
+--                      were when it was made, and who has seen it (the MD's "verified").
+--   cf_erp_md_dashboard  the permission that makes someone "the MD" for the dashboard and MD alerts (it was: any one of
+--                      three approval tags). Granted to every role that approves purchase orders.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS cf_settings (
+  company_id  INT          NOT NULL,
+  skey        VARCHAR(60)  NOT NULL,
+  value       VARCHAR(255) NULL,
+  updated_by  INT          NULL,
+  updated_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (company_id, skey),
+  CONSTRAINT fk_cfset_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE TABLE IF NOT EXISTS cf_md_reports (
+  id            INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT          NOT NULL,
+  kind          VARCHAR(24)  NOT NULL,          -- stores_week · plan_week · maintenance_week · purchase_week
+  period_start  DATE         NOT NULL,
+  period_end    DATE         NOT NULL,
+  headline      VARCHAR(300) NULL,
+  data          JSON         NULL,
+  seen_by       INT          NULL,
+  seen_at       DATETIME     NULL,
+  seen_note     VARCHAR(500) NULL,
+  created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_mdrep_period (company_id, kind, period_start),
+  KEY idx_mdrep_seen (company_id, seen_at),
+  CONSTRAINT fk_mdrep_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: the MD dashboard, MD alerts and company settings', 'cf_erp_md_dashboard', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_md_dashboard');
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id) FROM features f
+ WHERE f.feature_tag = 'cf_erp_md_dashboard' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_md_dashboard' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM role_capability po JOIN features_capability pfc ON pfc.capability_id = po.capability_id AND pfc.deleted_at IS NULL
+                WHERE po.role_id = r.id AND po.app_id = a.id AND po.deleted_at IS NULL AND pfc.name = 'cf_erp_approve_purchase_order')
+   AND NOT EXISTS (SELECT 1 FROM role_capability x WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('cf_settings', 'cf_md_reports')) = 2
+          AND (SELECT COUNT(*) FROM features WHERE feature_tag = 'cf_erp_md_dashboard') = 1,
+          'S113-OK', 'S113-MISSING') AS result;

@@ -27,6 +27,8 @@
 import { invalid, notFound } from '../lib/errors.js';
 import { deskSettings, ledger, outWith, countList, GIVEN_JOINS, givenOf } from './storesDeskService.js';
 import { setProcurement } from './procurementMethodService.js';
+import { getSettings, clearSettingsCache, zOf } from './settingsService.js';
+import { plantZone, wallOf } from './floorService.js';
 
 const blank = (v) => v == null || String(v).trim() === '';
 const pad = (n) => String(n).padStart(2, '0');
@@ -36,8 +38,6 @@ const addDays = (text, n) => { const d = new Date(`${text}T00:00:00`); d.setDate
 const daysBetween = (a, b) => Math.round((new Date(`${b}T00:00:00`) - new Date(`${a}T00:00:00`)) / 86400000);
 const round6 = (n) => Number(Number(n).toFixed(6));
 const STORE_PURPOSES = ['storage', 'quarantine'];
-/** The plant's clock against UTC, in seconds (India). A movement's created_at is an instant; "after hours" is wall time. */
-const PLANT_OFFSET_S = 19800;
 const minutesOf = (hhmm, def) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm ?? '')); return m ? Number(m[1]) * 60 + Number(m[2]) : def; };
 
 // --- settings -------------------------------------------------------------------
@@ -80,6 +80,7 @@ export async function setDeskSettings(db, c, input = {}) {
     await db.query('INSERT IGNORE INTO cf_company_settings (company_id) VALUES (?)', [c.companyId]);
     await db.query(`UPDATE cf_company_settings SET ${cols.map((k) => `${k} = ?`).join(', ')}, updated_by = ? WHERE company_id = ?`, [...Object.values(sets), c.userId ?? null, c.companyId]);
   }
+  clearSettingsCache(c.companyId);
   return deskSettings(db, c.companyId);
 }
 
@@ -102,17 +103,18 @@ async function afterHours(db, companyId, settings) {
         ORDER BY mm.id DESC LIMIT 500`, [companyId]),
   ]);
   const since = Number(last?.ts) || 0;
+  // A movement's created_at is an instant; "after hours" is the plant's wall clock (cf_floor_settings.timezone).
+  const tz = await plantZone(db, companyId);
   const entries = [];
   for (const r of rows) {
     const ts = Number(r.ts);
     if (!ts || ts <= since) continue;
-    const wall = ts + PLANT_OFFSET_S;
-    const minute = Math.floor((((wall % 86400) + 86400) % 86400) / 60);
+    const wall = wallOf(ts * 1000, tz);
+    const minute = Number(wall.slice(11, 13)) * 60 + Number(wall.slice(14, 16));
     const inHours = open <= close ? (minute >= open && minute < close) : (minute >= open || minute < close);
     if (inHours) continue;
-    const d = new Date(wall * 1000);
     entries.push({
-      id: r.id, code: r.code, type: r.movement_type, at: `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`,
+      id: r.id, code: r.code, type: r.movement_type, at: wall.slice(0, 16),
       by: r.by_name ?? null, given: givenOf(r), person: r.person_name ?? null,
       item: r.first_item ?? null, lines: Number(r.lines_n) || 0,
     });
@@ -131,7 +133,17 @@ export async function nightCheck(db, c, input = {}) {
 
 // --- level suggestions ----------------------------------------------------------
 
+/** The defaults (settingsService carries the same numbers); a company's own come from gateOf. */
 export const LEVEL_GATE = { weeks: 8, usedWeeks: 4, window: 26, service: 0.95, z: 1.65, reviewDays: 7, defaultLeadDays: 14, maxWeeks: 4, differs: 0.25 };
+/** The gate and method numbers of a company (settings group "Stock levels suggested from use"). */
+export function gateOf(S) {
+  const service = Number(S.level_service_pct) / 100;
+  return {
+    weeks: Number(S.level_min_weeks), usedWeeks: Number(S.level_min_used_weeks), window: Number(S.level_window_weeks), service,
+    z: service === 0.95 ? 1.65 : Number(zOf(service).toFixed(3)), reviewDays: Number(S.level_review_days), defaultLeadDays: Number(S.level_default_lead_days),
+    maxWeeks: Number(S.level_max_weeks), differs: Number(S.level_differs_pct) / 100,
+  };
+}
 
 /** A small seeded generator, so an item's suggestion is the same every time it is read. */
 function seeded(seed) {
@@ -182,7 +194,8 @@ const CLASS_WORDS = { smooth: 'used steadily', erratic: 'used most weeks, in une
  * 3 reads whatever the catalog's size: the store's areas, the weekly usage of every item that moved, their settings.
  */
 export async function levelSuggestions(db, companyId, q = {}) {
-  const gate = LEVEL_GATE;
+  const gate = gateOf(await getSettings(db, companyId));
+  const pct = Math.round(gate.service * 1000) / 10;
   const t = todayText();
   const from = addDays(t, -gate.window * 7);
   const [areas] = await db.query("SELECT id FROM cf_stocking_areas WHERE company_id = ? AND deleted_at IS NULL AND purpose IN (?)", [companyId, STORE_PURPOSES]);
@@ -193,7 +206,7 @@ export async function levelSuggestions(db, companyId, q = {}) {
          FROM cf_stock_ledger l JOIN cf_stock_movements mm ON mm.id = l.movement_id
         WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.stocking_area_id IN (?) AND mm.movement_date > ? AND mm.movement_date <= ?
           AND mm.reversed_by_id IS NULL AND mm.reversal_of_id IS NULL
-          AND ((mm.movement_type = 'issue' AND COALESCE(mm.used_for, '') <> 'vendor')
+          AND ((mm.movement_type = 'issue' AND COALESCE(mm.used_for, '') NOT IN ('vendor', 'asset'))
             OR (mm.movement_type = 'receipt' AND mm.given_type = 'return_in' AND mm.given_party_id IS NULL))
         GROUP BY l.item_id, wk`, [t, companyId, areaIds, from, t]),
     db.query(
@@ -250,7 +263,7 @@ export async function levelSuggestions(db, companyId, q = {}) {
     rows.push({
       ...base, kind, suggested: { min: s.min, max: s.max }, weeklyAvg: s.weeklyAvg, leadDays, leadAssumed: it.lead_time_days == null, pattern: s.cls,
       why: `${CLASS_WORDS[s.cls][0].toUpperCase()}${CLASS_WORDS[s.cls].slice(1)}: about ${round6(Number(s.weeklyAvg.toFixed(2)))} ${it.uom} a week over ${history} weeks (used in ${usedWeeks}). `
-        + `The minimum covers ${leadDays} days to get it${it.lead_time_days == null ? ' (assumed — set the item\'s lead time)' : ''} plus a week, 95 times in 100.`,
+        + `The minimum covers ${leadDays} days to get it${it.lead_time_days == null ? ' (assumed — set the item\'s lead time)' : ''} plus ${gate.reviewDays} days, ${pct} times in 100.`,
     });
   }
   const rank = { raise: 0, new: 1, lower: 2, unused: 3 };
@@ -293,9 +306,10 @@ export async function applyLevel(db, c, itemId, input = {}) {
 /** GET /stores-desk/today — every line of the page in one answer. */
 export async function today(db, companyId) {
   const settings = await deskSettings(db, companyId);
+  const S = await getSettings(db, companyId);
   const t = todayText();
-  const soon = addDays(t, 3);
-  const monday = addDays(t, -((new Date(`${t}T00:00:00`).getDay() + 6) % 7));
+  const soon = addDays(t, Number(S.po_follow_days));
+  const monday = addDays(t, -((new Date(`${t}T00:00:00`).getDay() - Number(S.week_start) + 7) % 7));
   const [[poLines], night, [[cnt]], daily, out, low, levels] = await Promise.all([
     db.query(
       `SELECT p.id, p.code, sp.name AS supplier_name, m.name AS item_name, pl.uom, COALESCE(pl.expected_date, p.expected_date) AS expected,
@@ -334,7 +348,7 @@ export async function today(db, companyId) {
   return {
     date: t,
     settings,
-    purchaseOrders: { late: poRows.filter((p) => p.daysLate > 0).length, dueSoon: poRows.filter((p) => p.daysLate === 0).length, rows: poRows.slice(0, 30) },
+    purchaseOrders: { late: poRows.filter((p) => p.daysLate > 0).length, dueSoon: poRows.filter((p) => p.daysLate === 0).length, followDays: Number(S.po_follow_days), rows: poRows.slice(0, 30) },
     afterHours: night,
     count: {
       toCount, countedToday, dailyDue: toCount > 0 && !countedToday,

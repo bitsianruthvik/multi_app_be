@@ -1011,3 +1011,25 @@ export async function maintenanceSummary(db, companyId) {
     cost: Math.round(Number(done.cost) * 100) / 100, doneThisWeek: Number(done.n), openOrders: Number(open.n), machinesDown: Number(open.down),
   };
 }
+
+/**
+ * The machines that are down right now: stopped under an open maintenance order (a false alarm is not down), with how
+ * long — on the plant's clock. departmentAlerts and the MD's page read it. 1 read.
+ */
+export async function machinesDownNow(db, companyId) {
+  const { wall } = await plantNow(db, companyId);
+  let rows;
+  try {
+    [rows] = await db.query(
+      `SELECT mo.id, mo.code, mo.title, mo.status, mo.machine_id, m.code AS machine_code, m.name AS machine_name, m.owner_name, st.started_at
+         FROM cf_maintenance_orders mo
+         JOIN cf_machine_stops st ON st.id = mo.stop_id AND st.deleted_at IS NULL AND st.ended_at IS NULL
+         JOIN cf_machines m ON m.id = mo.machine_id
+        WHERE mo.company_id = ? AND mo.deleted_at IS NULL AND mo.false_alarm = 0 AND mo.status IN ('open', 'in_progress', 'waiting_parts')`, [companyId]);
+  } catch (e) { if (missingSchema(e)) return []; throw e; }
+  return rows.map((r) => ({
+    orderId: r.id, code: r.code, title: r.title, status: r.status,
+    machine: { id: r.machine_id, code: r.machine_code, name: r.machine_name, owner: r.owner_name ?? null },
+    since: dbWall(r.started_at), hours: Math.round(minutesBetween(dbWall(r.started_at), wall) / 6) / 10,
+  }));
+}
