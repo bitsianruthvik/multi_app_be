@@ -424,6 +424,19 @@ export const USED_FOR = ['order', 'general'];
 const MO_OPEN = ['open', 'in_progress', 'waiting_parts'];
 export const USED_FOR_MISSING = 'Say what it is used for: a sales order, or General (overhead).';
 
+const daysBefore = (text, n) => { const d = new Date(`${text}T00:00:00`); d.setDate(d.getDate() - Number(n)); return dateOnly(d); };
+/** §112: the company's closed stock period and backdating rule. Defaults when the columns are not there yet. */
+export async function periodRule(db, companyId) {
+  try {
+    const [[s]] = await db.query('SELECT * FROM cf_company_settings WHERE company_id = ?', [companyId]);
+    const closed = s?.stock_closed_through ? String(dateOnly(s.stock_closed_through)).slice(0, 10) : null;
+    return { closedThrough: closed, storesV2: Number(s?.stores_v2) === 1, backdateDays: s?.stock_backdate_days == null ? 3 : Number(s.stock_backdate_days) };
+  } catch (e) {
+    if (e.errno === 1054 || e.errno === 1146) return { closedThrough: null, storesV2: false, backdateDays: 3 };
+    throw e;
+  }
+}
+
 export async function postMovement(db, c, input = {}, opts = {}) {
   // Production putting its own finished work on the shelf — never settable from
   // a request body, so a hand-typed receipt still refuses what only production
@@ -438,6 +451,17 @@ export async function postMovement(db, c, input = {}, opts = {}) {
     if (!DATE_RE.test(s)) problems.push('Date needs YYYY-MM-DD.');
     else if (s > todayText()) problems.push('A movement cannot be dated in the future.');
     else date = s;
+  }
+  // §112: the closed period, and how far back the Stores desk may date an entry. opts.allowBackdate is server-only
+  // (a load script run for the company) — never a body field.
+  if (!problems.length) {
+    const rule = await periodRule(db, c.companyId);
+    if (rule.closedThrough && date <= rule.closedThrough) {
+      throw invalid('PERIOD_CLOSED', `The stock book is closed up to ${rule.closedThrough}. An entry cannot be dated ${date}; date it after that, or ask Management to reopen the period.`);
+    }
+    if (rule.storesV2 && opts.allowBackdate !== true && date < daysBefore(todayText(), rule.backdateDays)) {
+      throw invalid('BACKDATED', `An entry can be dated at most ${rule.backdateDays} day${rule.backdateDays === 1 ? '' : 's'} back. ${date} is older than that.`);
+    }
   }
   const partyCache = new Map();
   const loadParty = async (id) => {
@@ -499,6 +523,9 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   if (type === 'issue' && opts.asset === true) {
     // §104: a machine / durable tool put on the register leaves stock as an ASSET — not a consumable of any order. Server-only.
     usedFor = 'asset';
+  } else if (type === 'issue' && opts.usedFor === 'vendor') {
+    // §111: sent out to a vendor for work — still ours (cf_stock_custody), so not a consumable of an order or of overhead. Server-only.
+    usedFor = 'vendor';
   } else if (type === 'issue') {
     const asked = blank(input.usedFor) ? null : String(input.usedFor);
     if (asked && !USED_FOR.includes(asked)) problems.push('Used for is a sales order or General.');
@@ -613,6 +640,12 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   );
   const movementId = r.insertId;
   if (!code) await db.query('UPDATE cf_stock_movements SET code = ? WHERE id = ?', [`${PREFIX[type]}-${String(movementId).padStart(6, '0')}`, movementId]);
+  // §111: who it was given to (storesDeskService validates it; never a body field of POST /movements).
+  if (opts.given) {
+    const g = opts.given;
+    await db.query('UPDATE cf_stock_movements SET given_type = ?, department_id = ?, given_party_id = ?, person_id = ?, machine_id = ? WHERE company_id = ? AND id = ?',
+      [g.type, g.departmentId ?? null, g.partyId ?? null, g.personId ?? null, g.machineId ?? null, c.companyId, movementId]);
+  }
 
   for (const p of moving) {
     if (p.newBatch) {

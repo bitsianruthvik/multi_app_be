@@ -32,6 +32,8 @@ export const APPROVAL_TYPES = {
   machine_condemn: { perm: 'cf_erp_approve_machine_condemn', label: 'Condemn a machine', subjectType: 'machine' },
   // §105 (2026-11-13): the planner's month plan — frozen once the MD approves (monthPlanService).
   month_plan: { perm: 'cf_erp_approve_month_plan', label: 'Month plan', subjectType: 'month_plan' },
+  // §111 (2026-11-19): a stock count that differs from the book by more than the company's limit (storesDeskService).
+  stock_count: { perm: 'cf_erp_approve_stock_count', label: 'Stock count difference', subjectType: 'stock_count' },
 };
 export const APPROVAL_TYPE_KEYS = Object.keys(APPROVAL_TYPES);
 export const APPROVAL_PERMS = APPROVAL_TYPE_KEYS.map((k) => APPROVAL_TYPES[k].perm);
@@ -51,6 +53,7 @@ const HANDLERS = {
   machine_pr_md: () => import('./machineRequestService.js').then((m) => m.mdApprovalHandler),
   machine_condemn: () => import('./machineLifeService.js').then((m) => m.condemnApprovalHandler),
   month_plan: () => import('./monthPlanService.js').then((m) => m.monthPlanApprovalHandler),
+  stock_count: () => import('./storesDeskService.js').then((m) => m.stockCountApprovalHandler),
 };
 
 const blank = (v) => v == null || String(v).trim() === '';

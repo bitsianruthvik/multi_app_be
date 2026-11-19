@@ -604,7 +604,7 @@ async function requisitionsOf(db, companyId, ids) {
   } catch (e) { if (missingSchema(e)) return []; throw e; }
 }
 
-const MO_SELECT = `SELECT mo.*, m.code AS machine_code, m.name AS machine_name, r.label AS reason_label, p.title AS plan_title,
+const MO_SELECT = `SELECT mo.*, m.code AS machine_code, m.name AS machine_name, m.owner_name AS machine_owner, r.label AS reason_label, p.title AS plan_title,
        st.started_at AS stop_started, st.ended_at AS stop_ended, op.name AS operator_name, u.name AS raised_by_name
   FROM cf_maintenance_orders mo
   JOIN cf_machines m ON m.id = mo.machine_id
@@ -620,7 +620,7 @@ function shapeOrder(r, nowWall, mrs = []) {
   const active = ACTIVE_STATUSES.includes(r.status);
   return {
     id: r.id, code: r.code, status: r.status, statusLabel: MO_STATUS_LABEL[r.status], source: r.source,
-    machine: { id: r.machine_id, code: r.machine_code, name: r.machine_name },
+    machine: { id: r.machine_id, code: r.machine_code, name: r.machine_name, owner: r.machine_owner ?? null },
     title: r.title, note: r.note ?? null, reason: r.reason_label ?? null, plan: r.plan_id ? { id: r.plan_id, title: r.plan_title } : null,
     raisedAt: dbWall(r.raised_at), raisedBy: r.operator_name ?? r.raised_by_name ?? null, startedAt: dbWall(r.started_at), doneAt: dbWall(r.done_at), cancelledAt: dbWall(r.cancelled_at),
     falseAlarm: !!Number(r.false_alarm), workDone: r.work_done ?? null,

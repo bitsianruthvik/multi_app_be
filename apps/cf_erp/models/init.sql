@@ -8797,3 +8797,219 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_alerts') = 1
           AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_purchase_date_changes' AND COLUMN_NAME = 'note') = 1,
           'S110-OK', 'S110-MISSING') AS result;
+
+-- ============================================================================
+-- §111 STORES DESK (user, 2026-11-19): stores run on the software from the item list they keep on paper.
+--   "User should not be able to edit the stock directly. They should only be able to do so using internal mechanism."
+--   A balance changes only through an event: a PO receipt, a give-out, a return, a count, a reversal.
+--
+--   cf_departments / cf_store_people        who material is given to (short lists, added at the counter).
+--   cf_stock_movements.given_type ...       every give-out is charged to exactly ONE of: order (order_id),
+--                                           department (department_id), vendor (given_party_id, sent out for work).
+--                                           person_id (who collected it) and machine_id are optional. return_in marks
+--                                           the receipt that brings a returnable or a lot at a vendor back.
+--   cf_item_details.stores_kind             consumed (default) | returnable (a tool: expected back) ; due_days.
+--   cf_stock_custody (+ _events)            "Out with": what left the store and is expected back, by holder, with what
+--                                           came back, was worn out, or was lost.
+--   cf_stock_counts (+ _lines)              a count: book against counted. Small differences post as one adjustment;
+--                                           above cf_company_settings.count_auto_limit (rupees) they wait for an approval
+--                                           (approval type stock_count, feature cf_erp_approve_stock_count).
+--   cf_company_settings.stores_v2           1 = the Stores menu of this company is the five-screen desk.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS cf_departments (
+  id          INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT          NOT NULL,
+  name        VARCHAR(80)  NOT NULL,
+  status      VARCHAR(10)  NOT NULL DEFAULT 'active',
+  deleted_at  DATETIME     NULL,
+  created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by  INT          NULL,
+  KEY idx_stdep_company (company_id, name),
+  CONSTRAINT fk_stdep_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+CREATE TABLE IF NOT EXISTS cf_store_people (
+  id            INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT          NOT NULL,
+  name          VARCHAR(120) NOT NULL,
+  department_id INT          NULL,
+  status        VARCHAR(10)  NOT NULL DEFAULT 'active',
+  deleted_at    DATETIME     NULL,
+  created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by    INT          NULL,
+  KEY idx_stppl_company (company_id, name),
+  CONSTRAINT fk_stppl_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+CREATE TABLE IF NOT EXISTS cf_stock_custody (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  movement_id   INT           NOT NULL,
+  item_id       INT           NOT NULL,
+  batch_id      INT           NULL,
+  area_id       INT           NULL,
+  quantity      DECIMAL(18,6) NOT NULL,
+  qty_returned  DECIMAL(18,6) NOT NULL DEFAULT 0,
+  qty_worn      DECIMAL(18,6) NOT NULL DEFAULT 0,
+  qty_lost      DECIMAL(18,6) NOT NULL DEFAULT 0,
+  holder_type   VARCHAR(12)   NOT NULL,
+  department_id INT           NULL,
+  person_id     INT           NULL,
+  party_id      INT           NULL,
+  order_id      INT           NULL,
+  machine_id    INT           NULL,
+  issued_on     DATE          NOT NULL,
+  due_on        DATE          NULL,
+  unit_cost     DECIMAL(18,4) NULL,
+  status        VARCHAR(8)    NOT NULL DEFAULT 'open',
+  closed_at     DATETIME      NULL,
+  notes         VARCHAR(255)  NULL,
+  deleted_at    DATETIME      NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by    INT           NULL,
+  KEY idx_stcus_open (company_id, status, holder_type),
+  KEY idx_stcus_item (company_id, item_id),
+  KEY idx_stcus_movement (company_id, movement_id),
+  CONSTRAINT fk_stcus_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+CREATE TABLE IF NOT EXISTS cf_stock_custody_events (
+  id          INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT           NOT NULL,
+  custody_id  INT           NOT NULL,
+  kind        VARCHAR(10)   NOT NULL,
+  quantity    DECIMAL(18,6) NOT NULL,
+  movement_id INT           NULL,
+  note        VARCHAR(255)  NULL,
+  created_at  TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  created_by  INT           NULL,
+  KEY idx_stcev_custody (company_id, custody_id),
+  CONSTRAINT fk_stcev_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+CREATE TABLE IF NOT EXISTS cf_stock_counts (
+  id           INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT           NOT NULL,
+  code         VARCHAR(30)   NULL,
+  kind         VARCHAR(10)   NOT NULL DEFAULT 'daily',
+  area_id      INT           NOT NULL,
+  count_date   DATE          NOT NULL,
+  status       VARCHAR(10)   NOT NULL,
+  lines_n      INT           NOT NULL DEFAULT 0,
+  diff_n       INT           NOT NULL DEFAULT 0,
+  diff_value   DECIMAL(18,2) NULL,
+  movement_id  INT           NULL,
+  approval_id  INT           NULL,
+  note         VARCHAR(500)  NULL,
+  decided_by   INT           NULL,
+  decided_at   DATETIME      NULL,
+  deleted_at   DATETIME      NULL,
+  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by   INT           NULL,
+  KEY idx_stcnt_company (company_id, count_date),
+  CONSTRAINT fk_stcnt_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+CREATE TABLE IF NOT EXISTS cf_stock_count_lines (
+  id          INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT           NOT NULL,
+  count_id    INT           NOT NULL,
+  item_id     INT           NOT NULL,
+  batch_id    INT           NULL,
+  book_qty    DECIMAL(18,6) NOT NULL,
+  counted_qty DECIMAL(18,6) NOT NULL,
+  diff        DECIMAL(18,6) NOT NULL,
+  unit_cost   DECIMAL(18,4) NULL,
+  reason      VARCHAR(255)  NULL,
+  KEY idx_stcnl_count (company_id, count_id),
+  KEY idx_stcnl_item (company_id, item_id),
+  CONSTRAINT fk_stcnl_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND COLUMN_NAME = 'given_type');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_movements ADD COLUMN given_type VARCHAR(12) NULL, ADD COLUMN department_id INT NULL, ADD COLUMN given_party_id INT NULL, ADD COLUMN person_id INT NULL, ADD COLUMN machine_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'stores_kind');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_item_details ADD COLUMN stores_kind VARCHAR(12) NULL, ADD COLUMN due_days INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'stores_v2');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN stores_v2 TINYINT NOT NULL DEFAULT 0, ADD COLUMN count_auto_limit DECIMAL(12,2) NOT NULL DEFAULT 500', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: approve a stock count that differs from the book', 'cf_erp_approve_stock_count', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_approve_stock_count');
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id) FROM features f
+ WHERE f.feature_tag = 'cf_erp_approve_stock_count' AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_approve_stock_count' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM role_capability po JOIN features_capability pfc ON pfc.capability_id = po.capability_id AND pfc.deleted_at IS NULL
+                WHERE po.role_id = r.id AND po.app_id = a.id AND po.deleted_at IS NULL AND pfc.name = 'cf_erp_approve_purchase_order')
+   AND NOT EXISTS (SELECT 1 FROM role_capability x WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME IN ('cf_departments', 'cf_store_people', 'cf_stock_custody', 'cf_stock_custody_events', 'cf_stock_counts', 'cf_stock_count_lines')) = 6
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_movements' AND COLUMN_NAME = 'given_type') = 1
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'stores_v2') = 1,
+          'S111-OK', 'S111-MISSING') AS result;
+
+-- ============================================================================
+-- §112 STORES — TODAY, THE CLOSED PERIOD, THE MACHINE'S OWNER (user, 2026-11-19)
+--   cf_company_settings.stock_closed_through   the stock book is closed up to and including this date: no movement may
+--                                              be dated on or before it (stockService.postMovement, PERIOD_CLOSED).
+--   cf_company_settings.stock_backdate_days    on a company that runs the Stores desk, a movement may be dated at most
+--                                              this many days back (default 3) — older is BACKDATED.
+--   cf_company_settings.store_open_time / store_close_time   the store's hours (plant clock). A movement entered
+--                                              outside them is "after hours": Today lists it until someone checks it.
+--   cf_company_settings.tools_out_days         a thing out with someone longer than this is "out too long" (default 90;
+--                                              an item's own due_days wins).
+--   cf_store_night_checks                      the morning check: who looked at the after-hours entries, and when.
+--   cf_machines.owner_name                     who answers for the machine (shown on its tickets and the board).
+-- ============================================================================
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'stock_closed_through');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN stock_closed_through DATE NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'stock_backdate_days');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN stock_backdate_days INT NOT NULL DEFAULT 3', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'store_open_time');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN store_open_time VARCHAR(5) NOT NULL DEFAULT '08:00'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'store_close_time');
+SET @sql = IF(@col = 0, "ALTER TABLE cf_company_settings ADD COLUMN store_close_time VARCHAR(5) NOT NULL DEFAULT '18:00'", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings' AND COLUMN_NAME = 'tools_out_days');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_company_settings ADD COLUMN tools_out_days INT NOT NULL DEFAULT 90', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machines' AND COLUMN_NAME = 'owner_name');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_machines ADD COLUMN owner_name VARCHAR(120) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS cf_store_night_checks (
+  id          INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id  INT          NOT NULL,
+  entries_n   INT          NOT NULL DEFAULT 0,
+  note        VARCHAR(500) NULL,
+  checked_by  INT          NULL,
+  checked_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_stnck_company (company_id, checked_at),
+  CONSTRAINT fk_stnck_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_company_settings'
+            AND COLUMN_NAME IN ('stock_closed_through', 'stock_backdate_days', 'store_open_time', 'store_close_time', 'tools_out_days')) = 5
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machines' AND COLUMN_NAME = 'owner_name') = 1
+          AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_store_night_checks') = 1,
+          'S112-OK', 'S112-MISSING') AS result;

@@ -34,6 +34,7 @@ function shape(m, production = null) {
     classificationName: m.classification_name ?? undefined,
     catalogItem: m.catalog_item_id ? { id: m.catalog_item_id, code: m.catalog_code ?? null, name: m.catalog_name ?? null } : null,
     serialNumber: m.serial_number,
+    ownerName: m.owner_name ?? null,   // §112: who answers for the machine
     status: m.status,
     isProduction: production ? production.has(m.id) : undefined,
     notes: m.notes,
@@ -109,6 +110,7 @@ export async function createMachine(db, c, input = {}) {
   try { classificationId = (await requireMachineType(db, c.companyId, input.classificationId)).id; } catch (e) { problems.push(e.message); }
   const catalogItemId = await readCatalogItem(db, c.companyId, input.catalogItemId, problems);
   const serialNumber = readText(input.serialNumber, 'Serial number', 100, problems);
+  const ownerName = readText(input.ownerName, 'Owner', 120, problems);
   const status = input.status ?? 'active';
   if (!['active', 'inactive'].includes(status)) problems.push('Status is active or inactive.');
   let code = blank(input.code) ? null : String(input.code).trim();
@@ -120,9 +122,9 @@ export async function createMachine(db, c, input = {}) {
     if (!code) throw invalid('CODE_REQUIRED', 'Type a machine code, or add a coding rule for machines under Coding rules.');
   }
   const [r] = await db.query(
-    `INSERT INTO cf_machines (company_id, code, name, classification_id, catalog_item_id, serial_number, status, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [c.companyId, code, name, classificationId, catalogItemId, serialNumber, status, blank(input.notes) ? null : String(input.notes), c.userId],
+    `INSERT INTO cf_machines (company_id, code, name, classification_id, catalog_item_id, serial_number, owner_name, status, notes, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [c.companyId, code, name, classificationId, catalogItemId, serialNumber, ownerName, status, blank(input.notes) ? null : String(input.notes), c.userId],
   );
   // Fixed and default values from its machine type land on it straight away.
   await materializeMachine(db, c, r.insertId);
@@ -147,6 +149,7 @@ export async function updateMachine(db, c, id, input = {}) {
   }
   if (input.catalogItemId !== undefined) sets.catalog_item_id = await readCatalogItem(db, c.companyId, input.catalogItemId, problems);
   if (input.serialNumber !== undefined) sets.serial_number = readText(input.serialNumber, 'Serial number', 100, problems);
+  if (input.ownerName !== undefined) sets.owner_name = readText(input.ownerName, 'Owner', 120, problems);
   if (input.notes !== undefined) sets.notes = blank(input.notes) ? null : String(input.notes);
   if (input.status !== undefined) {
     if (!['active', 'inactive'].includes(input.status)) problems.push('Status is active or inactive.');

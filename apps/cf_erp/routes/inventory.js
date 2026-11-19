@@ -44,6 +44,7 @@ import {
 import {
   postMovement, reverseMovement, listMovements, getMovement, listStock, itemStock, areaInventory, checkLedger,
 } from '../services/stockService.js';
+import { assertDeskAllows } from '../services/storesDeskService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -81,7 +82,8 @@ router.put('/batches/:id/values', manage, handle((req) => tx(req, (db, c) => set
 router.get('/batches/:id/history', view, handle((req) => getBatchHistory(pool, company(req), id(req), Number(req.query.limit) || 200)));
 
 router.get('/movements', view, handle((req) => listMovements(pool, company(req), req.query)));
-router.post('/movements', manage, handle((req) => tx(req, (db, c) => postMovement(db, c, req.body ?? {}))));
+// §111: on the Stores desk a free receipt, issue or count is refused — the balance changes by Receive against a PO, Give out, Count.
+router.post('/movements', manage, handle((req) => tx(req, async (db, c) => { await assertDeskAllows(db, c.companyId, req.body?.movementType); return postMovement(db, c, req.body ?? {}); })));
 router.get('/movements/:id', view, handle((req) => getMovement(pool, company(req), id(req))));
 router.post('/movements/:id/reverse', manage, handle((req) => tx(req, (db, c) => reverseMovement(db, c, id(req), req.body ?? {}))));
 

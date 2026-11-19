@@ -64,6 +64,8 @@ import machineLifeRoutes from './machineLife.js';
 import planningRoutes from './planning.js';
 // The stores chain: the general MR, To reorder, how items are procured, a machine's store (init.sql §79).
 import storesRoutes from './stores.js';
+// The Stores desk (init.sql §111): the ledger, give out, out with, counts.
+import storesDeskRoutes from './storesDesk.js';
 // Step 6: contractor work orders from a production order, in Accounts (init.sql §85).
 import contractorWorkOrderRoutes from './contractorWorkOrders.js';
 // Timings as Excel: standard times, an order's per-operation times, floor progress (2026-10-31).
@@ -181,6 +183,7 @@ router.use(maintenanceRoutes);
 router.use(machineLifeRoutes);
 router.use(planningRoutes);
 router.use(storesRoutes);
+router.use(storesDeskRoutes);
 router.use(contractorWorkOrderRoutes);
 router.use(timingSheetRoutes);
 
