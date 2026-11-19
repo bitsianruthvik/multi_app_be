@@ -82,7 +82,7 @@ export const appContext = async (req, res, next) => {
     if (
       parts.length > 2 &&
       parts[0].toLowerCase() === "api" &&
-      ["auth", "apps", "schema"].includes(parts[2].toLowerCase())
+      ["auth", "apps", "schema", "admin-panel"].includes(parts[2].toLowerCase())
     ) {
       req.company = null;
       req.appCtx = null;

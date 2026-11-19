@@ -170,3 +170,56 @@ SET @sql = IF(@needs_preferences = 1,
   'ALTER TABLE users ADD COLUMN preferences JSON NULL DEFAULT NULL',
   'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+-- ============================================================================
+-- COMPANY ADMIN PANEL (user, 2026-11-19): people, roles and what each role may do, for a company's own admin.
+--   users.username             a login for someone with no email (unique within the company). email stays NOT NULL:
+--                              such a person's email is <username>@<company>.login, never shown.
+--   users.must_change_password 1 = the password was set by an admin (new person, reset): it must be changed at the next login.
+--   users.is_company_admin     1 = may open the admin panel of the company. (A role NAMED admin still passes every check, as before.)
+--   users.deactivated_at       set = cannot log in; the name stays on everything the person recorded.
+--   users.last_login_at        shown on the People list.
+--   roles.standard_key         '<app>:<key>' when the role was made from a standard role of an app (apps/<app>/permissions.js).
+--   admin_audit                every change made in the panel: who, when, what.
+-- ============================================================================
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'username');
+SET @sql = IF(@c = 0, 'ALTER TABLE users ADD COLUMN username VARCHAR(60) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'must_change_password');
+SET @sql = IF(@c = 0, 'ALTER TABLE users ADD COLUMN must_change_password TINYINT NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'is_company_admin');
+SET @sql = IF(@c = 0, 'ALTER TABLE users ADD COLUMN is_company_admin TINYINT NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'deactivated_at');
+SET @sql = IF(@c = 0, 'ALTER TABLE users ADD COLUMN deactivated_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'last_login_at');
+SET @sql = IF(@c = 0, 'ALTER TABLE users ADD COLUMN last_login_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND INDEX_NAME = 'uq_users_company_username');
+SET @sql = IF(@c = 0, 'ALTER TABLE users ADD UNIQUE KEY uq_users_company_username (company_id, username)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @c = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'roles' AND COLUMN_NAME = 'standard_key');
+SET @sql = IF(@c = 0, 'ALTER TABLE roles ADD COLUMN standard_key VARCHAR(60) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id            INT          AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT          NOT NULL,
+  actor_id      INT          NULL,
+  actor_name    VARCHAR(100) NULL,
+  action        VARCHAR(40)  NOT NULL,
+  subject_type  VARCHAR(20)  NOT NULL,          -- person · role
+  subject_id    INT          NULL,
+  summary       VARCHAR(500) NOT NULL,
+  detail        JSON         NULL,
+  created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_admaud_company (company_id, id)
+);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'
+            AND COLUMN_NAME IN ('username', 'must_change_password', 'is_company_admin', 'deactivated_at', 'last_login_at')) = 5
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'roles' AND COLUMN_NAME = 'standard_key') = 1
+          AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'admin_audit') = 1,
+          'ADMIN-PANEL-OK', 'ADMIN-PANEL-MISSING') AS result;

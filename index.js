@@ -24,6 +24,7 @@ import { pool, getPoolStats } from "./db.js";
 import jobsStatusRoute from "./core/jobs/jobsStatusRoute.js";
 import schemaRoutes from "./core/routes/schemaRoutes.js";
 import appsRoutes from "./core/routes/appsRoutes.js";
+import adminPanelRoutes from "./core/admin/adminPanelRoute.js";
 import { createProcessGuard } from "./core/utils/processGuard.js";
 // CF_HRMS attendance (spec §28): the ZKTeco/eSSL ADMS push and the punch API, outside /api/:company/:app.
 import iclockRoutes from "./apps/cf_hrms/routes/iclock.js";
@@ -222,6 +223,8 @@ app.use("/api/:company/auth", companyAuthRoutes);
 
 app.use("/api/:company/:appSlug/auth", loginLimiter, authRoutes);
 app.use("/api/:companySlug/apps", appsRoutes);
+// The company admin panel: people, roles, what each role may do (core/admin). Company-level — listed in appContext's skip list.
+app.use("/api/:company/admin-panel", protect, adminPanelRoutes);
 app.post("/api/:company/:appSlug/login", loginLimiter, appContext, loginUser);
 app.get("/api/:company/:appSlug/verify", appContext, verifyUser);
 app.use("/api/:company/:appSlug/admin", protect, adminRoutes);

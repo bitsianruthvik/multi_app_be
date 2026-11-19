@@ -4,6 +4,7 @@ import { signToken, verifyToken } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import crypto from "crypto";
 import { getAppAccessForUser } from "../routes/appsRoutes.js";
+import { validLogin, findLoginUser, loginRefusal, loginFlags, touchLogin, userState } from "./loginRules.js";
 // LOGIN controller
 export const loginUser = async (req, res) => {
   try {
@@ -11,8 +12,9 @@ export const loginUser = async (req, res) => {
     if (!email || !password) {
       return res.status(400).json({ message: "Email and password are required" });
     }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ message: "Invalid email format" });
+    // An email, or a username for someone who has none (loginRules.js).
+    if (!validLogin(email)) {
+      return res.status(400).json({ message: "Enter your email or username" });
     }
     if (password.length < 8) {
       return res.status(400).json({ message: "Password must be at least 8 characters" });
@@ -34,14 +36,11 @@ export const loginUser = async (req, res) => {
     const correctCompanySlug = companys[0].slug;
     const companyName = companys[0].name;
 
-    const [rows] = await pool.query(`SELECT * FROM users WHERE email = ?`, [
-      email,
-    ]);
-
-    if (rows.length === 0)
+    const found = await findLoginUser(email, companys[0].id);
+    if (!found)
       return res.status(404).json({ message: "User not found" });
 
-    const user = rows[0];
+    const user = found;
 
     // Fetch the role name and team name from their respective tables
     const [roleRows] = await pool.query(
@@ -65,6 +64,9 @@ export const loginUser = async (req, res) => {
     if (user.company_id !== companys[0].id) {
       return res.status(403).json({ message: "User not in this company" });
     }
+    const refused = loginRefusal(user);
+    if (refused) return res.status(403).json({ message: refused });
+    void touchLogin(user.id);
 
     // Fetch role-based capability and features (permissions)
     // Single query via JSON_TABLE (MySQL 8.0+); falls back to two queries for older MySQL.
@@ -162,6 +164,7 @@ export const loginUser = async (req, res) => {
       companyId: companys[0]?.id,
       company_id: companys[0]?.id,
       uiPermissions,
+      ...loginFlags(user),
     };
 
     let token;
@@ -237,7 +240,10 @@ export const verifyUser = async (req, res) => {
     } catch (e) {
       logger.error({ err: e }, "appRoles lookup failed during verify");
     }
-    return res.status(200).json({ user: { ...decoded, appRoles }, appRoles });
+    // What may have changed since the token was made (loginRules.js): deactivated, must change the password, admin.
+    const state = decoded.id ? await userState(decoded.id).catch(() => null) : null;
+    if (state?.deactivated) return res.status(403).json({ message: "This login has been deactivated. Ask your company's admin." });
+    return res.status(200).json({ user: { ...decoded, appRoles, ...(state ? { mustChangePassword: state.mustChange, isCompanyAdmin: state.isCompanyAdmin } : {}) }, appRoles });
   } catch (err) {
     logger.error({ err }, "Verify user error");
     return res.status(500).json({ message: "Server error" });

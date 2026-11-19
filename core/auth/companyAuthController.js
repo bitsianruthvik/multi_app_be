@@ -4,6 +4,7 @@ import { pool } from "../../db.js";
 import { signToken, verifyToken } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import { getAppAccessForUser } from "../routes/appsRoutes.js";
+import { validLogin, findLoginUser, loginRefusal, loginFlags, touchLogin, userState } from "./loginRules.js";
 
 const resolveCompany = async (slug) => {
   const [rows] = await pool.query(
@@ -66,23 +67,26 @@ export const companyLogin = async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password)
       return res.status(400).json({ message: "Email and password are required" });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
-      return res.status(400).json({ message: "Invalid email format" });
+    // An email, or a username for someone who has none (loginRules.js).
+    if (!validLogin(email))
+      return res.status(400).json({ message: "Enter your email or username" });
     if (password.length < 8)
       return res.status(400).json({ message: "Password must be at least 8 characters" });
 
     const company = await resolveCompany(req.params.company);
     if (!company) return res.status(404).json({ message: "Company not found" });
 
-    const [userRows] = await pool.query("SELECT * FROM users WHERE email = ? LIMIT 1", [email]);
-    if (!userRows.length) return res.status(404).json({ message: "User not found" });
-    const user = userRows[0];
+    const user = await findLoginUser(email, company.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
 
     if (user.company_id !== company.id)
       return res.status(403).json({ message: "User does not belong to this company" });
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ message: "Invalid credentials" });
+    const refused = loginRefusal(user);
+    if (refused) return res.status(403).json({ message: refused });
+    void touchLogin(user.id);
 
     const [[roleRow]] = await pool.query("SELECT name FROM roles WHERE id = ? LIMIT 1", [user.role_id]);
     const [[teamRow]] = await pool.query("SELECT name FROM teams WHERE id = ? LIMIT 1", [user.team_id]);
@@ -101,6 +105,7 @@ export const companyLogin = async (req, res) => {
       companyId: company.id,
       company_id: company.id,
       uiPermissions,
+      ...loginFlags(user),
     };
 
     const token = signToken(payload);
@@ -145,7 +150,10 @@ export const companyVerify = async (req, res) => {
     } catch (e) {
       logger.error({ err: e }, "appRoles lookup failed during companyVerify");
     }
-    return res.json({ user: { ...decoded, appRoles }, appRoles });
+    // What may have changed since the token was made (loginRules.js): deactivated, must change the password, admin.
+    const state = await userState(decoded.id).catch(() => null);
+    if (state?.deactivated) return res.status(403).json({ message: "This login has been deactivated. Ask your company's admin." });
+    return res.json({ user: { ...decoded, appRoles, ...(state ? { mustChangePassword: state.mustChange, isCompanyAdmin: state.isCompanyAdmin } : {}) }, appRoles });
   } catch (err) {
     logger.error({ err }, "companyVerify error");
     return res.status(500).json({ message: "Server error" });

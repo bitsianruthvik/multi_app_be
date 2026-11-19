@@ -3,6 +3,7 @@
 import { verifyToken } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import { pool } from "../../db.js";
+import { userState } from "../auth/loginRules.js";
 
 /**
  * A role's feature tags in an app, kept 60 s per (role, app) in this process (2026-11-09: two queries ran on EVERY
@@ -97,6 +98,16 @@ export const protect = async (req, res, next) => {
     }, "Token decoded successfully");
 
     req.user = decoded; // Attach decoded payload (user info + permissions)
+
+    // Company admin panel (2026-11-19): a person deactivated since they signed in is stopped here, and one whose
+    // password was set by an admin changes it before anything else (loginRules.js; the state is re-read every 30 s).
+    if (decoded.id && !decoded.is_service) {
+      const state = await userState(decoded.id).catch(() => null);
+      if (state?.deactivated) return res.status(403).json({ error: "DEACTIVATED", message: "This login has been deactivated. Ask your company's admin." });
+      if (state?.mustChange && !/\/admin-panel\/me(\/|$|\?)/.test(req.originalUrl || "")) {
+        return res.status(403).json({ error: "PASSWORD_CHANGE_REQUIRED", message: "Change your password first." });
+      }
+    }
 
     // Check if user has access to the requested company/app
     if (req.company) {
