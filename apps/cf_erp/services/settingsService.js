@@ -20,6 +20,7 @@ export const GROUPS = [
   { key: 'stores_book', label: 'Stores: counting and the stock book', help: 'What a count may correct on its own, how far back an entry may be dated, and the closed period.' },
   { key: 'stores_day', label: 'Stores: the day and things given out', help: "The store's hours, what counts as out too long, and what the Today page lists." },
   { key: 'levels', label: 'Stock levels suggested from use', help: 'When the app suggests a minimum and maximum for an item, and how it works them out.' },
+  { key: 'maintenance', label: 'Maintenance: tickets, tools and machine health', help: 'How long a ticket of each kind may take, when a tool counts as worn early, and the period machine health looks at.' },
   { key: 'alerts', label: 'Alerts: when one is raised', help: 'How late something is before its own department hears of it.' },
   { key: 'md', label: 'Alerts: when it reaches the MD', help: 'How much later the same thing is put in front of the MD.' },
   { key: 'reports', label: 'MD dashboard and weekly reports', help: 'Which reports are made each week for the MD to verify, and who decides when the MD is away.' },
@@ -55,6 +56,15 @@ export const SETTINGS = [
   I('level_max_weeks', 'levels', 'Maximum = minimum plus this much average use', 4, 1, 52, 'weeks'),
   { key: 'level_differs_pct', group: 'levels', label: 'Suggest only when it differs from what is set by more than', type: 'number', def: 25, min: 0, max: 500, unit: '%' },
 
+  // --- maintenance (§114)
+  I('maint_target_fault_hours', 'maintenance', 'A breakdown ticket should close within', 24, 1, 2000, 'hours', 'From when it is raised. Past it the ticket is late.'),
+  I('maint_target_preventive_hours', 'maintenance', 'A preventive ticket should close within', 72, 1, 2000, 'hours'),
+  I('maint_target_setup_hours', 'maintenance', 'A new machine should be set up within', 168, 1, 4000, 'hours', 'From when Stores registers it.'),
+  I('maint_target_manual_hours', 'maintenance', "A job of maintenance's own should close within", 72, 1, 2000, 'hours'),
+  I('maint_health_days', 'maintenance', 'Machine health looks back', 90, 7, 730, 'days'),
+  I('maint_early_wear_pct', 'maintenance', 'A tool is worn early when it lasted less than', 60, 1, 100, '% of its life', 'Its life is set on the tool, on Maintenance today.'),
+  I('maint_wear_review_days', 'maintenance', 'A worn or lost tool stays on the review list for', 60, 7, 365, 'days', 'Until maintenance marks it reviewed.'),
+
   // --- alerts: raised
   I('alert_grace_min', 'alerts', 'A step is late after', 60, 0, 1440, 'minutes past its slot'),
   I('alert_machine_down_hours', 'alerts', 'A machine down is an alert after', 4, 0, 720, 'hours', 'To Maintenance and Planning.'),
@@ -65,10 +75,13 @@ export const SETTINGS = [
   I('alert_lost_days', 'alerts', 'A lost item stays on the alerts for', 14, 1, 120, 'days', 'To Stores and the MD.'),
   I('alert_billing_days', 'alerts', 'An invoice unpaid is an alert after', 30, 1, 365, 'days from its date', 'To Accounts.'),
 
+  I('alert_ticket_late_hours', 'alerts', 'A maintenance ticket past its target is an alert after', 0, 0, 720, 'hours past', 'To Maintenance.'),
+
   // --- alerts: to the MD
   I('md_po_late_days', 'md', 'A purchase order late by more than', 3, 0, 120, 'days'),
   { key: 'md_step_late_days', group: 'md', label: 'A start or finish late by', type: 'number', def: 1, min: 0, max: 60, unit: 'days' },
   I('md_machine_down_hours', 'md', 'A machine down for', 24, 1, 2000, 'hours'),
+  I('md_ticket_late_hours', 'md', 'A maintenance ticket past its target by', 48, 1, 2000, 'hours'),
   I('md_inquiry_days', 'md', 'An inquiry not confirmed for', 7, 1, 365, 'days'),
   I('md_count_skip_days', 'md', 'No stock count for', 4, 1, 120, 'days'),
   I('md_out_extra_days', 'md', 'A thing out too long by a further', 30, 0, 730, 'days'),

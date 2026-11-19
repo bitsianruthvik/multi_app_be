@@ -9073,3 +9073,41 @@ SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
 SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('cf_settings', 'cf_md_reports')) = 2
           AND (SELECT COUNT(*) FROM features WHERE feature_tag = 'cf_erp_md_dashboard') = 1,
           'S113-OK', 'S113-MISSING') AS result;
+
+-- =====================================================================================================================
+-- §114 MAINTENANCE TODAY: the ticket's owner and target time, a machine with no cycle, tool life and issue rules
+--      (user, 2026-11-20: "consolidate as much as you can" — tickets, alerts, the store's stock and the preventive plans
+--      carry it; one page, Maintenance today, shows it)
+--
+--   cf_maintenance_orders.owner_user_id   who answers for the ticket.
+--   cf_maintenance_orders.due_at          plant clock: raised_at + the target hours of its kind (settings, group
+--                                         "Maintenance"). Set once; maintenance may move it.
+--   cf_machines.no_plan_reason            "this machine needs no maintenance cycle, because …" — clears it from the list
+--                                         of machines without a preventive plan.
+--   cf_item_details.life_days             how long a tool given out should last. Worn out sooner = worn early.
+--   cf_item_details.issue_conditions      what the storekeeper asks or checks before giving it out (maintenance writes it).
+--   cf_stock_custody_events.days_used / reviewed_at / reviewed_by / review_note
+--                                         a tool recorded worn out or lost is read by maintenance and signed off.
+-- =====================================================================================================================
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_maintenance_orders' AND COLUMN_NAME = 'owner_user_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_maintenance_orders ADD COLUMN owner_user_id INT NULL, ADD COLUMN due_at DATETIME NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_machines' AND COLUMN_NAME = 'no_plan_reason');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_machines ADD COLUMN no_plan_reason VARCHAR(255) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_item_details' AND COLUMN_NAME = 'life_days');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_item_details ADD COLUMN life_days INT NULL, ADD COLUMN issue_conditions VARCHAR(1000) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_custody_events' AND COLUMN_NAME = 'reviewed_at');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_custody_events ADD COLUMN days_used INT NULL, ADD COLUMN reviewed_at DATETIME NULL, ADD COLUMN reviewed_by INT NULL, ADD COLUMN review_note VARCHAR(500) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()
+            AND ((TABLE_NAME = 'cf_maintenance_orders' AND COLUMN_NAME IN ('owner_user_id', 'due_at'))
+              OR (TABLE_NAME = 'cf_machines' AND COLUMN_NAME = 'no_plan_reason')
+              OR (TABLE_NAME = 'cf_item_details' AND COLUMN_NAME IN ('life_days', 'issue_conditions'))
+              OR (TABLE_NAME = 'cf_stock_custody_events' AND COLUMN_NAME IN ('days_used', 'reviewed_at', 'reviewed_by', 'review_note')))) = 9,
+          'S114-OK', 'S114-MISSING') AS result;

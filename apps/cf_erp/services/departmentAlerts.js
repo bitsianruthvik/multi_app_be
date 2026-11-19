@@ -15,15 +15,17 @@
  *   tool_lost         something recorded as lost in the last N days → stores, md.
  *   out_too_long      things given out past their due date / the company's limit → stores; the MD when one is a
  *                     further M days over.
+ *   ticket_late · machine_no_plan · spare_low · tool_worn_early   §114, found by maintenanceDeskService (Maintenance today).
  *   invoice_unpaid    an issued invoice with money still to come, N days after its date → accounts; the MD later.
  */
 import { machinesDownNow, planStatus } from './maintenanceService.js';
 import { deskSettings } from './storesDeskService.js';
+import { findMaintenanceDeskAlerts, MAINTENANCE_DESK_KINDS, MAINTENANCE_DESK_KIND_LABEL } from './maintenanceDeskService.js';
 
-export const DEPARTMENT_KINDS = ['machine_down', 'repeat_breakdown', 'pm_overdue', 'inquiry_waiting', 'count_skipped', 'tool_lost', 'out_too_long', 'invoice_unpaid'];
+export const DEPARTMENT_KINDS = ['machine_down', 'repeat_breakdown', 'pm_overdue', 'inquiry_waiting', 'count_skipped', 'tool_lost', 'out_too_long', 'invoice_unpaid', ...MAINTENANCE_DESK_KINDS];
 export const DEPARTMENT_KIND_LABEL = {
   machine_down: 'Machine down', repeat_breakdown: 'Repeat breakdown', pm_overdue: 'Preventive job overdue', inquiry_waiting: 'Inquiry waiting',
-  count_skipped: 'Count not done', tool_lost: 'Item lost', out_too_long: 'Out too long', invoice_unpaid: 'Invoice unpaid',
+  count_skipped: 'Count not done', tool_lost: 'Item lost', out_too_long: 'Out too long', invoice_unpaid: 'Invoice unpaid', ...MAINTENANCE_DESK_KIND_LABEL,
 };
 const plural = (n, one, many = `${one}s`) => `${n} ${Number(n) === 1 ? one : many}`;
 const rupees = (n) => `₹${Math.round(Number(n)).toLocaleString('en-IN')}`;
@@ -183,6 +185,7 @@ export async function findDepartmentAlerts(db, companyId, S) {
   await run(['pm_overdue'], () => pmOverdue(db, companyId));
   await run(['inquiry_waiting'], () => inquiriesWaiting(db, companyId, S));
   await run(['tool_lost', 'out_too_long', 'count_skipped'], () => storesAlerts(db, companyId, S));
+  await run(MAINTENANCE_DESK_KINDS, () => findMaintenanceDeskAlerts(db, companyId, S));
   await run(['invoice_unpaid'], () => invoicesUnpaid(db, companyId, S));
   return { found, ok };
 }

@@ -174,7 +174,7 @@ export async function ledger(db, companyId, q = {}) {
   const dir = String(q.dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
   const [[rows], [[{ n: total }]], [groups]] = await Promise.all([
     db.query(
-      `SELECT m.id, m.code, m.name, m.status, i.uom, i.tracked_by, i.stores_kind,
+      `SELECT m.id, m.code, m.name, m.status, i.uom, i.tracked_by, i.stores_kind, i.issue_conditions,
               f.id AS family_id, f.name AS family_name, s.id AS subfamily_id, s.name AS subfamily_name,
               COALESCE(bal.q, 0) - COALESCE(mv.after_q, 0) AS balance, COALESCE(bal.q, 0) AS now_q,
               COALESCE(bal.q, 0) - COALESCE(mv.since_q, 0) AS opening,
@@ -197,7 +197,7 @@ export async function ledger(db, companyId, q = {}) {
         GROUP BY f.id, f.name, s.id, s.name ORDER BY f.name, s.name`, [companyId]),
   ]);
   return pageOf(rows.map((r) => ({
-    item: { id: r.id, code: r.code, name: r.name, uom: r.uom, trackedBy: r.tracked_by, returnable: r.stores_kind === 'returnable', status: r.status },
+    item: { id: r.id, code: r.code, name: r.name, uom: r.uom, trackedBy: r.tracked_by, returnable: r.stores_kind === 'returnable', status: r.status, issueConditions: r.issue_conditions ?? null },
     group: { familyId: r.family_id, family: r.family_name, subfamilyId: r.subfamily_id, subfamily: r.subfamily_name },
     opening: round6(r.opening), in: round6(r.in_q), out: round6(r.out_q), balance: round6(r.balance), now: round6(r.now_q),
     outWith: round6(r.out_with), onOrder: round6(r.on_order), reserved: round6(r.reserved),
@@ -374,9 +374,11 @@ export async function giveOut(db, c, input = {}) {
     if (blank(l?.itemId)) { P('choose an item.'); continue; }
     if (!Number.isFinite(qty) || qty <= 0) { P('the quantity is a number above zero.'); continue; }
     const [[item]] = await db.query(
-      `SELECT m.id, m.code, m.name, i.tracked_by, i.stores_kind, i.due_days FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id
+      `SELECT i.*, m.id, m.code, m.name FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id
         WHERE m.company_id = ? AND m.id = ? AND m.deleted_at IS NULL AND m.record_kind = 'item'`, [c.companyId, Number(l.itemId)]);
     if (!item) { P('that item does not exist.'); continue; }
+    // §114: what maintenance wants checked before this goes out — the storekeeper confirms it on the line.
+    if (!blank(item.issue_conditions) && l.conditionsChecked !== true) { P(`${item.name} — check before giving it out: ${item.issue_conditions}`); continue; }
     const returnable = item.stores_kind === 'returnable';
     if (returnable && type === 'order' && !person) { P(`${item.name} comes back — say who is collecting it.`); continue; }
     const areaId = blank(l.areaId) ? await mainAreaOf(db, c.companyId, item.id) : Number(l.areaId);
@@ -507,6 +509,15 @@ export async function custodyBack(db, c, id, input = {}) {
   if (qty > left + 1e-9) throw invalid('TOO_MANY', `Only ${left} is still out.`);
   const note = blank(input.note) ? null : String(input.note).trim().slice(0, 255);
   if (kind === 'lost' && !note) throw invalid('REASON', 'Say what is known about the loss — the report to Management shows it.');
+  // §114: how long it lasted. A tool worn out well before its life needs a word on why — maintenance reads these.
+  const [[life]] = await db.query('SELECT i.*, DATEDIFF(CURDATE(), ?) AS days FROM cf_item_details i WHERE i.master_id = ?', [r.issued_on, r.item_id]);
+  const daysUsed = Math.max(0, Number(life?.days) || 0);
+  if (kind === 'worn' && !note && life?.life_days != null) {
+    const S = await getSettings(db, c.companyId);
+    if (daysUsed < (Number(life.life_days) * Number(S.maint_early_wear_pct)) / 100) {
+      throw invalid('REASON', `This lasted ${daysUsed} day${daysUsed === 1 ? '' : 's'}; it should last ${life.life_days}. Say what happened — Maintenance reads it.`);
+    }
+  }
   let movementId = null;
   if (kind === 'returned') {
     const [[src]] = await db.query('SELECT code FROM cf_stock_movements WHERE id = ?', [r.movement_id]);
@@ -523,8 +534,9 @@ export async function custodyBack(db, c, id, input = {}) {
   const closes = round6(left - qty) <= 1e-9;
   await db.query(`UPDATE cf_stock_custody SET ${col} = ${col} + ?, status = ?, closed_at = ${closes ? 'NOW()' : 'NULL'} WHERE company_id = ? AND id = ?`,
     [round6(qty), closes ? 'closed' : 'open', c.companyId, r.id]);
-  await db.query('INSERT INTO cf_stock_custody_events (company_id, custody_id, kind, quantity, movement_id, note, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  const [ev] = await db.query('INSERT INTO cf_stock_custody_events (company_id, custody_id, kind, quantity, movement_id, note, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
     [c.companyId, r.id, kind, round6(qty), movementId, note, c.userId ?? null]);
+  await db.query('UPDATE cf_stock_custody_events SET days_used = ? WHERE id = ?', [daysUsed, ev.insertId]).catch((e) => { if (e.errno !== 1054) throw e; });
   const [[fresh]] = await db.query(`${CUSTODY_SELECT} WHERE c.company_id = ? AND c.id = ?`, [c.companyId, r.id]);
   return shapeCustody(fresh);
 }

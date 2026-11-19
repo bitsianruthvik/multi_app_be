@@ -32,6 +32,7 @@ import { productionMachineIds } from './operationService.js';
 import { WEEKDAYS } from './shiftService.js';
 import * as requisitions from './requisitionService.js';
 import * as resources from './machineResourceService.js';
+import { getSettings } from './settingsService.js';
 
 export const MO_STATUSES = ['open', 'in_progress', 'waiting_parts', 'done', 'cancelled'];
 export const MO_STATUS_LABEL = { open: 'Open', in_progress: 'In progress', waiting_parts: 'Waiting for parts', done: 'Done', cancelled: 'Cancelled' };
@@ -360,6 +361,23 @@ async function insertOrders(db, c, rows) {
     [c.userId ?? null, c.companyId],
   );
   await db.query("UPDATE cf_maintenance_orders SET code = CONCAT('MO-', LPAD(id, 6, '0')) WHERE company_id = ? AND code IS NULL", [c.companyId]);
+  await ensureDue(db, c.companyId);
+}
+
+/**
+ * §114: every open ticket has a target time — raised_at + the hours of its kind (settings, group "Maintenance"). Set once,
+ * for tickets that have none (new ones, and those raised before §114); maintenance may move it (assignOrder).
+ */
+export const TARGET_KEY = { fault: 'maint_target_fault_hours', preventive: 'maint_target_preventive_hours', setup: 'maint_target_setup_hours', manual: 'maint_target_manual_hours' };
+export async function ensureDue(db, companyId) {
+  try {
+    const S = await getSettings(db, companyId);
+    await db.query(
+      `UPDATE cf_maintenance_orders
+          SET due_at = raised_at + INTERVAL (CASE source WHEN 'fault' THEN ? WHEN 'preventive' THEN ? WHEN 'setup' THEN ? ELSE ? END) HOUR
+        WHERE company_id = ? AND due_at IS NULL AND deleted_at IS NULL AND status IN ('open','in_progress','waiting_parts')`,
+      [Number(S.maint_target_fault_hours), Number(S.maint_target_preventive_hours), Number(S.maint_target_setup_hours), Number(S.maint_target_manual_hours), companyId]);
+  } catch (e) { if (!missingSchema(e)) throw e; }
 }
 
 const event = (db, c, moId, ev, from, to, note) => db.query(
@@ -605,20 +623,29 @@ async function requisitionsOf(db, companyId, ids) {
 }
 
 const MO_SELECT = `SELECT mo.*, m.code AS machine_code, m.name AS machine_name, m.owner_name AS machine_owner, r.label AS reason_label, p.title AS plan_title,
-       st.started_at AS stop_started, st.ended_at AS stop_ended, op.name AS operator_name, u.name AS raised_by_name
+       st.started_at AS stop_started, st.ended_at AS stop_ended, op.name AS operator_name, u.name AS raised_by_name, ow.name AS owner_name
   FROM cf_maintenance_orders mo
   JOIN cf_machines m ON m.id = mo.machine_id
   LEFT JOIN cf_stop_reasons r ON r.id = mo.reason_id
   LEFT JOIN cf_maintenance_plans p ON p.id = mo.plan_id
   LEFT JOIN cf_machine_stops st ON st.id = mo.stop_id
   LEFT JOIN cf_operators op ON op.id = mo.operator_id
-  LEFT JOIN users u ON u.id = mo.created_by`;
+  LEFT JOIN users u ON u.id = mo.created_by
+  LEFT JOIN users ow ON ow.id = mo.owner_user_id`;
 
 function shapeOrder(r, nowWall, mrs = []) {
   const stopStarted = dbWall(r.stop_started);
   const stopEnded = dbWall(r.stop_ended);
   const active = ACTIVE_STATUSES.includes(r.status);
+  // §114: the target time. An open ticket is late once the plant clock passes it; a closed one was on time or not.
+  const dueAt = dbWall(r.due_at);
+  const endWall = active ? nowWall : dbWall(r.done_at);
+  const lateMinutes = dueAt && endWall && r.status !== 'cancelled' && wallMs(endWall) > wallMs(dueAt) ? Math.round((wallMs(endWall) - wallMs(dueAt)) / 60000) : 0;
   return {
+    owner: r.owner_user_id ? { id: r.owner_user_id, name: r.owner_name ?? null } : null,
+    dueAt, late: lateMinutes > 0, lateMinutes,
+    minutesLeft: active && dueAt && !lateMinutes ? Math.round((wallMs(dueAt) - wallMs(nowWall)) / 60000) : null,
+    takenMinutes: r.status === 'done' && r.done_at ? minutesBetween(dbWall(r.raised_at), dbWall(r.done_at)) : null,
     id: r.id, code: r.code, status: r.status, statusLabel: MO_STATUS_LABEL[r.status], source: r.source,
     machine: { id: r.machine_id, code: r.machine_code, name: r.machine_name, owner: r.machine_owner ?? null },
     title: r.title, note: r.note ?? null, reason: r.reason_label ?? null, plan: r.plan_id ? { id: r.plan_id, title: r.plan_title } : null,
@@ -676,6 +703,34 @@ export async function getOrder(db, companyId, id) {
   out.events = events.map((e) => ({ id: e.id, event: e.event, from: e.from_status, to: e.to_status, note: e.note, by: e.user_name ?? null, at: e.created_at }));
   out.now = wall;
   return out;
+}
+
+/**
+ * POST /maintenance/orders/:id/assign { ownerUserId?: number | null, dueAt?: 'YYYY-MM-DD HH:MM' } — §114: who answers for
+ * the ticket, and (when maintenance knows better than the target hours) when it is due. Written to the ticket's history.
+ */
+export async function assignOrder(db, c, id, input = {}) {
+  const mo = await requireOrder(db, c.companyId, id);
+  const sets = []; const args = []; const said = [];
+  if ('ownerUserId' in input) {
+    if (blank(input.ownerUserId)) { sets.push('owner_user_id = NULL'); said.push('No owner'); }
+    else {
+      const [[u]] = await db.query('SELECT id, name FROM users WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(input.ownerUserId)]);
+      if (!u) throw invalid('INVALID', 'That person is not in this company.');
+      sets.push('owner_user_id = ?'); args.push(u.id); said.push(`Owner: ${u.name}`);
+    }
+  }
+  if (!blank(input.dueAt)) {
+    const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(String(input.dueAt));
+    if (!m) throw invalid('INVALID', 'The due time needs a date and a time.');
+    const due = `${m[1]} ${m[2]}:00`;
+    if (wallMs(due) <= wallMs(dbWall(mo.raised_at))) throw invalid('INVALID', 'The due time is after the ticket was raised.');
+    sets.push('due_at = ?'); args.push(due); said.push(`Due ${due.slice(0, 16)}`);
+  }
+  if (!sets.length) throw invalid('INVALID', 'Choose an owner or a due time.');
+  await db.query(`UPDATE cf_maintenance_orders SET ${sets.join(', ')} WHERE company_id = ? AND id = ?`, [...args, c.companyId, mo.id]);
+  await event(db, c, mo.id, 'assigned', mo.status, mo.status, said.join(' · '));
+  return getOrder(db, c.companyId, mo.id);
 }
 
 /* =================================================================================================

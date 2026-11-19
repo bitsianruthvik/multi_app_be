@@ -30,6 +30,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import * as M from '../services/maintenanceService.js';
+import * as T from '../services/maintenanceDeskService.js';
 
 export const MAINTENANCE = 'cf_erp_maintenance';
 const router = Router();
@@ -52,6 +53,17 @@ router.post('/maintenance/orders/:id/cancel', manage, handle((req) => tx(req, (d
 router.post('/maintenance/orders/:id/close', manage, handle((req) => tx(req, (db, c) => M.closeOrder(db, c, id(req), req.body ?? {}))));
 router.get('/maintenance/orders/:id/mr-lines', manage, handle((req) => M.mrLines(pool, ctx(req).companyId, id(req))));
 router.post('/maintenance/orders/:id/requisition', manage, handle((req) => tx(req, (db, c) => M.raiseRequisition(db, c, id(req), req.body ?? {}))));
+
+// §114 Maintenance today: one read of everything to clear; the ticket's owner and due time; a machine with no cycle;
+// worn-out tools to read; tool life and what Stores checks before giving one out; machine health.
+router.get('/maintenance/today', view, handle((req) => tx(req, (db, c) => T.today(db, c))));
+router.get('/maintenance/health', view, handle((req) => T.machineHealth(pool, ctx(req).companyId)));
+router.post('/maintenance/orders/:id/assign', manage, handle((req) => tx(req, (db, c) => M.assignOrder(db, c, id(req), req.body ?? {}))));
+router.post('/maintenance/machines/:id/no-plan', manage, handle((req) => tx(req, (db, c) => T.setNoPlan(db, c, id(req), req.body ?? {}))));
+router.get('/maintenance/wear', view, handle((req) => T.wearToReview(pool, ctx(req).companyId, req.query)));
+router.post('/maintenance/wear/:id/review', manage, handle((req) => tx(req, (db, c) => T.reviewWear(db, c, id(req), req.body ?? {}))));
+router.get('/maintenance/tool-rules', view, handle((req) => T.toolRules(pool, ctx(req).companyId, req.query)));
+router.put('/maintenance/tool-rules/:id', manage, handle((req) => tx(req, (db, c) => T.setToolRule(db, c, id(req), req.body ?? {}))));
 
 router.get('/maintenance/plans', view, handle((req) => tx(req, (db, c) => M.listPlans(db, c, req.query))));
 router.post('/maintenance/plans/raise-due', manage, handle((req) => tx(req, async (db, c) => ({ raised: (await M.raiseDue(db, c)).length }))));
