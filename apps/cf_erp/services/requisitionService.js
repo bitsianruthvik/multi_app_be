@@ -542,6 +542,18 @@ export async function createRequisition(db, c, input = {}, { internal = false } 
     ) : [[]],
   ]);
   const order = orders[0] ?? null;
+  // §116: the contractor the request is for. A tool asked for on a project goes to a contractor — he is named here.
+  const contractorId = blank(input.contractorId) ? null : Number(input.contractorId);
+  let contractor = null;
+  if (contractorId != null) {
+    [[contractor]] = await db.query('SELECT id, name, is_subcontractor FROM cf_parties WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, contractorId]);
+    if (!contractor) problems.push('That contractor does not exist.');
+    else if (!Number(contractor.is_subcontractor)) problems.push(`${contractor.name} is not marked as a contractor.`);
+  }
+  if (contractorId == null && forType === 'sales_order' && ids.length) {
+    const [tools] = await db.query("SELECT m.name FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id WHERE m.company_id = ? AND m.id IN (?) AND i.stores_kind = 'returnable' LIMIT 3", [c.companyId, ids]).catch(() => [[]]);
+    if (tools.length) problems.push(`${tools.map((t) => t.name).join(', ')}: a tool asked for on a sales order goes to a contractor — name the contractor.`);
+  }
   if (orderId != null && Number.isInteger(orderId) && !order) problems.push('That sales order does not exist.');
   else if (order && !OPEN_ORDER_STATUSES.includes(order.status)) problems.push(`${order.code} is ${order.status} — an MR is raised for an open order.`);
   const itemOf = new Map(items.map((i) => [Number(i.id), i]));
@@ -564,6 +576,7 @@ export async function createRequisition(db, c, input = {}, { internal = false } 
   const id = ins.insertId;
   const code = `MR-${String(id).padStart(6, '0')}`;
   await db.query('UPDATE cf_requisitions SET code = ? WHERE company_id = ? AND id = ?', [code, c.companyId, id]);
+  if (contractor) await db.query('UPDATE cf_requisitions SET contractor_party_id = ? WHERE company_id = ? AND id = ?', [contractor.id, c.companyId, id]);
   await insertRows(db, 'cf_requisition_lines', ['company_id', 'requisition_id', 'order_line_id', 'item_id', 'quantity', 'uom', 'created_by'],
     ids.map((itemId) => [c.companyId, id, null, itemId, want.get(itemId).qty, want.get(itemId).uom ?? itemOf.get(itemId)?.uom ?? null, c.userId ?? null]));
   return { id, code };

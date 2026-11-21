@@ -9182,3 +9182,16 @@ SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
 SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_reserved_use_requests') = 1
           AND (SELECT COUNT(*) FROM features WHERE feature_tag IN ('cf_erp_approve_reserved_planning', 'cf_erp_approve_reserved_production')) = 2,
           'S115-OK', 'S115-MISSING') AS result;
+
+-- =====================================================================================================================
+-- §116 A MATERIAL REQUEST FOR A CONTRACTOR (user, 2026-11-22)
+--      Production asks Stores for a tool (or anything) on a project FOR A CONTRACTOR: the request names the contractor.
+--      What Stores gives against it goes out to that contractor; a tool is then "out with" them until it comes back.
+--   cf_requisitions.contractor_party_id   the contractor (cf_parties, is_subcontractor) the request is for.
+-- =====================================================================================================================
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'contractor_party_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_requisitions ADD COLUMN contractor_party_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'contractor_party_id') = 1,
+          'S116-OK', 'S116-MISSING') AS result;

@@ -36,6 +36,7 @@ import {
 import { getPurchaseOrder, poStage, PO_STAGE_LABEL, askPoApproval } from './purchaseService.js';
 import { CURRENCY } from './priceService.js';
 import { postMovement } from './stockService.js';
+import { custodyForIssue } from './storesDeskService.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -174,6 +175,8 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
     lines,
     purchaseRequest: prOf.get(v.id) ?? null,
     purchaseOrders: [...pos.values()],
+    contractor: (await contractorsOf(db, companyId, [v.id])).get(Number(v.id)) ?? null,
+    giveOuts: await giveOutsOf(db, companyId, v.id),
     sentence: v.internal
       ? `Stores' own purchase — raised straight to ${prOf.get(v.id)?.code ?? 'its purchase request'} for Purchase. Not a request waiting for Stores, so it is not in the MR inbox.`
       : customer
@@ -194,6 +197,33 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
  * already asked for, has on purchase orders, has received and has been given, an item. 3 reads.
  * → { rows: [{ itemId, requested, ordered, received, given }] }
  */
+/** §116: the contractor each of some requests is for → Map(requisitionId → { id, name }). Empty before §116. */
+async function contractorsOf(db, companyId, ids) {
+  const out = new Map();
+  if (!ids.length) return out;
+  try {
+    const [rows] = await db.query('SELECT r.id, p.id AS pid, p.name FROM cf_requisitions r JOIN cf_parties p ON p.id = r.contractor_party_id WHERE r.company_id = ? AND r.id IN (?)', [companyId, ids]);
+    for (const r of rows) out.set(Number(r.id), { id: r.pid, name: r.name });
+  } catch (e) { if (e.errno !== 1054) throw e; }
+  return out;
+}
+
+/** What Stores gave out against a request: each entry with its lines, newest first (the request's own stock-outs). */
+async function giveOutsOf(db, companyId, requisitionId) {
+  const [rows] = await db.query(
+    `SELECT m.id, m.code, m.movement_date, m.reversed_by_id, m.reversal_of_id, u.name AS by_name, i.name AS item_name, d.uom, -SUM(l.quantity) AS q
+       FROM cf_stock_movements m JOIN cf_stock_ledger l ON l.movement_id = m.id AND l.deleted_at IS NULL
+       JOIN cf_master_records i ON i.id = l.item_id LEFT JOIN cf_item_details d ON d.master_id = l.item_id LEFT JOIN users u ON u.id = m.created_by
+      WHERE m.company_id = ? AND m.requisition_id = ? AND m.movement_type = 'issue' AND m.deleted_at IS NULL
+      GROUP BY m.id, m.code, m.movement_date, m.reversed_by_id, m.reversal_of_id, u.name, i.name, d.uom ORDER BY m.id DESC LIMIT 500`, [companyId, Number(requisitionId)]);
+  const by = new Map();
+  for (const r of rows) {
+    if (!by.has(r.id)) by.set(r.id, { id: r.id, code: r.code, date: String(r.movement_date instanceof Date ? r.movement_date.toISOString() : r.movement_date).slice(0, 10), by: r.by_name ?? null, undone: !!(r.reversed_by_id || r.reversal_of_id), lines: [] });
+    by.get(r.id).lines.push({ item: r.item_name, uom: r.uom ?? null, quantity: round6(r.q) });
+  }
+  return [...by.values()];
+}
+
 export async function orderItemTotals(db, companyId, orderId) {
   const [[asked], [bought], [given]] = await Promise.all([
     db.query(
@@ -231,6 +261,7 @@ export async function listMrs(db, companyId, q = {}) {
   const shown = onlyOpen ? all.filter((v) => !v.done) : all;
   const views = shown;
   const prOf = await prsOfRequisitions(db, companyId, views.map((v) => v.id));
+  const contractorOf = await contractorsOf(db, companyId, views.map((v) => v.id));
   const counts = { all: views.length, sales_order: 0, maintenance_order: 0, stock: 0, general: 0 };
   for (const v of views) counts[v.forType] += 1;
   return {
@@ -243,7 +274,7 @@ export async function listMrs(db, companyId, q = {}) {
         forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes, internal: !!v.internal,
         status: v.status, statusLabel: v.statusLabel, materials: live.length, lockedLines, heldForAcceptance: !!v.heldForAcceptance,
         lockedWords: live.length ? `${lockedLines} of ${live.length} locked` : 'Nothing to buy',
-        purchaseRequest: prOf.get(v.id) ?? null, raisedAt: v.raisedAt, done: !!v.done,
+        purchaseRequest: prOf.get(v.id) ?? null, raisedAt: v.raisedAt, done: !!v.done, contractor: contractorOf.get(Number(v.id)) ?? null,
       };
     }),
   };
@@ -386,7 +417,7 @@ export async function saveMr(db, c, id, input = {}) {
  */
 export async function issueMr(db, c, id, input = {}) {
   const [[head]] = await db.query(
-    `SELECT r.id, r.code, r.order_id, r.order_line_id, r.for_type, r.maintenance_order_id, r.held_for_acceptance, o.code AS order_code, sl.line_no
+    `SELECT r.*, o.code AS order_code, sl.line_no
        FROM cf_requisitions r LEFT JOIN cf_sales_orders o ON o.id = r.order_id LEFT JOIN cf_sales_order_lines sl ON sl.id = r.order_line_id
       WHERE r.company_id = ? AND r.id = ? AND r.deleted_at IS NULL FOR UPDATE`,
     [c.companyId, Number(id)],
@@ -510,7 +541,9 @@ export async function issueMr(db, c, id, input = {}) {
       ...(maintenanceOrderId != null ? { maintenanceOrderId } : {}),
       reference: head.code, notes: blank(input.notes) ? `Issued against ${head.code}` : String(input.notes),
       lines: lines.map((x) => ({ itemId: x.itemId, quantity: x.quantity, fromAreaId: x.fromAreaId, ...(x.batchId != null ? { batchId: x.batchId } : {}) })),
-    }, { requisitionId: head.id });
+    }, { requisitionId: head.id, ...(head.contractor_party_id ? { given: { type: 'vendor', partyId: head.contractor_party_id } } : head.order_id ? { given: { type: 'order' } } : {}) });
+    // §116: a tool given against a request is "out with" the contractor it was asked for (or with the sales order).
+    await custodyForIssue(db, c, movement, { partyId: head.contractor_party_id ?? null, orderId: head.order_id ?? null });
     await db.query('RELEASE SAVEPOINT mr_issue');
     const materialRequest = await mrScreen(db, c.companyId, head.id, { R: null });
     return { ...words, movement, materialRequest, message: `${movement.code} issued ${plan.length === 1 ? `${fmt(plan[0].quantity)}${unitOf(plan[0].item)} of ${nameOf(plan[0].item)}` : `${plan.length} materials`} from ${head.code}.` };

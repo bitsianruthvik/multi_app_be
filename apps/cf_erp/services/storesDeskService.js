@@ -452,8 +452,8 @@ export async function takeBack(db, c, input = {}) {
   if (m.reversed_by_id || m.reversal_of_id) throw invalid('REVERSED', `${m.code} was already undone.`);
   if (m.requisition_id != null) throw invalid('FROM_REQUEST', `${m.code} was given against a material request — take it back on that request.`);
   const full = await getMovement(db, c.companyId, m.id);
-  const [kinds] = await db.query('SELECT master_id, stores_kind FROM cf_item_details WHERE master_id IN (?)', [full.lines.map((l) => l.item.id)]);
-  if (kinds.some((k) => k.stores_kind === 'returnable')) throw invalid('HAS_TOOLS', `${m.code} includes a tool — a tool comes back on Stores › Out with.`);
+  const [[kind]] = await db.query('SELECT stores_kind FROM cf_item_details WHERE master_id = ?', [Number(input.itemId)]);
+  if (kind?.stores_kind === 'returnable') throw invalid('HAS_TOOLS', 'A tool comes back on Stores › Out with, not here.');
   const mine = full.lines.filter((l) => Number(l.item.id) === Number(input.itemId));
   const had = round6(mine.reduce((a, l) => a + l.quantity, 0));
   if (!mine.length) throw invalid('INVALID', 'That item is not on this give-out.');
@@ -478,8 +478,34 @@ export async function takeBack(db, c, input = {}) {
       reference: `In place of ${m.code}`.slice(0, 100), notes: m.notes ?? null, lines: keep,
     }, { given, ...(m.used_for === 'vendor' ? { usedFor: 'vendor' } : {}) });
     instead = mv.code;
+    // a tool given on the same entry is still out: its Out with row follows the entry written in its place
+    await db.query('UPDATE cf_stock_custody SET movement_id = ? WHERE company_id = ? AND movement_id = ?', [mv.id, c.companyId, m.id]);
   }
   return { takenBack: round6(qty), item: { id: mine[0].item.id, name: mine[0].item.name, uom: mine[0].item.uom }, from: m.code, instead };
+}
+
+/**
+ * The "Out with" rows of an issue made somewhere else than Give out (a material request's issue, §116): one a line whose
+ * item is a tool, held by the contractor named, else by the sales order. Nothing when it is for neither.
+ */
+export async function custodyForIssue(db, c, movement, { partyId = null, orderId = null } = {}) {
+  if (!partyId && !orderId) return 0;
+  const ids = [...new Set(movement.lines.map((l) => l.item.id))];
+  if (!ids.length) return 0;
+  const [tools] = await db.query("SELECT master_id, due_days FROM cf_item_details WHERE master_id IN (?) AND stores_kind = 'returnable'", [ids]);
+  const due = new Map(tools.map((t) => [Number(t.master_id), t.due_days]));
+  let n = 0;
+  for (const ln of movement.lines) {
+    if (!due.has(Number(ln.item.id))) continue;
+    const d = due.get(Number(ln.item.id));
+    await db.query(
+      `INSERT INTO cf_stock_custody (company_id, movement_id, item_id, batch_id, area_id, quantity, holder_type, party_id, order_id, issued_on, due_on, unit_cost, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [c.companyId, movement.id, ln.item.id, ln.batch?.id ?? null, ln.from?.id ?? null, ln.quantity, partyId ? 'vendor' : 'order', partyId, orderId, today(),
+        d ? dateText(new Date(Date.now() + Number(d) * 86400000)) : null, ln.unitCost ?? null, c.userId ?? null]);
+    n += 1;
+  }
+  return n;
 }
 
 // --- out with -------------------------------------------------------------------

@@ -154,6 +154,13 @@ try {
       ok('the old entry cannot be taken back from twice', again?.code === 'REVERSED');
       const tool = await D.takeBack(db, c, { movementId: g2.movement.id, itemId: item.id, quantity: 1 }).then(() => null, (e) => e);
       ok('a tool does not come back this way', ['HAS_TOOLS', 'REVERSED'].includes(tool?.code), tool?.code);
+      // a give-out with a consumable AND a tool: the consumable can be taken back, the tool stays out
+      await db.query("UPDATE cf_item_details SET stores_kind = 'returnable' WHERE master_id = ?", [item.id]);
+      const pz = await D.addPerson(db, c, { name: `Mixed ${Date.now()}`, departmentId: dz.id });
+      const gm = await D.giveOut(db, c, { givenFor: { type: 'department', departmentId: dz.id }, personId: pz.id, lines: [{ itemId: cz.id, quantity: 2 }, { itemId: item.id, quantity: 1 }] });
+      const tm = await D.takeBack(db, c, { movementId: gm.movement.id, itemId: cz.id, quantity: 2 });
+      const [[cu]] = await db.query('SELECT c.status, mv.code, mv.reversed_by_id FROM cf_stock_custody c JOIN cf_stock_movements mv ON mv.id = c.movement_id WHERE c.company_id = ? AND c.item_id = ? AND c.person_id = ?', [COMPANY, item.id, pz.id]);
+      ok('from a mixed give-out the consumable comes back; the tool is still out, on the entry written in its place', tm.takenBack === 2 && cu?.status === 'open' && cu.code === tm.instead && !cu.reversed_by_id, JSON.stringify({ tm, cu }));
     }
   }
 
