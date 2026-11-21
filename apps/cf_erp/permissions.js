@@ -62,6 +62,8 @@ export const approvals = [
   { tag: 'cf_erp_approve_machine_purchase', label: 'New machine' },
   { tag: 'cf_erp_approve_machine_condemn', label: 'Condemn a machine' },
   { tag: 'cf_erp_approve_stock_count', label: 'Stock count differences' },
+  { tag: 'cf_erp_approve_reserved_planning', label: 'Using reserved stock (planning)' },
+  { tag: 'cf_erp_approve_reserved_production', label: 'Using reserved stock (production)' },
   { tag: 'cf_erp_plate_change_approve', label: 'Plate changes' },
 ];
 

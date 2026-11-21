@@ -9111,3 +9111,74 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
               OR (TABLE_NAME = 'cf_item_details' AND COLUMN_NAME IN ('life_days', 'issue_conditions'))
               OR (TABLE_NAME = 'cf_stock_custody_events' AND COLUMN_NAME IN ('days_used', 'reviewed_at', 'reviewed_by', 'review_note')))) = 9,
           'S114-OK', 'S114-MISSING') AS result;
+
+-- =====================================================================================================================
+-- §115 USING STOCK THAT IS RESERVED FOR A SALES ORDER (user, 2026-11-21)
+--      Stock reserved for an order cannot be given out (stockService RESERVED). Stores may ASK to use some of it: planning
+--      AND production must both approve (two approvals, two different people); then that much of the reservation is let
+--      go, Purchase is told what the order is now short of, and Stores gives it out the usual way.
+--   cf_reserved_use_requests   one ask: item, quantity, why, who decided, what was let go (released_json).
+--   approval types reserved_use_planning / reserved_use_production
+--   features cf_erp_approve_reserved_planning (granted to roles that manage production = PPC) and
+--            cf_erp_approve_reserved_production (granted to floor roles that do not manage production).
+-- =====================================================================================================================
+CREATE TABLE IF NOT EXISTS cf_reserved_use_requests (
+  id              INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id      INT            NOT NULL,
+  code            VARCHAR(30)    NULL,
+  item_id         INT            NOT NULL,
+  batch_id        INT            NULL,
+  quantity        DECIMAL(18,6)  NOT NULL,
+  reason          VARCHAR(500)   NOT NULL,
+  wanted_for      VARCHAR(255)   NULL,
+  status          ENUM('pending','approved','rejected','withdrawn') NOT NULL DEFAULT 'pending',
+  planning_by     INT            NULL,
+  planning_at     DATETIME       NULL,
+  production_by   INT            NULL,
+  production_at   DATETIME       NULL,
+  decision_note   VARCHAR(500)   NULL,
+  reserved_json   JSON           NULL,
+  released_json   JSON           NULL,
+  requested_by    INT            NULL,
+  deleted_at      DATETIME       DEFAULT NULL,
+  created_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_cruq_company (company_id, status),
+  KEY idx_cruq_item (company_id, item_id),
+  CONSTRAINT fk_cruq_company FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: planning approves using stock reserved for an order', 'cf_erp_approve_reserved_planning', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_approve_reserved_planning');
+INSERT INTO features (feature_name, feature_tag, type)
+SELECT 'CF ERP: production approves using stock reserved for an order', 'cf_erp_approve_reserved_production', 'backend'
+ WHERE NOT EXISTS (SELECT 1 FROM features f WHERE f.feature_tag = 'cf_erp_approve_reserved_production');
+INSERT INTO features_capability (name, features_json)
+SELECT f.feature_tag, JSON_ARRAY(f.id) FROM features f
+ WHERE f.feature_tag IN ('cf_erp_approve_reserved_planning', 'cf_erp_approve_reserved_production') AND f.deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM features_capability fc WHERE fc.name = f.feature_tag AND fc.deleted_at IS NULL);
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_approve_reserved_planning' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM role_capability po JOIN features_capability pfc ON pfc.capability_id = po.capability_id AND pfc.deleted_at IS NULL
+                WHERE po.role_id = r.id AND po.app_id = a.id AND po.deleted_at IS NULL AND pfc.name = 'cf_erp_production_manage')
+   AND NOT EXISTS (SELECT 1 FROM role_capability x WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+INSERT INTO role_capability (role_id, team_id, company_id, app_id, capability_id)
+SELECT DISTINCT r.id, NULL, a.company_id, a.id, fc.capability_id
+  FROM apps a
+  JOIN roles r ON r.company_id = a.company_id AND r.deleted_at IS NULL
+  JOIN features_capability fc ON fc.name = 'cf_erp_approve_reserved_production' AND fc.deleted_at IS NULL
+ WHERE a.slug = 'cf_erp' AND a.deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM role_capability po JOIN features_capability pfc ON pfc.capability_id = po.capability_id AND pfc.deleted_at IS NULL
+                WHERE po.role_id = r.id AND po.app_id = a.id AND po.deleted_at IS NULL AND pfc.name = 'cf_erp_floor')
+   AND NOT EXISTS (SELECT 1 FROM role_capability po JOIN features_capability pfc ON pfc.capability_id = po.capability_id AND pfc.deleted_at IS NULL
+                WHERE po.role_id = r.id AND po.app_id = a.id AND po.deleted_at IS NULL AND pfc.name = 'cf_erp_production_manage')
+   AND NOT EXISTS (SELECT 1 FROM role_capability x WHERE x.role_id = r.id AND x.app_id = a.id AND x.capability_id = fc.capability_id AND x.deleted_at IS NULL);
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_reserved_use_requests') = 1
+          AND (SELECT COUNT(*) FROM features WHERE feature_tag IN ('cf_erp_approve_reserved_planning', 'cf_erp_approve_reserved_production')) = 2,
+          'S115-OK', 'S115-MISSING') AS result;

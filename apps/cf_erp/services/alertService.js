@@ -48,6 +48,7 @@ export const DEPARTMENT_LABEL = { md: 'MD', planning: 'Planning', stores: 'Store
 export const KIND_LABEL = {
   po_date_moved: 'Delivery date moved', po_late: 'Procurement late', start_late: 'Start late', unplanned_start: 'Unplanned start', finish_late: 'Finish late',
   ...DEPARTMENT_KIND_LABEL,
+  reserved_taken: 'Reserved stock given away',
 };
 /** The kinds the check finds (and resolves); po_date_moved is raised by the change and closed by a person. */
 const CHECKED = ['po_late', 'start_late', 'unplanned_start', 'finish_late'];

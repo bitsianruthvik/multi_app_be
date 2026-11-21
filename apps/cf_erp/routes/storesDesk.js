@@ -26,6 +26,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import { setDeskSettings, today, nightCheck, levelSuggestions, applyLevel } from '../services/storesTodayService.js';
+import * as R from '../services/reservedUseService.js';
 import {
   deskSettings, listDepartments, addDepartment, listPeople, addPerson, ledger, itemLedger, giveOut, outWith, custodyBack,
   countList, postCount, listCounts, getCount,
@@ -55,6 +56,11 @@ router.get('/stores-desk/counts/:id', view, handle((req) => getCount(pool, compa
 // §112
 const MANAGEMENT = 'cf_erp_approve_stock_count';
 router.put('/stores-desk/settings', guard(MANAGEMENT), handle((req) => tx(req, (db, c) => setDeskSettings(db, c, req.body ?? {}))));
+// §115: Stores asks to use stock reserved for an order; planning and production approve it in Approvals.
+router.get('/stores-desk/reserved-use', view, handle((req) => R.listRequests(pool, company(req), req.query)));
+router.get('/stores-desk/reserved-for/:id', view, handle((req) => R.reservedFor(pool, company(req), id(req))));
+router.post('/stores-desk/reserved-use', manage, handle((req) => tx(req, (db, c) => R.ask(db, c, req.body ?? {}))));
+router.post('/stores-desk/reserved-use/:id/withdraw', manage, handle((req) => tx(req, (db, c) => R.withdrawRequest(db, c, id(req)))));
 router.get('/stores-desk/today', view, handle((req) => today(pool, company(req))));
 router.post('/stores-desk/night-check', guardAny(PERM.inventory, PERM.stores, PERM.production, MANAGEMENT), handle((req) => tx(req, (db, c) => nightCheck(db, c, req.body ?? {}))));
 router.get('/stores-desk/level-suggestions', view, handle((req) => levelSuggestions(pool, company(req), req.query)));
