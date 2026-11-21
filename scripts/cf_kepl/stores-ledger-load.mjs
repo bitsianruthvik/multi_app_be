@@ -12,6 +12,8 @@
  *   purchase  a receipt on its day, at the ledger's rate — the ledger names no PO and no supplier, so neither is set
  *   issue     an issue on its day for each party sheet, as "general" use given to a department named "Project: <party>"
  *             (the ledger's parties are customers' projects; a company with those sales orders should use them instead)
+ * --orders "NECL=SO260022,NITIN SAI=SO260023"  (user, 2026-11-21, for the live company): a party named here is issued to
+ *             that SALES ORDER (usedFor 'order'); a party NOT named is LEFT OUT and listed — no department is made.
  * An issue the book cannot cover (the ledger's own balance goes below zero) is left out and listed.
  *
  * DRY RUN BY DEFAULT: everything in one transaction, rolled back. --apply commits one movement at a time; a movement
@@ -27,6 +29,7 @@ const COMPANY = Number(arg('company'));
 const MONTH = arg('month');
 const APPLY = process.argv.includes('--apply');
 const CHECK = process.argv.includes('--check');
+const ORDERS = arg('orders') ? new Map(String(arg('orders')).split(',').map((p) => p.split('=').map((x) => x.trim()))) : null;
 if (!COMPANY || !/^\d{4}-\d{2}$/.test(MONTH ?? '')) { console.error('Usage: --company <id> --month YYYY-MM [--prod] [--apply] [--check]'); process.exit(2); }
 const TM = path.join(__dir, '..', '..', '..');
 if (process.argv.includes('--prod')) {
@@ -75,6 +78,20 @@ try {
   const want = new Map();
   for (const r of bySno.values()) { const w = want.get(r.itemId) ?? { name: r.item, open: 0, bal: 0 }; w.open += r.openQty || 0; w.bal += r.balQty || 0; want.set(r.itemId, w); }
 
+  // --orders: the sales order of each party named
+  const orderOf = new Map();
+  if (ORDERS) {
+    for (const [party, code] of ORDERS) {
+      if (!(party in L.partySheets)) throw new Error(`No party sheet "${party}" in the ledger (${Object.keys(L.partySheets).join(', ')}).`);
+      const [[o]] = await pool.query('SELECT id, code, status FROM cf_sales_orders WHERE company_id = ? AND code = ? AND deleted_at IS NULL', [COMPANY, code]);
+      if (!o) throw new Error(`No sales order ${code} in company ${COMPANY}.`);
+      orderOf.set(party, o);
+    }
+    console.log(`issues go to sales orders: ${[...orderOf].map(([p, o]) => `${p} → ${o.code} (${o.status})`).join(', ')}`);
+  }
+  const leftOut = new Map();   // party -> issue lines left out
+  let book = null;             // what the script expects in the book, an item (set below)
+
   if (CHECK) { await compare(pool); process.exit(0); }
 
   // --- the movements, in date order -----------------------------------------------------------------
@@ -83,13 +100,14 @@ try {
   const opening = merge([...bySno.values()].filter((r) => r.openQty > 0).map((r) => ({ itemId: r.itemId, quantity: r.openQty, ...(r.openRate > 0 ? { unitCost: r.openRate } : {}) })));
   const N = Math.ceil(opening.length / 60);
   for (let k = 0; k < N; k++) events.push({ kind: 'receipt', date: day(1), reference: `${TAG} OPENING ${k + 1}/${N}`, notes: `Opening stock for ${MONTH} from the stores' ledger`, lines: opening.slice(k * 60, (k + 1) * 60) });
-  const book = new Map(opening.map((l) => [l.itemId, l.quantity]));
+  book = new Map(opening.map((l) => [l.itemId, l.quantity]));
   const short = [];
   for (let d = 1; d <= 31; d++) {
     const pur = merge(L.purchase.filter((p) => p.days[d]).map((p) => ({ itemId: bySno.get(p.sno).itemId, quantity: p.days[d], ...(p.rate > 0 ? { unitCost: p.rate } : {}) })));
     if (pur.length) { events.push({ kind: 'receipt', date: day(d), reference: `${TAG} PURCHASE ${String(d).padStart(2, '0')}`, notes: "Purchase in the stores' ledger (no PO or supplier named)", lines: pur }); for (const l of pur) book.set(l.itemId, r6((book.get(l.itemId) || 0) + l.quantity)); }
     for (const [party, list] of Object.entries(L.partySheets)) {
       if (['DEBITS', 'ABSTRACT'].includes(party)) continue;
+      if (ORDERS && !orderOf.has(party)) { const n = list.filter((p) => p.days[d]).length; if (n) leftOut.set(party, (leftOut.get(party) ?? 0) + n); continue; }
       const lines = [];
       for (const l of merge(list.filter((p) => p.days[d]).map((p) => ({ itemId: bySno.get(p.sno).itemId, quantity: p.days[d] })))) {
         const have = book.get(l.itemId) || 0;
@@ -102,12 +120,17 @@ try {
   console.log(`${events.length} movements: ${events.filter((e) => e.reference.includes('OPENING')).length} opening (${opening.length} items), ${events.filter((e) => e.reference.includes('PURCHASE')).length} purchase days, ${events.filter((e) => e.kind === 'issue').length} issues (${events.filter((e) => e.kind === 'issue').reduce((a, e) => a + e.lines.length, 0)} lines)`);
   if (short.length) { console.log(`${short.length} issue line(s) left out — the ledger gives out more than it holds:`); for (const s of short) console.log(`   ${s.date} ${s.party}: ${s.name} — ${s.asked} asked, ${s.have} in the book`); }
 
+  if (leftOut.size) console.log(`left out — no sales order named for: ${[...leftOut].map(([p, n]) => `${p} (${n} lines)`).join(', ')}`);
   const dept = new Map();
   const post = async (db, e) => {
     const [[there]] = await db.query('SELECT id FROM cf_stock_movements WHERE company_id = ? AND reference = ? AND reversal_of_id IS NULL LIMIT 1', [COMPANY, e.reference]);
     if (there) return 'skipped';
     if (e.kind === 'receipt') {
       await postMovement(db, c, { movementType: 'receipt', movementDate: e.date, reference: e.reference, notes: e.notes, toAreaId: area.id, lines: e.lines }, { allowBackdate: true });
+    } else if (orderOf.has(e.party)) {
+      const o = orderOf.get(e.party);
+      await postMovement(db, c, { movementType: 'issue', movementDate: e.date, usedFor: 'order', orderId: o.id, reference: e.reference, notes: `Stores' ledger: issued to ${e.party}`, fromAreaId: area.id, lines: e.lines },
+        { allowBackdate: true, given: { type: 'order' } });
     } else {
       const name = `Project: ${e.party}`;
       if (!dept.has(name)) {
@@ -152,9 +175,11 @@ try {
     const [bal] = await db.query('SELECT item_id, SUM(quantity) AS q FROM cf_stock_balances WHERE company_id = ? AND stocking_area_id = ? GROUP BY item_id', [COMPANY, area.id]);
     const have = new Map(bal.map((b) => [b.item_id, Number(b.q)]));
     let same = 0; const off = [];
-    for (const [id, w] of want) { const q = have.get(id) || 0; if (Math.abs(q - w.bal) < 1e-6) same++; else off.push(`${w.name}: book ${q}, ledger ${w.bal}`); }
+    let asLedger = 0;
+    for (const [id, w] of want) { const q = have.get(id) || 0; const exp = book ? (book.get(id) || 0) : w.bal; if (Math.abs(q - w.bal) < 1e-6) asLedger++; if (Math.abs(q - exp) < 1e-6) same++; else off.push(`${w.name}: book ${q}, expected ${exp}, ledger ${w.bal}`); }
+    console.log(`${asLedger} of ${want.size} items equal the ledger's own balance (the rest: issues left out, or the ledger below zero)`);
     const [[v]] = await db.query('SELECT ROUND(SUM(l.value)) AS v FROM cf_stock_ledger l JOIN cf_stock_movements m ON m.id = l.movement_id WHERE l.company_id = ? AND m.reference LIKE ?', [COMPANY, `${TAG} %`]);
-    console.log(`\nbook against the ledger: ${same} of ${want.size} items agree, ${off.length} differ; value of these entries ${v?.v ?? 0}`);
+    console.log(`\nbook against what was to be loaded: ${same} of ${want.size} items agree, ${off.length} differ; value of these entries ${v?.v ?? 0}`);
     for (const o of off.slice(0, 20)) console.log(`   ${o}`);
   }
 } finally { await pool.end(); }
