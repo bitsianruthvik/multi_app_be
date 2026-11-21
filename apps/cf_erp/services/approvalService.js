@@ -33,7 +33,7 @@ export const APPROVAL_TYPES = {
   // §105 (2026-11-13): the planner's month plan — frozen once the MD approves (monthPlanService).
   month_plan: { perm: 'cf_erp_approve_month_plan', label: 'Month plan', subjectType: 'month_plan' },
   // §111 (2026-11-19): a stock count that differs from the book by more than the company's limit (storesDeskService).
-  stock_count: { perm: 'cf_erp_approve_stock_count', label: 'Stock count difference', subjectType: 'stock_count' },
+  stock_count: { perm: 'cf_erp_approve_stock_count', label: 'Stock audit difference', subjectType: 'stock_count' },
   // §115 (2026-11-21): Stores asks to use stock reserved for an order — planning AND production approve (reservedUseService).
   reserved_use_planning: { perm: 'cf_erp_approve_reserved_planning', label: 'Use reserved stock — Planning', subjectType: 'reserved_use' },
   reserved_use_production: { perm: 'cf_erp_approve_reserved_production', label: 'Use reserved stock — Production', subjectType: 'reserved_use' },

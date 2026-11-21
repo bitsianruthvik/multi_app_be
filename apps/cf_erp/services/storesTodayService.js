@@ -72,7 +72,7 @@ export async function setDeskSettings(db, c, input = {}) {
   }
   if (input.countAutoLimit !== undefined) {
     const n = Number(input.countAutoLimit);
-    if (!Number.isFinite(n) || n < 0) throw invalid('INVALID', 'The count limit is an amount in rupees, zero or more.');
+    if (!Number.isFinite(n) || n < 0) throw invalid('INVALID', 'The audit limit is an amount in rupees, zero or more.');
     sets.count_auto_limit = n;
   }
   const cols = Object.keys(sets);

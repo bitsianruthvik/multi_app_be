@@ -28,7 +28,7 @@ export const departments = [
     { key: 'manage', label: 'Manage items', tags: t('catalog_view', 'catalog_manage') },
     { key: 'setup', label: 'Manage and set up', tags: t('catalog_view', 'catalog_manage', 'setup_manage', 'codegen_manage') },
   ] },
-  { key: 'stores', label: 'Stores', help: 'Stock, requests, receiving, counts and things given out.', levels: [
+  { key: 'stores', label: 'Stores', help: 'Stock, requests, receiving, audits and things given out.', levels: [
     { key: 'view', label: 'View stock', tags: t('inventory_view') },
     { key: 'manage', label: 'Manage', tags: t('inventory_view', 'inventory_manage', 'stores') },
   ] },
@@ -61,7 +61,7 @@ export const approvals = [
   { tag: 'cf_erp_approve_rebaseline', label: 'Re-baseline' },
   { tag: 'cf_erp_approve_machine_purchase', label: 'New machine' },
   { tag: 'cf_erp_approve_machine_condemn', label: 'Condemn a machine' },
-  { tag: 'cf_erp_approve_stock_count', label: 'Stock count differences' },
+  { tag: 'cf_erp_approve_stock_count', label: 'Stock audit differences' },
   { tag: 'cf_erp_approve_reserved_planning', label: 'Using reserved stock (planning)' },
   { tag: 'cf_erp_approve_reserved_production', label: 'Using reserved stock (production)' },
   { tag: 'cf_erp_plate_change_approve', label: 'Plate changes' },
@@ -78,7 +78,7 @@ export const standardRoles = [
     approvals: everyApproval, switches: ['management'] },
   { key: 'ppc', name: 'PPC', help: 'Plans and runs production.',
     levels: { sales: 'manage', catalog: 'view', stores: 'view', production: 'manage', maintenance: 'manage' }, approvals: [], switches: [] },
-  { key: 'stores', name: 'Stores', help: 'Keeps the stock: receives, gives out, counts.',
+  { key: 'stores', name: 'Stores', help: 'Keeps the stock: receives, gives out, audits.',
     levels: { sales: 'view', catalog: 'view', stores: 'manage' }, approvals: ['cf_erp_purchase_approve'], switches: [] },
   { key: 'procurement', name: 'Procurement', help: 'Buys: requests, quotes, purchase orders, suppliers.',
     levels: { sales: 'view', parties: 'manage', catalog: 'view', stores: 'view', purchase: 'manage' }, approvals: [], switches: [] },

@@ -130,7 +130,7 @@ async function departments(db, companyId, alerts, dec) {
     { key: 'production', label: 'Production', status: tone(['floor']), link: 'tracker', lines: [
       stepsText, `${plural(num(steps.running), 'step')} running now`, `${plural(waiting('Production'), 'contractor PO')} waiting for you`] },
     { key: 'stores', label: 'Stores', status: tone(['stores'], num(custody.overdue) > 0), link: desk.storesV2 ? 'stores-today' : 'stock', lines: [
-      desk.storesV2 ? (num(stores.counted) ? 'Counted today' : 'Not counted today') : 'Stock counts are not in use',
+      desk.storesV2 ? (num(stores.counted) ? 'Audited today' : 'Not audited today') : 'Stock audits are not in use',
       `${plural(num(stores.low), 'item')} below minimum`,
       `${plural(num(custody.overdue), 'thing')} out too long (of ${num(custody.n)} out)`] },
     { key: 'maintenance', label: 'Maintenance', status: tone(['maintenance'], down.length > 0), link: 'maintenance', lines: [
@@ -208,11 +208,11 @@ async function storesWeek(db, companyId, from, to) {
   const holder = (e) => (e.holder_type === 'vendor' ? e.party_name : e.person_name ?? e.department_name) ?? '—';
   const money = (v) => (v == null ? 'not costed' : rupees(v));
   return {
-    headline: `${daysCounted} of ${daysMoved} working days counted · ${plural(lost.length, 'item')} lost · ${plural(num(long[0]?.n), 'thing')} out too long`,
+    headline: `${daysCounted} of ${daysMoved} working days audited · ${plural(lost.length, 'item')} lost · ${plural(num(long[0]?.n), 'thing')} out too long`,
     data: {
       figures: [
-        { label: 'Days counted', value: `${daysCounted} of ${daysMoved}`, tone: daysMoved && daysCounted < daysMoved ? 'warn' : 'ok' },
-        { label: 'Counts that differed', value: String(counts.filter((c) => num(c.diff_n) > 0).length), tone: 'neutral' },
+        { label: 'Days audited', value: `${daysCounted} of ${daysMoved}`, tone: daysMoved && daysCounted < daysMoved ? 'warn' : 'ok' },
+        { label: 'Audits that differed', value: String(counts.filter((c) => num(c.diff_n) > 0).length), tone: 'neutral' },
         { label: 'Value of differences', value: rupees(diffValue), tone: diffValue > 0 ? 'warn' : 'ok' },
         { label: 'Waiting for approval', value: String(pending), tone: pending ? 'warn' : 'ok' },
         { label: 'Lost', value: String(lost.length), tone: lost.length ? 'bad' : 'ok' },
@@ -227,7 +227,7 @@ async function storesWeek(db, companyId, from, to) {
         table('Given out, by machine', ['Machine', 'Issues', 'Value'], byMachine.map((r) => [r.who, String(r.n), money(r.value)]), 'No give-out named a machine.'),
         table('Most used items', ['Item', 'Quantity', 'Value'], top.map((r) => [r.item_name, `${Number(Number(r.qty).toFixed(3))} ${r.uom}`, money(r.value)]), 'Nothing was used.'),
       ],
-      notes: desk.storesV2 ? [] : ['This company does not run the Stores desk: counts, lost items and "out with" are not recorded yet.'],
+      notes: desk.storesV2 ? [] : ['This company does not run the Stores desk: audits, lost items and "out with" are not recorded yet.'],
     },
   };
 }

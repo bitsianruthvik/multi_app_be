@@ -55,7 +55,7 @@ export async function deskSettings(db, companyId) {
  * POST /movements on a company that runs the Stores desk: the free receipt, issue and count are closed (user 2026-11-19:
  * stock changes only through the app's own mechanisms). A transfer between areas, a scrap and a customer return stay.
  */
-const DESK_WAY = { receipt: 'Receive against a PO (Stores › Receive)', issue: 'Give out (Stores › Stock)', adjustment: 'a count (Stores › Count)' };
+const DESK_WAY = { receipt: 'Receive against a PO (Stores › Receive)', issue: 'Give out (Stores › Stock)', adjustment: 'an audit (Stores › Audit)' };
 export async function assertDeskAllows(db, companyId, movementType) {
   if (!DESK_WAY[movementType]) return;
   if ((await deskSettings(db, companyId)).storesV2) throw invalid('USE_THE_DESK', `Stock is not changed directly here — use ${DESK_WAY[movementType]}.`);
@@ -122,7 +122,9 @@ async function storeAreas(db, companyId, areaId = null) {
 }
 
 /**
- * GET /stores-desk/ledger?from=&to=&areaId=&familyId=&subfamilyId=&search=&show=all|stock|low|out&paged=1
+ * GET /stores-desk/ledger?from=&to=&areaId=&familyId=&subfamilyId=&owner=ours|customer&search=&show=all|stock|low|out&paged=1
+ * owner (user, 2026-11-22): ours = our own stock only, customer = material a customer supplied (a lot with an owner);
+ * left out = both added up. Opening / in / out / balance all follow it; each row also says how much of it is a customer's.
  * One row an item of the catalog: opening, in, out, balance (at `to`), out with, on order, reserved, minimum.
  * Opening = the balance now less everything since `from`; a transfer between two store areas is neither in nor out.
  * Fixed reads: the areas, the rows (one statement), the total, the groups.
@@ -139,6 +141,10 @@ export async function ledger(db, companyId, q = {}) {
   if (!blank(q.familyId)) { where.push('f.id = ?'); params.push(Number(q.familyId)); }
   if (!blank(q.subfamilyId)) { where.push('s.id = ?'); params.push(Number(q.subfamilyId)); }
   const show = ['stock', 'low', 'out'].includes(q.show) ? q.show : 'all';
+  const owner = ['ours', 'customer'].includes(q.owner) ? q.owner : null;
+  const ownBal = owner === 'ours' ? 'AND ob.owner_party_id IS NULL' : owner === 'customer' ? 'AND ob.owner_party_id IS NOT NULL' : '';
+  const ownLed = owner === 'ours' ? 'AND l.owner_party_id IS NULL' : owner === 'customer' ? 'AND l.owner_party_id IS NOT NULL' : '';
+  if (owner === 'customer') where.push('(COALESCE(bal.q, 0) <> 0 OR COALESCE(mv.in_q, 0) <> 0 OR COALESCE(mv.out_q, 0) <> 0)');
   if (show === 'stock') where.push('(COALESCE(bal.q, 0) <> 0 OR COALESCE(mv.in_q, 0) <> 0 OR COALESCE(mv.out_q, 0) <> 0 OR COALESCE(cu.q, 0) <> 0)');
   if (show === 'low') where.push('ps.min_qty IS NOT NULL AND COALESCE(bal.q, 0) < ps.min_qty');
   if (show === 'out') where.push('COALESCE(cu.q, 0) > 0');
@@ -148,8 +154,9 @@ export async function ledger(db, companyId, q = {}) {
       LEFT JOIN cf_classification_nodes v ON v.id = m.classification_id
       LEFT JOIN cf_classification_nodes s ON s.id = v.parent_id
       LEFT JOIN cf_classification_nodes f ON f.id = s.parent_id
-      LEFT JOIN (SELECT k.item_id, SUM(k.quantity) AS q FROM cf_stock_balances k
-                  WHERE k.company_id = ? AND k.stocking_area_id IN (?) GROUP BY k.item_id) bal ON bal.item_id = m.id
+      LEFT JOIN (SELECT k.item_id, SUM(k.quantity) AS q, SUM(IF(ob.owner_party_id IS NOT NULL, k.quantity, 0)) AS cust_q
+                   FROM cf_stock_balances k LEFT JOIN cf_stock_batches ob ON ob.id = k.batch_id
+                  WHERE k.company_id = ? AND k.stocking_area_id IN (?) ${ownBal} GROUP BY k.item_id) bal ON bal.item_id = m.id
       LEFT JOIN (SELECT x.item_id,
                         SUM(CASE WHEN x.d <= ? AND x.live = 1 AND x.q > 0 THEN x.q ELSE 0 END) AS in_q,
                         SUM(CASE WHEN x.d <= ? AND x.live = 1 AND x.q < 0 THEN -x.q ELSE 0 END) AS out_q,
@@ -158,7 +165,7 @@ export async function ledger(db, companyId, q = {}) {
                    FROM (SELECT l.item_id, l.movement_id, mm.movement_date AS d, SUM(l.quantity) AS q,
                                 (mm.reversed_by_id IS NULL AND mm.reversal_of_id IS NULL) AS live
                            FROM cf_stock_ledger l JOIN cf_stock_movements mm ON mm.id = l.movement_id
-                          WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.stocking_area_id IN (?) AND mm.movement_date >= ?
+                          WHERE l.company_id = ? AND l.deleted_at IS NULL AND l.stocking_area_id IN (?) AND mm.movement_date >= ? ${ownLed}
                           GROUP BY l.item_id, l.movement_id, mm.movement_date, live) x
                   GROUP BY x.item_id) mv ON mv.item_id = m.id
       LEFT JOIN (SELECT item_id, SUM(quantity - qty_returned - qty_worn - qty_lost) AS q FROM cf_stock_custody
@@ -179,7 +186,7 @@ export async function ledger(db, companyId, q = {}) {
               COALESCE(bal.q, 0) - COALESCE(mv.after_q, 0) AS balance, COALESCE(bal.q, 0) AS now_q,
               COALESCE(bal.q, 0) - COALESCE(mv.since_q, 0) AS opening,
               COALESCE(mv.in_q, 0) AS in_q, COALESCE(mv.out_q, 0) AS out_q,
-              COALESCE(cu.q, 0) AS out_with, COALESCE(po.q, 0) AS on_order, COALESCE(rs.q, 0) AS reserved,
+              COALESCE(cu.q, 0) AS out_with, COALESCE(po.q, 0) AS on_order, COALESCE(rs.q, 0) AS reserved, COALESCE(bal.cust_q, 0) AS cust_q,
               ps.method, ps.min_qty, ps.max_qty
          ${FROM}
         WHERE ${where.join(' AND ')}
@@ -200,13 +207,13 @@ export async function ledger(db, companyId, q = {}) {
     item: { id: r.id, code: r.code, name: r.name, uom: r.uom, trackedBy: r.tracked_by, returnable: r.stores_kind === 'returnable', status: r.status, issueConditions: r.issue_conditions ?? null },
     group: { familyId: r.family_id, family: r.family_name, subfamilyId: r.subfamily_id, subfamily: r.subfamily_name },
     opening: round6(r.opening), in: round6(r.in_q), out: round6(r.out_q), balance: round6(r.balance), now: round6(r.now_q),
-    outWith: round6(r.out_with), onOrder: round6(r.on_order), reserved: round6(r.reserved),
+    outWith: round6(r.out_with), onOrder: round6(r.on_order), reserved: round6(r.reserved), customers: round6(r.cust_q),
     min: r.min_qty == null ? null : Number(r.min_qty), max: r.max_qty == null ? null : Number(r.max_qty), method: r.method ?? null,
     low: r.min_qty != null && Number(r.now_q) < Number(r.min_qty),
   })), total, page, {
     // beside the page, as every paged list carries its chips (lib/listing.js)
     counts: {
-      period: { from, to },
+      period: { from, to }, owner: owner ?? 'all',
       areas: areas.all,
       groups: groups.map((g) => ({ familyId: g.family_id, family: g.family_name, subfamilyId: g.subfamily_id, subfamily: g.subfamily_name, items: Number(g.n) })),
     },
@@ -564,7 +571,7 @@ async function costsOf(db, companyId, itemIds) {
 export async function countList(db, companyId, q = {}) {
   const areas = await storeAreas(db, companyId);
   const areaId = blank(q.areaId) ? areas.all.find((a) => a.purpose === 'storage')?.id ?? areas.all[0]?.id : Number(q.areaId);
-  if (!areaId || !areas.all.some((a) => Number(a.id) === Number(areaId))) throw invalid('INVALID', 'Choose one of the store areas to count.');
+  if (!areaId || !areas.all.some((a) => Number(a.id) === Number(areaId))) throw invalid('INVALID', 'Choose one of the store areas to audit.');
   const kind = q.kind === 'weekly' ? 'weekly' : 'daily';
   const S = await getSettings(db, companyId);
   const [[last]] = await db.query('SELECT MAX(count_date) AS d FROM cf_stock_counts WHERE company_id = ? AND area_id = ? AND deleted_at IS NULL', [companyId, areaId]);
@@ -577,7 +584,7 @@ export async function countList(db, companyId, q = {}) {
         GROUP BY l.item_id ORDER BY n DESC, l.item_id LIMIT ?`, [companyId, areaId, since, Number(S.count_daily_max_lines)]);
     itemIds = moved.map((r) => Number(r.item_id));
   } else {
-    if (blank(q.subfamilyId)) throw invalid('INVALID', 'Choose the group to count this week.');
+    if (blank(q.subfamilyId)) throw invalid('INVALID', 'Choose the group to audit this week.');
     const [inGroup] = await db.query(
       `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog'
          JOIN cf_classification_nodes v ON v.id = m.classification_id
@@ -606,7 +613,7 @@ export async function countList(db, companyId, q = {}) {
 async function postCountAdjustment(db, c, count, lines) {
   const mv = await postMovement(db, c, {
     movementType: 'adjustment',
-    reason: `Count ${count.code}`.slice(0, 255),
+    reason: `Audit ${count.code}`.slice(0, 255),
     areaId: count.area_id,
     lines: lines.map((l) => ({ itemId: l.item_id, quantity: Number(l.diff), ...(l.batch_id ? { batchId: l.batch_id } : {}), notes: l.reason ?? null })),
   });
@@ -626,25 +633,25 @@ export async function postCount(db, c, input = {}) {
   if (!area) problems.push('Choose one of the store areas.');
   const kind = COUNT_KINDS.includes(input.kind) ? input.kind : 'daily';
   const asked = Array.isArray(input.lines) ? input.lines.filter((l) => !blank(l?.counted)) : [];
-  if (!asked.length) problems.push('Type what was counted for at least one item.');
-  if (asked.length > 500) problems.push('Up to 500 lines a count.');
-  assertNoProblems(problems, 'The count cannot be saved.');
+  if (!asked.length) problems.push('Type what is on the shelf for at least one item.');
+  if (asked.length > 500) problems.push('Up to 500 lines an audit.');
+  assertNoProblems(problems, 'The audit cannot be saved.');
 
   const costs = await costsOf(db, c.companyId, [...new Set(asked.map((l) => Number(l.itemId)))]);
   const lines = [];
   for (const [n, l] of asked.entries()) {
     const counted = Number(l.counted);
-    if (!Number.isFinite(counted) || counted < 0) { problems.push(`Line ${n + 1}: the counted quantity is a number, zero or more.`); continue; }
+    if (!Number.isFinite(counted) || counted < 0) { problems.push(`Line ${n + 1}: the quantity on the shelf is a number, zero or more.`); continue; }
     const lotId = blank(l.lotId) ? null : Number(l.lotId);
     const [[k]] = await db.query('SELECT quantity FROM cf_stock_balances WHERE company_id = ? AND stocking_area_id = ? AND item_id = ? AND batch_key = ? FOR UPDATE',
       [c.companyId, area.id, Number(l.itemId), lotId ?? 0]);
     const book = k ? Number(k.quantity) : 0;
     const diff = round6(counted - book);
     const reason = blank(l.reason) ? null : String(l.reason).trim().slice(0, 255);
-    if (Math.abs(diff) > 1e-9 && !reason) problems.push(`Line ${n + 1}: say why the count differs from the book.`);
+    if (Math.abs(diff) > 1e-9 && !reason) problems.push(`Line ${n + 1}: say why the audit differs from the book.`);
     lines.push({ item_id: Number(l.itemId), batch_id: lotId, book, counted: round6(counted), diff, cost: costs.get(Number(l.itemId)) ?? null, reason });
   }
-  assertNoProblems(problems, 'The count cannot be saved.');
+  assertNoProblems(problems, 'The audit cannot be saved.');
 
   const diffs = lines.filter((l) => Math.abs(l.diff) > 1e-9);
   const { countAutoLimit } = await deskSettings(db, c.companyId);
@@ -671,7 +678,7 @@ export async function postCount(db, c, input = {}) {
   } else if (status === 'pending') {
     const approvalId = await requestApproval(db, c, {
       type: 'stock_count', subjectId: count.id, subjectCode: count.code,
-      title: `Stock count ${count.code}: ${diffs.length} item${diffs.length === 1 ? '' : 's'} differ in ${area.name}`,
+      title: `Stock audit ${count.code}: ${diffs.length} item${diffs.length === 1 ? '' : 's'} differ in ${area.name}`,
       summary: diffs.slice(0, 4).map((l) => `${l.diff > 0 ? '+' : ''}${l.diff}`).join(', ') + (value != null ? ` · ₹${value.toLocaleString('en-IN')}` : ' · some items have no cost yet'),
       amount: value, note,
     });
@@ -684,7 +691,7 @@ export async function getCount(db, companyId, id) {
   const [[h]] = await db.query(
     `SELECT n.*, a.name AS area_name, u.name AS by_name FROM cf_stock_counts n JOIN cf_stocking_areas a ON a.id = n.area_id LEFT JOIN users u ON u.id = n.created_by
       WHERE n.company_id = ? AND n.id = ? AND n.deleted_at IS NULL`, [companyId, Number(id)]);
-  if (!h) throw notFound('Count');
+  if (!h) throw notFound('Audit');
   const [lines] = await db.query(
     `SELECT l.*, m.code AS item_code, m.name AS item_name, i.uom, b.code AS batch_code FROM cf_stock_count_lines l
        JOIN cf_master_records m ON m.id = l.item_id JOIN cf_item_details i ON i.master_id = l.item_id LEFT JOIN cf_stock_batches b ON b.id = l.batch_id
@@ -716,7 +723,7 @@ export async function listCounts(db, companyId) {
 export const stockCountApprovalHandler = {
   async onApprove(db, c, row) {
     const [[n]] = await db.query('SELECT * FROM cf_stock_counts WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, row.subject_id]);
-    if (!n || n.status !== 'pending') throw invalid('NOT_PENDING', 'This count is not waiting for a decision.');
+    if (!n || n.status !== 'pending') throw invalid('NOT_PENDING', 'This audit is not waiting for a decision.');
     const [lines] = await db.query('SELECT item_id, batch_id, diff, reason FROM cf_stock_count_lines WHERE company_id = ? AND count_id = ? AND ABS(diff) > 0.0000001', [c.companyId, n.id]);
     const movementId = await postCountAdjustment(db, c, n, lines);
     await db.query("UPDATE cf_stock_counts SET status = 'posted', movement_id = ?, decided_by = ?, decided_at = NOW() WHERE id = ?", [movementId, c.userId ?? null, n.id]);

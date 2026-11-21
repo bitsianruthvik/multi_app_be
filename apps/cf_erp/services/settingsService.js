@@ -17,7 +17,7 @@ import { invalid, assertNoProblems } from '../lib/errors.js';
 
 export const GROUPS = [
   { key: 'plant', label: 'Plant', help: 'The week the plant works by. (Its time zone is set with the shop floor settings.)' },
-  { key: 'stores_book', label: 'Stores: counting and the stock book', help: 'What a count may correct on its own, how far back an entry may be dated, and the closed period.' },
+  { key: 'stores_book', label: 'Stores: audits and the stock book', help: 'What an audit may correct on its own, how far back an entry may be dated, and the closed period.' },
   { key: 'stores_day', label: 'Stores: the day and things given out', help: "The store's hours, what counts as out too long, and what the Today page lists." },
   { key: 'levels', label: 'Stock levels suggested from use', help: 'When the app suggests a minimum and maximum for an item, and how it works them out.' },
   { key: 'maintenance', label: 'Maintenance: tickets, tools and machine health', help: 'How long a ticket of each kind may take, when a tool counts as worn early, and the period machine health looks at.' },
@@ -29,14 +29,14 @@ export const GROUPS = [
 const I = (key, group, label, def, min, max, unit, help, extra = {}) => ({ key, group, label, type: 'int', def, min, max, unit, help, ...extra });
 export const SETTINGS = [
   // --- plant
-  { key: 'week_start', group: 'plant', label: 'The week starts on', type: 'choice', def: '1', choices: [['1', 'Monday'], ['0', 'Sunday'], ['6', 'Saturday']], help: 'Weekly reports and the weekly count follow this week.' },
+  { key: 'week_start', group: 'plant', label: 'The week starts on', type: 'choice', def: '1', choices: [['1', 'Monday'], ['0', 'Sunday'], ['6', 'Saturday']], help: 'Weekly reports and the weekly audit follow this week.' },
 
   // --- stores: counting and the book (the first four are cf_company_settings columns, §111–§112)
-  { key: 'count_auto_limit', col: 'count_auto_limit', group: 'stores_book', label: 'A count difference up to this value corrects the book at once', type: 'number', def: 500, min: 0, max: 10000000, unit: '₹', help: 'Above it the count waits in Approvals and the book does not move.' },
+  { key: 'count_auto_limit', col: 'count_auto_limit', group: 'stores_book', label: 'An audit difference up to this value corrects the book at once', type: 'number', def: 500, min: 0, max: 10000000, unit: '₹', help: 'Above it the count waits in Approvals and the book does not move.' },
   { key: 'stock_backdate_days', col: 'stock_backdate_days', group: 'stores_book', label: 'A stock entry may be dated back', type: 'int', def: 3, min: 0, max: 60, unit: 'days', help: 'On a company that runs the Stores desk. Older than this is refused.' },
   { key: 'stock_closed_through', col: 'stock_closed_through', group: 'stores_book', label: 'The stock book is closed up to and including', type: 'date', def: null, help: 'Nothing can be dated on or before it. Empty = nothing is closed.' },
-  I('count_daily_max_lines', 'stores_book', "Today's count lists at most", 40, 5, 500, 'items', 'The busiest items first.'),
-  I('count_weekly_lookback_days', 'stores_book', 'A weekly count includes items that moved in the last', 90, 7, 730, 'days', 'Besides everything of the group that has stock.'),
+  I('count_daily_max_lines', 'stores_book', "Today's audit lists at most", 40, 5, 500, 'items', 'The busiest items first.'),
+  I('count_weekly_lookback_days', 'stores_book', 'A weekly audit includes items that moved in the last', 90, 7, 730, 'days', 'Besides everything of the group that has stock.'),
 
   // --- stores: the day
   { key: 'store_open_time', col: 'store_open_time', group: 'stores_day', label: 'The store opens at', type: 'time', def: '08:00', help: 'An entry made outside these hours is listed on Today until someone checks it.' },
@@ -71,7 +71,7 @@ export const SETTINGS = [
   I('alert_repeat_breakdowns', 'alerts', 'Repeat breakdown: this many faults on one machine', 3, 2, 50, 'faults'),
   I('alert_repeat_days', 'alerts', '… within', 30, 1, 365, 'days'),
   I('alert_inquiry_days', 'alerts', 'An inquiry not yet confirmed is an alert after', 5, 1, 365, 'days', 'To Engineering (design and materials).'),
-  I('alert_count_skip_days', 'alerts', 'Stock moved and nobody counted for', 2, 1, 60, 'days', 'To Stores. Only on a company that runs the Stores desk.'),
+  I('alert_count_skip_days', 'alerts', 'Stock moved and nobody audited it for', 2, 1, 60, 'days', 'To Stores. Only on a company that runs the Stores desk.'),
   I('alert_lost_days', 'alerts', 'A lost item stays on the alerts for', 14, 1, 120, 'days', 'To Stores and the MD.'),
   I('alert_billing_days', 'alerts', 'An invoice unpaid is an alert after', 30, 1, 365, 'days from its date', 'To Accounts.'),
 
@@ -83,7 +83,7 @@ export const SETTINGS = [
   I('md_machine_down_hours', 'md', 'A machine down for', 24, 1, 2000, 'hours'),
   I('md_ticket_late_hours', 'md', 'A maintenance ticket past its target by', 48, 1, 2000, 'hours'),
   I('md_inquiry_days', 'md', 'An inquiry not confirmed for', 7, 1, 365, 'days'),
-  I('md_count_skip_days', 'md', 'No stock count for', 4, 1, 120, 'days'),
+  I('md_count_skip_days', 'md', 'No stock audit for', 4, 1, 120, 'days'),
   I('md_out_extra_days', 'md', 'A thing out too long by a further', 30, 0, 730, 'days'),
   I('md_billing_days', 'md', 'An invoice unpaid for', 60, 1, 730, 'days from its date'),
 

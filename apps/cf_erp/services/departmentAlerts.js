@@ -25,7 +25,7 @@ import { findMaintenanceDeskAlerts, MAINTENANCE_DESK_KINDS, MAINTENANCE_DESK_KIN
 export const DEPARTMENT_KINDS = ['machine_down', 'repeat_breakdown', 'pm_overdue', 'inquiry_waiting', 'count_skipped', 'tool_lost', 'out_too_long', 'invoice_unpaid', ...MAINTENANCE_DESK_KINDS];
 export const DEPARTMENT_KIND_LABEL = {
   machine_down: 'Machine down', repeat_breakdown: 'Repeat breakdown', pm_overdue: 'Preventive job overdue', inquiry_waiting: 'Inquiry waiting',
-  count_skipped: 'Count not done', tool_lost: 'Item lost', out_too_long: 'Out too long', invoice_unpaid: 'Invoice unpaid', ...MAINTENANCE_DESK_KIND_LABEL,
+  count_skipped: 'Audit not done', tool_lost: 'Item lost', out_too_long: 'Out too long', invoice_unpaid: 'Invoice unpaid', ...MAINTENANCE_DESK_KIND_LABEL,
 };
 const plural = (n, one, many = `${one}s`) => `${n} ${Number(n) === 1 ? one : many}`;
 const rupees = (n) => `₹${Math.round(Number(n)).toLocaleString('en-IN')}`;
@@ -143,8 +143,8 @@ async function storesAlerts(db, companyId, S) {
       const md = days >= Number(S.md_count_skip_days);
       out.push({
         key: `count_skipped:${a.id}`, kind: 'count_skipped', severity: md ? 'danger' : 'warning',
-        title: `${a.name}: ${plural(mv.items, 'item')} moved and not counted for ${plural(days, 'day')}`,
-        detail: a.last_on ? `Last counted on ${String(a.last_on).slice(0, 10)}.` : 'This area has never been counted.',
+        title: `${a.name}: ${plural(mv.items, 'item')} moved and not audited for ${plural(days, 'day')}`,
+        detail: a.last_on ? `Last audited on ${String(a.last_on).slice(0, 10)}.` : 'This area has never been audited.',
         departments: ['stores', ...(md ? ['md'] : [])], subjectType: 'stocking_area', subjectId: a.id, link: 'stores-count', daysLate: days, count: Number(mv.items),
       });
     }
