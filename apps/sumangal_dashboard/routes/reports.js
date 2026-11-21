@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { protect } from '../../../core/middleware/authmiddleware.js';
 import * as reports from '../services/reportService.js';
 import * as flow from '../services/flowService.js';
+import { v15Data } from '../services/v15Service.js';
 
 /**
  * The screens' side: a platform login with access to this app (protect checks
@@ -54,6 +55,19 @@ router.get('/step/:slug', protect, wrap((req) => reports.step(cid(req), req.para
 router.get('/customers/:id', protect, wrap((req) => reports.customerDetail(cid(req), req.params.id, req.query)));
 router.get('/parts/:id', protect, wrap((req) => reports.partDetail(cid(req), req.params.id, req.query)));
 router.get('/lines/:id', protect, wrap((req) => reports.lineDetail(cid(req), req.params.id)));
+
+// ERP dashboard (V15): the whole dataset, gzipped once and cached; the page works everything out in the browser.
+router.get('/v15/data', protect, async (req, res) => {
+  try {
+    const { key, gz } = await v15Data(cid(req));
+    if (req.headers['if-none-match'] === key) return res.status(304).end();
+    res.set({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'x-no-compression': '1', ETag: key, 'Cache-Control': 'private, no-cache' });
+    res.end(gz);
+  } catch (err) {
+    if (!err.status) req.log?.error?.({ err }, 'sumangal_dashboard v15');
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
 
 export default router;
 
