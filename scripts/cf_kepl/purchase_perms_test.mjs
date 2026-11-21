@@ -85,7 +85,7 @@ const TABLE = [
   ['purchaseRequests', 'DELETE', '/purchase-request-vendors/:id', ['buyer', 'admin']],
   ['purchaseRequests', 'PUT', '/purchase-request-vendors/:id/quotes', ['buyer', 'admin']],
   ['purchaseRequests', 'POST', '/purchase-request-vendors/:id/purchase-orders', ['buyer', 'admin']],
-  ['purchaseRequests', 'GET', '/purchase-requests/:id', ['stores', 'storesTag', 'buyer', 'viewer', 'admin']],
+  ['purchaseRequests', 'GET', '/purchase-requests/:id', ['stores', 'storesTag', 'buyer', 'viewer', 'admin', 'sales', 'maint']],
   ['purchase', 'GET', '/purchase-orders', ['stores', 'buyer', 'md', 'viewer', 'admin']],
   ['purchase', 'GET', '/purchase-orders/:id', ['stores', 'buyer', 'md', 'viewer', 'admin']],
   ['purchase', 'POST', '/purchase-orders', ['buyer', 'admin']],
@@ -107,7 +107,7 @@ const TABLE = [
   ['stockMoney', 'POST', '/customer-material/receive', ['stores', 'admin']],
   // MR vs PR (user 2026-10-27): an MR is a request TO Stores — New MR for everyone who asks Stores; a PR is what Stores
   // raises TO Purchase — New PR and To reorder's Raise PR are Stores' alone.
-  ['stores', 'POST', '/requisitions', ['stores', 'storesTag', 'sales', 'maint', 'admin']],
+  ['stores', 'POST', '/requisitions', ['sales', 'maint', 'admin']],
   ['stores', 'POST', '/stores/purchase-requests', ['stores', 'storesTag', 'admin']],
   ['stores', 'POST', '/stores/reorder/raise', ['stores', 'storesTag', 'admin']],
   // the sales order's Material request stage: Raise MR and who supplies a line — orders manage OR inventory manage

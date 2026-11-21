@@ -32,7 +32,8 @@ const storesView = guardAny(PERM.stores, PERM.inventoryView);
 const storesManage = guardAny(PERM.stores, PERM.inventory);
 
 // Stores raise any MR; maintenance raises its own; whoever manages orders may raise one for an order.
-router.post('/requisitions', guardAny(PERM.stores, PERM.inventory, PERM.maintenance, PERM.orders), handle((req) => tx(req, (db, c) => createRequisition(db, c, body(req)))));
+// 2026-11-22 (user): a request to Stores comes from someone else — Stores' own purchases go through /stores/purchase-requests.
+router.post('/requisitions', guardAny(PERM.maintenance, PERM.orders), handle((req) => tx(req, (db, c) => createRequisition(db, c, body(req)))));
 // §93: Stores' own purchase (New PR, To reorder's Raise PR) — Stores alone (or the older inventory manage), as the reorder.
 router.post('/stores/purchase-requests', storesManage, handle((req) => tx(req, (db, c) => raiseStoresPr(db, c, body(req)))));
 router.get('/stores/reorder', storesView, handle((req) => reorderSuggestions(pool, ctx(req).companyId, req.query)));

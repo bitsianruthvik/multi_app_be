@@ -38,7 +38,8 @@ const id = (req) => intParam(req.params.id);
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
 // §79: MRs are Stores' (cf_erp_stores, or inventory manage). The PR's vendors, quotes and raising its PO are PURCHASE's
 // alone (user, 2026-10-19: Stores raises the PR, Purchase buys) — inventory manage no longer opens them.
-const view = guardAny(PERM.inventoryView, PERM.stores, PERM.purchase);
+// 2026-11-22: whoever may ASK Stores (maintenance, orders) reads the requests too — to see the PR and PO against theirs.
+const view = guardAny(PERM.inventoryView, PERM.stores, PERM.purchase, PERM.maintenance, PERM.orders);
 const mrManage = guardAny(PERM.inventory, PERM.stores);
 const manage = guard(PERM.purchase);
 const body = (req) => req.body ?? {};
