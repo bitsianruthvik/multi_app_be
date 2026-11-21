@@ -62,7 +62,10 @@ const buy = guard(PERM.purchase);
 const poWrite = guardAny(PERM.purchase, PERM.inventory, PERM.stores);
 // Management approves purchase orders, so may read them without the inventory grants (§71; §73: any approval tag);
 // Purchase reads the POs it raises.
-const viewPo = guardAny(PERM.inventoryView, PERM.purchase, PERM.plateChangeApprove, ...APPROVAL_PERMS);
+// 2026-11-23: an approver reads the POs he may decide. Not every tag in APPROVAL_PERMS is about a PO: maintenance (it
+// approves a new machine's REQUEST, §103) and the two reserved-stock tags (§115) do not open the PO list and its prices.
+const PO_APPROVERS = APPROVAL_PERMS.filter((p) => !['cf_erp_maintenance', 'cf_erp_approve_reserved_planning', 'cf_erp_approve_reserved_production', 'cf_erp_approve_stock_count'].includes(p));
+const viewPo = guardAny(PERM.inventoryView, PERM.purchase, PERM.plateChangeApprove, ...PO_APPROVERS);
 
 /**
  * Purchase's action on one PO (by `poId`, or the PO of `lineId`): cf_erp_purchase passes; inventory manage or Stores pass
@@ -82,7 +85,7 @@ export async function assertPoActor(db, user, companyId, { poId = null, lineId =
 }
 /** A write on one PO, inside its transaction, after assertPoActor. */
 const onPo = (req, which, fn) => tx(req, async (db, c) => { await assertPoActor(db, req.user, c.companyId, which); return fn(db, c); });
-const approve = guardAny(...APPROVAL_PERMS);
+const approve = guardAny('cf_erp_approve_purchase_order', 'cf_erp_approve_contractor_po');
 /** The PO's own approval decided through the inbox (approvalService.decide checks the tag and requester ≠ approver). */
 const decidePo = (decision) => handle((req) => withTransaction(async (db) => {
   const c = ctx(req);

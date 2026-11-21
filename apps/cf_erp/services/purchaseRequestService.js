@@ -516,14 +516,28 @@ export async function issueMr(db, c, id, input = {}) {
     plan.push({ lineId, item: l.item, quantity: round6(q - need) });
   }
   assertNoProblems(problems, `${head.code} cannot be issued.`);
+  // Maintenance's pre-issue checks for these items (the column may be missing on an old database).
+  const conditionsOf = new Map();
+  try {
+    const [cond] = await db.query("SELECT master_id, issue_conditions FROM cf_item_details WHERE company_id = ? AND master_id IN (?) AND deleted_at IS NULL AND issue_conditions IS NOT NULL AND TRIM(issue_conditions) <> ''", [c.companyId, wantItems]);
+    for (const r of cond) conditionsOf.set(Number(r.master_id), String(r.issue_conditions));
+  } catch (e) { if (e.errno !== 1054) throw e; }
   const usedFor = issueUsedFor(forType, head.order_id);
   const maintenanceOrderId = forType === 'maintenance_order' ? head.maintenance_order_id ?? null : null;
   const lines = [...legs.values()];
   const words = {
     usedFor, order: usedFor === 'order' ? { id: head.order_id, code: head.order_code } : null, maintenanceOrderId,
-    lines: plan.map((p) => ({ ...p, from: lines.filter((x) => x.lineId === p.lineId).map((x) => ({ area: x.area, batch: x.batch, quantity: x.quantity })) })),
+    lines: plan.map((p) => ({ ...p, conditions: conditionsOf.get(Number(p.item.id)) ?? null, from: lines.filter((x) => x.lineId === p.lineId).map((x) => ({ area: x.area, batch: x.batch, quantity: x.quantity })) })),
   };
   if (input.dryRun === true || input.dryRun === 'true') return { dryRun: true, ...words };
+
+  // Maintenance's pre-issue check for a tool: each item that has one must be confirmed as checked, as in Give out.
+  const checkedIds = new Set((Array.isArray(input.conditionsChecked) ? input.conditionsChecked : []).map((x) => Number(x)));
+  for (const p of plan) {
+    const text = conditionsOf.get(Number(p.item.id));
+    if (text && !checkedIds.has(Number(p.item.id))) problems.push(`${nameOf(p.item)} — check before giving it out: ${text}`);
+  }
+  assertNoProblems(problems, `${head.code} cannot be issued.`);
 
   // The holds fall first (so the issue does not trip over its own earmark); a refusal by postMovement undoes them.
   await db.query('SAVEPOINT mr_issue');

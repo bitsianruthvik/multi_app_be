@@ -128,7 +128,8 @@ ok('Stores with inventory manage can no longer type a quote', !passes(routers.pu
 {
   const res = { statusCode: 200, body: null, status(n) { this.statusCode = n; return this; }, json(b) { this.body = b; return this; } };
   const layer = routers.purchaseRequests.stack.find((l) => l.route?.path === '/purchase-request-vendors/:id/quotes');
-  layer.route.stack[1].handle({ user: USERS.stores }, res, () => {});
+  // the guard is [protect, standIn, requirePerm] since the MD's stand-in (lib/http.js): the permission check is the one before the handler
+  layer.route.stack.at(-2).handle({ user: USERS.stores }, res, () => {});
   ok('the refusal is a 403 naming cf_erp_purchase', res.statusCode === 403 && /cf_erp_purchase/.test(res.body?.message ?? ''), j(res.body));
 }
 

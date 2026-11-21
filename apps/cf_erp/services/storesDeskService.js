@@ -481,7 +481,8 @@ export async function takeBack(db, c, input = {}) {
     for (const k of keep) byItem.set(Number(k.itemId), round6((byItem.get(Number(k.itemId)) ?? 0) + k.quantity));
     const again = [...byItem].filter(([itemId]) => lineOf.has(itemId)).map(([itemId, quantity]) => ({ lineId: lineOf.get(itemId), quantity }));
     if (again.length) {
-      const out = await issueMr(db, c, m.requisition_id, { lines: again });
+      // What is put back in its place was checked when it first went out, so it is not asked again.
+      const out = await issueMr(db, c, m.requisition_id, { lines: again, conditionsChecked: [...byItem.keys()] });
       instead = out.movement.code;
       // tools: the Out with row written again by the request's issue replaces an untouched old one; an old row that
       // already had something come back is kept, moved to the new entry, and its new twin is dropped.

@@ -85,11 +85,11 @@ export async function ask(db, c, input = {}) {
   if (!item) throw notFound('Item');
   const held = await reservedFor(db, c.companyId, item.id);
   const reserved = r6(held.reduce((a, h) => a + h.quantity, 0));
-  if (reserved <= EPS) throw invalid('NOT_RESERVED', `Nothing of ${item.name} is reserved — give it out the usual way.`);
+  if (reserved <= EPS) throw invalid('NOT_RESERVED', `Nothing of ${item.name} is reserved — issue it on its material request.`);
   const stock = await usableStock(db, c.companyId, item.id);
   const free = Math.max(0, r6(stock - reserved));
   if (qty > stock + EPS) throw invalid('TOO_MANY', `The store holds only ${stock} ${item.uom ?? ''} of ${item.name}.`);
-  if (qty <= free + EPS) throw invalid('FREE', `${free} ${item.uom ?? ''} of ${item.name} is free — give it out the usual way.`);
+  if (qty <= free + EPS) throw invalid('FREE', `${free} ${item.uom ?? ''} of ${item.name} is free — issue it on its material request.`);
   const [[waiting]] = await db.query("SELECT code FROM cf_reserved_use_requests WHERE company_id = ? AND item_id = ? AND status = 'pending' AND deleted_at IS NULL LIMIT 1", [c.companyId, item.id]);
   if (waiting) throw invalid('WAITING', `${waiting.code} for ${item.name} is still waiting for planning and production.`);
   const need = r6(qty - free);   // how much of the reservations must be let go

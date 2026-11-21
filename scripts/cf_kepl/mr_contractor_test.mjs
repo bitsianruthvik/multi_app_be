@@ -60,7 +60,13 @@ try {
 
   console.log('2. giving out against it');
   await P.saveMr(db, c, mr.id, { lines: screen.lines.map((l) => ({ lineId: l.id, takeFromStock: l.required ?? l.need ?? l.quantity })) });
-  const out = await P.issueMr(db, c, mr.id, {});
+  await db.query("UPDATE cf_item_details SET issue_conditions = 'Ask what size is being drilled' WHERE master_id = ?", [tool.id]);
+  const dry = await P.issueMr(db, c, mr.id, { dryRun: true });
+  ok("a dry run shows Maintenance's check on the tool's line only", dry.lines.find((l) => Number(l.item.id) === tool.id)?.conditions === 'Ask what size is being drilled' && dry.lines.find((l) => Number(l.item.id) === cons.id)?.conditions === null, JSON.stringify(dry.lines.map((l) => l.conditions)));
+  const unchecked = await refusal(P.issueMr(db, c, mr.id, {}));
+  ok('issuing without the check ticked is refused, in words', /check before giving it out/.test(said(unchecked)) && /Ask what size/.test(said(unchecked)), said(unchecked));
+  const out = await P.issueMr(db, c, mr.id, { conditionsChecked: [String(tool.id)] });
+  ok('issuing with the tool checked goes through', /^[A-Z]/.test(out.movement?.code ?? ''), JSON.stringify(out.movement));
   const [[mv]] = await db.query('SELECT given_type, given_party_id, requisition_id, order_id FROM cf_stock_movements WHERE id = ?', [out.movement.id]);
   ok('the give-out is tied to the request, the order and the contractor', Number(mv.requisition_id) === mr.id && Number(mv.order_id) === order.id && mv.given_type === 'vendor' && Number(mv.given_party_id) === contractor.id, JSON.stringify(mv));
   const ow = await D.outWith(db, COMPANY, { holder: 'vendor', search: tool.name });
