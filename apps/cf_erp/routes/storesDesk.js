@@ -29,7 +29,7 @@ import { setDeskSettings, today, nightCheck, levelSuggestions, applyLevel } from
 import * as R from '../services/reservedUseService.js';
 import { getSettings } from '../services/settingsService.js';
 import {
-  deskSettings, listDepartments, addDepartment, listPeople, addPerson, ledger, itemLedger, giveOut, outWith, custodyBack,
+  deskSettings, listDepartments, addDepartment, listPeople, addPerson, ledger, itemLedger, giveOut, takeBack, outWith, custodyBack,
   countList, postCount, listCounts, getCount,
 } from '../services/storesDeskService.js';
 
@@ -51,6 +51,8 @@ router.post('/stores-desk/people', manage, handle((req) => tx(req, (db, c) => ad
 router.get('/stores-desk/ledger', view, handle((req) => ledger(pool, company(req), req.query)));
 router.get('/stores-desk/ledger/:id', view, handle((req) => itemLedger(pool, company(req), id(req), req.query)));
 router.post('/stores-desk/give-out', manage, handle((req) => tx(req, (db, c) => giveOut(db, c, req.body ?? {}))));
+// 2026-11-22: some of what was given out comes back unused.
+router.post('/stores-desk/take-back', manage, handle((req) => tx(req, (db, c) => takeBack(db, c, req.body ?? {}))));
 router.get('/stores-desk/out-with', view, handle((req) => outWith(pool, company(req), req.query)));
 router.post('/stores-desk/out-with/:id/back', manage, handle((req) => tx(req, (db, c) => custodyBack(db, c, id(req), req.body ?? {}))));
 router.get('/stores-desk/count-list', manage, handle((req) => countList(pool, company(req), req.query)));

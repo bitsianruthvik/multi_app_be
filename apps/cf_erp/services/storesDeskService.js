@@ -17,7 +17,7 @@
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { likeOf, pageArgs, pageOf } from '../lib/listing.js';
-import { postMovement } from './stockService.js';
+import { postMovement, reverseMovement, getMovement } from './stockService.js';
 import { requestApproval } from './approvalService.js';
 import { getSettings } from './settingsService.js';
 
@@ -140,7 +140,7 @@ export async function ledger(db, companyId, q = {}) {
   if (like) { where.push('(m.name LIKE ? OR m.code LIKE ?)'); params.push(like, like); }
   if (!blank(q.familyId)) { where.push('f.id = ?'); params.push(Number(q.familyId)); }
   if (!blank(q.subfamilyId)) { where.push('s.id = ?'); params.push(Number(q.subfamilyId)); }
-  const show = ['stock', 'low', 'out'].includes(q.show) ? q.show : 'all';
+  const show = ['stock', 'low', 'out', 'reserved'].includes(q.show) ? q.show : 'all';
   const owner = ['ours', 'customer'].includes(q.owner) ? q.owner : null;
   const ownBal = owner === 'ours' ? 'AND ob.owner_party_id IS NULL' : owner === 'customer' ? 'AND ob.owner_party_id IS NOT NULL' : '';
   const ownLed = owner === 'ours' ? 'AND l.owner_party_id IS NULL' : owner === 'customer' ? 'AND l.owner_party_id IS NOT NULL' : '';
@@ -148,6 +148,7 @@ export async function ledger(db, companyId, q = {}) {
   if (show === 'stock') where.push('(COALESCE(bal.q, 0) <> 0 OR COALESCE(mv.in_q, 0) <> 0 OR COALESCE(mv.out_q, 0) <> 0 OR COALESCE(cu.q, 0) <> 0)');
   if (show === 'low') where.push('ps.min_qty IS NOT NULL AND COALESCE(bal.q, 0) < ps.min_qty');
   if (show === 'out') where.push('COALESCE(cu.q, 0) > 0');
+  if (show === 'reserved') where.push('COALESCE(rs.q, 0) > 0');   // locked for a sales order (2026-11-22)
   const FROM = `
       FROM cf_master_records m
       JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
@@ -433,6 +434,52 @@ export async function giveOut(db, c, input = {}) {
     outWith += 1;
   }
   return { movement, outWith };
+}
+
+/**
+ * POST /stores-desk/take-back { movementId, itemId, quantity, note? } — some of what was given out comes back unused
+ * (user, 2026-11-22: "if there was excess of consumable given and they want to return … super simple").
+ * The give-out is undone and written again for what was really used, so the sales order (or contractor) is charged
+ * only for that and the store's book is right — both by the stock's own reversal, nothing typed into the book.
+ * A tool comes back on Out with, not here. → { takenBack, item, from: code, instead: code | null }
+ */
+export async function takeBack(db, c, input = {}) {
+  const qty = Number(input.quantity);
+  if (blank(input.movementId) || blank(input.itemId)) throw invalid('INVALID', 'Choose the give-out and the item.');
+  if (!Number.isFinite(qty) || qty <= 0) throw invalid('INVALID', 'The quantity is a number above zero.');
+  const [[m]] = await db.query('SELECT * FROM cf_stock_movements WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, Number(input.movementId)]);
+  if (!m || m.movement_type !== 'issue') throw notFound('This give-out');
+  if (m.reversed_by_id || m.reversal_of_id) throw invalid('REVERSED', `${m.code} was already undone.`);
+  if (m.requisition_id != null) throw invalid('FROM_REQUEST', `${m.code} was given against a material request — take it back on that request.`);
+  const full = await getMovement(db, c.companyId, m.id);
+  const [kinds] = await db.query('SELECT master_id, stores_kind FROM cf_item_details WHERE master_id IN (?)', [full.lines.map((l) => l.item.id)]);
+  if (kinds.some((k) => k.stores_kind === 'returnable')) throw invalid('HAS_TOOLS', `${m.code} includes a tool — a tool comes back on Stores › Out with.`);
+  const mine = full.lines.filter((l) => Number(l.item.id) === Number(input.itemId));
+  const had = round6(mine.reduce((a, l) => a + l.quantity, 0));
+  if (!mine.length) throw invalid('INVALID', 'That item is not on this give-out.');
+  if (qty > had + 1e-9) throw invalid('TOO_MANY', `Only ${had} ${mine[0].item.uom ?? ''} of ${mine[0].item.name} was given out on ${m.code}.`);
+  const note = blank(input.note) ? null : String(input.note).trim().slice(0, 200);
+  await reverseMovement(db, c, m.id, { reason: `Taken back: ${round6(qty)} ${mine[0].item.uom ?? ''} of ${mine[0].item.name}${note ? ` — ${note}` : ''}`.slice(0, 255) });
+  // what was really used: every other line as it was, this item less what came back (from its last lot first)
+  let back = round6(qty);
+  const keep = [];
+  for (const l of [...full.lines].reverse()) {
+    let q = l.quantity;
+    if (Number(l.item.id) === Number(input.itemId) && back > 1e-9) { const t = Math.min(back, q); q = round6(q - t); back = round6(back - t); }
+    if (q > 1e-9) keep.unshift({ itemId: l.item.id, quantity: q, fromAreaId: l.from?.id, ...(l.batch ? { batchId: l.batch.id } : {}) });
+  }
+  let instead = null;
+  if (keep.length) {
+    const given = { type: m.given_type ?? (m.order_id ? 'order' : 'department'), departmentId: m.department_id ?? null, partyId: m.given_party_id ?? null, personId: m.person_id ?? null, machineId: m.machine_id ?? null };
+    const mv = await postMovement(db, c, {
+      movementType: 'issue',
+      ...(m.used_for === 'order' ? { usedFor: 'order', orderId: m.order_id, ...(m.order_line_id ? { orderLineId: m.order_line_id } : {}) } : m.used_for === 'general' ? { usedFor: 'general' } : {}),
+      ...(m.maintenance_order_id ? { maintenanceOrderId: m.maintenance_order_id } : {}),
+      reference: `In place of ${m.code}`.slice(0, 100), notes: m.notes ?? null, lines: keep,
+    }, { given, ...(m.used_for === 'vendor' ? { usedFor: 'vendor' } : {}) });
+    instead = mv.code;
+  }
+  return { takenBack: round6(qty), item: { id: mine[0].item.id, name: mine[0].item.name, uom: mine[0].item.uom }, from: m.code, instead };
 }
 
 // --- out with -------------------------------------------------------------------

@@ -128,6 +128,35 @@ try {
   await D.stockCountApprovalHandler.onReject(db, c, { subject_id: c3.id }, 'Count it again');
   ok('sent back: rejected, the book does not move', (await D.getCount(db, COMPANY, c3.id)).status === 'rejected' && (await row()).balance === 6);
 
+  console.log('5b. take back what was given out');
+  {
+    const [[cz]] = await db.query(
+      `SELECT m.id, m.name, k.quantity AS q FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id JOIN cf_stock_balances k ON k.item_id = m.id AND k.stocking_area_id = ? AND k.quantity >= 10
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND i.tracked_by = 'quantity' AND i.stores_kind IS NULL AND i.issue_conditions IS NULL AND m.id <> ?
+          AND NOT EXISTS (SELECT 1 FROM cf_stock_reservations v WHERE v.item_id = m.id AND v.status = 'active') LIMIT 1`, [area.id, COMPANY, item.id]);
+    if (!cz) console.log('  (no consumable with 10 in stock: skipped)');
+    else {
+      const bal = async () => Number((await db.query('SELECT COALESCE(SUM(quantity), 0) AS q FROM cf_stock_balances WHERE company_id = ? AND item_id = ? AND stocking_area_id = ?', [COMPANY, cz.id, area.id]))[0][0].q);
+      const before = await bal();
+      const dz = await D.addDepartment(db, c, { name: `Take back ${Date.now()}` });
+      const gz = await D.giveOut(db, c, { givenFor: { type: 'department', departmentId: dz.id }, lines: [{ itemId: cz.id, quantity: 8 }] });
+      ok('8 given out', (await bal()) === before - 8);
+      const tooMany = await D.takeBack(db, c, { movementId: gz.movement.id, itemId: cz.id, quantity: 9 }).then(() => null, (e) => e);
+      ok('more than was given is refused', tooMany?.code === 'TOO_MANY');
+      const tb = await D.takeBack(db, c, { movementId: gz.movement.id, itemId: cz.id, quantity: 3, note: 'not needed' });
+      ok('3 taken back: the store has them again and the give-out stands for 5', tb.takenBack === 3 && !!tb.instead && (await bal()) === before - 5, JSON.stringify(tb));
+      const [[cost]] = await db.query(
+        `SELECT COALESCE(-SUM(l.quantity), 0) AS used FROM cf_stock_ledger l JOIN cf_stock_movements mm ON mm.id = l.movement_id
+          WHERE l.company_id = ? AND l.item_id = ? AND mm.movement_type = 'issue'
+            AND (mm.department_id = ? OR mm.reversal_of_id IN (SELECT id FROM cf_stock_movements WHERE department_id = ?))`, [COMPANY, cz.id, dz.id, dz.id]);
+      ok('what is charged is the 5 that were used', Number(cost.used) === 5, String(cost.used));
+      const again = await D.takeBack(db, c, { movementId: gz.movement.id, itemId: cz.id, quantity: 1 }).then(() => null, (e) => e);
+      ok('the old entry cannot be taken back from twice', again?.code === 'REVERSED');
+      const tool = await D.takeBack(db, c, { movementId: g2.movement.id, itemId: item.id, quantity: 1 }).then(() => null, (e) => e);
+      ok('a tool does not come back this way', ['HAS_TOOLS', 'REVERSED'].includes(tool?.code), tool?.code);
+    }
+  }
+
   console.log('6. refusals');
   ok('given for nothing', /sales order, a department or a contractor/.test(said(await refusal(D.giveOut(db, c, { lines: [{ itemId: item.id, quantity: 1 }] })))));
   ok('a department that is not there', /Choose the department/.test(said(await refusal(D.giveOut(db, c, { givenFor: { type: 'department', departmentId: 999999999 }, lines: [{ itemId: item.id, quantity: 1 }] })))));
