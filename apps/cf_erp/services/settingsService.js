@@ -44,6 +44,7 @@ export const SETTINGS = [
   { key: 'tools_out_days', col: 'tools_out_days', group: 'stores_day', label: 'A thing given out is "out too long" after', type: 'int', def: 90, min: 1, max: 730, unit: 'days', help: "When the item has no due days of its own." },
   I('out_bucket_1_days', 'stores_day', 'Out with: the first age band ends at', 30, 1, 365, 'days', 'The chips on the Out with screen: up to this, up to the next, and over.'),
   I('out_bucket_2_days', 'stores_day', 'Out with: the second age band ends at', 90, 2, 730, 'days'),
+  { key: 'giveout_loose', group: 'stores_day', label: 'Give out without a material request', type: 'bool', def: false, help: 'Off: stock leaves the store only by "Issue now" on a request, so every stock-out is tied to one (user, 2026-11-23). On: Stores › Stock also has a Give out button.' },
   { key: 'giveout_departments', group: 'stores_day', label: 'Give out may be charged to a department', type: 'bool', def: false, help: 'Off: a give-out is for a sales order or goes to a contractor (user, 2026-11-22).' },
   { key: 'giveout_person', group: 'stores_day', label: 'Give out records who collected it', type: 'bool', def: false, help: 'Off: nobody is named; a tool given for a sales order is out with that order.' },
   I('po_follow_days', 'stores_day', 'Today lists a purchase order due within', 3, 0, 60, 'days', 'Late ones are always listed.'),

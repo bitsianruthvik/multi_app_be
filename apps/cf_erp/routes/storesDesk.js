@@ -42,7 +42,7 @@ const manage = guardAny(PERM.inventory, PERM.stores);
 
 router.get('/stores-desk/settings', view, handle(async (req) => {
   const [d, S] = await Promise.all([deskSettings(pool, company(req)), getSettings(pool, company(req))]);
-  return { ...d, giveOutDepartments: S.giveout_departments === true, giveOutPerson: S.giveout_person === true };
+  return { ...d, giveOutDepartments: S.giveout_departments === true, giveOutPerson: S.giveout_person === true, giveOutLoose: S.giveout_loose === true };
 }));
 router.get('/stores-desk/departments', view, handle((req) => listDepartments(pool, company(req))));
 router.post('/stores-desk/departments', manage, handle((req) => tx(req, (db, c) => addDepartment(db, c, req.body ?? {}))));

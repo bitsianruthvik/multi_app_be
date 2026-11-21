@@ -34,7 +34,7 @@ try {
   const [[user]] = await db.query('SELECT id FROM users WHERE company_id = ? ORDER BY id LIMIT 1', [COMPANY]);
   const c = { companyId: COMPANY, userId: user?.id ?? null };
   // 2026-11-22: departments and "collected by" are company settings, off by default — this suite runs with both on.
-  { const St_ = await imp('apps/cf_erp/services/settingsService.js'); await St_.saveSettings(db, c, { values: { giveout_departments: true, giveout_person: true } }); St_.clearSettingsCache(); }
+  { const St_ = await imp('apps/cf_erp/services/settingsService.js'); await St_.saveSettings(db, c, { values: { giveout_departments: true, giveout_person: true, giveout_loose: true } }); St_.clearSettingsCache(); }
   const [[item]] = await db.query(
     `SELECT m.id, m.name FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id
       WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' AND i.item_type = 'catalog' AND i.tracked_by = 'quantity'

@@ -71,7 +71,21 @@ try {
   ok('each line says how much was issued', screen.lines.every((l) => (l.issued ?? 0) > 0));
   const tot = (await P.orderItemTotals(db, COMPANY, order.id)).rows.find((r) => Number(r.itemId) === cons.id);
   ok("the order's totals count it: asked and given", tot?.requested >= 6 && tot.given === 6, JSON.stringify(tot));
-  const back = await D.custodyBack(db, c, ow.rows[0].id, { kind: 'returned' });
+
+  console.log('3. no loose give-out; taking back from a request');
+  const loose = await refusal(D.giveOut(db, c, { givenFor: { type: 'order', orderId: order.id }, lines: [{ itemId: cons.id, quantity: 1 }] }));
+  ok('a give-out with no request is refused, in words', loose?.code === 'USE_A_REQUEST' && /Issue now/.test(loose.message), loose?.message);
+  const tb = await D.takeBack(db, c, { movementId: out.movement.id, itemId: cons.id, quantity: 2 });
+  ok('2 of the 6 come back through the request', tb.takenBack === 2 && tb.request === mr.id && !!tb.instead && tb.instead !== out.movement.code, JSON.stringify(tb));
+  screen = await P.mrScreen(db, COMPANY, mr.id);
+  const consLine = screen.lines.find((l) => Number(l.item?.id ?? l.itemId) === cons.id);
+  ok('the request now says 4 issued and has 2 in store to issue', (consLine?.issued ?? 0) === 4 && (consLine?.toIssue ?? 0) === 2, JSON.stringify({ issued: consLine?.issued, toIssue: consLine?.toIssue }));
+  ok('its stock-outs: the first undone, the one in its place live', screen.giveOuts.filter((g) => !g.undone).length === 1 && screen.giveOuts.find((g) => !g.undone).code === tb.instead && screen.giveOuts.some((g) => g.undone && g.code === out.movement.code));
+  const ow2 = await D.outWith(db, COMPANY, { holder: 'vendor', search: tool.name });
+  ok('the tool is still out with the contractor, once, on the new entry', ow2.rows.length === 1 && ow2.rows[0].left === 1 && ow2.rows[0].movementCode === tb.instead, JSON.stringify(ow2.rows.map((r) => [r.movementCode, r.left])));
+  const tot2 = (await P.orderItemTotals(db, COMPANY, order.id)).rows.find((r) => Number(r.itemId) === cons.id);
+  ok('the order is charged for the 4', tot2?.given === 4, JSON.stringify(tot2));
+  const back = await D.custodyBack(db, c, ow2.rows[0].id, { kind: 'returned' });
   ok('the tool comes back from the contractor', back.left === 0);
 
   console.log(`\n${pass} passed, ${fail} failed — rolled back`);

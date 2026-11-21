@@ -346,6 +346,8 @@ export async function giveOut(db, c, input = {}) {
   // 2026-11-22 (user): a give-out is for a sales order or goes to a contractor; departments and "collected by" are
   // company settings, off unless switched on (Setup › Settings › Stores: the day).
   const S0 = await getSettings(db, c.companyId);
+  // 2026-11-23 (user): "there shouldn't be a loose stock-out" — without the switch a give-out is made on a request.
+  if (S0.giveout_loose !== true) throw invalid('USE_A_REQUEST', 'Stock is given out against a material request: open the request on Stores › Requests and press Issue now.');
   const allowDept = S0.giveout_departments === true;
   const allowPerson = S0.giveout_person === true;
   const type = GIVEN_TYPES.includes(g.type) && (g.type !== 'department' || allowDept) ? g.type : null;
@@ -450,7 +452,6 @@ export async function takeBack(db, c, input = {}) {
   const [[m]] = await db.query('SELECT * FROM cf_stock_movements WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, Number(input.movementId)]);
   if (!m || m.movement_type !== 'issue') throw notFound('This give-out');
   if (m.reversed_by_id || m.reversal_of_id) throw invalid('REVERSED', `${m.code} was already undone.`);
-  if (m.requisition_id != null) throw invalid('FROM_REQUEST', `${m.code} was given against a material request — take it back on that request.`);
   const full = await getMovement(db, c.companyId, m.id);
   const [[kind]] = await db.query('SELECT stores_kind FROM cf_item_details WHERE master_id = ?', [Number(input.itemId)]);
   if (kind?.stores_kind === 'returnable') throw invalid('HAS_TOOLS', 'A tool comes back on Stores › Out with, not here.');
@@ -459,6 +460,7 @@ export async function takeBack(db, c, input = {}) {
   if (!mine.length) throw invalid('INVALID', 'That item is not on this give-out.');
   if (qty > had + 1e-9) throw invalid('TOO_MANY', `Only ${had} ${mine[0].item.uom ?? ''} of ${mine[0].item.name} was given out on ${m.code}.`);
   const note = blank(input.note) ? null : String(input.note).trim().slice(0, 200);
+  const [oldCust] = await db.query('SELECT id, item_id, qty_returned, qty_worn, qty_lost FROM cf_stock_custody WHERE company_id = ? AND movement_id = ? AND deleted_at IS NULL', [c.companyId, m.id]);
   await reverseMovement(db, c, m.id, { reason: `Taken back: ${round6(qty)} ${mine[0].item.uom ?? ''} of ${mine[0].item.name}${note ? ` — ${note}` : ''}`.slice(0, 255) });
   // what was really used: every other line as it was, this item less what came back (from its last lot first)
   let back = round6(qty);
@@ -469,6 +471,31 @@ export async function takeBack(db, c, input = {}) {
     if (q > 1e-9) keep.unshift({ itemId: l.item.id, quantity: q, fromAreaId: l.from?.id, ...(l.batch ? { batchId: l.batch.id } : {}) });
   }
   let instead = null;
+  if (m.requisition_id != null) {
+    // A give-out made on a request: undoing it puts the stock back on hold for that request (stockService), and what
+    // was really used is issued again THROUGH the request, so the request, its order and its contractor stay right.
+    const { issueMr } = await import('./purchaseRequestService.js');
+    const [mrLines] = await db.query('SELECT id, item_id FROM cf_requisition_lines WHERE company_id = ? AND requisition_id = ? AND deleted_at IS NULL', [c.companyId, m.requisition_id]);
+    const lineOf = new Map(mrLines.map((l) => [Number(l.item_id), l.id]));
+    const byItem = new Map();
+    for (const k of keep) byItem.set(Number(k.itemId), round6((byItem.get(Number(k.itemId)) ?? 0) + k.quantity));
+    const again = [...byItem].filter(([itemId]) => lineOf.has(itemId)).map(([itemId, quantity]) => ({ lineId: lineOf.get(itemId), quantity }));
+    if (again.length) {
+      const out = await issueMr(db, c, m.requisition_id, { lines: again });
+      instead = out.movement.code;
+      // tools: the Out with row written again by the request's issue replaces an untouched old one; an old row that
+      // already had something come back is kept, moved to the new entry, and its new twin is dropped.
+      for (const o of oldCust) {
+        const touched = Number(o.qty_returned) + Number(o.qty_worn) + Number(o.qty_lost) > 1e-9;
+        if (!touched) await db.query('UPDATE cf_stock_custody SET deleted_at = NOW() WHERE id = ?', [o.id]);
+        else {
+          await db.query('UPDATE cf_stock_custody SET deleted_at = NOW() WHERE company_id = ? AND movement_id = ? AND item_id = ? AND deleted_at IS NULL LIMIT 1', [c.companyId, out.movement.id, o.item_id]);
+          await db.query('UPDATE cf_stock_custody SET movement_id = ? WHERE id = ?', [out.movement.id, o.id]);
+        }
+      }
+    } else if (oldCust.length) await db.query('UPDATE cf_stock_custody SET deleted_at = NOW() WHERE id IN (?)', [oldCust.map((o) => o.id)]);
+    return { takenBack: round6(qty), item: { id: mine[0].item.id, name: mine[0].item.name, uom: mine[0].item.uom }, from: m.code, instead, request: m.requisition_id };
+  }
   if (keep.length) {
     const given = { type: m.given_type ?? (m.order_id ? 'order' : 'department'), departmentId: m.department_id ?? null, partyId: m.given_party_id ?? null, personId: m.person_id ?? null, machineId: m.machine_id ?? null };
     const mv = await postMovement(db, c, {
