@@ -326,7 +326,7 @@ export async function today(db, companyId) {
       `SELECT SUM(count_date = ?) AS today_n, SUM(kind = 'weekly' AND count_date >= ?) AS week_n,
               SUM(status = 'pending') AS pending_n, SUM(status = 'rejected' AND count_date >= ?) AS rejected_n, MAX(count_date) AS last_on
          FROM cf_stock_counts WHERE company_id = ? AND deleted_at IS NULL`, [t, monday, addDays(t, -7), companyId]),
-    countList(db, companyId, { kind: 'daily' }).catch(() => null),
+    countList(db, companyId, { kind: 'monthly' }).catch(() => null),
     outWith(db, companyId, { overdue: 1 }),
     ledger(db, companyId, { show: 'low', paged: 1, limit: 200 }),
     levelSuggestions(db, companyId, { limit: 50 }),
@@ -343,7 +343,9 @@ export async function today(db, companyId) {
   }
   const poRows = [...pos.values()].map((p) => ({ ...p, daysLate: Math.max(0, daysBetween(p.expected, t)), dueIn: Math.max(0, daysBetween(t, p.expected)) }));
   const lowRows = low.rows.filter((r) => r.onOrder <= 0);
-  const toCount = daily?.lines.length ?? 0;
+  // 2026-11-22: the audit is monthly and of everything — what is left of this month's.
+  const month = daily?.month ?? { from: null, total: 0, audited: 0, done: true };
+  const toCount = Math.max(0, month.total - month.audited);
   const countedToday = Number(cnt?.today_n) > 0;
   return {
     date: t,
@@ -351,8 +353,8 @@ export async function today(db, companyId) {
     purchaseOrders: { late: poRows.filter((p) => p.daysLate > 0).length, dueSoon: poRows.filter((p) => p.daysLate === 0).length, followDays: Number(S.po_follow_days), rows: poRows.slice(0, 30) },
     afterHours: night,
     count: {
-      toCount, countedToday, dailyDue: toCount > 0 && !countedToday,
-      weeklyDone: Number(cnt?.week_n) > 0, pending: Number(cnt?.pending_n) || 0, rejected: Number(cnt?.rejected_n) || 0, lastCount: dateText(cnt?.last_on),
+      toCount, countedToday, dailyDue: false, month,
+      weeklyDone: true, pending: Number(cnt?.pending_n) || 0, rejected: Number(cnt?.rejected_n) || 0, lastCount: dateText(cnt?.last_on),
     },
     outTooLong: { count: out.counts.overdue, longDays: out.longDays, rows: out.rows.slice(0, 8) },
     belowMinimum: { count: lowRows.length, lowAll: low.total, rows: lowRows.slice(0, 8).map((r) => ({ item: r.item, balance: r.now, min: r.min })) },

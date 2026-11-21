@@ -27,6 +27,7 @@ import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import { setDeskSettings, today, nightCheck, levelSuggestions, applyLevel } from '../services/storesTodayService.js';
 import * as R from '../services/reservedUseService.js';
+import { getSettings } from '../services/settingsService.js';
 import {
   deskSettings, listDepartments, addDepartment, listPeople, addPerson, ledger, itemLedger, giveOut, outWith, custodyBack,
   countList, postCount, listCounts, getCount,
@@ -39,7 +40,10 @@ const company = (req) => ctx(req).companyId;
 const view = guardAny(PERM.inventoryView, PERM.inventory, PERM.stores, PERM.purchase, PERM.productionView, PERM.production, PERM.maintenance, PERM.ordersView, PERM.floor);
 const manage = guardAny(PERM.inventory, PERM.stores);
 
-router.get('/stores-desk/settings', view, handle((req) => deskSettings(pool, company(req))));
+router.get('/stores-desk/settings', view, handle(async (req) => {
+  const [d, S] = await Promise.all([deskSettings(pool, company(req)), getSettings(pool, company(req))]);
+  return { ...d, giveOutDepartments: S.giveout_departments === true, giveOutPerson: S.giveout_person === true };
+}));
 router.get('/stores-desk/departments', view, handle((req) => listDepartments(pool, company(req))));
 router.post('/stores-desk/departments', manage, handle((req) => tx(req, (db, c) => addDepartment(db, c, req.body ?? {}))));
 router.get('/stores-desk/people', view, handle((req) => listPeople(pool, company(req), req.query)));

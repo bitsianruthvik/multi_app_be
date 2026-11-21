@@ -33,7 +33,7 @@ const num = (v) => (v == null ? 0 : Number(v));
 const STORE_PURPOSES = ['storage', 'quarantine'];
 export const GIVEN_TYPES = ['order', 'department', 'vendor'];
 export const CUSTODY_KINDS = ['returned', 'worn', 'lost'];
-export const COUNT_KINDS = ['daily', 'weekly', 'spot'];
+export const COUNT_KINDS = ['daily', 'weekly', 'spot', 'monthly'];
 
 /** The stores switches of a company. Reads the defaults when the columns are not there yet. */
 export async function deskSettings(db, companyId) {
@@ -342,8 +342,13 @@ async function lotsFor(db, companyId, itemId, areaId, quantity) {
 export async function giveOut(db, c, input = {}) {
   const problems = [];
   const g = input.givenFor ?? {};
-  const type = GIVEN_TYPES.includes(g.type) ? g.type : null;
-  if (!type) problems.push('Say what it is given for: a sales order, a department or a vendor.');
+  // 2026-11-22 (user): a give-out is for a sales order or goes to a contractor; departments and "collected by" are
+  // company settings, off unless switched on (Setup › Settings › Stores: the day).
+  const S0 = await getSettings(db, c.companyId);
+  const allowDept = S0.giveout_departments === true;
+  const allowPerson = S0.giveout_person === true;
+  const type = GIVEN_TYPES.includes(g.type) && (g.type !== 'department' || allowDept) ? g.type : null;
+  if (!type) problems.push(allowDept ? 'Say what it is given for: a sales order, a department or a contractor.' : 'Say what it is given for: a sales order or a contractor.');
   const given = { type };
   let orderId = null;
   if (type === 'order') {
@@ -356,12 +361,13 @@ export async function giveOut(db, c, input = {}) {
     else given.departmentId = d.id;
   }
   if (type === 'vendor') {
-    const [[p]] = blank(g.partyId) ? [[null]] : await db.query('SELECT id, name FROM cf_parties WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(g.partyId)]);
-    if (!p) problems.push('Choose the vendor it is sent to.');
+    const [[p]] = blank(g.partyId) ? [[null]] : await db.query('SELECT id, name, is_subcontractor FROM cf_parties WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(g.partyId)]);
+    if (!p) problems.push('Choose the contractor it is sent to.');
+    else if (!Number(p.is_subcontractor)) problems.push(`${p.name} is not marked as a contractor. Mark it on its party page, or choose a contractor.`);
     else given.partyId = p.id;
   }
   let person = null;
-  if (!blank(input.personId)) {
+  if (allowPerson && !blank(input.personId)) {
     [[person]] = await db.query('SELECT id, name, department_id FROM cf_store_people WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [c.companyId, Number(input.personId)]);
     if (!person) problems.push('That person is not on the list.');
     else given.personId = person.id;
@@ -387,7 +393,7 @@ export async function giveOut(db, c, input = {}) {
     // §114: what maintenance wants checked before this goes out — the storekeeper confirms it on the line.
     if (!blank(item.issue_conditions) && l.conditionsChecked !== true) { P(`${item.name} — check before giving it out: ${item.issue_conditions}`); continue; }
     const returnable = item.stores_kind === 'returnable';
-    if (returnable && type === 'order' && !person) { P(`${item.name} comes back — say who is collecting it.`); continue; }
+    if (allowPerson && returnable && type === 'order' && !person) { P(`${item.name} comes back — say who is collecting it.`); continue; }
     const areaId = blank(l.areaId) ? await mainAreaOf(db, c.companyId, item.id) : Number(l.areaId);
     if (!areaId) { P('there is no store area to give it out from.'); continue; }
     const before = lines.length;
@@ -398,7 +404,7 @@ export async function giveOut(db, c, input = {}) {
     } else {
       lines.push({ itemId: item.id, quantity: round6(qty), fromAreaId: areaId, ...(blank(l.batchId) ? {} : { batchId: Number(l.batchId) }) });
     }
-    for (let k = before; k < lines.length; k++) plans.push({ item, areaId, expectBack: returnable || type === 'vendor' });
+    for (let k = before; k < lines.length; k++) plans.push({ item, areaId, expectBack: returnable });   // Out with holds tools only — a consumable sent to a contractor is used up (user, 2026-11-22)
   }
   assertNoProblems(problems, 'It cannot be given out.');
 
@@ -417,7 +423,7 @@ export async function giveOut(db, c, input = {}) {
   for (const [k, ln] of movement.lines.entries()) {
     const plan = plans[k];
     if (!plan?.expectBack) continue;
-    const holder = type === 'vendor' ? 'vendor' : person ? 'person' : 'department';
+    const holder = type === 'vendor' ? 'vendor' : person ? 'person' : type === 'order' ? 'order' : 'department';
     const due = plan.item.due_days ? dateText(new Date(Date.now() + Number(plan.item.due_days) * 86400000)) : null;
     await db.query(
       `INSERT INTO cf_stock_custody (company_id, movement_id, item_id, batch_id, area_id, quantity, holder_type, department_id, person_id, party_id, order_id, machine_id, issued_on, due_on, unit_cost, created_by)
@@ -452,7 +458,7 @@ function shapeCustody(r, longDays = 90) {
     id: r.id, item: { id: r.item_id, code: r.item_code, name: r.item_name, uom: r.uom },
     quantity: round6(r.quantity), returned: round6(r.qty_returned), worn: round6(r.qty_worn), lost: round6(r.qty_lost), left,
     holderType: r.holder_type,
-    holder: r.holder_type === 'vendor' ? r.party_name : r.holder_type === 'person' ? r.person_name : r.department_name,
+    holder: r.holder_type === 'vendor' ? r.party_name : r.holder_type === 'person' ? r.person_name : r.holder_type === 'order' ? r.order_code : r.department_name,
     department: r.department_name ?? null, order: r.order_code ?? null, machine: r.machine_code ?? null,
     issuedOn: dateText(r.issued_on), dueOn: due, daysOut,
     // past its own due date, or (with none) out longer than the company's limit
@@ -477,11 +483,11 @@ export async function outWith(db, companyId, q = {}) {
   const status = q.status === 'closed' ? 'closed' : 'open';
   const where = ['c.company_id = ?', 'c.deleted_at IS NULL', 'c.status = ?'];
   const params = [companyId, status];
-  if (['person', 'department', 'vendor'].includes(q.holder)) { where.push('c.holder_type = ?'); params.push(q.holder); }
+  if (['person', 'department', 'vendor', 'order'].includes(q.holder)) { where.push('c.holder_type = ?'); params.push(q.holder); }
   if (q.overdue === '1' || q.overdue === 1) { where.push(LONG_OUT); params.push(toolsOutDays); }
   if (['d30', 'd90', 'over'].includes(q.age)) where.push(AGE_BUCKETS[q.age]);
   const like = likeOf(q.search);
-  if (like) { where.push('(m.name LIKE ? OR pe.name LIKE ? OR dp.name LIKE ? OR pa.name LIKE ?)'); params.push(like, like, like, like); }
+  if (like) { where.push('(m.name LIKE ? OR pe.name LIKE ? OR dp.name LIKE ? OR pa.name LIKE ? OR so.code LIKE ?)'); params.push(like, like, like, like, like); }
   const [[rows], [chips]] = await Promise.all([
     db.query(`${CUSTODY_SELECT} WHERE ${where.join(' AND ')} ORDER BY (c.due_on IS NULL), c.due_on, c.issued_on, c.id LIMIT 500`, params),
     db.query(
@@ -489,7 +495,7 @@ export async function outWith(db, companyId, q = {}) {
               SUM(${AGE_BUCKETS.d30}) AS d30, SUM(${AGE_BUCKETS.d90}) AS d90, SUM(${AGE_BUCKETS.over}) AS over_n
          FROM cf_stock_custody c WHERE c.company_id = ? AND c.deleted_at IS NULL AND c.status = 'open' GROUP BY c.holder_type`, [toolsOutDays, companyId]),
   ]);
-  const counts = { person: 0, department: 0, vendor: 0, overdue: 0, all: 0, d30: 0, d90: 0, over: 0 };
+  const counts = { person: 0, department: 0, vendor: 0, order: 0, overdue: 0, all: 0, d30: 0, d90: 0, over: 0 };
   for (const r of chips) {
     counts[r.k] = Number(r.n); counts.all += Number(r.n); counts.overdue += Number(r.overdue) || 0;
     counts.d30 += Number(r.d30) || 0; counts.d90 += Number(r.d90) || 0; counts.over += Number(r.over_n) || 0;
@@ -566,13 +572,17 @@ async function costsOf(db, companyId, itemIds) {
  * GET /stores-desk/count-list?areaId=&kind=daily|weekly&subfamilyId=
  *   daily    what moved in that area since its last count (at most 40 lines, the busiest first)
  *   weekly   every item of one group that has stock there or moved in the last 90 days
+ *   monthly  EVERYTHING that has stock there or moved this month (user, 2026-11-22: "monthly audit should not just be one
+ *            group but everything"); ?subfamilyId= only narrows what is shown. Each line says whether it was audited this
+ *            month already — the audit is saved in parts (500 lines a save) until every line is done.
  * Each line: the book quantity now (per lot for a batch-kept item).
  */
 export async function countList(db, companyId, q = {}) {
   const areas = await storeAreas(db, companyId);
   const areaId = blank(q.areaId) ? areas.all.find((a) => a.purpose === 'storage')?.id ?? areas.all[0]?.id : Number(q.areaId);
   if (!areaId || !areas.all.some((a) => Number(a.id) === Number(areaId))) throw invalid('INVALID', 'Choose one of the store areas to audit.');
-  const kind = q.kind === 'weekly' ? 'weekly' : 'daily';
+  const kind = q.kind === 'weekly' ? 'weekly' : q.kind === 'monthly' ? 'monthly' : 'daily';
+  const monthStart = `${dateText(new Date()).slice(0, 8)}01`;
   const S = await getSettings(db, companyId);
   const [[last]] = await db.query('SELECT MAX(count_date) AS d FROM cf_stock_counts WHERE company_id = ? AND area_id = ? AND deleted_at IS NULL', [companyId, areaId]);
   const since = dateText(last?.d) ?? dateText(new Date(Date.now() - 2 * 86400000));
@@ -583,6 +593,16 @@ export async function countList(db, companyId, q = {}) {
         WHERE l.company_id = ? AND l.stocking_area_id = ? AND l.deleted_at IS NULL AND mm.movement_date >= ? AND mm.movement_type <> 'adjustment'
         GROUP BY l.item_id ORDER BY n DESC, l.item_id LIMIT ?`, [companyId, areaId, since, Number(S.count_daily_max_lines)]);
     itemIds = moved.map((r) => Number(r.item_id));
+  } else if (kind === 'monthly') {
+    const [all] = await db.query(
+      `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog'
+         LEFT JOIN cf_classification_nodes v ON v.id = m.classification_id
+        WHERE m.company_id = ? AND m.deleted_at IS NULL ${blank(q.subfamilyId) ? '' : 'AND v.parent_id = ?'}
+          AND (EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = m.company_id AND k.item_id = m.id AND k.stocking_area_id = ? AND k.quantity <> 0)
+            OR EXISTS (SELECT 1 FROM cf_stock_ledger l JOIN cf_stock_movements mm ON mm.id = l.movement_id
+                        WHERE l.company_id = m.company_id AND l.item_id = m.id AND l.stocking_area_id = ? AND l.deleted_at IS NULL AND mm.movement_date >= ?))
+        ORDER BY m.name LIMIT 5000`, [companyId, ...(blank(q.subfamilyId) ? [] : [Number(q.subfamilyId)]), areaId, areaId, monthStart]);
+    itemIds = all.map((r) => Number(r.id));
   } else {
     if (blank(q.subfamilyId)) throw invalid('INVALID', 'Choose the group to audit this week.');
     const [inGroup] = await db.query(
@@ -606,7 +626,22 @@ export async function countList(db, companyId, q = {}) {
       item: { id: r.id, code: r.code, name: r.name, uom: r.uom }, lot: r.batch_id ? { id: r.batch_id, code: r.batch_code } : null, book: round6(r.q),
     }));
   }
-  return { area: areas.all.find((a) => Number(a.id) === Number(areaId)), areas: areas.all, kind, since, lines, lastCount: dateText(last?.d) };
+  let month = null;
+  if (kind === 'monthly') {
+    // what this month's audits already covered in this area (a line a lot)
+    const [done] = await db.query(
+      `SELECT DISTINCT cl.item_id, IFNULL(cl.batch_id, 0) AS b FROM cf_stock_count_lines cl JOIN cf_stock_counts n ON n.id = cl.count_id
+        WHERE cl.company_id = ? AND n.area_id = ? AND n.deleted_at IS NULL AND n.status <> 'rejected' AND n.count_date >= ?`, [companyId, areaId, monthStart]);
+    const seen = new Set(done.map((d) => `${d.item_id}:${d.b}`));
+    for (const l of lines) l.audited = seen.has(`${l.item.id}:${l.lot?.id ?? 0}`);
+    let total = lines.length; let audited = lines.filter((l) => l.audited).length;
+    if (!blank(q.subfamilyId)) {   // the progress is of everything, whatever is shown
+      const whole = await countList(db, companyId, { areaId, kind: 'monthly' });
+      total = whole.month.total; audited = whole.month.audited;
+    }
+    month = { from: monthStart, total, audited, done: total > 0 && audited >= total };
+  }
+  return { area: areas.all.find((a) => Number(a.id) === Number(areaId)), areas: areas.all, kind, since, lines, lastCount: dateText(last?.d), ...(month ? { month } : {}) };
 }
 
 /** The adjustment a count's differences become: signed changes, one movement. */

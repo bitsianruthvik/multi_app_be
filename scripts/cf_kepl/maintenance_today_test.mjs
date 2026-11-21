@@ -34,6 +34,8 @@ try {
   const c = { companyId: COMPANY, userId: user.id };
   await db.query('DELETE FROM cf_settings WHERE company_id = ?', [COMPANY]);
   St.clearSettingsCache();
+  // 2026-11-22: departments and "collected by" are company settings, off by default — this suite runs with both on.
+  { const St_ = await imp('apps/cf_erp/services/settingsService.js'); await St_.saveSettings(db, c, { values: { giveout_departments: true, giveout_person: true } }); St_.clearSettingsCache(); }
   const S = await St.getSettings(db, COMPANY, { fresh: true });
   const [[mc]] = await db.query("SELECT id, code FROM cf_machines WHERE company_id = ? AND deleted_at IS NULL AND status = 'active' AND COALESCE(kind, 'machine') = 'machine' AND COALESCE(stage, 'live') = 'live' ORDER BY id LIMIT 1", [COMPANY]);
   if (!mc) throw new Error('No live machine in this company.');

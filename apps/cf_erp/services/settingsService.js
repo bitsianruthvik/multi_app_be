@@ -44,6 +44,8 @@ export const SETTINGS = [
   { key: 'tools_out_days', col: 'tools_out_days', group: 'stores_day', label: 'A thing given out is "out too long" after', type: 'int', def: 90, min: 1, max: 730, unit: 'days', help: "When the item has no due days of its own." },
   I('out_bucket_1_days', 'stores_day', 'Out with: the first age band ends at', 30, 1, 365, 'days', 'The chips on the Out with screen: up to this, up to the next, and over.'),
   I('out_bucket_2_days', 'stores_day', 'Out with: the second age band ends at', 90, 2, 730, 'days'),
+  { key: 'giveout_departments', group: 'stores_day', label: 'Give out may be charged to a department', type: 'bool', def: false, help: 'Off: a give-out is for a sales order or goes to a contractor (user, 2026-11-22).' },
+  { key: 'giveout_person', group: 'stores_day', label: 'Give out records who collected it', type: 'bool', def: false, help: 'Off: nobody is named; a tool given for a sales order is out with that order.' },
   I('po_follow_days', 'stores_day', 'Today lists a purchase order due within', 3, 0, 60, 'days', 'Late ones are always listed.'),
 
   // --- levels from use
@@ -71,7 +73,7 @@ export const SETTINGS = [
   I('alert_repeat_breakdowns', 'alerts', 'Repeat breakdown: this many faults on one machine', 3, 2, 50, 'faults'),
   I('alert_repeat_days', 'alerts', '… within', 30, 1, 365, 'days'),
   I('alert_inquiry_days', 'alerts', 'An inquiry not yet confirmed is an alert after', 5, 1, 365, 'days', 'To Engineering (design and materials).'),
-  I('alert_count_skip_days', 'alerts', 'Stock moved and nobody audited it for', 2, 1, 60, 'days', 'To Stores. Only on a company that runs the Stores desk.'),
+  I('alert_count_skip_days', 'alerts', 'Stock moved and nobody audited it for', 35, 1, 120, 'days', 'To Stores. Only on a company that runs the Stores desk.'),
   I('alert_lost_days', 'alerts', 'A lost item stays on the alerts for', 14, 1, 120, 'days', 'To Stores and the MD.'),
   I('alert_billing_days', 'alerts', 'An invoice unpaid is an alert after', 30, 1, 365, 'days from its date', 'To Accounts.'),
 
@@ -83,7 +85,7 @@ export const SETTINGS = [
   I('md_machine_down_hours', 'md', 'A machine down for', 24, 1, 2000, 'hours'),
   I('md_ticket_late_hours', 'md', 'A maintenance ticket past its target by', 48, 1, 2000, 'hours'),
   I('md_inquiry_days', 'md', 'An inquiry not confirmed for', 7, 1, 365, 'days'),
-  I('md_count_skip_days', 'md', 'No stock audit for', 4, 1, 120, 'days'),
+  I('md_count_skip_days', 'md', 'No stock audit for', 45, 1, 240, 'days'),
   I('md_out_extra_days', 'md', 'A thing out too long by a further', 30, 0, 730, 'days'),
   I('md_billing_days', 'md', 'An invoice unpaid for', 60, 1, 730, 'days from its date'),
 

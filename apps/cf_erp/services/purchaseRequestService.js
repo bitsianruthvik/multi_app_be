@@ -193,12 +193,16 @@ export async function listMrs(db, companyId, q = {}) {
   const onlyOpen = !(q.open === false || q.open === 'false' || q.open === '0');
   const internal = q.internal === 'all' ? null : (q.internal === 'only' || q.internal === true || q.internal === 'true' || q.internal === '1');
   // §79: Stores' MR inbox filters by "For" (sales_order | maintenance_order | stock | general).
-  const views = await readRequisitions(db, companyId, {
+  const all = await readRequisitions(db, companyId, {
     open: onlyOpen, orderId: blank(q.orderId) ? null : Number(q.orderId), search: q.search,
     forType: blank(q.for ?? q.forType) ? null : String(q.for ?? q.forType),
     maintenanceOrderId: blank(q.maintenanceOrderId) ? null : Number(q.maintenanceOrderId),
     ...(internal == null ? {} : { internal }),
   });
+  // "Open" is the request's own state: something on it is still to take or to buy (2026-11-22 — it used to follow only
+  // the sales order's status, so "Closed too" never changed the list).
+  const shown = onlyOpen ? all.filter((v) => !v.done) : all;
+  const views = shown;
   const prOf = await prsOfRequisitions(db, companyId, views.map((v) => v.id));
   const counts = { all: views.length, sales_order: 0, maintenance_order: 0, stock: 0, general: 0 };
   for (const v of views) counts[v.forType] += 1;
@@ -212,7 +216,7 @@ export async function listMrs(db, companyId, q = {}) {
         forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes, internal: !!v.internal,
         status: v.status, statusLabel: v.statusLabel, materials: live.length, lockedLines, heldForAcceptance: !!v.heldForAcceptance,
         lockedWords: live.length ? `${lockedLines} of ${live.length} locked` : 'Nothing to buy',
-        purchaseRequest: prOf.get(v.id) ?? null, raisedAt: v.raisedAt,
+        purchaseRequest: prOf.get(v.id) ?? null, raisedAt: v.raisedAt, done: !!v.done,
       };
     }),
   };

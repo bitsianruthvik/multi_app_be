@@ -33,6 +33,8 @@ try {
   await db.beginTransaction(); attachNodeCache(db);
   const [[user]] = await db.query('SELECT id FROM users WHERE company_id = ? ORDER BY id LIMIT 1', [COMPANY]);
   const c = { companyId: COMPANY, userId: user?.id ?? null };
+  // 2026-11-22: departments and "collected by" are company settings, off by default — this suite runs with both on.
+  { const St_ = await imp('apps/cf_erp/services/settingsService.js'); await St_.saveSettings(db, c, { values: { giveout_departments: true, giveout_person: true } }); St_.clearSettingsCache(); }
   const [[item]] = await db.query(
     `SELECT m.id, m.name FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id
       WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' AND i.item_type = 'catalog' AND i.tracked_by = 'quantity'
@@ -86,6 +88,19 @@ try {
   const [[party]] = await db.query('SELECT id, name FROM cf_parties WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY]);
   if (!party) console.log('  (no party in this company: skipped)');
   else {
+    // 2026-11-22: only a contractor is a vendor things are given to; and only a tool is then "out with" them.
+    await db.query('UPDATE cf_parties SET is_subcontractor = 0 WHERE id = ?', [party.id]);
+    const notC = await D.giveOut(db, c, { givenFor: { type: 'vendor', partyId: party.id }, lines: [{ itemId: item.id, quantity: 5 }] }).then(() => null, (e) => e);
+    ok('a party that is not a contractor is refused', /not marked as a contractor/.test((notC?.problems ?? []).join(' ')));
+    await db.query('UPDATE cf_parties SET is_subcontractor = 1 WHERE id = ?', [party.id]);
+    const [[cons]] = await db.query(
+      `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id JOIN cf_stock_balances k ON k.item_id = m.id AND k.stocking_area_id = ? AND k.quantity >= 1
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND i.tracked_by = 'quantity' AND i.stores_kind IS NULL AND i.issue_conditions IS NULL AND m.id <> ? LIMIT 1`, [area.id, COMPANY, item.id]);
+    if (cons) {
+      const gc = await D.giveOut(db, c, { givenFor: { type: 'vendor', partyId: party.id }, lines: [{ itemId: cons.id, quantity: 1 }] });
+      ok('a consumable sent to a contractor is not on Out with', gc.outWith === 0);
+    }
+    // the tool below is the one that is out with the contractor
     const g3 = await D.giveOut(db, c, { givenFor: { type: 'vendor', partyId: party.id }, lines: [{ itemId: item.id, quantity: 5 }] });
     const [[m3]] = await db.query('SELECT used_for, given_type, given_party_id FROM cf_stock_movements WHERE id = ?', [g3.movement.id]);
     ok('sent to a vendor: not an order, not overhead', m3.used_for === 'vendor' && m3.given_type === 'vendor' && Number(m3.given_party_id) === party.id);
@@ -114,7 +129,7 @@ try {
   ok('sent back: rejected, the book does not move', (await D.getCount(db, COMPANY, c3.id)).status === 'rejected' && (await row()).balance === 6);
 
   console.log('6. refusals');
-  ok('given for nothing', /sales order, a department or a vendor/.test(said(await refusal(D.giveOut(db, c, { lines: [{ itemId: item.id, quantity: 1 }] })))));
+  ok('given for nothing', /sales order, a department or a contractor/.test(said(await refusal(D.giveOut(db, c, { lines: [{ itemId: item.id, quantity: 1 }] })))));
   ok('a department that is not there', /Choose the department/.test(said(await refusal(D.giveOut(db, c, { givenFor: { type: 'department', departmentId: 999999999 }, lines: [{ itemId: item.id, quantity: 1 }] })))));
   ok('more than the shelf holds is refused by the stock itself', !!(await refusal(D.giveOut(db, c, { givenFor: { type: 'department', departmentId: dept.id }, lines: [{ itemId: item.id, quantity: 1000 }] }))));
   await db.query('INSERT INTO cf_company_settings (company_id, stores_v2) VALUES (?, 1) ON DUPLICATE KEY UPDATE stores_v2 = 1', [COMPANY]);
