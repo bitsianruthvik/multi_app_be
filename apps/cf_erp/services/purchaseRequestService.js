@@ -189,6 +189,33 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
  * the MRs under Stores' own "Raise PR" / "New PR" are left out (internal=all lists them too, internal=only alone).
  * Fixed reads (one requisition read for all of them).
  */
+/**
+ * GET /orders/:id/item-totals — for someone raising another MR on a sales order (user, 2026-11-22): what this order has
+ * already asked for, has on purchase orders, has received and has been given, an item. 3 reads.
+ * → { rows: [{ itemId, requested, ordered, received, given }] }
+ */
+export async function orderItemTotals(db, companyId, orderId) {
+  const [[asked], [bought], [given]] = await Promise.all([
+    db.query(
+      `SELECT rl.item_id, SUM(rl.quantity) AS q FROM cf_requisition_lines rl JOIN cf_requisitions r ON r.id = rl.requisition_id
+        WHERE rl.company_id = ? AND r.order_id = ? AND r.deleted_at IS NULL AND rl.deleted_at IS NULL AND rl.skipped = 0 GROUP BY rl.item_id`, [companyId, Number(orderId)]),
+    db.query(
+      `SELECT pl.item_id, SUM(po.quantity) AS q, SUM(po.qty_received) AS got FROM cf_purchase_line_orders po
+         JOIN cf_purchase_order_lines pl ON pl.id = po.purchase_line_id AND pl.deleted_at IS NULL
+         JOIN cf_purchase_orders p ON p.id = pl.purchase_order_id AND p.deleted_at IS NULL AND p.status <> 'cancelled'
+        WHERE po.company_id = ? AND po.order_id = ? AND po.deleted_at IS NULL GROUP BY pl.item_id`, [companyId, Number(orderId)]).catch((e) => { if (e.errno === 1054 || e.errno === 1146) return [[]]; throw e; }),
+    db.query(
+      `SELECT l.item_id, -SUM(l.quantity) AS q FROM cf_stock_ledger l JOIN cf_stock_movements m ON m.id = l.movement_id
+        WHERE l.company_id = ? AND m.order_id = ? AND m.movement_type = 'issue' AND m.deleted_at IS NULL AND l.deleted_at IS NULL GROUP BY l.item_id`, [companyId, Number(orderId)]),
+  ]);
+  const by = new Map();
+  const at = (id) => { if (!by.has(id)) by.set(id, { itemId: id, requested: 0, ordered: 0, received: 0, given: 0 }); return by.get(id); };
+  for (const r of asked) at(r.item_id).requested = round6(r.q);
+  for (const r of bought) { at(r.item_id).ordered = round6(r.q); at(r.item_id).received = round6(r.got); }
+  for (const r of given) at(r.item_id).given = Math.max(0, round6(r.q));
+  return { rows: [...by.values()] };
+}
+
 export async function listMrs(db, companyId, q = {}) {
   const onlyOpen = !(q.open === false || q.open === 'false' || q.open === '0');
   const internal = q.internal === 'all' ? null : (q.internal === 'only' || q.internal === true || q.internal === 'true' || q.internal === '1');

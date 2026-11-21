@@ -29,7 +29,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
-  listMrs, mrScreen, saveMr, issueMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
+  listMrs, orderItemTotals, mrScreen, saveMr, issueMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
 } from '../services/purchaseRequestService.js';
 import { askApprovalAgain, listMachineModels, requestMachine } from '../services/machineRequestService.js';
 
@@ -45,6 +45,7 @@ const manage = guard(PERM.purchase);
 const body = (req) => req.body ?? {};
 const company = (req) => ctx(req).companyId;
 
+router.get('/orders/:id/item-totals', view, handle((req) => orderItemTotals(pool, company(req), id(req))));
 router.get('/material-requests', view, handle((req) => listMrs(pool, company(req), req.query)));
 router.get('/material-requests/:id', view, handle((req) => mrScreen(pool, company(req), id(req))));
 router.put('/material-requests/:id', mrManage, handle((req) => tx(req, (db, c) => saveMr(db, c, id(req), body(req)))));
