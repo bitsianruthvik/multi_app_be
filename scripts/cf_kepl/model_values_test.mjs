@@ -111,6 +111,16 @@ const bbox = (pts) => { const xs = pts.map((p) => p[0]); const ys = pts.map((p) 
   ok('a weld size from bom.json by the member it names ("stringer web to flanges" → Stringer)', weldSizeFor([{ where: 'stringer web to flanges', sizeMm: 12 }, { where: 'box members, webs to flanges', sizeMm: 6 }], 'Stringer STG')?.mm === 12
     && weldSizeFor([{ where: 'box members, webs to flanges', sizeMm: 6 }], 'Bottom chord BC1') === null);
   ok('segments that share a width are joined end to end; an angle\'s legs share the length', pieceShape([m.parts.P, m.parts.P]).lengthMm === 1000 && pieceShape([{ pts: [[0, 0], [450, 0], [450, 100], [0, 100]], t: 10 }, { pts: [[0, 0], [450, 0], [450, 90], [0, 90]], t: 10 }]).kind === 'section');
+  // A plate broken at camber stations and cut to a plan bend (Khajaguda XBP1-P2, 2026-11-22): 4 stretches of one length,
+  // widths 2006 to 2020, laid end to end on a fold of a fraction of a degree: one plate 4 × 1521.6, not an angle's legs.
+  {
+    const st = (w) => ({ pts: [[0, 0], [1521.6, 0], [1521.6, w], [0, w]], t: 12 }); const a0 = 0.3 * Math.PI / 180;
+    const el = (i) => ({ o: [i * 1521.6, 0, i * 1521.6 * Math.sin(a0)], u: [Math.cos(a0), 0, Math.sin(a0)], v: [0, 1, 0], w: [-Math.sin(a0), 0, Math.cos(a0)] });
+    const x = pieceShape([st(2006), st(2006), st(2006), st(2020)], [0, 1, 2, 3].map(el));
+    ok('stretches end to end of one length, widths differing: a plate 6086.4 × 2020, not an angle (how: stretches)', x.kind === 'plate' && x.how === 'stretches' && near(x.lengthMm, 6086.4, 0.01) && x.widthMm === 2020, JSON.stringify(x));
+    const legs = pieceShape([st(100), st(90)], [{ o: [0, 0, 0], u: [1, 0, 0], v: [0, 1, 0], w: [0, 0, 1] }, { o: [0, 0, 0], u: [1, 0, 0], v: [0, 0, 1], w: [0, -1, 0] }]);
+    ok('…an angle\'s two legs with their elements stay a section', legs.kind === 'section', JSON.stringify(legs));
+  }
   const v = valuesForRow({ shape: marksOfModel(m).get('P').shape, file: null, drill: d.get('P') }, new Set(['LENGTH', 'WIDTH', 'THICKNESS', 'HOLES', 'HOLE_DRILL_THICKNESS', 'TRUE_AREA', 'SURFACE_AREA']));
   ok('a row\'s values: 500 × 300 × 20, 1 hole, drilled through 32, area 150000 − π·11²', v.values.get('LENGTH').value === 500 && v.values.get('WIDTH').value === 300 && v.values.get('THICKNESS').value === 20 && v.values.get('HOLES').value === 1
     && v.values.get('HOLE_DRILL_THICKNESS').value === 32 && near(v.values.get('TRUE_AREA').value, 150000 - Math.PI * 121, 0.01));

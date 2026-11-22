@@ -84,8 +84,11 @@ const near = (a, b, tol = 1) => Math.abs(a - b) <= tol;
  * The shape of one piece from its parts (one per segment, in segment order). → { kind, lengthMm, widthMm, t, areaMm2,
  * cutLengthMm, holes, holeDiameters, how } — `how` says which rule joined the segments ('one' | 'end to end' | 'folded' |
  * 'bent'); null fields are what the model cannot say for this piece.
+ * `els` (optional, the segments' elements in the same order) tell stretches laid end to end from an angle's folded legs when
+ * the stretches are of one length: a plate broken at the camber stations and cut to a plan bend has stretches of equal length
+ * and slightly different widths (Khajaguda XBP1-P2: 4 × 1521.6, 2006 to 2020), which the length rule alone took for legs.
  */
-export function pieceShape(parts) {
+export function pieceShape(parts, els = null) {
   const fs = parts.map(partFacts);
   if (!fs.length) return null;
   const ts = [...new Set(fs.map((f) => f.t))];
@@ -107,6 +110,29 @@ export function pieceShape(parts) {
   if (fs.every((f) => near(f.dy, fs[0].dy))) {          // joined end to end along x (a flange split at a kink)
     const [L, W] = sorted(fs.reduce((s, f) => s + f.dx, 0), fs[0].dy);
     return { kind: 'plate', lengthMm: r3(L), widthMm: r3(W), cutLengthMm: per - 2 * k * fs[0].dy, ...base, how: 'end to end' };
+  }
+  // Stretches end to end whose widths differ (cut to a plan bend): each next stretch's centre lies about a stretch further
+  // along (an angle's legs share one span: their centres lie within a leg's width of each other).
+  if (els?.length === fs.length && fs.every((f) => f.dy > 4 * (f.t ?? 0))) {
+    const ctr = els.map((e, i) => { const b = bbox(parts[i].pts); const cx = b.minX + b.dx / 2, cy = b.minY + b.dy / 2; return e.o && e.u && e.v ? [0, 1, 2].map((q) => e.o[q] + e.u[q] * cx + e.v[q] * cy) : null; });
+    const endToEnd = ctr.every(Boolean) && ctr.slice(1).every((c, i) => Math.hypot(c[0] - ctr[i][0], c[1] - ctr[i][1], c[2] - ctr[i][2]) >= 0.8 * (fs[i].dx + fs[i + 1].dx) / 2);
+    // folds of a few degrees at most (camber stations turn well under 1°): a real knuckle (RDSO U1-P2) is a bent plate
+    const shallow = els.slice(1).every((e, i) => { const p = els[i]; return p.w && e.w && Math.abs(p.w[0] * e.w[0] + p.w[1] * e.w[1] + p.w[2] * e.w[2]) >= Math.cos((5 * Math.PI) / 180); });
+    if (endToEnd && shallow) {
+      // folded at camber stations: the flat length is the stretches' lengths added; accepted only where the stretches line up
+      // across the plate (each one's edges, placed by its origin in the one before's frame, within 5 mm of the widest): a web
+      // cut to the camber steps across from stretch to stretch, so its flat blank is left to its part file, as before
+      let off = 0; let lo = Infinity, hi = -Infinity;
+      els.forEach((e, i) => {
+        if (i > 0) { const p = els[i - 1]; const d = [0, 1, 2].map((q) => e.o[q] - p.o[q]); off += d[0] * p.v[0] + d[1] * p.v[1] + d[2] * p.v[2]; }
+        const b = bbox(parts[i].pts); lo = Math.min(lo, off + b.minY); hi = Math.max(hi, off + b.minY + b.dy);
+      });
+      const W = Math.max(...fs.map((f) => f.dy));
+      if (hi - lo <= W + 5) {
+        const L = fs.reduce((s2, f) => s2 + f.dx, 0); const joints = fs.slice(1).reduce((s2, f, i) => s2 + 2 * Math.min(f.dy, fs[i].dy), 0);
+        return { kind: 'plate', lengthMm: r3(Math.max(L, W)), widthMm: r3(Math.min(L, W)), cutLengthMm: per - joints, ...base, how: 'stretches' };
+      }
+    }
   }
   if (fs.every((f) => near(f.dx, fs[0].dx))) {          // folded along x: an angle's legs — a section, its length only
     return { kind: 'section', lengthMm: r3(fs[0].dx), widthMm: null, cutLengthMm: null, ...base, areaMm2: null, how: 'folded' };
@@ -162,7 +188,7 @@ export function marksOfModel(model) {
       continue;
     }
     const parts = segs.map((e) => model.parts?.[e.part]).filter(Boolean);
-    x.shape = parts.length === segs.length ? pieceShape(parts) : null;
+    x.shape = parts.length === segs.length ? pieceShape(parts, segs) : null;
     // Variants of one mark (mirrored hole patterns, #2) with another outline or thickness: said, the first one used.
     if (x.variants.size > 1) {
       const shapes = pieces.filter((p) => normMark(p.mark) === normMark(x.mark))
