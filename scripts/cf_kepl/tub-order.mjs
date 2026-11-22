@@ -5,7 +5,8 @@
  * production order, and the cut pieces. DRY RUN BY DEFAULT (rolled back); --apply commits.
  *
  *   cd multi_app_be
- *   node scripts/cf_kepl/tub-order.mjs --company 30005 --prod [--order SO260019] [--apply]     --order: new lines on that order
+ *   node scripts/cf_kepl/tub-order.mjs --company 30005 --prod [--order SO260019] [--sets KHAJ_P7P10_v2,KHAJ_P17P20_v2] [--no-levels] [--apply]
+ *        --order: new lines on that order; --sets: which packages (default KHAJ_3X30, KHAJ_2X30)
  * Uses the app's own services, as the screens do. Import the standards first (standard-import.mjs).
  */
 import fs from 'fs';
@@ -35,10 +36,15 @@ const { uploadDrawings, rowsOfLine } = await imp('apps/cf_erp/services/partDrawi
 const { saveExecutionPlan } = await imp('apps/cf_erp/services/executionPlanService.js');
 
 const OUT = path.join(BE, '..', 'drawing_bom', 'out');
-const SETS = [
+const ALL = [
   { dir: 'KHAJ_3X30', description: 'P10–P13: 3 × 30 m continuous steel tub girder superstructure, two girders' },
   { dir: 'KHAJ_2X30', description: 'P15–P17: 2 × 30 m continuous steel tub girder superstructure, two girders' },
+  // 2026-11-22: two more 3 × 30 m units, built by method2 (drawing_bom src/method2/khaj, sibling sets of KHAJ_3X30)
+  { dir: 'KHAJ_P7P10_v2', description: 'P7–P10: 3 × 30 m continuous steel tub girder superstructure, two girders' },
+  { dir: 'KHAJ_P17P20_v2', description: 'P17–P20: 3 × 30 m continuous steel tub girder superstructure, two girders' },
 ];
+// --sets <dir,dir>: only these packages (new lines on --order); default the first two
+const SETS = arg('sets') ? arg('sets').split(',').map((d) => { const x = ALL.find((q) => q.dir === d); if (!x) throw new Error(`--sets: no package ${d}`); return x; }) : ALL.slice(0, 2);
 // The mill's rules for custom plates (user, 2026-11-02); standard sizes carry no such rule.
 const CUSTOM = { on: true, maxLength: 14000, maxWidth: 3000, minLength: 6000, minWidth: 1250, minLotPieces: 5, minLotTonnes: 20 };
 
@@ -69,7 +75,8 @@ try {
   // from it — a lost connection on TiDB redoes one step, never the whole job.
   const step = async (what) => { if (APPLY) { await db.commit(); console.log(`  committed: ${what}`); await db.beginTransaction(); } };
   const [[had0]] = await db.query('SELECT nest_custom_plates AS v FROM cf_company_settings WHERE company_id = ?', [COMPANY]);
-  const same = had0?.v && JSON.stringify(typeof had0.v === 'string' ? JSON.parse(had0.v) : had0.v) === JSON.stringify(CUSTOM);
+  const canon = (o) => JSON.stringify(Object.fromEntries(Object.entries(o ?? {}).sort(([x], [y]) => x.localeCompare(y)))); // key order differs as stored
+  const same = had0?.v && canon(typeof had0.v === 'string' ? JSON.parse(had0.v) : had0.v) === canon(CUSTOM);
   if (!same) {
     await db.query(
       `INSERT INTO cf_company_settings (company_id, nest_custom_plates, updated_by) VALUES (?, ?, ?)
