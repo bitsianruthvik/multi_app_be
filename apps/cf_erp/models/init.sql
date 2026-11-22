@@ -9228,7 +9228,11 @@ CREATE TABLE IF NOT EXISTS cf_brands (
 );
 
 SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND COLUMN_NAME = 'brand_id');
-SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_batches ADD COLUMN brand_id INT NULL, ADD KEY idx_csb_brand (company_id, brand_id)', 'SELECT 1');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_batches ADD COLUMN brand_id INT NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+-- (TiDB: the index in a statement of its own)
+SET @idx = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND INDEX_NAME = 'idx_csb_brand');
+SET @sql = IF(@idx = 0, 'ALTER TABLE cf_stock_batches ADD KEY idx_csb_brand (company_id, brand_id)', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND CONSTRAINT_NAME = 'fk_csb_brand');
 SET @sql = IF(@fk = 0, 'ALTER TABLE cf_stock_batches ADD CONSTRAINT fk_csb_brand FOREIGN KEY (company_id, brand_id) REFERENCES cf_brands(company_id, id)', 'SELECT 1');
