@@ -37,6 +37,8 @@ export const SETTINGS = [
   { key: 'stock_closed_through', col: 'stock_closed_through', group: 'stores_book', label: 'The stock book is closed up to and including', type: 'date', def: null, help: 'Nothing can be dated on or before it. Empty = nothing is closed.' },
   I('count_daily_max_lines', 'stores_book', "Today's audit lists at most", 40, 5, 500, 'items', 'The busiest items first.'),
   I('count_weekly_lookback_days', 'stores_book', 'A weekly audit includes items that moved in the last', 90, 7, 730, 'days', 'Besides everything of the group that has stock.'),
+  // 2026-11-23 (user): a temporary screen to get the real stock in, lot by lot, "active for next one week".
+  { key: 'stock_entry_until', group: 'stores_book', label: 'The stock entry screen is open up to and including', type: 'date', def: null, help: 'Stores › Stock entry: every item, its quantity typed and split into lots / brands / vendors, saved without an approval. Empty or past = closed (use Audit).' },
 
   // --- stores: the day
   { key: 'store_open_time', col: 'store_open_time', group: 'stores_day', label: 'The store opens at', type: 'time', def: '08:00', help: 'An entry made outside these hours is listed on Today until someone checks it.' },
@@ -48,7 +50,10 @@ export const SETTINGS = [
   { key: 'giveout_departments', group: 'stores_day', label: 'Give out may be charged to a department', type: 'bool', def: false, help: 'Off: a give-out is for a sales order or goes to a contractor (user, 2026-11-22).' },
   { key: 'giveout_person', group: 'stores_day', label: 'Give out records who collected it', type: 'bool', def: false, help: 'Off: nobody is named; a tool given for a sales order is out with that order.' },
   { key: 'grn_brand_required', group: 'stores_day', label: 'A GRN line must name the brand', type: 'bool', def: true, help: 'On: every new lot received from a supplier is given a brand from the brand list (or Unbranded); its vendor is the supplier on the GRN (user, 2026-11-22). Off: the brand may be left empty.' },
-  I('po_follow_days', 'stores_day', 'Today lists a purchase order due within', 3, 0, 60, 'days', 'Late ones are always listed.'),
+  I('po_follow_days', 'stores_day', 'The dashboard lists a purchase order due within', 3, 0, 60, 'days', 'Late ones are always listed.'),
+  I('dash_pr_stale_days', 'stores_day', 'A purchase request with something still to order is followed up after', 3, 1, 60, 'days', 'From when it was raised. On the Stores dashboard.'),
+  I('dash_mr_stale_days', 'stores_day', 'A material request with something still to give out or buy is followed up after', 2, 1, 60, 'days', 'From when it was raised. On the Stores dashboard.'),
+  I('dash_audit_warn_days', 'stores_day', "The month's audit is a warning when this many days are left and it is not done", 7, 1, 28, 'days', 'On the Stores dashboard.'),
 
   // --- levels from use
   I('level_min_weeks', 'levels', 'History an item needs before a level is suggested', 8, 2, 104, 'weeks'),

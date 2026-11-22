@@ -141,6 +141,10 @@ export async function ledger(db, companyId, q = {}) {
   const params = [companyId];
   const like = likeOf(q.search);
   if (like) { where.push('(m.name LIKE ? OR m.code LIKE ?)'); params.push(like, like); }
+  // one item (the item page's "Stock" link) / everything but some (the stock entry screen's "not entered yet")
+  if (!blank(q.itemId)) { where.push('m.id = ?'); params.push(Number(q.itemId)); }
+  const notIds = String(q.excludeIds ?? '').split(',').map(Number).filter((x) => Number.isInteger(x) && x > 0);
+  if (notIds.length) { where.push('m.id NOT IN (?)'); params.push(notIds); }
   if (!blank(q.familyId)) { where.push('f.id = ?'); params.push(Number(q.familyId)); }
   if (!blank(q.subfamilyId)) { where.push('s.id = ?'); params.push(Number(q.subfamilyId)); }
   // several families / sub-families / variants (the picker narrows top-down): the most specific level picked under a
@@ -272,9 +276,11 @@ export async function itemLedger(db, companyId, itemId, q = {}) {
         WHERE k.company_id = ? AND k.item_id = ? GROUP BY a.id, a.code, a.name, a.purpose HAVING ABS(SUM(k.quantity)) > 0.0000001 ORDER BY a.name`, [companyId, id]),
     db.query(
       `SELECT b.id, b.code, b.status, b.supplier_ref, b.received_on, b.unit_cost, a.id AS area_id, a.name AS area_name, k.quantity,
-              b.brand_id, br.name AS brand_name, br.is_unbranded, b.supplier_id, sp.name AS supplier_name
+              b.brand_id, br.name AS brand_name, br.is_unbranded, b.supplier_id, sp.name AS supplier_name, b.owner_party_id, op.name AS owner_name,
+              (SELECT SUM(r.quantity) FROM cf_stock_reservations r
+                WHERE r.company_id = k.company_id AND r.batch_id = b.id AND r.status = 'active' AND r.deleted_at IS NULL) AS held_q
          FROM cf_stock_balances k JOIN cf_stock_batches b ON b.id = k.batch_id JOIN cf_stocking_areas a ON a.id = k.stocking_area_id
-         LEFT JOIN cf_brands br ON br.id = b.brand_id LEFT JOIN cf_parties sp ON sp.id = b.supplier_id
+         LEFT JOIN cf_brands br ON br.id = b.brand_id LEFT JOIN cf_parties sp ON sp.id = b.supplier_id LEFT JOIN cf_parties op ON op.id = b.owner_party_id
         WHERE k.company_id = ? AND k.item_id = ? AND k.quantity > 0 AND a.purpose IN (?) ORDER BY b.id LIMIT 200`, [companyId, id, STORE_PURPOSES]),
     db.query(
       `SELECT l.id, l.quantity, l.batch_id, bt.code AS batch_code, a.name AS area_name, a.purpose,
@@ -311,6 +317,8 @@ export async function itemLedger(db, companyId, itemId, q = {}) {
       receivedOn: dateText(b.received_on), unitCost: b.unit_cost == null ? null : Number(b.unit_cost),
       brand: b.brand_id ? { id: b.brand_id, name: b.brand_name, unbranded: Number(b.is_unbranded) === 1 } : null,
       vendor: b.supplier_id ? { id: b.supplier_id, name: b.supplier_name } : null,
+      // 2026-11-23: whose it is (a customer's material) and how much of it is held for a request or an order
+      owner: b.owner_party_id ? { id: b.owner_party_id, name: b.owner_name } : null, held: round6(b.held_q ?? 0),
     })),
     events: events.map((e) => ({
       id: e.id, movementId: e.movement_id, code: e.code, type: e.movement_type, date: dateText(e.movement_date), change: round6(e.quantity),

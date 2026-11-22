@@ -32,6 +32,8 @@ import {
   deskSettings, listDepartments, addDepartment, listPeople, addPerson, ledger, itemLedger, giveOut, takeBack, outWith, custodyBack,
   countList, postCount, listCounts, getCount,
 } from '../services/storesDeskService.js';
+import { dashboard } from '../services/storesDashboardService.js';
+import { entryList, saveEntry, entryWindow } from '../services/stockEntryService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -41,9 +43,16 @@ const view = guardAny(PERM.inventoryView, PERM.inventory, PERM.stores, PERM.purc
 const manage = guardAny(PERM.inventory, PERM.stores);
 
 router.get('/stores-desk/settings', view, handle(async (req) => {
-  const [d, S] = await Promise.all([deskSettings(pool, company(req)), getSettings(pool, company(req))]);
-  return { ...d, giveOutDepartments: S.giveout_departments === true, giveOutPerson: S.giveout_person === true, giveOutLoose: S.giveout_loose === true, brandRequired: S.grn_brand_required !== false };
+  const [d, S, W] = await Promise.all([deskSettings(pool, company(req)), getSettings(pool, company(req)), entryWindow(pool, company(req))]);
+  return { ...d, giveOutDepartments: S.giveout_departments === true, giveOutPerson: S.giveout_person === true, giveOutLoose: S.giveout_loose === true, brandRequired: S.grn_brand_required !== false,
+    // 2026-11-23: the stock entry week (the menu shows Stock entry while it is open)
+    stockEntryUntil: W.until, stockEntryOpen: W.open };
 }));
+// 2026-11-23 (user): the Stores dashboard — alerts, notifications and what to do (PRs, things out, the month's audit).
+router.get('/stores-desk/dashboard', view, handle((req) => dashboard(pool, company(req))));
+// 2026-11-23 (user): the stock entry week — every item typed as it is on the shelf, split by lot / brand / vendor.
+router.get('/stores-desk/stock-entry', manage, handle((req) => entryList(pool, company(req), req.query)));
+router.post('/stores-desk/stock-entry', manage, handle((req) => tx(req, (db, c) => saveEntry(db, c, req.body ?? {}))));
 router.get('/stores-desk/departments', view, handle((req) => listDepartments(pool, company(req))));
 router.post('/stores-desk/departments', manage, handle((req) => tx(req, (db, c) => addDepartment(db, c, req.body ?? {}))));
 router.get('/stores-desk/people', view, handle((req) => listPeople(pool, company(req), req.query)));
