@@ -10,7 +10,7 @@
  *                     Freight ₹ · Freight GST % · Other charges ₹ · Other charges GST %  (a blank GST % = no GST on it)
  *   lines table     under a row whose A cell is "Item code"; columns found by their header text:
  *                     Item code · Item name · UoM · Pending (grey) · Receive qty (white, = pending) · Unit price (the PO's) ·
- *                     HSN / SAC · GST % · Heat / supplier lot no. · Add to batch (an existing batch code; batch items only)
+ *                     HSN / SAC · GST % · Brand (§117, from the brand list; batch items) · Heat / supplier lot no. (optional) · Add to batch (an existing batch code; batch items only)
  *
  * UPLOAD (POST /purchase-orders/:id/grn-sheet { fileBase64, dryRun }) — matched by BUSINESS KEYS, no hidden ids:
  *   a row       -> the PO's pending line(s) of that ITEM CODE; one item on two lines is filled in line order (and said so)
@@ -28,6 +28,8 @@ import { CfError, invalid } from '../lib/errors.js';
 import { getPurchaseOrder } from './purchaseService.js';
 import { grnContext, receiveGrn } from './grnService.js';
 import { RECEIVING_PURPOSES } from './stockingAreaService.js';
+import { addBrand, brandKey } from './brandService.js';
+import { getSettings } from './settingsService.js';
 
 export const SHEET_NAME = 'GRN';
 export const BANNER = 'Grey cells are from the purchase order — fill the white ones. A row is matched to the PO by its item code; a Receive qty of 0 or blank leaves the row out.';
@@ -47,11 +49,11 @@ export const HEAD = {
 };
 export const COL = {
   code: 'Item code', name: 'Item name', uom: 'UoM', pending: 'Pending', qty: 'Receive qty', price: 'Unit price ₹',
-  hsn: 'HSN / SAC', gst: 'GST %', lot: 'Heat / supplier lot no.', batch: 'Add to batch (batch code)',
+  hsn: 'HSN / SAC', gst: 'GST %', brand: 'Brand (from the brand list, or Unbranded)', lot: 'Heat / supplier lot no.', batch: 'Add to batch (batch code)',
 };
-const COL_ORDER = ['code', 'name', 'uom', 'pending', 'qty', 'price', 'hsn', 'gst', 'lot', 'batch'];
-const COL_WIDTH = { code: 26, name: 36, uom: 8, pending: 11, qty: 12, price: 13, hsn: 12, gst: 8, lot: 24, batch: 24 };
-const WHITE_COLS = new Set(['qty', 'price', 'hsn', 'gst', 'lot', 'batch']);
+const COL_ORDER = ['code', 'name', 'uom', 'pending', 'qty', 'price', 'hsn', 'gst', 'brand', 'lot', 'batch'];
+const COL_WIDTH = { code: 26, name: 36, uom: 8, pending: 11, qty: 12, price: 13, hsn: 12, gst: 8, brand: 22, lot: 24, batch: 24 };
+const WHITE_COLS = new Set(['qty', 'price', 'hsn', 'gst', 'brand', 'lot', 'batch']);
 
 const GREY = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
 const GREY_HEAD = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
@@ -113,6 +115,13 @@ export async function exportGrnSheet(db, companyId, poId) {
   if (!pending.length) throw invalid('NOTHING_PENDING', `Nothing is pending on ${po.code} — there is nothing to receive.`);
   const [ctx, store] = await Promise.all([grnContext(db, companyId, po.id), usualStore(db, companyId)]);
   const tax = new Map(ctx.lines.map((l) => [Number(l.lineId), l]));
+  // §117: each item's brand of its last lot, filled in for the storekeeper to keep or change
+  const itemIds = [...new Set(pending.map((l) => Number(l.item.id)))];
+  const [last] = itemIds.length ? await db.query(
+    `SELECT b.item_id, br.name FROM cf_stock_batches b JOIN cf_brands br ON br.id = b.brand_id
+      WHERE b.company_id = ? AND b.item_id IN (?) AND b.deleted_at IS NULL AND b.id = (SELECT MAX(b2.id) FROM cf_stock_batches b2 WHERE b2.company_id = b.company_id AND b2.item_id = b.item_id AND b2.brand_id IS NOT NULL AND b2.deleted_at IS NULL)`,
+    [companyId, itemIds]).catch((e) => { if (e.errno === 1054 || e.errno === 1146) return [[]]; throw e; }) : [[]];
+  const lastBrand = new Map(last.map((x) => [Number(x.item_id), x.name]));
 
   const wb = new ExcelJS.Workbook();
   wb.creator = 'CF ERP';
@@ -149,14 +158,14 @@ export async function exportGrnSheet(db, companyId, poId) {
     const byBatch = l.item.trackedBy === 'batch';
     const values = {
       code: l.item.code ?? '', name: l.item.name ?? '', uom: l.item.uom ?? '', pending: round6(l.pending), qty: round6(l.pending),
-      price: l.unitPrice ?? (t.unitPrice ?? ''), hsn: t.hsnCode ?? '', gst: t.gstRate ?? '', lot: '', batch: '',
+      price: l.unitPrice ?? (t.unitPrice ?? ''), hsn: t.hsnCode ?? '', gst: t.gstRate ?? '', brand: lastBrand.get(Number(l.item.id)) ?? '', lot: '', batch: '',
     };
     COL_ORDER.forEach((k, i) => {
       const cell = ws.getCell(r, i + 1);
       cell.value = values[k] === '' ? null : values[k];
       cell.border = BOX;
       // "Add to batch" is only for an item kept by batch; for anything else it stays grey.
-      const white = WHITE_COLS.has(k) && (k !== 'batch' || byBatch) && (k !== 'lot' || byBatch);
+      const white = WHITE_COLS.has(k) && (k !== 'batch' || byBatch) && (k !== 'lot' || byBatch) && (k !== 'brand' || byBatch);
       if (!white) cell.fill = GREY;
       if (k === 'hsn' || k === 'code' || k === 'lot' || k === 'batch') cell.numFmt = '@';
     });
@@ -207,7 +216,7 @@ async function readSheet(buffer, problems) {
     const code = get('code');
     const qty = get('qty');
     if (blank(code) && blank(qty)) continue;
-    rows.push({ excelRow: i, code, qty: numText(qty), price: numText(get('price')), hsn: get('hsn'), gst: numText(get('gst')), lot: get('lot'), batch: get('batch'), name: get('name') });
+    rows.push({ excelRow: i, code, qty: numText(qty), price: numText(get('price')), hsn: get('hsn'), gst: numText(get('gst')), brand: get('brand'), lot: get('lot'), batch: get('batch'), name: get('name') });
   }
   if (rows.length > MAX_ROWS) problems.push(`At most ${MAX_ROWS} rows in one sheet.`);
   return { head, rows };
@@ -296,6 +305,10 @@ export async function importGrnSheet(db, c, poId, input = {}) {
     ? await db.query('SELECT id, code, item_id, status FROM cf_stock_batches WHERE company_id = ? AND LOWER(code) IN (?) AND deleted_at IS NULL', [c.companyId, batchCodes])
     : [[]];
 
+  // §117: the brand list, read once; whether a new lot must name its brand
+  const [brandRows] = await db.query('SELECT id, name, is_unbranded FROM cf_brands WHERE company_id = ? AND deleted_at IS NULL', [c.companyId])
+    .catch((e) => { if (e.errno === 1146) return [[]]; throw e; });
+  const brandRequired = (await getSettings(db, c.companyId)).grn_brand_required !== false;
   const lines = [];
   const changes = [];
   for (const [k, g] of groups) {
@@ -303,7 +316,7 @@ export async function importGrnSheet(db, c, poId, input = {}) {
     const first = g.rows[0];
     const label = poLines[0].item.code ?? poLines[0].item.name;
     // Several rows of one item must agree on what describes the delivery.
-    for (const f of ['price', 'hsn', 'gst', 'lot', 'batch']) {
+    for (const f of ['price', 'hsn', 'gst', 'brand', 'lot', 'batch']) {
       const vals = new Set(g.rows.map((r) => norm(r[f])));
       if (vals.size > 1) problems.push(`${label}: its rows (${g.rows.map((r) => r.excelRow).join(', ')}) give different ${COL[f]} values — one delivery of an item has one.`);
     }
@@ -322,8 +335,18 @@ export async function importGrnSheet(db, c, poId, input = {}) {
         else if (Number(b.item_id) !== Number(poLines[0].item.id)) problems.push(`${label}: batch ${b.code} is of another item.`);
         else if (b.status === 'rejected') problems.push(`${label}: batch ${b.code} is rejected — give a heat / lot number for a new batch instead.`);
         else batchId = Number(b.id);
-      } else if (blank(first.lot)) problems.push(`${label} is kept by batch — give the ${COL.lot} (a new batch), or an existing batch code under "${COL.batch}".`);
-      else batch = { supplierRef: first.lot.trim(), values: [] };
+      } else {
+        // a new lot: its heat / supplier lot number when there is one (a paint tin has none: §117, stores items kept by lot)
+        batch = { ...(blank(first.lot) ? {} : { supplierRef: first.lot.trim() }), values: [] };
+        // §117: its brand, by name from the brand list ("Unbranded" is on it). A name not on the list is added when the GRN is
+        // booked (a preview writes nothing: it is only checked), unless it looks like one already there.
+        if (!blank(first.brand)) {
+          const known = brandRows.find((b) => brandKey(b.name) === brandKey(first.brand) || (Number(b.is_unbranded) === 1 && /^(UN|NON|NO)BRAND(ED)?$/.test(brandKey(first.brand))));
+          if (known) batch.brandId = known.id;
+          else if (dryRun) { batch.brandPending = true; notes.push(`${label}: "${first.brand.trim()}" is not on the brand list yet — it is added when the GRN is booked.`); }
+          else { try { batch.brandId = (await addBrand(db, c, { name: first.brand })).brand.id; } catch (e) { problems.push(`${label}: ${e.message}`); } }
+        } else if (brandRequired) problems.push(`${label} — pick its brand (the ${COL.brand} column; Unbranded is on the list).`);
+      }
     } else if (!blank(first.lot) || !blank(first.batch)) {
       notes.push(`${label} is counted by quantity, not by batch — its lot / batch cell is ignored.`);
     }
@@ -344,7 +367,7 @@ export async function importGrnSheet(db, c, poId, input = {}) {
         action: 'receive', lineId: l.id, lineNo: l.lineNo, itemCode: l.item.code, itemName: l.item.name, uom: l.item.uom,
         quantity: take, pending: l.pending, rows: g.rows.map((r) => r.excelRow),
         unitPrice: blank(first.price) ? l.unitPrice : Number(first.price),
-        batch: batchId ? first.batch.trim() : batch ? `new · ${batch.supplierRef}` : null,
+        batch: batchId ? first.batch.trim() : batch ? `new${batch.supplierRef ? ` · ${batch.supplierRef}` : ''}${blank(first.brand) ? '' : ` · ${first.brand.trim()}`}` : null,
         detail: `${fmt(take)} of ${fmt(l.pending)} ${l.item.uom ?? ''} pending`.trim(),
       });
     }

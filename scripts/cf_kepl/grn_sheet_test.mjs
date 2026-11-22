@@ -8,12 +8,12 @@
  *
  *   1  download: header block (PO no., supplier, store, invoice …), one row per pending line, qty = pending, price = PO's
  *   2  dry run: ok, the plan, and NOTHING written (bills, movements, ledger, qty received, batches)
- *   3  round trip: ONE GRN through receiveGrn, a new batch from the heat / lot no., the PO closes
+ *   3  round trip: ONE GRN through receiveGrn, a new batch from the heat / lot no. and its brand (§117), the PO closes
  *   4  a prepared file on a SECOND PO with the same items: matched by item code, "file made for … applying to …" note,
  *      partial on the bigger line; "Add to batch" by an existing batch code
  *   5  partial receipt: 0 / blank rows left out; the next download shows what is still pending
  *   6  refusals, every one at once: over pending, unknown item, a dispatch store, unknown store, no invoice, batch item
- *      without a lot, an unknown batch code, a PO not yet ordered (found by the booking inside the savepoint)
+ *      without a brand (§117), an unknown batch code, a PO not yet ordered (found by the booking inside the savepoint)
  */
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -169,16 +169,17 @@ try {
   ok('pending (grey) and receive qty (white, = pending)', rA.pending === 10 && rA.qty === 10 && rA.pendingGrey && rA.qtyWhite, JSON.stringify(rA));
   ok('unit price from the PO, HSN / GST from the item', rA.price === 100 && rA.hsn === '7208' && rA.gst === 18 && rA.uom === 'nos' && rA.name === `${RUN} A`);
   ok('a lot and an "add to batch" column', !!s1.cols.lot && !!s1.cols.batch);
+  ok('§117: a Brand column', !!s1.cols.brand);
 
   /* ───────────── 2. dry run ───────────── */
   section('2. Dry run writes nothing');
-  const f1 = await fill(x1.buffer, { head: goodHead(1), rows: { [CODE.BT]: { lot: `HEAT-${RUN}` } } });
+  const f1 = await fill(x1.buffer, { head: goodHead(1), rows: { [CODE.BT]: { lot: `HEAT-${RUN}`, brand: 'Unbranded' } } });
   const c0 = await counts();
   const census0 = await census(db);
   const d1 = await imp1(P1.id, f1, true);
   ok('the preview is ok, no problems', d1.ok === true && d1.problems.length === 0 && d1.dryRun === true && d1.applied === false, JSON.stringify(d1.problems));
   ok('three lines planned with their quantities', d1.changes.length === 3 && d1.changes.map((x) => x.quantity).join(',') === '10,5,4');
-  ok('the batch line names its new lot', d1.changes[2].batch === `new · HEAT-${RUN}`);
+  ok('the batch line names its new lot and its brand', d1.changes[2].batch === `new · HEAT-${RUN} · Unbranded`, d1.changes[2].batch);
   // goods 1000 + 1000 + 200 = 2200; GST 18% on 1200 = 216, 12% on 1000 = 120; freight 100 + 18 = 118 → 2654
   ok('the bill total is worked out (2,654.00)', near(d1.summary.total, 2654), String(d1.summary.total));
   ok('the sentence says what would be booked', /Would book one GRN on .*3 lines/.test(d1.summary.sentence), d1.summary.sentence);
@@ -242,7 +243,7 @@ try {
   const c4 = await counts();
   const f4 = await fill(x4.buffer, {
     head: { store: DS, invoiceNo: '', invoiceDate: '', toFollow: 'No' },
-    rows: { [CODE.A]: { qty: 11 }, [CODE.BT]: { lot: '' }, [`+${RUN}-NOPE`]: { qty: 2 } },
+    rows: { [CODE.A]: { qty: 11 }, [CODE.BT]: { lot: '', brand: '' }, [`+${RUN}-NOPE`]: { qty: 2 } },
   });
   const d4 = await imp1(P4.id, f4, false);   // a NON-dry run that is refused
   const has = (re) => d4.problems.some((p) => re.test(p));
@@ -250,7 +251,8 @@ try {
   ok('more than pending', has(new RegExp(`${CODE.A}: 11 nos to receive, but only 10 is pending`)), JSON.stringify(d4.problems));
   ok('an item not on the PO', has(new RegExp(`${RUN}-NOPE is not on ${P4.code}`)));
   ok('a dispatch area is not a store', has(/is a dispatch area/));
-  ok('a batch item without a lot or batch code', has(new RegExp(`${CODE.BT} is kept by batch`)));
+  // §117: a new lot needs no heat / lot no. any more (a paint tin has none), but it names its brand
+  ok('a new lot of a batch item with no brand', has(new RegExp(`${CODE.BT} — pick its brand`)), JSON.stringify(d4.problems));
   ok('the sentence counts the problems', /problems — nothing booked/.test(d4.summary.sentence));
   ok('nothing written by the refused upload', same(c4, await counts()));
   const f4b = await fill(x4.buffer, { head: { store: 'NO-SUCH-STORE', invoiceNo: '', invoiceDate: '', toFollow: 'maybe' }, rows: { [CODE.BT]: { batch: 'NO-SUCH-BATCH' } } });

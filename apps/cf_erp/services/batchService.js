@@ -13,6 +13,7 @@ import { resolveBatch, publicResolution } from './resolutionService.js';
 import { loadSpecs, coerce, upsertValues, getHistory } from './valueService.js';
 import { draftValueMap } from './drafts.js';
 import { generate } from '../modules/codegen/index.js';
+import { brandForLot } from './brandService.js';
 import { wantsPage, pageArgs, orderBy, likeOf, pageOf, countsBy } from '../lib/listing.js';
 
 export const BATCH_STATUSES = ['available', 'on_hold', 'rejected'];
@@ -24,13 +25,15 @@ const dateOnly = (d) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getM
 // named (matched by order NUMBER — owner_order_code_active — so a revision keeps it).
 const SELECT = `SELECT b.*, m.code AS item_code, m.name AS item_name, i.uom AS item_uom, p.code AS supplier_code, p.name AS supplier_name,
        op.code AS owner_party_code, op.name AS owner_party_name, oo.code AS owner_order_code, oo.code_active AS owner_order_code_active,
+       br.name AS brand_name, br.is_unbranded AS brand_unbranded,
        (SELECT COALESCE(SUM(k.quantity), 0) FROM cf_stock_balances k WHERE k.company_id = b.company_id AND k.batch_id = b.id) AS on_hand
   FROM cf_stock_batches b
   JOIN cf_master_records m ON m.id = b.item_id
   JOIN cf_item_details i ON i.master_id = b.item_id
   LEFT JOIN cf_parties p ON p.id = b.supplier_id
   LEFT JOIN cf_parties op ON op.id = b.owner_party_id
-  LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id`;
+  LEFT JOIN cf_sales_orders oo ON oo.id = b.owner_order_id
+  LEFT JOIN cf_brands br ON br.id = b.brand_id`;
 
 /** Whose a lot is, as every screen shows it: null = ours. */
 export const ownerOf = (b) => (b.owner_party_id
@@ -48,6 +51,8 @@ export function shapeBatch(b) {
     receivedOn: dateOnly(b.received_on),
     supplier: b.supplier_id ? { id: b.supplier_id, code: b.supplier_code, name: b.supplier_name } : null,
     supplierRef: b.supplier_ref,
+    // §117: the lot's brand (null = not recorded: stock that came in before brands were asked for)
+    brand: b.brand_id ? { id: b.brand_id, name: b.brand_name ?? null, unbranded: Number(b.brand_unbranded) === 1 } : null,
     notes: b.notes,
     owner: ownerOf(b),
     unitCost: b.unit_cost == null ? null : Number(b.unit_cost),   // null = not costed, never 0
@@ -65,20 +70,23 @@ export async function requireBatch(db, companyId, id) {
 
 const ON_HAND_SQL = '(SELECT COALESCE(SUM(k.quantity), 0) FROM cf_stock_balances k WHERE k.company_id = b.company_id AND k.batch_id = b.id)';
 const BATCH_SORT = {
-  code: 'b.code', item: 'm.code', received: 'b.received_on', supplier: 'p.name', owner: 'op.name', status: 'b.status', unitCost: 'b.unit_cost',
+  code: 'b.code', item: 'm.code', received: 'b.received_on', supplier: 'p.name', brand: 'br.name', owner: 'op.name', status: 'b.status', unitCost: 'b.unit_cost',
   onHand: ON_HAND_SQL,
   value: `(CASE WHEN b.owner_party_id IS NULL AND b.unit_cost IS NOT NULL THEN ${ON_HAND_SQL} * b.unit_cost END)`,
 };
 const BATCH_FROM = `FROM cf_stock_batches b
   JOIN cf_master_records m ON m.id = b.item_id
   LEFT JOIN cf_parties p ON p.id = b.supplier_id
-  LEFT JOIN cf_parties op ON op.id = b.owner_party_id`;
+  LEFT JOIN cf_parties op ON op.id = b.owner_party_id
+  LEFT JOIN cf_brands br ON br.id = b.brand_id`;
 
 /** Batch filters; `skip` leaves facets out ('status', 'owner') so a chip counts the others. */
 function batchWhere(companyId, q, skip = []) {
   const where = ['b.company_id = ?', 'b.deleted_at IS NULL'];
   const params = [companyId];
   if (!blank(q.itemId)) { where.push('b.item_id = ?'); params.push(Number(q.itemId)); }
+  if (!blank(q.brandId)) { where.push('b.brand_id = ?'); params.push(Number(q.brandId)); }
+  if (!blank(q.supplierId)) { where.push('b.supplier_id = ?'); params.push(Number(q.supplierId)); }
   if (!skip.includes('status') && !blank(q.status)) { where.push('b.status = ?'); params.push(q.status); }
   // owner: ours | customer | a party id
   if (!skip.includes('owner')) {
@@ -88,8 +96,8 @@ function batchWhere(companyId, q, skip = []) {
   }
   if (!blank(q.search)) {
     const like = likeOf(q.search);
-    where.push('(b.code LIKE ? OR b.supplier_ref LIKE ? OR m.code LIKE ? OR m.name LIKE ?)');
-    params.push(like, like, like, like);
+    where.push('(b.code LIKE ? OR b.supplier_ref LIKE ? OR m.code LIKE ? OR m.name LIKE ? OR br.name LIKE ? OR p.name LIKE ?)');
+    params.push(like, like, like, like, like, like);
   }
   if (String(q.inStock) === '1') where.push(`${ON_HAND_SQL} <> 0`);
   return { where: where.join(' AND '), params };
@@ -199,7 +207,7 @@ async function writeBatchValues(db, c, batchId, item, entries) {
 }
 
 /**
- * Creates a batch inside a receipt. input: { code?, supplierId?, supplierRef?, receivedOn?, values? }.
+ * Creates a batch inside a receipt. input: { code?, supplierId?, supplierRef?, receivedOn?, values?, brandId? }.
  * The caller has already checked the values (checkBatchValues).
  */
 export async function createBatch(db, c, item, input = {}) {
@@ -208,6 +216,7 @@ export async function createBatch(db, c, item, input = {}) {
   if (code && (!CODE_RE.test(code) || code.length > 60)) problems.push('Batch code: up to 60 letters, digits and - _ . /, no spaces.');
   const supplierRef = blank(input.supplierRef) ? null : String(input.supplierRef).trim().slice(0, 100);
   assertNoProblems(problems);
+  const brand = await brandForLot(db, c.companyId, input.brandId);
   if (!code) {
     const g = await generate(db, c.companyId, 'stock_batch', 'code',
       { draft: { itemId: item.id, supplierId: input.supplierId ?? null, values: input.values ?? [] } }, { consume: true });
@@ -215,11 +224,11 @@ export async function createBatch(db, c, item, input = {}) {
   }
   const [r] = await db.query(
     `INSERT INTO cf_stock_batches (company_id, item_id, code, received_on, supplier_id, supplier_ref, production_item_id,
-                                   owner_party_id, owner_order_id, unit_cost, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                   owner_party_id, owner_order_id, unit_cost, created_by${brand ? ', brand_id' : ''})
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${brand ? ', ?' : ''})`,
     // Owner and cost were checked by stockService.postMovement (init.sql §35).
     [c.companyId, item.id, code, input.receivedOn ?? null, input.supplierId ?? null, supplierRef, input.productionItemId ?? null,
-      input.ownerPartyId ?? null, input.ownerOrderId ?? null, input.unitCost ?? null, c.userId],
+      input.ownerPartyId ?? null, input.ownerOrderId ?? null, input.unitCost ?? null, c.userId, ...(brand ? [brand.id] : [])],
   );
   if (!code) await db.query('UPDATE cf_stock_batches SET code = ? WHERE id = ?', [`B${String(r.insertId).padStart(6, '0')}`, r.insertId]);
   const values = (input.values ?? []).filter((v) => !blank(v.value));
@@ -248,6 +257,8 @@ export async function updateBatch(db, c, id, input = {}) {
   const sets = {};
   if (input.supplierRef !== undefined) sets.supplier_ref = blank(input.supplierRef) ? null : String(input.supplierRef).trim().slice(0, 100);
   if (input.notes !== undefined) sets.notes = blank(input.notes) ? null : String(input.notes);
+  // §117: a lot's brand can be set or corrected afterwards (a GRN booked before brands were asked for)
+  if (input.brandId !== undefined) sets.brand_id = blank(input.brandId) ? null : (await brandForLot(db, c.companyId, input.brandId)).id;
   if (Object.keys(sets).length) {
     await db.query(`UPDATE cf_stock_batches SET ${Object.keys(sets).map((k) => `${k} = ?`).join(', ')} WHERE company_id = ? AND id = ?`,
       [...Object.values(sets), c.companyId, id]);

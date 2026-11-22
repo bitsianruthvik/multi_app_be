@@ -24,6 +24,7 @@ import {
 import { syncUnits, checkUnits } from './unitService.js';
 import { unitKgOf } from './valuationService.js';
 import { hasV67, missingV67 } from '../lib/schemaV67.js';
+import { getSettings } from './settingsService.js';
 // Tools with a life (§81): each piece issued gets a tool-life row.
 import { trackIssuedTools, voidIssuedTools } from './toolLifeService.js';
 // §95: an issue may name the MR it was made from ("Issue now") and the maintenance order it is for.
@@ -606,6 +607,13 @@ export async function postMovement(db, c, input = {}, opts = {}) {
   }
   if (type === 'receipt' && !party && ownersSeen.size === 1) party = await loadParty([...ownersSeen][0]);
   if (type === 'return' && !reason) problems.push('Say why it goes back — offcuts, unused plate, scrap.');
+  // §117: a new lot bought from a supplier names its brand (from the brand list, or Unbranded): the GRN collects it.
+  if (type === 'receipt' && party && Number(party.is_supplier) && plans.some((p) => p.newBatch && !p.owner && !p.newBatch.productionItemId && (p.newBatch.brandId == null || p.newBatch.brandId === '') && !p.newBatch.brandPending)) {
+    const S = await getSettings(db, c.companyId);
+    if (S.grn_brand_required !== false) {
+      for (const p of plans) if (p.newBatch && !p.owner && !p.newBatch.productionItemId && (p.newBatch.brandId == null || p.newBatch.brandId === '') && !p.newBatch.brandPending) problems.push(`Line ${p.lineNo}: ${p.item.code ?? p.item.name} — pick its brand (or Unbranded).`);
+    }
+  }
   assertNoProblems(problems, 'The movement cannot be posted.');
 
   // A count becomes the change it needs; lines that already match record nothing.
@@ -1400,4 +1408,70 @@ export async function inventoryPartyReferences(db, companyId, partyId) {
 export async function hasStockHistory(db, companyId, itemId) {
   const [[{ n }]] = await db.query('SELECT COUNT(*) AS n FROM cf_stock_ledger WHERE company_id = ? AND item_id = ?', [companyId, itemId]);
   return Number(n) > 0;
+}
+
+/**
+ * §117 (user, 2026-11-22: stores items are kept by lot, one lot per GRN line). An item counted by quantity becomes kept by
+ * lot: its tracking changes and its LOOSE stock (ours, no lot) becomes ONE opening lot per stocking area — same quantity,
+ * at the item's average cost, received on the day that stock first came in, with a brand when one is given (else none:
+ * "not recorded"). Written as one adjustment (ADJ) whose two rows per area take the loose stock out and put the lot in:
+ * nothing is bought, used or lost, and the value of stock does not change. Stock that already sits in lots (production's,
+ * a customer's) is not touched. Refused while loose stock of the item is held for a material request (the hold names no lot).
+ *   items: [{ itemId, brandId? }]  → { movement, items: [{ itemId, code, lots: [{ areaId, batchId, quantity }] }], unchanged }
+ */
+export async function keepByLot(db, c, items = [], { reason = 'Kept by lot from today: loose stock becomes an opening lot', date = null } = {}) {
+  const list = (items ?? []).filter((x) => x && Number.isInteger(Number(x.itemId)));
+  if (!list.length) throw invalid('INVALID', 'Name the items.');
+  const ids = [...new Set(list.map((x) => Number(x.itemId)))];
+  const [masters] = await db.query(
+    `SELECT m.id, m.code, m.name, i.uom, i.tracked_by FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id
+      WHERE m.company_id = ? AND m.id IN (?) AND m.deleted_at IS NULL FOR UPDATE`, [c.companyId, ids]);
+  if (masters.length !== ids.length) throw invalid('INVALID', 'Some of these items do not exist.');
+  const problems = [];
+  for (const m of masters) if (m.tracked_by === 'individual') problems.push(`${m.code}: tracked unit by unit — not changed.`);
+  const [held] = await db.query(
+    `SELECT DISTINCT r.item_id FROM cf_stock_reservations r WHERE r.company_id = ? AND r.item_id IN (?) AND r.batch_id IS NULL AND r.status = 'active' AND r.deleted_at IS NULL`, [c.companyId, ids])
+    .catch((e) => { if (e.errno === 1054 || e.errno === 1146) return [[]]; throw e; });
+  for (const h of held) problems.push(`${masters.find((m) => m.id === h.item_id)?.code}: some of its loose stock is held for a request — issue or release it first.`);
+  assertNoProblems(problems, 'These items cannot be kept by lot yet.');
+
+  const [loose] = await db.query(
+    `SELECT k.stocking_area_id, k.item_id, k.quantity FROM cf_stock_balances k
+      WHERE k.company_id = ? AND k.item_id IN (?) AND k.batch_key = 0 AND k.quantity <> 0 FOR UPDATE`, [c.companyId, ids]);
+  if (loose.some((l) => Number(l.quantity) < 0)) throw invalid('NEGATIVE', 'Some loose stock is below zero — correct it with an audit first.');
+  const [firstIn] = loose.length ? await db.query(
+    `SELECT item_id, stocking_area_id, MIN(m.movement_date) AS first_in FROM cf_stock_ledger l JOIN cf_stock_movements m ON m.id = l.movement_id
+      WHERE l.company_id = ? AND l.item_id IN (?) AND l.batch_id IS NULL AND l.quantity > 0 GROUP BY item_id, stocking_area_id`, [c.companyId, ids]) : [[]];
+  const firstOf = new Map(firstIn.map((r) => [`${r.item_id}:${r.stocking_area_id}`, dateOnly(r.first_in)]));
+  const pools = await loadPools(db, c.companyId, ids);
+  const day = date ?? dateOnly(new Date());
+
+  let movementId = null;
+  const out = [];
+  if (loose.length) {
+    const code = await movementCode(db, c, 'adjustment', {}, loose[0].stocking_area_id);
+    const [r] = await db.query(
+      'INSERT INTO cf_stock_movements (company_id, code, movement_type, movement_date, reason, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [c.companyId, code, 'adjustment', day, String(reason).slice(0, 255), 'Loose stock → opening lot (same quantity and value)', c.userId ?? null]);
+    movementId = r.insertId;
+    if (!code) await db.query('UPDATE cf_stock_movements SET code = ? WHERE id = ?', [`ADJ-${String(movementId).padStart(6, '0')}`, movementId]);
+    let lineNo = 0;
+    for (const l of loose) {
+      const m = masters.find((x) => x.id === l.item_id); const want = list.find((x) => Number(x.itemId) === m.id);
+      const area = await requireArea(db, c.companyId, l.stocking_area_id);
+      const qty = Number(l.quantity); const pool = pools.get(m.id); const unit = poolCost(pool);
+      const value = unit == null ? null : round2(qty * unit);
+      const batchId = await createBatch(db, c, m, { receivedOn: firstOf.get(`${m.id}:${area.id}`) ?? day, unitCost: unit, brandId: want?.brandId ?? null });
+      const batch = await requireBatch(db, c.companyId, batchId);
+      lineNo += 1;
+      await writeLeg(db, c, { movementId, lineNo, area, item: m, batch: null, delta: round6(-qty), notes: 'loose stock', unitCost: unit, value: value == null ? null : -value });
+      await writeLeg(db, c, { movementId, lineNo, area, item: m, batch, delta: round6(qty), notes: 'opening lot', unitCost: unit, value });
+      poolOut(pool, qty, value == null ? null : -value);
+      (out.find((o) => o.itemId === m.id) ?? (out.push({ itemId: m.id, code: m.code, lots: [] }), out.at(-1))).lots.push({ areaId: area.id, batchId, quantity: qty });
+    }
+    await savePools(db, c.companyId, pools, movementId);
+  }
+  const change = masters.filter((m) => m.tracked_by !== 'batch').map((m) => m.id);
+  if (change.length) await db.query("UPDATE cf_item_details SET tracked_by = 'batch' WHERE company_id = ? AND master_id IN (?)", [c.companyId, change]);
+  return { movement: movementId ? await getMovement(db, c.companyId, movementId) : null, items: out, switched: change.length, unchanged: ids.length - change.length };
 }

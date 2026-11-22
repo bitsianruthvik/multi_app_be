@@ -6295,7 +6295,7 @@ CREATE TABLE IF NOT EXISTS cf_buy_requests (
   created_by     INT          NULL,
   req_live       INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, requisition_id, NULL)) VIRTUAL,
 
-  UNIQUE KEY uq_cbr_tenant (company_id, id),
+  UNIQUE KEY uq_cbrand_tenant (company_id, id),
   UNIQUE KEY uq_cbr_req    (company_id, req_live),
   KEY idx_cbr_order (company_id, order_id),
 
@@ -9195,3 +9195,45 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_requisitions' AND COLUMN_NAME = 'contractor_party_id') = 1,
           'S116-OK', 'S116-MISSING') AS result;
+
+-- =====================================================================================================================
+-- §117 BRANDS ON LOTS (user, 2026-11-22): "brand names and vendor names should be selected at a batch level ... a list
+--      rather than free text with an ability to add more to the list. Also, the same should be collected during GRN ...
+--      brands can cut across families or sub families ... just list all the brands for now. And we should have an
+--      un-branded as an option too." User's choice: stores items are kept by lot, one lot per GRN line.
+--   cf_brands                  ONE list per company, not tied to families; 'Unbranded' is a row of its own (is_unbranded).
+--   cf_stock_batches.brand_id  the lot's brand; its vendor is the lot's supplier_id (the GRN's supplier).
+--   A new lot received from a supplier must name its brand (company setting grn_brand_required, default on).
+-- =====================================================================================================================
+CREATE TABLE IF NOT EXISTS cf_brands (
+  id            INT           AUTO_INCREMENT PRIMARY KEY,
+  company_id    INT           NOT NULL,
+  name          VARCHAR(100)  NOT NULL,
+  is_unbranded  TINYINT(1)    NOT NULL DEFAULT 0,
+  merged_into_id INT          NULL,               -- a duplicate merged into another brand (its lots moved there)
+  notes         VARCHAR(255)  NULL,
+
+  deleted_at    DATETIME      DEFAULT NULL,
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  created_by    INT           NULL,
+
+  name_active   VARCHAR(100)  GENERATED ALWAYS AS (IF(deleted_at IS NULL, LOWER(name), NULL)) VIRTUAL,
+
+  UNIQUE KEY uq_cbrand_tenant (company_id, id),
+  UNIQUE KEY uq_cbrand_name   (company_id, name_active),
+
+  CONSTRAINT fk_cbrand_company FOREIGN KEY (company_id) REFERENCES companies(id),
+  CONSTRAINT fk_cbrand_creator FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND COLUMN_NAME = 'brand_id');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_stock_batches ADD COLUMN brand_id INT NULL, ADD KEY idx_csb_brand (company_id, brand_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @fk = (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND CONSTRAINT_NAME = 'fk_csb_brand');
+SET @sql = IF(@fk = 0, 'ALTER TABLE cf_stock_batches ADD CONSTRAINT fk_csb_brand FOREIGN KEY (company_id, brand_id) REFERENCES cf_brands(company_id, id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_brands') = 1
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND COLUMN_NAME = 'brand_id') = 1,
+          'S117-OK', 'S117-MISSING') AS result;

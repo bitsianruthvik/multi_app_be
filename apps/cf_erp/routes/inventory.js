@@ -23,6 +23,11 @@
  *   POST   /batches/:id/status              { status: available | on_hold | rejected, note? }
  *   PUT    /batches/:id/values              { values: [{ specificationId | specCode, value }] }
  *   GET    /batches/:id/history
+ *   GET    /brands?search=&withUse=1          §117: the company's brand list (Unbranded first)
+ *   POST   /brands                          { name, confirm? } — the existing brand when the name is the same; SIMILAR asks first
+ *   PUT    /brands/:id                      { name }
+ *   POST   /brands/:id/merge                { intoId } — a duplicate: its lots move to the other brand
+ *   PUT    /batches/:id  also takes { brandId } (a lot's brand set or corrected later)
  *   GET    /movements?type=&areaId=&itemId=&batchId=&orderId=&from=&to=&search=
  *   POST   /movements                       see stockService.postMovement
  *   GET    /movements/:id
@@ -45,6 +50,7 @@ import {
   postMovement, reverseMovement, listMovements, getMovement, listStock, itemStock, areaInventory, checkLedger,
 } from '../services/stockService.js';
 import { assertDeskAllows } from '../services/storesDeskService.js';
+import { listBrands, addBrand, renameBrand, mergeBrand } from '../services/brandService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -74,6 +80,13 @@ router.get('/offcuts', view, handle((req) => listOffcuts(pool, company(req), req
 router.get('/items/:id/stock', view, handle((req) => itemStock(pool, company(req), id(req))));
 router.get('/items/:id/batch-template', view, handle((req) => batchTemplate(pool, company(req), id(req))));
 
+// §117 brands: whoever sees stock, buys or runs stores reads the list; whoever receives or buys may add to it
+const brandsView = guardAny(PERM.inventoryView, PERM.purchase, PERM.stores, PERM.view);
+const brandsAdd = guardAny(PERM.inventory, PERM.purchase, PERM.stores);
+router.get('/brands', brandsView, handle((req) => listBrands(pool, company(req), req.query)));
+router.post('/brands', brandsAdd, handle((req) => tx(req, (db, c) => addBrand(db, c, req.body ?? {}))));
+router.put('/brands/:id', manage, handle((req) => tx(req, (db, c) => renameBrand(db, c, id(req), req.body ?? {}))));
+router.post('/brands/:id/merge', manage, handle((req) => tx(req, (db, c) => mergeBrand(db, c, id(req), req.body ?? {}))));
 router.get('/batches', view, handle((req) => listBatches(pool, company(req), req.query)));
 router.get('/batches/:id', view, handle((req) => getBatch(pool, company(req), id(req))));
 router.put('/batches/:id', manage, handle((req) => tx(req, (db, c) => updateBatch(db, c, id(req), req.body ?? {}))));

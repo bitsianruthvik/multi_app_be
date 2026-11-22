@@ -47,6 +47,7 @@ export const SETTINGS = [
   { key: 'giveout_loose', group: 'stores_day', label: 'Give out without a material request', type: 'bool', def: false, help: 'Off: stock leaves the store only by "Issue now" on a request, so every stock-out is tied to one (user, 2026-11-23). On: Stores › Stock also has a Give out button.' },
   { key: 'giveout_departments', group: 'stores_day', label: 'Give out may be charged to a department', type: 'bool', def: false, help: 'Off: a give-out is for a sales order or goes to a contractor (user, 2026-11-22).' },
   { key: 'giveout_person', group: 'stores_day', label: 'Give out records who collected it', type: 'bool', def: false, help: 'Off: nobody is named; a tool given for a sales order is out with that order.' },
+  { key: 'grn_brand_required', group: 'stores_day', label: 'A GRN line must name the brand', type: 'bool', def: true, help: 'On: every new lot received from a supplier is given a brand from the brand list (or Unbranded); its vendor is the supplier on the GRN (user, 2026-11-22). Off: the brand may be left empty.' },
   I('po_follow_days', 'stores_day', 'Today lists a purchase order due within', 3, 0, 60, 'days', 'Late ones are always listed.'),
 
   // --- levels from use

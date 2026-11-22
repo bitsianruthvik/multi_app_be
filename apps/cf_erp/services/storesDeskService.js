@@ -256,8 +256,10 @@ export async function itemLedger(db, companyId, itemId, q = {}) {
       `SELECT a.id, a.code, a.name, a.purpose, SUM(k.quantity) AS q FROM cf_stock_balances k JOIN cf_stocking_areas a ON a.id = k.stocking_area_id
         WHERE k.company_id = ? AND k.item_id = ? GROUP BY a.id, a.code, a.name, a.purpose HAVING ABS(SUM(k.quantity)) > 0.0000001 ORDER BY a.name`, [companyId, id]),
     db.query(
-      `SELECT b.id, b.code, b.status, b.supplier_ref, a.id AS area_id, a.name AS area_name, k.quantity
+      `SELECT b.id, b.code, b.status, b.supplier_ref, b.received_on, b.unit_cost, a.id AS area_id, a.name AS area_name, k.quantity,
+              b.brand_id, br.name AS brand_name, br.is_unbranded, b.supplier_id, sp.name AS supplier_name
          FROM cf_stock_balances k JOIN cf_stock_batches b ON b.id = k.batch_id JOIN cf_stocking_areas a ON a.id = k.stocking_area_id
+         LEFT JOIN cf_brands br ON br.id = b.brand_id LEFT JOIN cf_parties sp ON sp.id = b.supplier_id
         WHERE k.company_id = ? AND k.item_id = ? AND k.quantity > 0 AND a.purpose IN (?) ORDER BY b.id LIMIT 200`, [companyId, id, STORE_PURPOSES]),
     db.query(
       `SELECT l.id, l.quantity, l.batch_id, bt.code AS batch_code, a.name AS area_name, a.purpose,
@@ -288,7 +290,13 @@ export async function itemLedger(db, companyId, itemId, q = {}) {
     },
     period: { from, to },
     areas: byArea.map((a) => ({ id: a.id, code: a.code, name: a.name, purpose: a.purpose, quantity: round6(a.q), store: STORE_PURPOSES.includes(a.purpose) })),
-    lots: lots.map((b) => ({ id: b.id, code: b.code, status: b.status, supplierRef: b.supplier_ref ?? null, area: { id: b.area_id, name: b.area_name }, quantity: round6(b.quantity) })),
+    // §117: each lot's brand (null = not recorded) and vendor (the GRN's supplier), oldest first: the order give-out takes them
+    lots: lots.map((b) => ({
+      id: b.id, code: b.code, status: b.status, supplierRef: b.supplier_ref ?? null, area: { id: b.area_id, name: b.area_name }, quantity: round6(b.quantity),
+      receivedOn: dateText(b.received_on), unitCost: b.unit_cost == null ? null : Number(b.unit_cost),
+      brand: b.brand_id ? { id: b.brand_id, name: b.brand_name, unbranded: Number(b.is_unbranded) === 1 } : null,
+      vendor: b.supplier_id ? { id: b.supplier_id, name: b.supplier_name } : null,
+    })),
     events: events.map((e) => ({
       id: e.id, movementId: e.movement_id, code: e.code, type: e.movement_type, date: dateText(e.movement_date), change: round6(e.quantity),
       area: e.area_name, store: STORE_PURPOSES.includes(e.purpose), lot: e.batch_code ?? null, reference: e.reference ?? null, reason: e.reason ?? null,
