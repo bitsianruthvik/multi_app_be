@@ -79,9 +79,10 @@ export const standardRoles = [
   { key: 'ppc', name: 'PPC', help: 'Plans and runs production.',
     levels: { sales: 'manage', catalog: 'view', stores: 'view', production: 'manage', maintenance: 'manage' }, approvals: [], switches: [] },
   { key: 'stores', name: 'Stores', help: 'Keeps the stock: receives, gives out, audits.',
-    levels: { sales: 'view', catalog: 'view', stores: 'manage' }, approvals: ['cf_erp_purchase_approve'], switches: [] },
+    // 2026-11-23 (user): the catalog sits in Stores — Stores or Procurement set up items, categories and definitions
+    levels: { sales: 'view', catalog: 'manage', stores: 'manage' }, approvals: ['cf_erp_purchase_approve'], switches: [] },
   { key: 'procurement', name: 'Procurement', help: 'Buys: requests, quotes, purchase orders, suppliers.',
-    levels: { sales: 'view', parties: 'manage', catalog: 'view', stores: 'view', purchase: 'manage' }, approvals: [], switches: [] },
+    levels: { sales: 'view', parties: 'manage', catalog: 'manage', stores: 'view', purchase: 'manage' }, approvals: [], switches: [] },
   { key: 'accounts', name: 'Accounts', help: 'Bills, records payments, reads costing.',
     levels: { sales: 'view', parties: 'manage', catalog: 'view', accounts: 'manage' }, approvals: [], switches: [] },
   { key: 'design', name: 'Design & materials', help: 'Builds the structure of an order and its materials.',

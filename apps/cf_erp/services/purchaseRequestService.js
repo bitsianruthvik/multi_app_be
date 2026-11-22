@@ -126,10 +126,18 @@ function issueRefusal(v) {
 const issueUsedFor = (forType, orderId) => (orderId != null && forType !== 'maintenance_order' ? 'order' : 'general');
 
 /** The PRs of some MRs, in short: Map requisitionId -> { id, code, status, statusLabel }. */
-async function prsOfRequisitions(db, companyId, reqIds) {
+async function prsOfRequisitions(db, companyId, reqIds, { all = false } = {}) {
   if (!reqIds.length) return new Map();
   const prs = await readPrs(db, companyId, { requisitionIds: reqIds });
-  return new Map(prs.map((p) => [p.requisition.id, { id: p.id, code: p.code, status: p.status, statusLabel: p.statusLabel }]));
+  // §118: an MR may have several PRs (readPrs gives them newest first): the newest is "its PR"; all = every one, with lines
+  const out = new Map();
+  for (const p of prs) {
+    const short = { id: p.id, code: p.code, status: p.status, statusLabel: p.statusLabel, createdAt: p.createdAt, picked: !!p.picked,
+      lines: p.lines.map((l) => ({ mrLineId: l.mrLineId, item: l.item, quantity: l.needed, poRaised: l.poRaised, received: l.received })) };
+    if (all) { if (!out.has(p.requisition.id)) out.set(p.requisition.id, []); out.get(p.requisition.id).push(short); }
+    else if (!out.has(p.requisition.id)) out.set(p.requisition.id, short);
+  }
+  return out;
 }
 
 /**
@@ -146,12 +154,20 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
   const [held, av, prOf] = await Promise.all([
     stockHoldRows(db, companyId, v.lines.map((l) => l.id)),
     itemIds.length ? availability(db, companyId, itemIds, { orderId: v.manual ? null : v.order?.id ?? null, holds: 'none' }) : new Map(),
-    prsOfRequisitions(db, companyId, [v.id]),
+    prsOfRequisitions(db, companyId, [v.id], { all: true }),
   ]);
+  const allPrs = prOf.get(v.id) ?? [];
+  const onPrOf = new Map();
+  for (const p of allPrs) for (const pl of p.lines) onPrOf.set(Number(pl.mrLineId), round6((onPrOf.get(Number(pl.mrLineId)) ?? 0) + pl.quantity));
   const lines = v.lines.map((l) => {
     const a = av.get(Number(l.item.id));
     const free = (customer ? a?.theirsFree : a?.free) ?? 0;
-    const s = screenLine(l, { free: forStock ? 0 : free, held: held.get(l.id) ?? [], customer });
+    const s0 = screenLine(l, { free: forStock ? 0 : free, held: held.get(l.id) ?? [], customer });
+    // §118: on PRs (every PR of the MR) and what is LEFT to cover — not given out, not earmarked in the store, not still
+    // coming on a PR: required − issued − to issue − (on PRs − received)
+    const onPr = round6(onPrOf.get(Number(l.id)) ?? 0);
+    const left = round6(Math.max(0, s0.required - s0.issued - s0.toIssue - Math.max(0, onPr - s0.received)));
+    const s = { ...s0, onPr, left };
     return forStock ? { ...s, inStock: round6(free), takeMax: 0, proposedTake: null } : s;
   });
   const pos = new Map();
@@ -173,16 +189,22 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
     issueReason,
     issueUsedFor: issueUsedFor(v.forType, v.order?.id ?? null),
     lines,
-    purchaseRequest: prOf.get(v.id) ?? null,
+    purchaseRequest: allPrs[0] ?? null,
+    // §118: every PR of the MR (newest first) with its lines; Stores raises them here for chosen lines (Raise PR)
+    purchaseRequests: allPrs,
+    // §118: an MR raised by hand (from a sales order's New MR, a machine's maintenance order) is worked line by line:
+    // Give out (from its earmark, then free stock) and Raise PR (chosen lines, at most what is left)
+    pickMode: v.manual && !v.internal && !customer && v.forType !== 'stock' && !heldMr,
     purchaseOrders: [...pos.values()],
     contractor: (await contractorsOf(db, companyId, [v.id])).get(Number(v.id)) ?? null,
     giveOuts: await giveOutsOf(db, companyId, v.id),
     sentence: v.internal
-      ? `Stores' own purchase — raised straight to ${prOf.get(v.id)?.code ?? 'its purchase request'} for Purchase. Not a request waiting for Stores, so it is not in the MR inbox.`
+      ? `Stores' own purchase — raised straight to ${allPrs[0]?.code ?? 'its purchase request'} for Purchase. Not a request waiting for Stores, so it is not in the MR inbox.`
       : customer
       ? 'The customer supplies this material. What is not in their stock here is asked of them on a purchase order (₹0).'
       : forStock ? 'An MR for stock: everything on it is bought — save to put it on the purchase request.'
-        : 'Take what you can from stock; the rest goes on the purchase request.',
+        : v.manual && !heldMr ? 'Give out what is in stock; raise a purchase request for what is left — a line at a time, as often as needed.'
+          : 'Take what you can from stock; the rest goes on the purchase request.',
   };
 }
 
@@ -576,6 +598,107 @@ export async function issueMr(db, c, id, input = {}) {
  * at once with nothing taken from stock, so every line is to buy → its PR.
  * → { requisition: { id, code }, materialRequest (the MR screen), purchaseRequest: { id, code, status, statusLabel } }.
  */
+// --- §118: an MR raised by hand, worked line by line ---------------------------------------------------------
+
+/** The MR (raised by hand, open, ours to buy) and its screen, locked; or a refusal in words. */
+async function pickableMr(db, c, id) {
+  const [[head]] = await db.query('SELECT id, code, order_id, order_line_id, for_type, supply, held_for_acceptance FROM cf_requisitions WHERE company_id = ? AND id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, Number(id)]);
+  if (!head) throw notFound('Material request');
+  const screen = await mrScreen(db, c.companyId, head.id, { R: null });
+  if (!screen.pickMode) {
+    throw invalid('NOT_PICKED', head.order_line_id != null
+      ? `${head.code} is the material of a line of ${screen.order?.code ?? 'its order'}: it is worked with Take from stock and Save.`
+      : Number(head.held_for_acceptance) ? heldMessage(head.code) : `${head.code} is not worked line by line (for stock, customer-supplied, or a purchase Stores raised for itself).`);
+  }
+  if (!screen.canEdit) throw invalid('NOT_OPEN', screen.reason ?? `${head.code} no longer changes.`);
+  return { head, screen };
+}
+
+/** [{ lineId, quantity }] → Map lineId → quantity (> 0), every problem at once. */
+function pickedLines(screen, input, problems) {
+  const byId = new Map(screen.lines.map((l) => [l.id, l]));
+  const out = new Map();
+  for (const [k, r] of (Array.isArray(input.lines) ? input.lines : []).entries()) {
+    const l = byId.get(Number(r?.lineId));
+    if (!l) { problems.push(`Row ${k + 1}: that line is not on ${screen.code}.`); continue; }
+    if (blank(r?.quantity)) continue;
+    const q = Number(r.quantity);
+    if (!Number.isFinite(q) || q < 0) { problems.push(`${nameOf(l.item)}: the quantity is a number, zero or more.`); continue; }
+    if (q > EPS) out.set(l.id, round6((out.get(l.id) ?? 0) + q));
+  }
+  if (!out.size && !problems.length) problems.push('Give a quantity for at least one line.');
+  return { out, byId };
+}
+
+/**
+ * POST /material-requests/:id/give-out { lines: [{ lineId, quantity }], notes? } — STOCK OUT from the MR (§118): each line's
+ * quantity leaves the store against the MR, from what is earmarked for it first (received on its PRs' POs, or taken
+ * before), then from free stock — at most what is earmarked plus what is left to cover. Free stock is earmarked for the
+ * MR and then issued with the earmark by Issue now's own path (issueMr): the sales order / contractor / maintenance order
+ * the MR names is on the issue, a tool goes on Out with the contractor. One issue.
+ */
+export async function giveOutMr(db, c, id, input = {}) {
+  const { screen } = await pickableMr(db, c, id);
+  const problems = [];
+  const { out: want, byId } = pickedLines(screen, input, problems);
+  const itemIds = [...new Set([...want.keys()].map((lid) => Number(byId.get(lid).item.id)))].sort((a, b) => a - b);
+  if (itemIds.length) await db.query('SELECT master_id FROM cf_item_details WHERE company_id = ? AND master_id IN (?) ORDER BY master_id FOR UPDATE', [c.companyId, itemIds]);
+  const av = itemIds.length ? await availability(db, c.companyId, itemIds, { orderId: null, holds: 'none' }) : new Map();
+  const holdRows = [];
+  const takes = [];
+  for (const [lid, q] of want) {
+    const l = byId.get(lid); const u = unitOf(l.item);
+    const extra = round6(q - l.toIssue);
+    if (extra <= EPS) continue;
+    if (extra > l.left + EPS) { problems.push(`${nameOf(l.item)}: ${fmt(l.toIssue)}${u} is earmarked for it and ${fmt(l.left)} is left to cover — give out at most ${fmt(l.toIssue + l.left)}.`); continue; }
+    const a = av.get(Number(l.item.id));
+    const free = round6(a?.free ?? 0);
+    if (extra > free + EPS) { problems.push(`${nameOf(l.item)}: only ${fmt(free)}${u} is free in the store${l.toIssue > EPS ? ` (besides the ${fmt(l.toIssue)} earmarked for it)` : ''} — raise a PR for the rest.`); continue; }
+    const took = claimRows(a, l.item.trackedBy, extra, {});
+    if (took.left > EPS) { problems.push(`${nameOf(l.item)}: ${fmt(took.left)}${u} of it sits in lots that cannot be given out (on hold, or not in a storage area).`); continue; }
+    for (const x of took.rows) {
+      const lot = x.batchId != null ? a.batches.find((b) => b.batchId === x.batchId) : null;
+      if (lot) lot.free = round6(lot.free - x.quantity);
+      a.free = round6(a.free - x.quantity);
+      holdRows.push([c.companyId, null, l.id, l.item.id, x.batchId, x.quantity, c.userId ?? null]);
+    }
+    takes.push([l.id, round6(l.takeFromStock + extra)]);
+  }
+  assertNoProblems(problems, `Nothing was given out against ${screen.code}.`);
+  await insertRows(db, 'cf_stock_reservations', ['company_id', 'held_for_order_id', 'pr_line_id', 'item_id', 'batch_id', 'quantity', 'created_by'], holdRows);
+  if (takes.length) {
+    await db.query(`UPDATE cf_requisition_lines SET stock_take = CASE id ${takes.map(() => 'WHEN ? THEN ?').join(' ')} END WHERE company_id = ? AND id IN (?)`,
+      [...takes.flat(), c.companyId, takes.map((x) => x[0])]);
+  }
+  return issueMr(db, c, screen.id, { lines: [...want].map(([lineId, quantity]) => ({ lineId, quantity })), notes: input.notes, movementDate: input.movementDate, conditionsChecked: input.conditionsChecked });
+}
+
+/**
+ * POST /material-requests/:id/purchase-requests { lines: [{ lineId, quantity }], notes? } — RAISE PR from the MR (§118): a
+ * NEW purchase request for the chosen lines, each at most what is LEFT on its line (not given out, not earmarked, not
+ * already on a PR). An MR may have any number of them; each goes to Purchase as it is (a new machine's to Maintenance, MD).
+ */
+export async function raisePrFromMr(db, c, id, input = {}) {
+  const { head, screen } = await pickableMr(db, c, id);
+  const problems = [];
+  const { out: want, byId } = pickedLines(screen, input, problems);
+  for (const [lid, q] of want) {
+    const l = byId.get(lid);
+    if (q > l.left + EPS) problems.push(`${nameOf(l.item)}: only ${fmt(l.left)}${unitOf(l.item)} is left to cover on this MR — a PR for ${fmt(q)} is more.`);
+  }
+  assertNoProblems(problems, `No purchase request was raised from ${screen.code}.`);
+  const note = blank(input.notes) ? null : String(input.notes).trim().slice(0, 500);
+  const [ins] = await db.query('INSERT INTO cf_buy_requests (company_id, requisition_id, order_id, notes, picked, created_by) VALUES (?, ?, ?, ?, 1, ?)',
+    [c.companyId, head.id, head.order_id, note, c.userId ?? null]);
+  const prId = ins.insertId;
+  await db.query("UPDATE cf_buy_requests SET code = CONCAT('PR-', LPAD(id, 6, '0')) WHERE company_id = ? AND id = ?", [c.companyId, prId]);
+  await insertRows(db, 'cf_buy_request_lines', ['company_id', 'request_id', 'requisition_line_id', 'item_id', 'quantity', 'uom', 'created_by'],
+    [...want].map(([lid, q]) => { const l = byId.get(lid); return [c.companyId, prId, l.id, l.item.id, q, l.item.uom ?? null, c.userId ?? null]; }));
+  if (head.for_type === 'machine') await (await import('./machineRequestService.js')).askMaintenance(db, c, prId);
+  const out = await mrScreen(db, c.companyId, head.id, { R: null });
+  return { ...out, raised: out.purchaseRequests.find((p) => Number(p.id) === Number(prId)) ?? { id: prId } };
+}
+
 export async function raiseStoresPr(db, c, input = {}) {
   const made = await createRequisition(db, c, input, { internal: true });
   const screen = await mrScreen(db, c.companyId, made.id, { R: null });
@@ -585,7 +708,11 @@ export async function raiseStoresPr(db, c, input = {}) {
 
 /** Makes or updates THE PR of an MR: one line per MR line, quantity = to buy. No PR is made while nothing is to buy. */
 async function upsertPr(db, c, head, lines, toBuy) {
-  const [[pr]] = await db.query('SELECT id FROM cf_buy_requests WHERE company_id = ? AND requisition_id = ? AND deleted_at IS NULL FOR UPDATE', [c.companyId, head.id]);
+  // §118: once Stores raised PRs on this MR by hand (Raise PR), "the rest goes on the PR" no longer applies to it
+  const [[picked]] = await db.query('SELECT COUNT(*) AS n FROM cf_buy_requests WHERE company_id = ? AND requisition_id = ? AND deleted_at IS NULL AND picked = 1', [c.companyId, head.id])
+    .catch((e) => { if (e.errno === 1054) return [[{ n: 0 }]]; throw e; });
+  if (Number(picked?.n)) return null;
+  const [[pr]] = await db.query('SELECT id FROM cf_buy_requests WHERE company_id = ? AND requisition_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 1 FOR UPDATE', [c.companyId, head.id]);
   let prId = pr?.id ?? null;
   let newMachinePr = null;
   if (!prId) {
@@ -634,7 +761,7 @@ export async function readPrs(db, companyId, filter = {}) {
   const like = likeOf(filter.search);
   if (like) { where.push('(br.code LIKE ? OR r.code LIKE ? OR o.code LIKE ? OR cu.name LIKE ?)'); args.push(like, like, like, like); }
   const [heads] = await db.query(
-    `SELECT br.id, br.code, br.requisition_id, br.order_id, br.notes, br.created_at, br.approval_state, r.machine_request_json, r.code AS mr_code, r.order_line_id, sl.line_no, r.for_type,
+    `SELECT br.*, br.id, br.code, br.requisition_id, br.order_id, br.notes, br.created_at, br.approval_state, r.machine_request_json, r.code AS mr_code, r.order_line_id, sl.line_no, r.for_type,
             o.code AS order_code, o.status AS order_status, o.customer_id, cu.name AS customer_name, m.code AS line_item_code, m.name AS line_item_name, sl.description
        FROM cf_buy_requests br
        JOIN cf_requisitions r ON r.id = br.requisition_id
@@ -682,6 +809,22 @@ export async function readPrs(db, companyId, filter = {}) {
       ORDER BY p.id, a.id`,
     [companyId, rlIds],
   ) : [[]];
+  // §118: an MR line may be on several PRs; its PO quantities (recorded against the MR line) are shared out to them
+  // oldest PR first — each takes up to what it asks for, the newest takes anything over.
+  const [allRl] = rlIds.length ? await db.query(
+    `SELECT bl.request_id, bl.requisition_line_id, bl.quantity FROM cf_buy_request_lines bl JOIN cf_buy_requests br ON br.id = bl.request_id AND br.deleted_at IS NULL
+      WHERE bl.company_id = ? AND bl.requisition_line_id IN (?) AND bl.deleted_at IS NULL ORDER BY bl.request_id`, [companyId, rlIds]) : [[]];
+  const shareOf = (rl, requestId, total) => {
+    const list = allRl.filter((x) => Number(x.requisition_line_id) === Number(rl));
+    if (list.length <= 1) return total;
+    let left = total;
+    for (const [k, x] of list.entries()) {
+      const take = k === list.length - 1 ? Math.max(0, left) : Math.min(Math.max(0, left), Number(x.quantity));
+      if (Number(x.request_id) === Number(requestId)) return round6(take);
+      left = round6(left - take);
+    }
+    return 0;
+  };
   const today = clockToday();
   return heads.map((h) => {
     const mine = lines.filter((l) => l.request_id === h.id);
@@ -689,10 +832,10 @@ export async function readPrs(db, companyId, filter = {}) {
     const shaped = mine.map((l) => {
       const sh = shares.filter((x) => Number(x.pr_line_id) === Number(l.requisition_line_id));
       const needed = round6(l.quantity);
-      const poRaised = round6(sh.reduce((t, x) => t + Number(x.quantity), 0));
-      const received = round6(sh.reduce((t, x) => t + Number(x.qty_received), 0));
-      const pending = round6(sh.filter((x) => LIVE_STAGES.has(poStage(x))).reduce((t, x) => t + Math.max(0, Number(x.quantity) - Number(x.qty_received)), 0));
-      for (const x of sh) {
+      const poRaised = shareOf(l.requisition_line_id, h.id, round6(sh.reduce((t, x) => t + Number(x.quantity), 0)));
+      const received = shareOf(l.requisition_line_id, h.id, round6(sh.reduce((t, x) => t + Number(x.qty_received), 0)));
+      const pending = shareOf(l.requisition_line_id, h.id, round6(sh.filter((x) => LIVE_STAGES.has(poStage(x))).reduce((t, x) => t + Math.max(0, Number(x.quantity) - Number(x.qty_received)), 0)));
+      for (const x of poRaised > EPS ? sh : []) {
         const stage = poStage(x);
         if (!pos.has(x.po_id)) pos.set(x.po_id, { id: x.po_id, code: x.po_code, stage, stageLabel: PO_STAGE_LABEL[stage], supplier: x.supplier_id ? { id: x.supplier_id, name: x.supplier_name } : null, lines: [] });
         pos.get(x.po_id).lines.push({ lineId: l.id, quantity: Number(x.quantity), received: Number(x.qty_received) });
@@ -727,7 +870,7 @@ export async function readPrs(db, companyId, filter = {}) {
       // §103: a new machine's PR — its approvals and the request behind it.
       approval: h.approval_state ? { state: h.approval_state, label: ({ maintenance: 'Waiting for Maintenance', md: 'Waiting for the MD', approved: 'Approved', rejected: 'Sent back' })[h.approval_state] ?? h.approval_state } : null,
       machineRequest: h.machine_request_json ? (typeof h.machine_request_json === 'string' ? JSON.parse(h.machine_request_json) : h.machine_request_json) : null,
-      createdAt: h.created_at, notes: h.notes ?? null,
+      createdAt: h.created_at, notes: h.notes ?? null, picked: Number(h.picked ?? 0) === 1,
       lines: shaped, vendors: cols, purchaseOrders: [...pos.values()],
       counts: { lines: counted.length, open: counted.filter((l) => l.open > EPS).length, vendors: cols.length },
     };

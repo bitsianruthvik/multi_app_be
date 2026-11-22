@@ -29,7 +29,7 @@ import { Router } from 'express';
 import { pool, withTransaction } from '../lib/db.js';
 import { PERM, guard, guardAny, handle, ctx, intParam } from '../lib/http.js';
 import {
-  listMrs, orderItemTotals, mrScreen, saveMr, issueMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
+  listMrs, orderItemTotals, mrScreen, saveMr, issueMr, giveOutMr, raisePrFromMr, listPrs, getPr, addVendor, setVendor, removeVendor, setQuotes, raisePo, pendingPosOfVendor,
 } from '../services/purchaseRequestService.js';
 import { askApprovalAgain, listMachineModels, requestMachine } from '../services/machineRequestService.js';
 
@@ -50,6 +50,9 @@ router.get('/material-requests', view, handle((req) => listMrs(pool, company(req
 router.get('/material-requests/:id', view, handle((req) => mrScreen(pool, company(req), id(req))));
 router.put('/material-requests/:id', mrManage, handle((req) => tx(req, (db, c) => saveMr(db, c, id(req), body(req)))));
 router.post('/material-requests/:id/issue', mrManage, handle((req) => tx(req, (db, c) => issueMr(db, c, id(req), body(req)))));
+// §118 (user 2026-11-23): an MR raised by hand is worked line by line on its own screen — Give out, Raise PR (any number).
+router.post('/material-requests/:id/give-out', mrManage, handle((req) => tx(req, (db, c) => giveOutMr(db, c, id(req), body(req)))));
+router.post('/material-requests/:id/purchase-requests', mrManage, handle((req) => tx(req, (db, c) => raisePrFromMr(db, c, id(req), body(req)))));
 
 router.get('/purchase-requests', view, handle((req) => listPrs(pool, company(req), req.query)));
 router.get('/purchase-requests/:id', view, handle((req) => getPr(pool, company(req), id(req))));

@@ -6295,7 +6295,7 @@ CREATE TABLE IF NOT EXISTS cf_buy_requests (
   created_by     INT          NULL,
   req_live       INT GENERATED ALWAYS AS (IF(deleted_at IS NULL, requisition_id, NULL)) VIRTUAL,
 
-  UNIQUE KEY uq_cbrand_tenant (company_id, id),
+  UNIQUE KEY uq_cbr_tenant (company_id, id),
   UNIQUE KEY uq_cbr_req    (company_id, req_live),
   KEY idx_cbr_order (company_id, order_id),
 
@@ -9241,3 +9241,25 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_brands') = 1
           AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_stock_batches' AND COLUMN_NAME = 'brand_id') = 1,
           'S117-OK', 'S117-MISSING') AS result;
+
+-- =====================================================================================================================
+-- §118 SEVERAL PURCHASE REQUESTS ON ONE MR (user, 2026-11-23): "when the stores person opens an MR ... either stock out the
+--      remainder on the MR or create a PR for a bunch of items from the MR with a set quantity no more than what's left. All
+--      the PRs and stock outs should be visible on that MR". An MR raised by hand may have many PRs, each raised by Stores
+--      for chosen lines and quantities (picked = 1). A PO's quantity is still recorded against the MR line; the PR read
+--      shares it out to the line's PRs oldest first (purchaseRequestService.readPrs).
+--   cf_buy_requests: the one-PR-per-MR unique key becomes a plain index; picked = raised by hand from the MR.
+-- =====================================================================================================================
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND INDEX_NAME = 'idx_cbr_req');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_buy_requests ADD KEY idx_cbr_req (company_id, requisition_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND INDEX_NAME = 'uq_cbr_req');
+SET @sql = IF(@ix > 0, 'ALTER TABLE cf_buy_requests DROP INDEX uq_cbr_req', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND COLUMN_NAME = 'picked');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_buy_requests ADD COLUMN picked TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND INDEX_NAME = 'uq_cbr_req') = 0
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND COLUMN_NAME = 'picked') = 1,
+          'S118-OK', 'S118-MISSING') AS result;

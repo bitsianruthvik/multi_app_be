@@ -49,7 +49,7 @@ try {
     S.levelOf(stores, new Set()) === 'none' && S.levelOf(stores, new Set(['cf_erp_inventory_view'])) === 'view'
     && S.levelOf(stores, new Set(['cf_erp_inventory_view', 'cf_erp_inventory_manage', 'cf_erp_stores'])) === 'manage' && S.levelOf(stores, new Set(['cf_erp_stores'])) === 'custom');
   const stdStores = cat.standardRoles.find((s) => s.key === 'stores');
-  ok('the standard Stores role is six permissions', S.standardTags(cat, stdStores).length === 6, S.standardTags(cat, stdStores).join(' '));
+  ok('the standard Stores role is seven permissions (2026-11-23: catalog manage — the catalog sits in Stores)', S.standardTags(cat, stdStores).length === 7 && S.standardTags(cat, stdStores).includes('cf_erp_catalog_manage'), S.standardTags(cat, stdStores).join(' '));
   ok('the standard MD role is every permission', S.standardTags(cat, cat.standardRoles.find((s) => s.key === 'md')).length === placed.size);
   ok('every standard role names real departments, levels, approvals and switches', cat.standardRoles.every((s) =>
     Object.entries(s.levels).every(([d, l]) => cat.departments.find((x) => x.key === d)?.levels.some((x) => x.key === l))
@@ -61,14 +61,14 @@ try {
   ok('a role from the standard Stores role: stores manage, sales view, one approval', ra.departments.find((d) => d.key === 'stores').level === 'manage'
     && ra.departments.find((d) => d.key === 'sales').level === 'view' && ra.approvals.filter((a) => a.on).length === 1 && ra.standard?.differs === false, JSON.stringify(ra.tags));
   const [[rows1]] = await db.query('SELECT COUNT(*) AS n FROM role_capability WHERE role_id = ? AND app_id = ? AND deleted_at IS NULL', [role.id, app.id]);
-  ok('one grant row a permission', rows1.n === 6);
+  ok('one grant row a permission', rows1.n === 7);
   role = await S.saveRole(db, c, role.id, { apps: { [app.id]: { tags: [...ra.tags, 'cf_erp_maintenance'] } } });
   ra = role.apps.find((a) => a.appId === app.id);
   ok('maintenance added: the level reads Manage, and it now differs from the standard', ra.departments.find((d) => d.key === 'maintenance').level === 'manage' && ra.standard.differs === true);
   const copy = await S.createRole(db, c, { name: `T Stores copy ${stamp}`, copyOf: role.id });
-  ok('a copy holds the same seven', copy.apps.find((a) => a.appId === app.id).tags.length === 7);
+  ok('a copy holds the same eight', copy.apps.find((a) => a.appId === app.id).tags.length === 8);
   role = await S.resetRole(db, c, role.id, { appId: app.id });
-  ok('reset to standard: six again, no difference', role.apps.find((a) => a.appId === app.id).tags.length === 6 && role.apps.find((a) => a.appId === app.id).standard.differs === false);
+  ok('reset to standard: seven again, no difference', role.apps.find((a) => a.appId === app.id).tags.length === 7 && role.apps.find((a) => a.appId === app.id).standard.differs === false);
   ok('a second role of the same name is refused', (await refusal(S.createRole(db, c, { name: `t stores ${stamp}` })))?.code === 'INVALID');
   ok('a role cannot be called admin', /every check/.test((await refusal(S.createRole(db, c, { name: 'Admin' })))?.message ?? ''));
   ok('a tag that is not the app\'s is refused', (await refusal(S.saveRole(db, c, role.id, { apps: { [app.id]: { tags: ['nonsense_tag'] } } })))?.code === 'INVALID');
@@ -84,14 +84,14 @@ try {
   const [[u1]] = await db.query('SELECT password, email, role_id FROM users WHERE id = ?', [made.person.id]);
   ok('the password is stored hashed and is the one shown', await bcrypt.compare(made.tempPassword, u1.password) && /\.login$/.test(u1.email));
   ok('their role in the app, and the base role set because it was empty', made.person.apps[0]?.roleId === role.id && Number(u1.role_id) === role.id);
-  ok('what they hold is the role\'s six', made.person.apps[0].tags.length === 6 && made.person.apps[0].tags.includes('cf_erp_stores'));
+  ok('what they hold is the role\'s seven', made.person.apps[0].tags.length === 7 && made.person.apps[0].tags.includes('cf_erp_stores'));
   const p2 = await S.createPerson(db, c, { name: 'Test Mail', login: `mail${stamp}@example.com`, apps: {} });
   ok('added with an email and no app yet', p2.person.email === `mail${stamp}@example.com` && p2.person.apps.length === 0);
   ok('the same login twice is refused', (await refusal(S.createPerson(db, c, { name: 'X', login: `keeper${stamp}` })))?.code === 'INVALID'
     && (await refusal(S.createPerson(db, c, { name: 'X', login: `mail${stamp}@example.com` })))?.code === 'INVALID');
   ok('a login that is neither is refused in words', /username is 3 to 40/.test(said(await refusal(S.createPerson(db, c, { name: 'X', login: 'a b' })))));
   let kp = await S.updatePerson(db, c, made.person.id, { apps: { [app.id]: copy.id }, name: 'Test Keeper II' });
-  ok('role changed and renamed', kp.apps[0].roleId === copy.id && kp.name === 'Test Keeper II' && kp.apps[0].tags.length === 7);
+  ok('role changed and renamed', kp.apps[0].roleId === copy.id && kp.name === 'Test Keeper II' && kp.apps[0].tags.length === 8);
   kp = await S.updatePerson(db, c, made.person.id, { apps: { [app.id]: null } });
   ok('access taken away', kp.apps.length === 0);
   kp = await S.updatePerson(db, c, made.person.id, { apps: { [app.id]: role.id } });

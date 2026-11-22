@@ -123,6 +123,9 @@ async function storeAreas(db, companyId, areaId = null) {
 
 /**
  * GET /stores-desk/ledger?from=&to=&areaId=&familyId=&subfamilyId=&owner=ours|customer&search=&show=all|stock|low|out&paged=1
+ *   (2026-11-23) familyIds= / subfamilyIds= / variantIds= — several at once, comma lists (each level narrows the one above:
+ *   an item passes when it is in a picked variant, else in a picked sub-family, else in a picked family); all=1 every row
+ *   (print / download). Rows and groups carry the variant too.
  * owner (user, 2026-11-22): ours = our own stock only, customer = material a customer supplied (a lot with an owner);
  * left out = both added up. Opening / in / out / balance all follow it; each row also says how much of it is a customer's.
  * One row an item of the catalog: opening, in, out, balance (at `to`), out with, on order, reserved, minimum.
@@ -140,6 +143,17 @@ export async function ledger(db, companyId, q = {}) {
   if (like) { where.push('(m.name LIKE ? OR m.code LIKE ?)'); params.push(like, like); }
   if (!blank(q.familyId)) { where.push('f.id = ?'); params.push(Number(q.familyId)); }
   if (!blank(q.subfamilyId)) { where.push('s.id = ?'); params.push(Number(q.subfamilyId)); }
+  // several families / sub-families / variants (the picker narrows top-down): the most specific level picked under a
+  // family decides for that family, so "Consumables + its Painting sub-family + all of Tools" reads as the user means it
+  const ids = (v) => String(v ?? '').split(',').map((x) => Number(x)).filter((x) => Number.isInteger(x) && x > 0);
+  const fams = ids(q.familyIds); const subsP = ids(q.subfamilyIds); const vars = ids(q.variantIds);
+  if (fams.length || subsP.length || vars.length) {
+    const ors = [];
+    if (vars.length) { ors.push('v.id IN (?)'); params.push(vars); }
+    if (subsP.length) { ors.push(`(s.id IN (?)${vars.length ? ' AND NOT EXISTS (SELECT 1 FROM cf_classification_nodes pv WHERE pv.parent_id = s.id AND pv.id IN (?))' : ''})`); params.push(subsP); if (vars.length) params.push(vars); }
+    if (fams.length) { ors.push(`(f.id IN (?)${subsP.length || vars.length ? ' AND NOT EXISTS (SELECT 1 FROM cf_classification_nodes ps2 WHERE ps2.parent_id = f.id AND (ps2.id IN (?) OR EXISTS (SELECT 1 FROM cf_classification_nodes pv2 WHERE pv2.parent_id = ps2.id AND pv2.id IN (?))))' : ''})`); params.push(fams); if (subsP.length || vars.length) params.push(subsP.length ? subsP : [0], vars.length ? vars : [0]); }
+    where.push(`(${ors.join(' OR ')})`);
+  }
   const show = ['stock', 'low', 'out', 'reserved'].includes(q.show) ? q.show : 'all';
   const owner = ['ours', 'customer'].includes(q.owner) ? q.owner : null;
   const ownBal = owner === 'ours' ? 'AND ob.owner_party_id IS NULL' : owner === 'customer' ? 'AND ob.owner_party_id IS NOT NULL' : '';
@@ -183,7 +197,7 @@ export async function ledger(db, companyId, q = {}) {
   const [[rows], [[{ n: total }]], [groups]] = await Promise.all([
     db.query(
       `SELECT m.id, m.code, m.name, m.status, i.uom, i.tracked_by, i.stores_kind, i.issue_conditions,
-              f.id AS family_id, f.name AS family_name, s.id AS subfamily_id, s.name AS subfamily_name,
+              f.id AS family_id, f.name AS family_name, s.id AS subfamily_id, s.name AS subfamily_name, v.id AS variant_id, v.name AS variant_name,
               COALESCE(bal.q, 0) - COALESCE(mv.after_q, 0) AS balance, COALESCE(bal.q, 0) AS now_q,
               COALESCE(bal.q, 0) - COALESCE(mv.since_q, 0) AS opening,
               COALESCE(mv.in_q, 0) AS in_q, COALESCE(mv.out_q, 0) AS out_q,
@@ -191,22 +205,22 @@ export async function ledger(db, companyId, q = {}) {
               ps.method, ps.min_qty, ps.max_qty
          ${FROM}
         WHERE ${where.join(' AND ')}
-        ORDER BY ${sort ? `${sort} ${dir}, ` : ''}f.name, s.name, m.name, m.id
+        ORDER BY ${sort ? `${sort} ${dir}, ` : ''}f.name, s.name, v.name, m.name, m.id
         LIMIT ? OFFSET ?`,
       [...fromParams, ...params, page.limit, page.offset]),
     db.query(`SELECT COUNT(*) AS n ${FROM} WHERE ${where.join(' AND ')}`, [...fromParams, ...params]),
     db.query(
-      `SELECT f.id AS family_id, f.name AS family_name, s.id AS subfamily_id, s.name AS subfamily_name, COUNT(*) AS n
+      `SELECT f.id AS family_id, f.name AS family_name, s.id AS subfamily_id, s.name AS subfamily_name, v.id AS variant_id, v.name AS variant_name, COUNT(*) AS n
          FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
          JOIN cf_classification_nodes v ON v.id = m.classification_id
          JOIN cf_classification_nodes s ON s.id = v.parent_id
          JOIN cf_classification_nodes f ON f.id = s.parent_id
         WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.record_kind = 'item' AND i.item_type = 'catalog'
-        GROUP BY f.id, f.name, s.id, s.name ORDER BY f.name, s.name`, [companyId]),
+        GROUP BY f.id, f.name, s.id, s.name, v.id, v.name ORDER BY f.name, s.name, v.name`, [companyId]),
   ]);
   return pageOf(rows.map((r) => ({
     item: { id: r.id, code: r.code, name: r.name, uom: r.uom, trackedBy: r.tracked_by, returnable: r.stores_kind === 'returnable', status: r.status, issueConditions: r.issue_conditions ?? null },
-    group: { familyId: r.family_id, family: r.family_name, subfamilyId: r.subfamily_id, subfamily: r.subfamily_name },
+    group: { familyId: r.family_id, family: r.family_name, subfamilyId: r.subfamily_id, subfamily: r.subfamily_name, variantId: r.variant_id, variant: r.variant_name },
     opening: round6(r.opening), in: round6(r.in_q), out: round6(r.out_q), balance: round6(r.balance), now: round6(r.now_q),
     outWith: round6(r.out_with), onOrder: round6(r.on_order), reserved: round6(r.reserved), customers: round6(r.cust_q),
     min: r.min_qty == null ? null : Number(r.min_qty), max: r.max_qty == null ? null : Number(r.max_qty), method: r.method ?? null,
@@ -216,7 +230,8 @@ export async function ledger(db, companyId, q = {}) {
     counts: {
       period: { from, to }, owner: owner ?? 'all',
       areas: areas.all,
-      groups: groups.map((g) => ({ familyId: g.family_id, family: g.family_name, subfamilyId: g.subfamily_id, subfamily: g.subfamily_name, items: Number(g.n) })),
+      // one row a variant (2026-11-23); a sub-family's items = its variants' added up
+      groups: groups.map((g) => ({ familyId: g.family_id, family: g.family_name, subfamilyId: g.subfamily_id, subfamily: g.subfamily_name, variantId: g.variant_id, variant: g.variant_name, items: Number(g.n) })),
     },
   });
 }
