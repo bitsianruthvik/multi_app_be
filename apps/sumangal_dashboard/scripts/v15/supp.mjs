@@ -4,7 +4,7 @@ import fs from 'fs';
 const WORK = process.env.SUMANGAL_WORK || 'D:/SumangalData/work';
 const here = (f) => WORK + '/' + f;
 const s = fs.readFileSync(here('v13-data.js'), 'utf8'); const D = JSON.parse(s.slice(s.indexOf('{'), s.lastIndexOf('}') + 1));
-const db = new DatabaseSync('D:/SumangalData/work/casting.sqlite', { readOnly: true });
+const db = new DatabaseSync(process.env.SUMANGAL_DB || 'D:/SumangalData/work/casting.sqlite', { readOnly: true });
 const all = (q) => db.prepare(q).all();
 const D0 = Date.UTC(2024, 0, 1);
 const day = (x) => (x ? Math.round((Date.UTC(+x.slice(0, 4), +x.slice(5, 7) - 1, +x.slice(8, 10)) - D0) / 864e5) : null);

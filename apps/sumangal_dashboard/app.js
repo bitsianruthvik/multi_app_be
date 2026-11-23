@@ -2,6 +2,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Router } from 'express';
 import reportRoutes from './routes/reports.js';
+import agentRoutes from './routes/agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,6 +17,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  */
 const router = Router({ mergeParams: true });
 router.get('/health', (req, res) => res.json({ ok: true, app: 'sumangal_dashboard' }));
+router.use(agentRoutes);
 router.use(reportRoutes);
 
 export default {

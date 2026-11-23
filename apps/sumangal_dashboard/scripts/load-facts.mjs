@@ -34,7 +34,8 @@ const [have] = await conn.query('SELECT dataset, COUNT(*) n FROM sd_rows WHERE c
 const stored = new Map(have.map((r) => [r.dataset, Number(r.n)]));
 const todo = Object.entries(facts).filter(([k]) => !ONLY || ONLY.includes(k));
 for (const [k, v] of todo) console.log(`${k.padEnd(12)} ${String(v.length).padStart(7)}   stored now ${stored.get(k) ?? 0}`);
-const gone = ONLY ? [] : [...stored.keys()].filter((k) => !(k in facts));
+// The ERP dashboard (V15) dataset is loaded by scripts/v15 or pushed by the agent, never by this file: keep it.
+const gone = ONLY ? [] : [...stored.keys()].filter((k) => !(k in facts) && !['v15', 'v15meta'].includes(k));
 if (gone.length) console.log(`no longer in the file, to remove: ${gone.join(', ')}`);
 
 if (APPLY) {

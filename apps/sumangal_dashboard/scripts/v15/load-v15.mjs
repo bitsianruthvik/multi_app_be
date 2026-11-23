@@ -23,8 +23,9 @@ console.log(`company ${SLUG} (${company.id}): ${text.length} bytes in ${parts.le
 if (APPLY) {
   await conn.beginTransaction();
   try {
-    await conn.query("DELETE FROM sd_rows WHERE company_id = ? AND dataset = 'v15'", [company.id]);
+    await conn.query("DELETE FROM sd_rows WHERE company_id = ? AND dataset IN ('v15', 'v15meta')", [company.id]);
     for (let i = 0; i < parts.length; i++) await conn.query("INSERT INTO sd_rows (company_id, dataset, data) VALUES (?, 'v15', ?)", [company.id, JSON.stringify({ i, s: parts[i] })]);
+    await conn.query("INSERT INTO sd_rows (company_id, dataset, data) VALUES (?, 'v15meta', ?)", [company.id, JSON.stringify({ loadedAt: new Date().toISOString(), source: 'load-v15.mjs', end: JSON.parse(text).D.end, bytes: text.length })]);
     await conn.commit(); console.log('loaded');
   } catch (e) { await conn.rollback(); console.error('FAILED, nothing changed:', e.message); process.exitCode = 1; }
 }
