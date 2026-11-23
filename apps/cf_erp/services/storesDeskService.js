@@ -140,7 +140,13 @@ export async function ledger(db, companyId, q = {}) {
   const where = ["m.company_id = ?", 'm.deleted_at IS NULL', "m.record_kind = 'item'", "i.item_type = 'catalog'"];
   const params = [companyId];
   const like = likeOf(q.search);
-  if (like) { where.push('(m.name LIKE ? OR m.code LIKE ?)'); params.push(like, like); }
+  // (2026-11-23) also the description (the stores' own other names for it: "Also called: …", "Stores ledger name: …")
+  // and the brand of any of its lots — stores look for "Berger" or "Epilux" once the brand is off the item's name
+  if (like) {
+    where.push(`(m.name LIKE ? OR m.code LIKE ? OR m.description LIKE ? OR EXISTS (SELECT 1 FROM cf_stock_batches sb JOIN cf_brands br ON br.id = sb.brand_id
+      WHERE sb.company_id = m.company_id AND sb.item_id = m.id AND sb.deleted_at IS NULL AND br.name LIKE ?))`);
+    params.push(like, like, like, like);
+  }
   // one item (the item page's "Stock" link) / everything but some (the stock entry screen's "not entered yet")
   if (!blank(q.itemId)) { where.push('m.id = ?'); params.push(Number(q.itemId)); }
   const notIds = String(q.excludeIds ?? '').split(',').map(Number).filter((x) => Number.isInteger(x) && x > 0);
