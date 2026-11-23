@@ -34,6 +34,8 @@ router.get('/agent/files/:name', (req, res) => {
   const f = path.join(AGENT_DIR, req.params.name);
   if (!fs.existsSync(f)) return res.status(404).end();
   res.set('Content-Type', 'text/plain; charset=utf-8').set('Cache-Control', 'no-cache');
+  // git keeps LF; wscript wants CRLF
+  if (f.endsWith('.vbs')) return res.send(fs.readFileSync(f, 'utf8').replace(/\r?\n/g, '\r\n'));
   fs.createReadStream(f).pipe(res);
 });
 
