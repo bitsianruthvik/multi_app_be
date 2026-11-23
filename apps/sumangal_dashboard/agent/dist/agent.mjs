@@ -68979,7 +68979,7 @@ var WORK = path3.join(DIR, "work");
 var LOGS = path3.join(DIR, "logs");
 var COPY = path3.join(WORK, "erp.sqlite");
 var STATE = path3.join(WORK, "state.json");
-var VERSION = "2026-11-24a";
+var VERSION = "2026-11-24b";
 fs6.mkdirSync(WORK, { recursive: true });
 fs6.mkdirSync(LOGS, { recursive: true });
 var ARGS = process.argv.slice(2);
@@ -69022,6 +69022,8 @@ var DT = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 var pad = (x) => String(x).padStart(2, "0");
 var fmtDate = (v) => `${v.getUTCFullYear()}-${pad(v.getUTCMonth() + 1)}-${pad(v.getUTCDate())} ${pad(v.getUTCHours())}:${pad(v.getUTCMinutes())}:${pad(v.getUTCSeconds())}`;
 var val = (v) => v == null ? null : v instanceof Date ? fmtDate(v) : typeof v === "boolean" ? v ? 1 : 0 : typeof v === "bigint" ? Number(v) : Buffer.isBuffer(v) ? null : v;
+var SECRET_COL = /pass|pwd/i;
+var SKIP_TABLES = /* @__PURE__ */ new Set(["dtproperties", "sysdiagrams"]);
 var SKIP_TYPES = /* @__PURE__ */ new Set(["image", "varbinary", "binary", "timestamp", "rowversion", "xml", "geography", "geometry", "hierarchyid", "sql_variant"]);
 function whereSql(w, q, lit = (d) => d) {
   if (!w) return "";
@@ -69088,8 +69090,13 @@ function mssqlSource(c) {
     async columns(t) {
       const out = [];
       await run(`SELECT c.name, ty.name FROM sys.columns c JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE c.object_id = OBJECT_ID(N'dbo.${ident(t)}') ORDER BY c.column_id`, (r) => {
-        if (!SKIP_TYPES.has(String(r[1]).toLowerCase())) out.push(r[0]);
+        if (!SKIP_TYPES.has(String(r[1]).toLowerCase()) && !SECRET_COL.test(r[0])) out.push(r[0]);
       });
+      return out;
+    },
+    async tables() {
+      const out = [];
+      await run("SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID('dbo') AND is_ms_shipped = 0 ORDER BY name", (r) => out.push(r[0]));
       return out;
     },
     async key(t) {
@@ -69138,7 +69145,10 @@ function sqliteSource(file) {
       return fmtDate(new Date(Date.now() + 330 * 6e4));
     },
     async columns(t) {
-      return db.prepare(`PRAGMA table_info(${q(ident(t))})`).all().map((r) => r.name);
+      return db.prepare(`PRAGMA table_info(${q(ident(t))})`).all().map((r) => r.name).filter((c) => !SECRET_COL.test(c));
+    },
+    async tables() {
+      return db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((r) => r.name);
     },
     async key(t) {
       const k = db.prepare(`PRAGMA table_info(${q(ident(t))})`).all().filter((r) => r.pk).map((r) => r.name);
@@ -69161,6 +69171,11 @@ function sqliteSource(file) {
 var source = () => opt("server-sqlite") ? sqliteSource(opt("server-sqlite")) : mssqlSource(cfg());
 var TABLES = () => JSON.parse(fs6.readFileSync(path3.join(DIR, "tables.json"), "utf8"));
 var DATE_COLS = ["modified_date", "created_date"];
+async function allTables(src) {
+  const dash = TABLES();
+  const rest = (await src.tables()).filter((t) => IDENT.test(t) && !SKIP_TABLES.has(t.toLowerCase()) && !/^sqlite_/i.test(t) && !dash.includes(t));
+  return [...dash, ...rest];
+}
 async function extractAll() {
   const src = source();
   await src.open();
@@ -69173,7 +69188,8 @@ async function extractAll() {
     state.since = await src.now();
     const db = new DatabaseSync(tmp);
     db.exec("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;");
-    for (const t of TABLES()) {
+    const dash = new Set(TABLES());
+    for (const t of await allTables(src)) {
       const cols = await src.columns(t);
       if (!cols.length) {
         log(`  ${t}: not found, skipped`);
@@ -69185,7 +69201,7 @@ async function extractAll() {
       const n = await src.select(t, cols, null, (r) => ins.run(...r));
       db.exec("COMMIT");
       total += n;
-      state.tables[t] = { cols, key: await src.key(t), dates: DATE_COLS.filter((d) => cols.includes(d)) };
+      state.tables[t] = { cols, key: await src.key(t), dates: DATE_COLS.filter((d) => cols.includes(d)), dash: dash.has(t) };
       log(`  ${t}: ${n} rows`);
     }
     const keyOwner = new Map(Object.entries(state.tables).filter(([, v]) => v.key.length === 1).map(([t, v]) => [v.key[0], t]));
@@ -69200,6 +69216,14 @@ async function extractAll() {
         db.exec(`CREATE INDEX IF NOT EXISTS "fx_${t}" ON "${t}"("${v.fk}")`);
       }
     }
+    for (const v of Object.values(state.tables)) v.live = v.dash;
+    for (let more = true; more; ) {
+      more = false;
+      for (const v of Object.values(state.tables)) if (v.live && v.parent && !state.tables[v.parent].live) {
+        state.tables[v.parent].live = true;
+        more = true;
+      }
+    }
     for (const [t, v] of Object.entries(state.tables)) for (const k of v.key) db.exec(`CREATE INDEX IF NOT EXISTS "kx_${t}_${k}" ON "${t}"("${k}")`);
     db.close();
   } finally {
@@ -69209,8 +69233,8 @@ async function extractAll() {
   fs6.renameSync(tmp, COPY);
   state.fullAt = (/* @__PURE__ */ new Date()).toISOString();
   fs6.writeFileSync(STATE, JSON.stringify(state, null, 1));
-  const follow = Object.entries(state.tables).filter(([, v]) => !v.dates.length).map(([t, v]) => `${t}${v.parent ? " <- " + v.parent : " (re-read whole)"}`);
-  log(`read ${total} rows from ${src.kind} in ${Math.round((Date.now() - t0) / 1e3)} s; tables without dates: ${follow.join(", ")}`);
+  const follow = Object.entries(state.tables).filter(([, v]) => v.live && !v.dates.length).map(([t, v]) => `${t}${v.parent ? " <- " + v.parent : " (re-read whole)"}`);
+  log(`read ${total} rows from ${src.kind} in ${Math.round((Date.now() - t0) / 1e3)} s; ${Object.keys(state.tables).length} tables, ${Object.values(state.tables).filter((v) => v.live).length} kept up to date in the day; those without dates: ${follow.join(", ")}`);
 }
 async function extractChanges() {
   if (!fs6.existsSync(COPY) || !fs6.existsSync(STATE)) {
@@ -69219,6 +69243,11 @@ async function extractChanges() {
     return -1;
   }
   const state = JSON.parse(fs6.readFileSync(STATE, "utf8"));
+  if (Object.values(state.tables).some((v) => v.live === void 0)) {
+    log("working copy from an older agent: reading everything");
+    await extractAll();
+    return -1;
+  }
   const src = source();
   await src.open();
   const t0 = Date.now();
@@ -69255,14 +69284,14 @@ async function extractChanges() {
       total += rows.length;
       return rows.length;
     };
-    for (const [t, v] of Object.entries(state.tables)) if (v.dates.length) {
+    for (const [t, v] of Object.entries(state.tables)) if (v.live && v.dates.length) {
       const n = await take(t, v, { since, cols: v.dates });
       if (n) log(`  ${t}: ${n} changed`);
     }
     for (let round = 0; round < 4; round++) {
       let any = false;
       for (const [t, v] of Object.entries(state.tables)) {
-        if (v.dates.length || !v.parent || v.done) continue;
+        if (!v.live || v.dates.length || !v.parent || v.done) continue;
         const ids = [...changed.get(v.parent) || []];
         const parentDone = state.tables[v.parent].dates.length || state.tables[v.parent].done;
         if (!parentDone) continue;
@@ -69278,7 +69307,7 @@ async function extractChanges() {
       }
       if (!any) break;
     }
-    for (const [t, v] of Object.entries(state.tables)) if (!v.dates.length && !v.parent) {
+    for (const [t, v] of Object.entries(state.tables)) if (v.live && !v.dates.length && !v.parent) {
       db.exec(`DELETE FROM "${t}"`);
       const n = await take(t, v, null);
       log(`  ${t}: re-read whole (${n})`);
@@ -69413,19 +69442,24 @@ async function cmdTest() {
       const extra = await src.rights();
       log(extra.length ? `  NOTE: this login can also change data (${extra.join(", ")}). The agent never does: it sends only SELECTs. A read-only login is still better.` : "  login rights: read-only");
     }
-    for (const t of TABLES()) {
+    const dash = new Set(TABLES());
+    const all = await allTables(src);
+    let rows = 0;
+    for (const t of all) {
       try {
         const [n, k] = [await src.count(t), await src.key(t)];
-        log(`  ${t}: ${n} rows, key ${k.join("+") || "none"}`);
+        rows += n;
+        log(`  ${t}: ${n} rows, key ${k.join("+") || "none"}${dash.has(t) ? " (dashboard)" : ""}`);
       } catch (e) {
-        missing++;
+        if (dash.has(t)) missing++;
         log(`  ${t}: ${e.message}`);
       }
     }
+    log(`  ${all.length} tables, ${rows} rows (password columns are never read)`);
   } finally {
     src.close();
   }
-  log(missing ? `${missing} tables could not be read` : "all tables readable");
+  log(missing ? `${missing} dashboard tables could not be read` : "all tables readable");
   if (missing) process.exitCode = 1;
 }
 async function cmdRegister() {
@@ -69468,11 +69502,11 @@ async function cmdUpdate() {
 }
 async function cmdDay() {
   const until = opt("until") || "21:00";
-  const every = +(opt("every") || 15) * 6e4;
+  const every = +(opt("every") || 0) * 6e4;
   const [hh, mm] = until.split(":").map(Number);
   const end = /* @__PURE__ */ new Date();
   end.setHours(hh, mm, 0, 0);
-  log(`agent ${VERSION}: day mode until ${until}, an update every ${every / 6e4} min and on request`);
+  log(`agent ${VERSION}: day mode until ${until}, an update when the dashboard asks${every ? `, and every ${every / 6e4} min` : ""}`);
   let last = 0;
   while (Date.now() < end.getTime()) {
     let job = null;
@@ -69482,7 +69516,7 @@ async function cmdDay() {
       log("waiting for requests failed: " + e.message);
       await new Promise((r) => setTimeout(r, 3e4));
     }
-    if (job?.id || Date.now() - last >= every) {
+    if (job?.id || every && Date.now() - last >= every) {
       if (job?.id) log(`refresh requested (job ${job.id})`);
       const ok = await oneRun("update", async () => {
         const n = await extractChanges();
@@ -69503,7 +69537,7 @@ async function cmdDay() {
 var [cmd] = ARGS;
 var cmds = { test: cmdTest, register: cmdRegister, status: cmdStatus, run: cmdRun, update: cmdUpdate, day: cmdDay };
 if (!cmds[cmd]) {
-  console.log("Usage: node agent.mjs test | register | status | run | update | day [--until=21:00] [--every=15]   (tests: --source=sqlite:<file>, --server-sqlite=<file>, --keep)");
+  console.log("Usage: node agent.mjs test | register | status | run | update | day [--until=21:00] [--every=<minutes>, default only on request]   (tests: --source=sqlite:<file>, --server-sqlite=<file>, --keep)");
   process.exit(cmd ? 1 : 0);
 }
 cmds[cmd]().catch((e) => {

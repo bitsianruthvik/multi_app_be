@@ -37,7 +37,7 @@ if ($v.Major -lt 10) { throw "This Windows is too old for the agent (it needs Wi
 if (-not [Environment]::Is64BitOperatingSystem) { throw "The agent needs 64-bit Windows. Use another PC on the same network." }
 $free = [math]::Round((Get-PSDrive ($Dir.Substring(0, 1))).Free / 1GB, 1)
 Write-Host "  free disk on $($Dir.Substring(0, 2)) $free GB"
-if ($free -lt 1.5) { Write-Host "  Warning: about 1.5 GB free is needed." -ForegroundColor Yellow }
+if ($free -lt 2.5) { Write-Host "  Warning: about 2.5 GB free is needed." -ForegroundColor Yellow }
 
 Step "Agent folder $Dir"
 New-Item -ItemType Directory -Force -Path $Dir, "$Dir\work", "$Dir\logs" | Out-Null
@@ -99,7 +99,7 @@ if ($mode -match '^[12]$') {
   $nightAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$Dir\run-hidden.vbs`" run" -WorkingDirectory $Dir
   $dayAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$Dir\run-hidden.vbs`" day --until=$DayUntil" -WorkingDirectory $Dir
   $nightTrigger = New-ScheduledTaskTrigger -Daily -At $At
-  # working hours: an update every 15 minutes and on "Refresh now" (Wednesday is the weekly off)
+  # working hours: an update whenever the dashboard asks (opened, or "Refresh now"); Wednesday is the weekly off
   $dayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Tuesday, Thursday, Friday, Saturday, Sunday -At $DayFrom
   # StartWhenAvailable: a run missed while the PC was off or nobody was signed in starts as soon as it can
   $nightSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
