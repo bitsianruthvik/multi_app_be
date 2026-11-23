@@ -178,7 +178,7 @@ export async function mrScreen(db, companyId, id, { R = null } = {}) {
   const issueReason = issueRefusal({ heldForAcceptance: heldMr, code: v.code, manual: v.manual, forType: v.forType, lineNo: v.line?.lineNo, orderCode: v.order?.code });
   return {
     id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel,
-    forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes, raisedAt: v.raisedAt, raisedBy: v.raisedBy,
+    forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, maintenanceOrder: v.maintenanceOrder ?? null, notes: v.notes, raisedAt: v.raisedAt, raisedBy: v.raisedBy,
     internal: !!v.internal,
     order: v.order, line: v.line, status: v.status, statusLabel: v.statusLabel, stale: v.stale, needKnown: v.needKnown, needComplete: v.needComplete,
     heldForAcceptance: heldMr,
@@ -293,7 +293,7 @@ export async function listMrs(db, companyId, q = {}) {
       const lockedLines = live.filter((l) => (l.cover.earmarked ?? 0) + EPS >= l.need).length;
       return {
         id: v.id, code: v.code, supply: v.supply, supplyLabel: v.supplyLabel, order: v.order, line: v.line,
-        forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, notes: v.notes, internal: !!v.internal,
+        forType: v.forType, forLabel: v.forLabel, manual: v.manual, maintenanceOrderId: v.maintenanceOrderId, maintenanceOrder: v.maintenanceOrder ?? null, notes: v.notes, internal: !!v.internal,
         status: v.status, statusLabel: v.statusLabel, materials: live.length, lockedLines, heldForAcceptance: !!v.heldForAcceptance,
         lockedWords: live.length ? `${lockedLines} of ${live.length} locked` : 'Nothing to buy',
         purchaseRequest: prOf.get(v.id) ?? null, raisedAt: v.raisedAt, done: !!v.done, contractor: contractorOf.get(Number(v.id)) ?? null,

@@ -293,12 +293,15 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
   if (filter.maintenanceOrderId != null) { where.push('r.maintenance_order_id = ?'); args.push(Number(filter.maintenanceOrderId)); }
   // An MR raised by hand (no order line) stays in the open list whatever its order (if any) is doing.
   if (filter.open) { where.push('(r.order_line_id IS NULL OR o.status IN (?))'); args.push(OPEN_ORDER_STATUSES); }
-  if (!blank(filter.search)) { where.push('(r.code LIKE ? OR o.code LIKE ? OR cu.name LIKE ? OR r.notes LIKE ?)'); args.push(...Array(4).fill(`%${String(filter.search).trim()}%`)); }
+  if (!blank(filter.search)) { where.push('(r.code LIKE ? OR o.code LIKE ? OR cu.name LIKE ? OR r.notes LIKE ? OR r.maintenance_order_id IN (SELECT mo.id FROM cf_maintenance_orders mo WHERE mo.company_id = r.company_id AND mo.code LIKE ?))'); args.push(...Array(5).fill(`%${String(filter.search).trim()}%`)); }
   // §93: internal false = real requests to Stores only (the MR inbox); true = only Stores' own (its "Raise PR" / "New PR").
   const internalWhere = (has) => (has && filter.internal === false ? ['r.internal_pr = 0'] : has && filter.internal === true ? ['r.internal_pr = 1'] : []);
   const [heads] = await withInternalColumn((has) => (filter.internal === true && !has ? [[]] : db.query(
     `SELECT r.id, r.code, r.order_id, r.order_line_id, r.notes, r.synced_at, r.created_at, r.created_by, r.supply, r.held_for_acceptance, r.customer_date, u.name AS raised_by_name,
             r.for_type, r.maintenance_order_id, ${has ? 'r.internal_pr' : '0 AS internal_pr'},
+            -- 2026-11-23: the maintenance order by its code (the inbox said "Maintenance order #199")
+            (SELECT CONCAT(mo.code, ' · ', mc.code) FROM cf_maintenance_orders mo LEFT JOIN cf_machines mc ON mc.id = mo.machine_id WHERE mo.id = r.maintenance_order_id) AS mo_label,
+            (SELECT mo.code FROM cf_maintenance_orders mo WHERE mo.id = r.maintenance_order_id) AS mo_code,
             o.code AS order_code, o.status AS order_status, o.customer_id, cu.name AS customer_name,
             l.line_no, l.quantity AS line_quantity, l.locked_at, l.description, m.code AS item_code, m.name AS item_name,
             (SELECT pr.id FROM cf_production_releases pr WHERE pr.company_id = l.company_id AND pr.order_line_id = l.id AND pr.deleted_at IS NULL LIMIT 1) AS release_id
@@ -399,6 +402,7 @@ export async function readRequisitions(db, companyId, filter = {}, { R: given = 
       id: h.id, code: h.code, supply, supplyLabel: SUPPLY_LABEL[supply],
       // §79: what it is for (the cost follows it); an MR raised by hand has no line, and may have no order.
       forType, forLabel: FOR_LABEL[forType], manual, maintenanceOrderId: h.maintenance_order_id ?? null, notes: h.notes ?? null,
+      maintenanceOrder: h.maintenance_order_id == null ? null : { id: Number(h.maintenance_order_id), code: h.mo_code ?? null, label: h.mo_label ?? h.mo_code ?? null },
       // §93: made under Stores' own PR (To reorder / New PR) — not a request to Stores, not in the MR inbox.
       internal: !!Number(h.internal_pr ?? 0),
       order: h.order_id == null ? null : { id: h.order_id, code: h.order_code, status: h.order_status, customer: h.customer_id ? { id: h.customer_id, name: h.customer_name } : null },

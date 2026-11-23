@@ -374,7 +374,9 @@ export async function ensureDue(db, companyId) {
     const S = await getSettings(db, companyId);
     await db.query(
       `UPDATE cf_maintenance_orders
-          SET due_at = raised_at + INTERVAL (CASE source WHEN 'fault' THEN ? WHEN 'preventive' THEN ? WHEN 'setup' THEN ? ELSE ? END) HOUR
+          -- 2026-11-23: TiDB (production) refuses "INTERVAL (CASE …) HOUR" — every new maintenance order failed there ("Something
+          -- went wrong" on Raise a fault / New). TIMESTAMPADD takes an expression in both MySQL and TiDB; minutes keep 1.5 h exact.
+          SET due_at = TIMESTAMPADD(MINUTE, ROUND((CASE source WHEN 'fault' THEN ? WHEN 'preventive' THEN ? WHEN 'setup' THEN ? ELSE ? END) * 60), raised_at)
         WHERE company_id = ? AND due_at IS NULL AND deleted_at IS NULL AND status IN ('open','in_progress','waiting_parts')`,
       [Number(S.maint_target_fault_hours), Number(S.maint_target_preventive_hours), Number(S.maint_target_setup_hours), Number(S.maint_target_manual_hours), companyId]);
   } catch (e) { if (!missingSchema(e)) throw e; }
