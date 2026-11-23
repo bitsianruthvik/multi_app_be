@@ -40,7 +40,7 @@ const WORK = path.join(DIR, 'work');
 const LOGS = path.join(DIR, 'logs');
 const COPY = path.join(WORK, 'erp.sqlite');
 const STATE = path.join(WORK, 'state.json');
-const VERSION = '2026-11-23b';
+const VERSION = '2026-11-24a';
 fs.mkdirSync(WORK, { recursive: true }); fs.mkdirSync(LOGS, { recursive: true });
 const ARGS = process.argv.slice(2);
 const opt = (k) => (ARGS.find((a) => a.startsWith(`--${k}=`)) || '').slice(k.length + 3) || null;
@@ -107,6 +107,12 @@ function mssqlSource(c) {
       return out;
     },
     async count(t) { let n = 0; await run(`SELECT COUNT(*) FROM [dbo].${q(ident(t))}`, (r) => { n = r[0]; }); return n; },
+    /** What this login could do besides reading (the agent itself only ever sends SELECTs). */
+    async rights() {
+      const names = ['INSERT', 'UPDATE', 'DELETE', 'ALTER', 'EXECUTE', 'db_owner', 'db_datawriter', 'sysadmin']; let row;
+      await run(`SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UPDATE'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'DELETE'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'EXECUTE'), IS_MEMBER('db_owner'), IS_MEMBER('db_datawriter'), IS_SRVROLEMEMBER('sysadmin')`, (r) => { row = r; });
+      return names.filter((_, i) => row && row[i] === 1);
+    },
     // dates as 'YYYY-MM-DDTHH:MM:SS': read the same whatever the server's date format setting
     select(t, cols, w, onRow) { return run(`SELECT ${cols.map((x) => q(ident(x))).join(', ')} FROM [dbo].${q(ident(t))}${whereSql(w, q, (d) => d.replace(' ', 'T'))}`, (r) => onRow(r.map(val))); },
   };
@@ -225,7 +231,22 @@ async function buildAndSend(kind, dbFile) {
   return { kb: Math.round(gz.length / 1024), chunks: r.chunks };
 }
 async function approvedOrThrow() { const st = await api('GET', '/agent/status'); if (st.status !== 'approved') throw new Error(`this agent is ${st.status}; an admin has to approve it first`); }
+/** One run at a time: on a PC that was off at night, the nightly run and the day task can start together. */
+async function takeLock() {
+  const f = path.join(WORK, 'run.lock'); const t0 = Date.now(); let said = false;
+  for (;;) {
+    try { fs.writeFileSync(f, String(process.pid), { flag: 'wx' }); return () => { try { fs.unlinkSync(f); } catch { /* gone */ } }; } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    let stale = false; try { stale = Date.now() - fs.statSync(f).mtimeMs > 3 * 3600e3; } catch { continue; }
+    if (stale) { try { fs.unlinkSync(f); } catch { /* raced */ } continue; }
+    if (Date.now() - t0 > 3 * 3600e3) throw new Error('another run has been busy for 3 hours');
+    if (!said) { log('another run is busy, waiting for it'); said = true; }
+    await new Promise((r) => setTimeout(r, 10000));
+  }
+}
 async function oneRun(kind, work) {
+  const unlock = await takeLock(); try { return await oneRunLocked(kind, work); } finally { unlock(); }
+}
+async function oneRunLocked(kind, work) {
   const t0 = Date.now();
   try {
     await approvedOrThrow();
@@ -246,6 +267,10 @@ async function cmdTest() {
   const src = source(); log(`agent ${VERSION}: testing ${src.kind}`); await src.open(); let missing = 0;
   try {
     log('  ' + await src.version()); log('  server clock ' + await src.now());
+    if (src.rights) {
+      const extra = await src.rights();
+      log(extra.length ? `  NOTE: this login can also change data (${extra.join(', ')}). The agent never does: it sends only SELECTs. A read-only login is still better.` : '  login rights: read-only');
+    }
     for (const t of TABLES()) { try { const [n, k] = [await src.count(t), await src.key(t)]; log(`  ${t}: ${n} rows, key ${k.join('+') || 'none'}`); } catch (e) { missing++; log(`  ${t}: ${e.message}`); } }
   } finally { src.close(); }
   log(missing ? `${missing} tables could not be read` : 'all tables readable'); if (missing) process.exitCode = 1;

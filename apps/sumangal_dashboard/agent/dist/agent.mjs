@@ -68979,7 +68979,7 @@ var WORK = path3.join(DIR, "work");
 var LOGS = path3.join(DIR, "logs");
 var COPY = path3.join(WORK, "erp.sqlite");
 var STATE = path3.join(WORK, "state.json");
-var VERSION = "2026-11-23b";
+var VERSION = "2026-11-24a";
 fs6.mkdirSync(WORK, { recursive: true });
 fs6.mkdirSync(LOGS, { recursive: true });
 var ARGS = process.argv.slice(2);
@@ -69104,6 +69104,15 @@ function mssqlSource(c) {
         n = r[0];
       });
       return n;
+    },
+    /** What this login could do besides reading (the agent itself only ever sends SELECTs). */
+    async rights() {
+      const names = ["INSERT", "UPDATE", "DELETE", "ALTER", "EXECUTE", "db_owner", "db_datawriter", "sysadmin"];
+      let row;
+      await run(`SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UPDATE'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'DELETE'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER'), HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'EXECUTE'), IS_MEMBER('db_owner'), IS_MEMBER('db_datawriter'), IS_SRVROLEMEMBER('sysadmin')`, (r) => {
+        row = r;
+      });
+      return names.filter((_, i) => row && row[i] === 1);
     },
     // dates as 'YYYY-MM-DDTHH:MM:SS': read the same whatever the server's date format setting
     select(t, cols, w, onRow) {
@@ -69328,7 +69337,52 @@ async function approvedOrThrow() {
   const st = await api("GET", "/agent/status");
   if (st.status !== "approved") throw new Error(`this agent is ${st.status}; an admin has to approve it first`);
 }
+async function takeLock() {
+  const f = path3.join(WORK, "run.lock");
+  const t0 = Date.now();
+  let said = false;
+  for (; ; ) {
+    try {
+      fs6.writeFileSync(f, String(process.pid), { flag: "wx" });
+      return () => {
+        try {
+          fs6.unlinkSync(f);
+        } catch {
+        }
+      };
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+    }
+    let stale = false;
+    try {
+      stale = Date.now() - fs6.statSync(f).mtimeMs > 3 * 36e5;
+    } catch {
+      continue;
+    }
+    if (stale) {
+      try {
+        fs6.unlinkSync(f);
+      } catch {
+      }
+      continue;
+    }
+    if (Date.now() - t0 > 3 * 36e5) throw new Error("another run has been busy for 3 hours");
+    if (!said) {
+      log("another run is busy, waiting for it");
+      said = true;
+    }
+    await new Promise((r) => setTimeout(r, 1e4));
+  }
+}
 async function oneRun(kind, work) {
+  const unlock = await takeLock();
+  try {
+    return await oneRunLocked(kind, work);
+  } finally {
+    unlock();
+  }
+}
+async function oneRunLocked(kind, work) {
   const t0 = Date.now();
   try {
     await approvedOrThrow();
@@ -69355,6 +69409,10 @@ async function cmdTest() {
   try {
     log("  " + await src.version());
     log("  server clock " + await src.now());
+    if (src.rights) {
+      const extra = await src.rights();
+      log(extra.length ? `  NOTE: this login can also change data (${extra.join(", ")}). The agent never does: it sends only SELECTs. A read-only login is still better.` : "  login rights: read-only");
+    }
     for (const t of TABLES()) {
       try {
         const [n, k] = [await src.count(t), await src.key(t)];

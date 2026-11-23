@@ -17,4 +17,6 @@ const tables = [...new Set(builders.flatMap((f) => fs.readFileSync(path.join(v15
 fs.writeFileSync(path.join(dist, 'tables.json'), JSON.stringify(tables, null, 1));
 fs.copyFileSync(path.join(here, 'setup.ps1'), path.join(dist, 'setup.ps1'));
 fs.copyFileSync(path.join(here, 'README.md'), path.join(dist, 'README.md'));
+// wscript wants CRLF line ends
+fs.writeFileSync(path.join(dist, 'run-hidden.vbs'), fs.readFileSync(path.join(here, 'run-hidden.vbs'), 'utf8').replace(/\r?\n/g, '\r\n'));
 console.log('dist:', fs.readdirSync(dist).map((f) => `${f} ${Math.round(fs.statSync(path.join(dist, f)).size / 1024)} KB`).join(', '), '| tables', tables.length);

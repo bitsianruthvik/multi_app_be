@@ -31,7 +31,12 @@ Invoke-WebRequest https://multi-app-be-svpc.onrender.com/api/sumangal/sumangal_d
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
-It asks for the SQL Server (`machine` or `machine\INSTANCE`), the database, the login and its password. It tests the connection and registers the agent. It can also create the task "Sumangal dashboard agent" daily at 02:00, which needs that user's Windows password and the right to "log on as a batch job".
+No admin rights are needed. It checks the Windows version (10/11 or Server 2016+, 64-bit) and asks for the SQL Server (IP or `machine`, or `machine\INSTANCE`), the port, the database, the login and its password (`-Server`, `-Port`, `-User` fill the defaults). The test reports the login's rights: one that could also write is noted, not refused, since the agent only sends `SELECT`s. Then it registers the agent and creates the two tasks, which start `run-hidden.vbs` (node with no window):
+
+- **1 (default): while the user is signed in.** No password and no admin right. Locking the screen is fine; signing out stops them. A run missed while the PC was off starts when it is next on, so a PC that is only on in the daytime does its full read in the morning.
+- **2: signed in or not.** Needs the user's Windows password and the "Log on as a batch job" right.
+
+Runs never overlap: a run waits for the one before it (`work\run.lock`).
 
 **Approve the agent.** It is ignored until an admin approves it on our side:
 

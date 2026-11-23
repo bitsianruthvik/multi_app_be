@@ -26,7 +26,7 @@ import { storeV15, v15Status } from '../services/v15Service.js';
 const router = Router({ mergeParams: true });
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const AGENT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'agent', 'dist');
-const FILES = ['agent.mjs', 'build-d.mjs', 'supp.mjs', 'hist.mjs', 'build-v15.mjs', 'setup.ps1', 'README.md', 'tables.json'];
+const FILES = ['agent.mjs', 'build-d.mjs', 'supp.mjs', 'hist.mjs', 'build-v15.mjs', 'setup.ps1', 'README.md', 'tables.json', 'run-hidden.vbs'];
 const MAX_PENDING = 3;
 
 router.get('/agent/files/:name', (req, res) => {
