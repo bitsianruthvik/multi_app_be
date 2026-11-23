@@ -18,8 +18,10 @@ import { storeV15, v15Status } from '../services/v15Service.js';
  *   GET  /agent/status        → { status }                                    (headers below)
  *   POST /agent/push          body: the dataset JSON, gzipped (application/octet-stream)
  *   POST /agent/report        { ok, message, seconds }                        → last run kept
+ *   GET  /agent/jobs?wait=25  day mode: waits for a 'Refresh now' request (204 = none); POST /agent/jobs/:id/done
  * Headers on status/push/report: X-Agent-Uid, Authorization: Bearer <key>.
- * For a platform login: GET /agent/runs → the agents and their last runs, and when the data was loaded.
+ * For a platform login: GET /agent/runs → the agents, their last runs, when the data was loaded, the last refresh
+ * request; POST /agent/refresh → asks the agent for an update now (answered within about a minute in working hours).
  */
 const router = Router({ mergeParams: true });
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
@@ -72,7 +74,8 @@ router.post('/agent/push', express.raw({ type: 'application/octet-stream', limit
     const text = zlib.gunzipSync(req.body).toString('utf8');
     const data = JSON.parse(text);
     if (!data.D || !Array.isArray(data.D.items) || !data.S || !data.H) return res.status(400).json({ error: 'Not an ERP dashboard dataset (D, S, H).' });
-    const out = await storeV15(req.company.id, text, { source: `agent ${a.id}`, end: data.D.end });
+    const kind = req.get('x-run-kind') === 'update' ? 'update' : 'nightly';
+    const out = await storeV15(req.company.id, text, { source: `agent ${a.id} ${kind}`, end: data.D.end });
     res.json({ ok: true, ...out });
   } catch (err) { req.log?.error?.({ err }, 'sumangal agent push'); res.status(500).json({ error: err.message }); }
 });
@@ -86,10 +89,49 @@ router.post('/agent/report', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+/** Day mode: the agent waits here (up to ?wait= seconds, max 25) for a "Refresh now" request and takes it. 204 = none. */
+router.get('/agent/jobs', async (req, res) => {
+  try {
+    const a = await agentOf(req, res); if (!a) return;
+    const until = Date.now() + Math.min(25, Math.max(0, +req.query.wait || 0)) * 1000;
+    for (;;) {
+      const [r] = await pool.query("UPDATE sd_agent_jobs SET status = 'running', picked_at = UTC_TIMESTAMP(), picked_by = ? WHERE company_id = ? AND status = 'waiting' ORDER BY id LIMIT 1", [a.id, req.company.id]);
+      if (r.affectedRows) {
+        const [[job]] = await pool.query("SELECT id, kind, created_at FROM sd_agent_jobs WHERE company_id = ? AND status = 'running' AND picked_by = ? ORDER BY picked_at DESC, id DESC LIMIT 1", [req.company.id, a.id]);
+        // requests that came in meanwhile are answered by this same update
+        await pool.query("UPDATE sd_agent_jobs SET status = 'running', picked_at = UTC_TIMESTAMP(), picked_by = ? WHERE company_id = ? AND status = 'waiting'", [a.id, req.company.id]);
+        return res.json(job);
+      }
+      if (Date.now() >= until || req.socket.destroyed) return res.status(204).end();
+      await new Promise((ok) => setTimeout(ok, 2000));
+    }
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/agent/jobs/:id/done', async (req, res) => {
+  try {
+    const a = await agentOf(req, res); if (!a) return;
+    await pool.query("UPDATE sd_agent_jobs SET status = 'done', done_at = UTC_TIMESTAMP(), ok = ? WHERE company_id = ? AND status = 'running' AND picked_by = ?", [req.body?.ok ? 1 : 0, req.company.id, a.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/** "Refresh now" from the dashboard (platform login). One waiting request per company is enough. */
+router.post('/agent/refresh', protect, async (req, res) => {
+  try {
+    const cid = req.company.id;
+    const [[agent]] = await pool.query("SELECT id, last_seen_at, TIMESTAMPDIFF(SECOND, last_seen_at, UTC_TIMESTAMP()) idle FROM sd_agents WHERE company_id = ? AND status = 'approved' ORDER BY last_seen_at DESC LIMIT 1", [cid]);
+    if (!agent) return res.status(409).json({ error: 'No approved ERP agent for this company yet.' });
+    const [[open]] = await pool.query("SELECT id, status FROM sd_agent_jobs WHERE company_id = ? AND status IN ('waiting', 'running') AND created_at > UTC_TIMESTAMP() - INTERVAL 30 MINUTE ORDER BY id DESC LIMIT 1", [cid]);
+    const id = open ? open.id : (await pool.query('INSERT INTO sd_agent_jobs (company_id, requested_by) VALUES (?, ?)', [cid, req.user?.id ?? null]))[0].insertId;
+    res.json({ id, status: open ? open.status : 'waiting', agentListening: agent.idle != null && agent.idle < 90 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 router.get('/agent/runs', protect, async (req, res) => {
   try {
-    const [agents] = await pool.query('SELECT id, machine, win_user, status, created_at, approved_at, last_seen_at, last_run_at, last_ok, last_message, last_seconds FROM sd_agents WHERE company_id = ? ORDER BY id DESC', [req.company.id]);
-    res.json({ agents, data: await v15Status(req.company.id) });
+    const [agents] = await pool.query('SELECT id, machine, win_user, status, created_at, approved_at, last_seen_at, last_run_at, last_ok, last_message, last_seconds, TIMESTAMPDIFF(SECOND, last_seen_at, UTC_TIMESTAMP()) idle_seconds FROM sd_agents WHERE company_id = ? ORDER BY id DESC', [req.company.id]);
+    const [[job]] = await pool.query("SELECT id, status, created_at, picked_at, done_at, ok FROM sd_agent_jobs WHERE company_id = ? ORDER BY id DESC LIMIT 1", [req.company.id]);
+    res.json({ agents, data: await v15Status(req.company.id), job: job || null });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

@@ -33,3 +33,19 @@ CREATE TABLE IF NOT EXISTS sd_agents (
   UNIQUE KEY uq_sd_agents_uid (agent_uid),
   KEY idx_sd_agents_company (company_id)
 );
+
+-- §3 Refresh requests for the ERP agent: "Refresh now" on the dashboard adds one; the agent, in day mode, waits for
+-- them (GET /agent/jobs long-poll), runs an update and closes it. Old rows can be cleared at any time.
+CREATE TABLE IF NOT EXISTS sd_agent_jobs (
+  id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+  company_id    BIGINT       NOT NULL,
+  kind          VARCHAR(20)  NOT NULL DEFAULT 'refresh',
+  status        VARCHAR(12)  NOT NULL DEFAULT 'waiting',
+  requested_by  BIGINT       NULL,
+  created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  picked_at     DATETIME     NULL,
+  picked_by     BIGINT       NULL,
+  done_at       DATETIME     NULL,
+  ok            TINYINT      NULL,
+  KEY idx_sd_agent_jobs_company (company_id, status)
+);

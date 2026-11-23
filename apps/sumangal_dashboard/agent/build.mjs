@@ -13,7 +13,7 @@ await build({
 });
 const builders = ['build-d.mjs', 'supp.mjs', 'hist.mjs', 'build-v15.mjs'];
 for (const f of builders) fs.copyFileSync(path.join(v15, f), path.join(dist, f));
-const tables = [...new Set(builders.flatMap((f) => fs.readFileSync(path.join(v15, f), 'utf8').match(/\btbl_[a-z0-9_]+/gi) || []))].sort();
+const tables = [...new Set(builders.flatMap((f) => fs.readFileSync(path.join(v15, f), 'utf8').match(/\btbl_[a-z0-9_]+/gi) || []))].filter((t) => !t.endsWith('_')).sort();
 fs.writeFileSync(path.join(dist, 'tables.json'), JSON.stringify(tables, null, 1));
 fs.copyFileSync(path.join(here, 'setup.ps1'), path.join(dist, 'setup.ps1'));
 fs.copyFileSync(path.join(here, 'README.md'), path.join(dist, 'README.md'));

@@ -1478,8 +1478,8 @@ var require_log = __commonJS({
     var import_node_os2 = __require("node:os");
     var import_node_util7 = __toESM2(__require("node:util"));
     var import_node_process9 = __toESM2(__require("node:process"));
-    function log2(message, ...args2) {
-      import_node_process9.default.stderr.write(`${import_node_util7.default.format(message, ...args2)}${import_node_os2.EOL}`);
+    function log2(message, ...args) {
+      import_node_process9.default.stderr.write(`${import_node_util7.default.format(message, ...args)}${import_node_os2.EOL}`);
     }
   }
 });
@@ -1704,14 +1704,14 @@ var require_debug = __commonJS({
         namespace,
         extend
       });
-      function debug(...args2) {
+      function debug(...args) {
         if (!newDebugger.enabled) {
           return;
         }
-        if (args2.length > 0) {
-          args2[0] = `${namespace} ${args2[0]}`;
+        if (args.length > 0) {
+          args[0] = `${namespace} ${args[0]}`;
         }
-        newDebugger.log(...args2);
+        newDebugger.log(...args);
       }
       debuggers.push(newDebugger);
       return newDebugger;
@@ -1782,8 +1782,8 @@ var require_logger = __commonJS({
       error: 100
     };
     function patchLogMethod(parent, child) {
-      child.log = (...args2) => {
-        parent.log(...args2);
+      child.log = (...args) => {
+        parent.log(...args);
       };
     }
     function isTypeSpecRuntimeLogLevel(level) {
@@ -1794,8 +1794,8 @@ var require_logger = __commonJS({
       const logLevelFromEnv = (0, import_env.getEnvironmentVariable)(options.logLevelEnvVarName);
       let logLevel;
       const clientLogger = (0, import_debug.default)(options.namespace);
-      clientLogger.log = (...args2) => {
-        import_debug.default.log(...args2);
+      clientLogger.log = (...args) => {
+        import_debug.default.log(...args);
       };
       function contextSetLogLevel(level) {
         if (level && !isTypeSpecRuntimeLogLevel(level)) {
@@ -2780,8 +2780,8 @@ var require_jwa = __commonJS({
       return base64url.replace(/\-/g, "+").replace(/_/g, "/");
     }
     function typeError(template) {
-      var args2 = [].slice.call(arguments, 1);
-      var errMsg = util.format.bind(util, template).apply(null, args2);
+      var args = [].slice.call(arguments, 1);
+      var errMsg = util.format.bind(util, template).apply(null, args);
       return new TypeError(errMsg);
     }
     function bufferOrString(obj) {
@@ -3437,7 +3437,7 @@ var require_constants2 = __commonJS({
 var require_debug2 = __commonJS({
   "node_modules/semver/internal/debug.js"(exports, module) {
     "use strict";
-    var debug = typeof process === "object" && process.env && process.env.NODE_DEBUG && /\bsemver\b/i.test(process.env.NODE_DEBUG) ? (...args2) => console.error("SEMVER", ...args2) : () => {
+    var debug = typeof process === "object" && process.env && process.env.NODE_DEBUG && /\bsemver\b/i.test(process.env.NODE_DEBUG) ? (...args) => console.error("SEMVER", ...args) : () => {
     };
     module.exports = debug;
   }
@@ -6440,8 +6440,8 @@ var require_sign = __commonJS({
           payload = Object.assign({}, payload);
         }
       } else {
-        const invalid_options = options_for_objects.filter(function(opt) {
-          return typeof options[opt] !== "undefined";
+        const invalid_options = options_for_objects.filter(function(opt2) {
+          return typeof options[opt2] !== "undefined";
         });
         if (invalid_options.length > 0) {
           return failure(new Error("invalid " + invalid_options.join(",") + " option for " + typeof payload + " payload"));
@@ -6690,7 +6690,7 @@ var require_msal_node = __commonJS({
     var CLAIMS = "claims";
     var SCOPE = "scope";
     var REFRESH_TOKEN = "refresh_token";
-    var STATE = "state";
+    var STATE2 = "state";
     var NONCE = "nonce";
     var PROMPT = "prompt";
     var CODE = "code";
@@ -7378,9 +7378,9 @@ var require_msal_node = __commonJS({
        *
        * @param query
        */
-      static queryStringToObject(query2) {
+      static queryStringToObject(query) {
         const obj = {};
-        const params = query2.split("&");
+        const params = query.split("&");
         const decode = (s) => decodeURIComponent(s.replace(/\+/g, " "));
         params.forEach((pair) => {
           if (pair.trim()) {
@@ -7660,15 +7660,15 @@ var require_msal_node = __commonJS({
       }
       return staticAliases || [];
     }
-    function getAliasesFromMetadata(logger2, correlationId, authorityHost, cloudDiscoveryMetadata, source) {
-      logger2.trace(`getAliasesFromMetadata called with source: '${source}'`, correlationId);
+    function getAliasesFromMetadata(logger2, correlationId, authorityHost, cloudDiscoveryMetadata, source2) {
+      logger2.trace(`getAliasesFromMetadata called with source: '${source2}'`, correlationId);
       if (authorityHost && cloudDiscoveryMetadata) {
         const metadata = getCloudDiscoveryMetadataFromNetworkResponse(cloudDiscoveryMetadata, authorityHost);
         if (metadata) {
-          logger2.trace(`getAliasesFromMetadata: found cloud discovery metadata in '${source}', returning aliases`, correlationId);
+          logger2.trace(`getAliasesFromMetadata: found cloud discovery metadata in '${source2}', returning aliases`, correlationId);
           return metadata.aliases;
         } else {
-          logger2.trace(`getAliasesFromMetadata: did not find cloud discovery metadata in '${source}'`, correlationId);
+          logger2.trace(`getAliasesFromMetadata: did not find cloud discovery metadata in '${source2}'`, correlationId);
         }
       }
       return null;
@@ -7728,14 +7728,14 @@ var require_msal_node = __commonJS({
     var RegionDiscoveryGetCurrentVersion = "regionDiscoveryGetCurrentVersion";
     var CacheManagerGetRefreshToken = "cacheManagerGetRefreshToken";
     var invoke = (callback, eventName, logger2, telemetryClient, correlationId) => {
-      return (...args2) => {
+      return (...args) => {
         logger2.trace(`Executing function '${eventName}'`, correlationId);
         const inProgressEvent = telemetryClient.startMeasurement(eventName, correlationId);
         if (correlationId) {
           telemetryClient.incrementFields({ [`ext.${eventName}CallCount`]: 1 }, correlationId);
         }
         try {
-          const result = callback(...args2);
+          const result = callback(...args);
           inProgressEvent.end({
             success: true
           });
@@ -7756,13 +7756,13 @@ var require_msal_node = __commonJS({
       };
     };
     var invokeAsync = (callback, eventName, logger2, telemetryClient, correlationId) => {
-      return (...args2) => {
+      return (...args) => {
         logger2.trace(`Executing function '${eventName}'`, correlationId);
         const inProgressEvent = telemetryClient.startMeasurement(eventName, correlationId);
         if (correlationId) {
           telemetryClient.incrementFields({ [`ext.${eventName}CallCount`]: 1 }, correlationId);
         }
-        return callback(...args2).then((response) => {
+        return callback(...args).then((response) => {
           logger2.trace(`Returning result from '${eventName}'`, correlationId);
           inProgressEvent.end({
             success: true
@@ -9129,7 +9129,7 @@ Error Description: '${typedError.message}'`, this.correlationId);
     }
     function addState(parameters, state) {
       if (state) {
-        parameters.set(STATE, state);
+        parameters.set(STATE2, state);
       }
     }
     function addNonce(parameters, nonce) {
@@ -17244,11 +17244,11 @@ ${serverError}`, correlationId);
        * @returns the managed identity Source
        */
       selectManagedIdentitySource(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries, managedIdentityId) {
-        const source = ServiceFabric.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries, managedIdentityId) || AppService.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries) || MachineLearning.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries) || CloudShell.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries, managedIdentityId) || AzureArc.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries, managedIdentityId) || Imds.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries);
-        if (!source) {
+        const source2 = ServiceFabric.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries, managedIdentityId) || AppService.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries) || MachineLearning.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries) || CloudShell.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries, managedIdentityId) || AzureArc.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries, managedIdentityId) || Imds.tryCreate(logger2, nodeStorage, networkClient, cryptoProvider, disableInternalRetries);
+        if (!source2) {
           throw createManagedIdentityError(unableToCreateSource, "");
         }
-        return source;
+        return source2;
       }
     };
     var SOURCES_THAT_SUPPORT_TOKEN_REVOCATION = [ManagedIdentitySourceNames.SERVICE_FABRIC];
@@ -17925,9 +17925,9 @@ var require_responseBody = __commonJS({
     function isBrowserResponseBody(value) {
       return typeof value === "object" && value !== null && "cancel" in value && typeof value.cancel === "function";
     }
-    function setResponseBodySource(body, source) {
-      if (isNodeResponseBody(body) && isNodeResponseBody(source)) {
-        responseBodySources.set(body, source);
+    function setResponseBodySource(body, source2) {
+      if (isNodeResponseBody(body) && isNodeResponseBody(source2)) {
+        responseBodySources.set(body, source2);
       }
     }
     function setResponseBodyDisposer(response, dispose) {
@@ -17943,7 +17943,7 @@ var require_responseBody = __commonJS({
         return;
       }
       disposed.add(readableStream);
-      const source = responseBodySources.get(readableStream);
+      const source2 = responseBodySources.get(readableStream);
       responseBodySources.delete(readableStream);
       if (readableStream.closed !== true) {
         if (readableStream.destroy) {
@@ -17970,8 +17970,8 @@ var require_responseBody = __commonJS({
           readableStream.resume();
         }
       }
-      if (source) {
-        disposeNodeResponseBody(source, disposed);
+      if (source2) {
+        disposeNodeResponseBody(source2, disposed);
       }
     }
     function disposeNodeStream(stream) {
@@ -21448,9 +21448,9 @@ var require_nodeHttpClient = __commonJS({
       }
       return stream;
     }
-    function pipeUploadStream(source, destination, request, onError) {
+    function pipeUploadStream(source2, destination, request, onError) {
       let tearingDown = false;
-      const cleanupFinished = (0, import_node_stream.finished)(source, { writable: false }, onSourceComplete);
+      const cleanupFinished = (0, import_node_stream.finished)(source2, { writable: false }, onSourceComplete);
       function onSourceComplete(error) {
         cleanupFinished();
         destination.removeListener("close", onDestinationClose);
@@ -21462,19 +21462,19 @@ var require_nodeHttpClient = __commonJS({
       }
       function onDestinationClose() {
         tearingDown = true;
-        source.unpipe(destination);
-        (0, import_responseBody.disposeNodeStream)(source);
+        source2.unpipe(destination);
+        (0, import_responseBody.disposeNodeStream)(source2);
       }
       destination.once("close", onDestinationClose);
-      source.pipe(destination);
+      source2.pipe(destination);
     }
-    function pipeResponseStream(source, destination, abortSignal) {
-      (0, import_responseBody.setResponseBodySource)(destination, source);
+    function pipeResponseStream(source2, destination, abortSignal) {
+      (0, import_responseBody.setResponseBodySource)(destination, source2);
       let cleanupSource = () => {
       };
       let cleanupDestination = () => {
       };
-      cleanupSource = (0, import_node_stream.finished)(source, { writable: false }, (error) => {
+      cleanupSource = (0, import_node_stream.finished)(source2, { writable: false }, (error) => {
         cleanupSource();
         if (error) {
           destination.destroy(abortSignal.aborted ? new import_AbortError.AbortError() : error);
@@ -21482,12 +21482,12 @@ var require_nodeHttpClient = __commonJS({
       });
       cleanupDestination = (0, import_node_stream.finished)(destination, { writable: false }, () => {
         cleanupDestination();
-        source.unpipe(destination);
-        if (source.readable) {
-          (0, import_responseBody.disposeNodeStream)(source);
+        source2.unpipe(destination);
+        if (source2.readable) {
+          (0, import_responseBody.disposeNodeStream)(source2);
         }
       });
-      return source.pipe(destination);
+      return source2.pipe(destination);
     }
     function streamToText(stream) {
       return new Promise((resolve, reject) => {
@@ -22451,7 +22451,7 @@ var require_common = __commonJS({
         let enableOverride = null;
         let namespacesCache;
         let enabledCache;
-        function debug(...args2) {
+        function debug(...args) {
           if (!debug.enabled) {
             return;
           }
@@ -22462,28 +22462,28 @@ var require_common = __commonJS({
           self2.prev = prevTime;
           self2.curr = curr;
           prevTime = curr;
-          args2[0] = createDebug.coerce(args2[0]);
-          if (typeof args2[0] !== "string") {
-            args2.unshift("%O");
+          args[0] = createDebug.coerce(args[0]);
+          if (typeof args[0] !== "string") {
+            args.unshift("%O");
           }
           let index = 0;
-          args2[0] = args2[0].replace(/%([a-zA-Z%])/g, (match, format) => {
+          args[0] = args[0].replace(/%([a-zA-Z%])/g, (match, format) => {
             if (match === "%%") {
               return "%";
             }
             index++;
             const formatter = createDebug.formatters[format];
             if (typeof formatter === "function") {
-              const val2 = args2[index];
+              const val2 = args[index];
               match = formatter.call(self2, val2);
-              args2.splice(index, 1);
+              args.splice(index, 1);
               index--;
             }
             return match;
           });
-          createDebug.formatArgs.call(self2, args2);
+          createDebug.formatArgs.call(self2, args);
           const logFn = self2.log || createDebug.log;
-          logFn.apply(self2, args2);
+          logFn.apply(self2, args);
         }
         debug.namespace = namespace;
         debug.useColors = createDebug.useColors();
@@ -22705,16 +22705,16 @@ var require_browser = __commonJS({
       typeof navigator !== "undefined" && navigator.userAgent && (m = navigator.userAgent.toLowerCase().match(/firefox\/(\d+)/)) && parseInt(m[1], 10) >= 31 || // Double check webkit in userAgent just in case we are in a worker
       typeof navigator !== "undefined" && navigator.userAgent && navigator.userAgent.toLowerCase().match(/applewebkit\/(\d+)/);
     }
-    function formatArgs(args2) {
-      args2[0] = (this.useColors ? "%c" : "") + this.namespace + (this.useColors ? " %c" : " ") + args2[0] + (this.useColors ? "%c " : " ") + "+" + module.exports.humanize(this.diff);
+    function formatArgs(args) {
+      args[0] = (this.useColors ? "%c" : "") + this.namespace + (this.useColors ? " %c" : " ") + args[0] + (this.useColors ? "%c " : " ") + "+" + module.exports.humanize(this.diff);
       if (!this.useColors) {
         return;
       }
       const c = "color: " + this.color;
-      args2.splice(1, 0, c, "color: inherit");
+      args.splice(1, 0, c, "color: inherit");
       let index = 0;
       let lastC = 0;
-      args2[0].replace(/%[a-zA-Z%]/g, (match) => {
+      args[0].replace(/%[a-zA-Z%]/g, (match) => {
         if (match === "%%") {
           return;
         }
@@ -22723,7 +22723,7 @@ var require_browser = __commonJS({
           lastC = index;
         }
       });
-      args2.splice(lastC, 0, c);
+      args.splice(lastC, 0, c);
     }
     exports.log = console.debug || console.log || (() => {
     });
@@ -22998,16 +22998,16 @@ var require_node = __commonJS({
     function useColors() {
       return "colors" in exports.inspectOpts ? Boolean(exports.inspectOpts.colors) : tty.isatty(process.stderr.fd);
     }
-    function formatArgs(args2) {
+    function formatArgs(args) {
       const { namespace: name, useColors: useColors2 } = this;
       if (useColors2) {
         const c = this.color;
         const colorCode = "\x1B[3" + (c < 8 ? c : "8;5;" + c);
         const prefix = `  ${colorCode};1m${name} \x1B[0m`;
-        args2[0] = prefix + args2[0].split("\n").join("\n" + prefix);
-        args2.push(colorCode + "m+" + module.exports.humanize(this.diff) + "\x1B[0m");
+        args[0] = prefix + args[0].split("\n").join("\n" + prefix);
+        args.push(colorCode + "m+" + module.exports.humanize(this.diff) + "\x1B[0m");
       } else {
-        args2[0] = getDate() + name + " " + args2[0];
+        args[0] = getDate() + name + " " + args[0];
       }
     }
     function getDate() {
@@ -23016,8 +23016,8 @@ var require_node = __commonJS({
       }
       return (/* @__PURE__ */ new Date()).toISOString() + " ";
     }
-    function log2(...args2) {
-      return process.stderr.write(util.formatWithOptions(exports.inspectOpts, ...args2) + "\n");
+    function log2(...args) {
+      return process.stderr.write(util.formatWithOptions(exports.inspectOpts, ...args) + "\n");
     }
     function save(namespaces) {
       if (namespaces) {
@@ -23488,10 +23488,10 @@ var require_dist2 = __commonJS({
         const proxyResponsePromise = (0, parse_proxy_response_1.parseProxyResponse)(socket);
         socket.write(`${payload}\r
 `);
-        const { connect: connect2, buffered } = await proxyResponsePromise;
-        req.emit("proxyConnect", connect2);
-        this.emit("proxyConnect", connect2, req);
-        if (connect2.statusCode === 200) {
+        const { connect, buffered } = await proxyResponsePromise;
+        req.emit("proxyConnect", connect);
+        this.emit("proxyConnect", connect, req);
+        if (connect.statusCode === 200) {
           req.once("socket", resume);
           if (opts.secureEndpoint) {
             debug("Upgrading socket connection to TLS");
@@ -24138,13 +24138,13 @@ var require_concat = __commonJS({
         return stream;
       }
     }
-    function toStream(source) {
-      if (source instanceof Uint8Array) {
-        return import_stream.Readable.from(Buffer.from(source));
-      } else if ((0, import_typeGuards.isBlob)(source)) {
-        return ensureNodeStream(source.stream());
+    function toStream(source2) {
+      if (source2 instanceof Uint8Array) {
+        return import_stream.Readable.from(Buffer.from(source2));
+      } else if ((0, import_typeGuards.isBlob)(source2)) {
+        return ensureNodeStream(source2.stream());
       } else {
-        return ensureNodeStream(source);
+        return ensureNodeStream(source2);
       }
     }
     async function concat(sources) {
@@ -24205,19 +24205,19 @@ var require_multipartPolicy = __commonJS({
       }
       return result;
     }
-    function getLength(source) {
-      if (source instanceof Uint8Array) {
-        return source.byteLength;
-      } else if ((0, import_typeGuards.isBlob)(source)) {
-        return source.size === -1 ? void 0 : source.size;
+    function getLength(source2) {
+      if (source2 instanceof Uint8Array) {
+        return source2.byteLength;
+      } else if ((0, import_typeGuards.isBlob)(source2)) {
+        return source2.size === -1 ? void 0 : source2.size;
       } else {
         return void 0;
       }
     }
     function getTotalLength(sources) {
       let total = 0;
-      for (const source of sources) {
-        const partLength = getLength(source);
+      for (const source2 of sources) {
+        const partLength = getLength(source2);
         if (partLength === void 0) {
           return void 0;
         } else {
@@ -25350,8 +25350,8 @@ var require_getClient = __commonJS({
       const noDefaultAcceptHeader = clientOptions.internal?.noDefaultAcceptHeader ?? false;
       const { allowInsecureConnection, httpClient } = clientOptions;
       const endpointUrl = clientOptions.endpoint ?? endpoint;
-      const client = (path4, ...args2) => {
-        const getUrl = (requestOptions) => (0, import_urlHelpers.buildRequestUrl)(endpointUrl, path4, args2, { allowInsecureConnection, ...requestOptions });
+      const client = (path4, ...args) => {
+        const getUrl = (requestOptions) => (0, import_urlHelpers.buildRequestUrl)(endpointUrl, path4, args, { allowInsecureConnection, ...requestOptions });
         return {
           get: (requestOptions = {}) => {
             return buildOperation(
@@ -26286,17 +26286,17 @@ var require_file = __commonJS({
         [rawContent]: stream
       };
     }
-    function hasArrayBuffer(source) {
-      return "resize" in source.buffer;
+    function hasArrayBuffer(source2) {
+      return "resize" in source2.buffer;
     }
-    function toArrayBuffer(source) {
-      if (hasArrayBuffer(source)) {
-        if (source.byteOffset !== 0 || source.byteLength !== source.buffer.byteLength) {
-          return new Uint8Array(source);
+    function toArrayBuffer(source2) {
+      if (hasArrayBuffer(source2)) {
+        if (source2.byteOffset !== 0 || source2.byteLength !== source2.buffer.byteLength) {
+          return new Uint8Array(source2);
         }
-        return source;
+        return source2;
       }
-      return source.map((x) => x);
+      return source2.map((x) => x);
     }
   }
 });
@@ -29231,7 +29231,7 @@ var require_identityClient = __commonJS({
         if (clientSecret !== void 0) {
           refreshParams.client_secret = clientSecret;
         }
-        const query2 = new URLSearchParams(refreshParams);
+        const query = new URLSearchParams(refreshParams);
         return import_tracing.tracingClient.withSpan(
           "IdentityClient.refreshAccessToken",
           options,
@@ -29241,7 +29241,7 @@ var require_identityClient = __commonJS({
               const request = (0, import_core_rest_pipeline.createPipelineRequest)({
                 url: `${this.authorityHost}/${tenantId}/${urlSuffix}`,
                 method: "POST",
-                body: query2.toString(),
+                body: query.toString(),
                 abortSignal: options.abortSignal,
                 headers: (0, import_core_rest_pipeline.createHttpHeaders)({
                   Accept: "application/json",
@@ -32814,8 +32814,8 @@ var require_normalizeCommand = __commonJS({
       }
       return false;
     }
-    function snapshotArguments(args2) {
-      return args2.map((arg, index) => {
+    function snapshotArguments(args) {
+      return args.map((arg, index) => {
         if (typeof arg !== "string" || arg.includes("\0")) {
           throw new import_errors.ProcessError(`Process argument ${index} is invalid.`, {
             code: "ERR_INVALID_PROCESS_ARGUMENT"
@@ -32824,8 +32824,8 @@ var require_normalizeCommand = __commonJS({
         return arg;
       });
     }
-    function validateBatchArguments(args2) {
-      for (const [index, arg] of args2.entries()) {
+    function validateBatchArguments(args) {
+      for (const [index, arg] of args.entries()) {
         if (containsControlCharacter(arg) || UNSAFE_BATCH_ARGUMENT.test(arg) || /\\"/.test(arg) || /\\{2,}$/.test(arg)) {
           throw new import_errors.ProcessError(`Windows batch argument ${index} is unsafe.`, {
             code: "ERR_UNSAFE_WINDOWS_BATCH_ARGUMENT"
@@ -32848,8 +32848,8 @@ var require_normalizeCommand = __commonJS({
       escaped = `"${escaped}"`;
       return escaped.replace(BATCH_META_CHARACTER, "^$1");
     }
-    function normalizeCommand(command, args2, context) {
-      const copiedArgs = snapshotArguments(args2);
+    function normalizeCommand(command, args, context) {
+      const copiedArgs = snapshotArguments(args);
       const resolvedPath = (0, import_resolveExecutable.resolveExecutableWithContext)(command, context);
       if (!resolvedPath) {
         throw new import_errors.ProcessError("The executable could not be found.", { code: "ENOENT" });
@@ -32976,15 +32976,15 @@ var require_process = __commonJS({
     }
     function sanitizeChildProcessErrors(child) {
       const originalEmit = child.emit;
-      child.emit = (eventName, ...args2) => {
+      child.emit = (eventName, ...args) => {
         if (eventName === "error") {
-          args2[0] = sanitizeChildProcessError(args2[0]);
+          args[0] = sanitizeChildProcessError(args[0]);
         }
-        return Reflect.apply(originalEmit, child, [eventName, ...args2]);
+        return Reflect.apply(originalEmit, child, [eventName, ...args]);
       };
       return child;
     }
-    function prepareProcess(executable, args2, options, allowedOptionNames) {
+    function prepareProcess(executable, args, options, allowedOptionNames) {
       if (options.shell !== void 0 || options.windowsVerbatimArguments !== void 0) {
         throw new import_errors.ProcessError("Shell-related process options are not supported.", {
           code: "ERR_UNSAFE_PROCESS_OPTION"
@@ -33014,7 +33014,7 @@ var require_process = __commonJS({
         env,
         allowWindowsBatchFiles
       });
-      const command = (0, import_normalizeCommand.normalizeCommand)(executable, args2, context);
+      const command = (0, import_normalizeCommand.normalizeCommand)(executable, args, context);
       if (command.windowsVerbatimArguments && nodeOptions.argv0 !== void 0) {
         throw new import_errors.ProcessError("The argv0 option is not supported for Windows batch files.", {
           code: "ERR_UNSAFE_PROCESS_OPTION"
@@ -33022,8 +33022,8 @@ var require_process = __commonJS({
       }
       return { command, nodeOptions };
     }
-    function spawn2(command, args2 = [], options = {}) {
-      const prepared = prepareProcess(command, args2, options, spawnOptionNames);
+    function spawn2(command, args = [], options = {}) {
+      const prepared = prepareProcess(command, args, options, spawnOptionNames);
       const child = callWithSanitizedChildProcessErrors(
         () => childProcess4.spawn(prepared.command.executable, prepared.command.args, {
           ...prepared.nodeOptions,
@@ -33035,8 +33035,8 @@ var require_process = __commonJS({
       );
       return sanitizeChildProcessErrors(child);
     }
-    function spawnSync3(command, args2 = [], options = {}) {
-      const prepared = prepareProcess(command, args2, options, spawnSyncOptionNames);
+    function spawnSync3(command, args = [], options = {}) {
+      const prepared = prepareProcess(command, args, options, spawnSyncOptionNames);
       const result = callWithSanitizedChildProcessErrors(
         () => childProcess4.spawnSync(prepared.command.executable, prepared.command.args, {
           ...prepared.nodeOptions,
@@ -33054,8 +33054,8 @@ var require_process = __commonJS({
       }
       return result;
     }
-    async function execFile8(command, args2 = [], options = {}) {
-      const prepared = prepareProcess(command, args2, options, execFileOptionNames);
+    async function execFile8(command, args = [], options = {}) {
+      const prepared = prepareProcess(command, args, options, execFileOptionNames);
       return new Promise((resolve, reject) => {
         callWithSanitizedChildProcessErrors(
           () => childProcess4.execFile(
@@ -33307,7 +33307,7 @@ var require_azureDeveloperCliCredential = __commonJS({
           const encodedClaims = (0, import_core_util.uint8ArrayToString)((0, import_core_util.stringToUint8Array)(claims, "utf-8"), "base64");
           claimsSections = ["--claims", encodedClaims];
         }
-        const args2 = [
+        const args = [
           "auth",
           "token",
           "--output",
@@ -33317,7 +33317,7 @@ var require_azureDeveloperCliCredential = __commonJS({
           ...tenantSection,
           ...claimsSections
         ];
-        return import_processUtils.processUtils.execFileWithResult("azd", args2, {
+        return import_processUtils.processUtils.execFileWithResult("azd", args, {
           allowWindowsBatchFiles: true,
           cwd: developerCliCredentialInternals.getSafeWorkingDir(),
           encoding: "utf8",
@@ -33548,7 +33548,7 @@ var require_azureCliCredential = __commonJS({
         if (subscription) {
           subscriptionSection = ["--subscription", subscription];
         }
-        const args2 = [
+        const args = [
           "account",
           "get-access-token",
           "--output",
@@ -33558,7 +33558,7 @@ var require_azureCliCredential = __commonJS({
           ...tenantSection,
           ...subscriptionSection
         ];
-        return import_processUtils.processUtils.execFileWithResult("az", args2, {
+        return import_processUtils.processUtils.execFileWithResult("az", args, {
           allowWindowsBatchFiles: true,
           cwd: cliCredentialInternals.getSafeWorkingDir(),
           encoding: "utf8",
@@ -37814,8 +37814,8 @@ var require_request = __commonJS({
       /**
        * @private
        */
-      emit(event, ...args2) {
-        return super.emit(event, ...args2);
+      emit(event, ...args) {
+        return super.emit(event, ...args);
       }
       /**
        * @param sqlTextOrProcedure
@@ -38273,8 +38273,8 @@ var require_primordials = __commonJS({
         return self2.slice(start, end);
       },
       Error,
-      FunctionPrototypeCall(fn, thisArgs, ...args2) {
-        return fn.call(thisArgs, ...args2);
+      FunctionPrototypeCall(fn, thisArgs, ...args) {
+        return fn.call(thisArgs, ...args);
       },
       FunctionPrototypeSymbolHasInstance(self2, instance) {
         return Function.prototype[Symbol.hasInstance].call(self2, instance);
@@ -38353,9 +38353,9 @@ var require_inspect2 = __commonJS({
   "node_modules/readable-stream/lib/ours/util/inspect.js"(exports, module) {
     "use strict";
     module.exports = {
-      format(format, ...args2) {
+      format(format, ...args) {
         return format.replace(/%([sdifj])/g, function(...[_unused, type]) {
-          const replacement = args2.shift();
+          const replacement = args.shift();
           if (type === "f") {
             return replacement.toFixed(6);
           } else if (type === "j") {
@@ -38436,32 +38436,32 @@ var require_errors4 = __commonJS({
       }
       return `${val2.slice(0, i)}${res}`;
     }
-    function getMessage(key, msg, args2) {
+    function getMessage(key, msg, args) {
       if (typeof msg === "function") {
         assert(
-          msg.length <= args2.length,
+          msg.length <= args.length,
           // Default options do not count.
-          `Code: ${key}; The provided arguments length (${args2.length}) does not match the required ones (${msg.length}).`
+          `Code: ${key}; The provided arguments length (${args.length}) does not match the required ones (${msg.length}).`
         );
-        return msg(...args2);
+        return msg(...args);
       }
       const expectedLength = (msg.match(/%[dfijoOs]/g) || []).length;
       assert(
-        expectedLength === args2.length,
-        `Code: ${key}; The provided arguments length (${args2.length}) does not match the required ones (${expectedLength}).`
+        expectedLength === args.length,
+        `Code: ${key}; The provided arguments length (${args.length}) does not match the required ones (${expectedLength}).`
       );
-      if (args2.length === 0) {
+      if (args.length === 0) {
         return msg;
       }
-      return format(msg, ...args2);
+      return format(msg, ...args);
     }
     function E(code, message, Base) {
       if (!Base) {
         Base = Error;
       }
       class NodeError extends Base {
-        constructor(...args2) {
-          super(getMessage(code, message, args2));
+        constructor(...args) {
+          super(getMessage(code, message, args));
         }
         toString() {
           return `${this.name} [${code}]: ${this.message}`;
@@ -38653,22 +38653,22 @@ var require_errors4 = __commonJS({
     );
     E(
       "ERR_MISSING_ARGS",
-      (...args2) => {
-        assert(args2.length > 0, "At least one arg needs to be specified");
+      (...args) => {
+        assert(args.length > 0, "At least one arg needs to be specified");
         let msg;
-        const len = args2.length;
-        args2 = (Array.isArray(args2) ? args2 : [args2]).map((a) => `"${a}"`).join(" or ");
+        const len = args.length;
+        args = (Array.isArray(args) ? args : [args]).map((a) => `"${a}"`).join(" or ");
         switch (len) {
           case 1:
-            msg += `The ${args2[0]} argument`;
+            msg += `The ${args[0]} argument`;
             break;
           case 2:
-            msg += `The ${args2[0]} and ${args2[1]} arguments`;
+            msg += `The ${args[0]} and ${args[1]} arguments`;
             break;
           default:
             {
-              const last = args2.pop();
-              msg += `The ${args2.join(", ")}, and ${last} arguments`;
+              const last = args.pop();
+              msg += `The ${args.join(", ")}, and ${last} arguments`;
             }
             break;
         }
@@ -39420,12 +39420,12 @@ var require_util = __commonJS({
       kEmptyObject: Object.freeze({}),
       once(callback) {
         let called = false;
-        return function(...args2) {
+        return function(...args) {
           if (called) {
             return;
           }
           called = true;
-          callback.apply(this, args2);
+          callback.apply(this, args);
         };
       },
       createDeferredPromise: function() {
@@ -39443,11 +39443,11 @@ var require_util = __commonJS({
       },
       promisify(fn) {
         return new Promise((resolve, reject) => {
-          fn((err, ...args2) => {
+          fn((err, ...args) => {
             if (err) {
               return reject(err);
             }
-            return resolve(...args2);
+            return resolve(...args);
           });
         });
       },
@@ -40210,9 +40210,9 @@ var require_end_of_stream = __commonJS({
           addAbortListener = addAbortListener || require_util().addAbortListener;
           const disposable = addAbortListener(options.signal, abort);
           const originalCallback = callback;
-          callback = once((...args2) => {
+          callback = once((...args) => {
             disposable[SymbolDispose]();
-            originalCallback.apply(stream, args2);
+            originalCallback.apply(stream, args);
           });
         }
       }
@@ -40237,15 +40237,15 @@ var require_end_of_stream = __commonJS({
           addAbortListener = addAbortListener || require_util().addAbortListener;
           const disposable = addAbortListener(options.signal, abort);
           const originalCallback = callback;
-          callback = once((...args2) => {
+          callback = once((...args) => {
             disposable[SymbolDispose]();
-            originalCallback.apply(stream, args2);
+            originalCallback.apply(stream, args);
           });
         }
       }
-      const resolverFn = (...args2) => {
+      const resolverFn = (...args) => {
         if (!isAborted) {
-          process10.nextTick(() => callback.apply(stream, args2));
+          process10.nextTick(() => callback.apply(stream, args));
         }
       };
       PromisePrototypeThen(stream[kIsClosedPromise].promise, resolverFn, resolverFn);
@@ -40556,22 +40556,22 @@ var require_legacy = __commonJS({
     ObjectSetPrototypeOf(Stream.prototype, EE.prototype);
     ObjectSetPrototypeOf(Stream, EE);
     Stream.prototype.pipe = function(dest, options) {
-      const source = this;
+      const source2 = this;
       function ondata(chunk) {
-        if (dest.writable && dest.write(chunk) === false && source.pause) {
-          source.pause();
+        if (dest.writable && dest.write(chunk) === false && source2.pause) {
+          source2.pause();
         }
       }
-      source.on("data", ondata);
+      source2.on("data", ondata);
       function ondrain() {
-        if (source.readable && source.resume) {
-          source.resume();
+        if (source2.readable && source2.resume) {
+          source2.resume();
         }
       }
       dest.on("drain", ondrain);
       if (!dest._isStdio && (!options || options.end !== false)) {
-        source.on("end", onend);
-        source.on("close", onclose);
+        source2.on("end", onend);
+        source2.on("close", onclose);
       }
       let didOnEnd = false;
       function onend() {
@@ -40591,23 +40591,23 @@ var require_legacy = __commonJS({
           this.emit("error", er);
         }
       }
-      prependListener(source, "error", onerror);
+      prependListener(source2, "error", onerror);
       prependListener(dest, "error", onerror);
       function cleanup() {
-        source.removeListener("data", ondata);
+        source2.removeListener("data", ondata);
         dest.removeListener("drain", ondrain);
-        source.removeListener("end", onend);
-        source.removeListener("close", onclose);
-        source.removeListener("error", onerror);
+        source2.removeListener("end", onend);
+        source2.removeListener("close", onclose);
+        source2.removeListener("error", onerror);
         dest.removeListener("error", onerror);
-        source.removeListener("end", cleanup);
-        source.removeListener("close", cleanup);
+        source2.removeListener("end", cleanup);
+        source2.removeListener("close", cleanup);
         dest.removeListener("close", cleanup);
       }
-      source.on("end", cleanup);
-      source.on("close", cleanup);
+      source2.on("end", cleanup);
+      source2.on("close", cleanup);
       dest.on("close", cleanup);
-      dest.emit("pipe", source);
+      dest.emit("pipe", source2);
       return dest;
     };
     function prependListener(emitter, event, fn) {
@@ -44198,8 +44198,8 @@ var require_operators = __commonJS({
       }
       return !await some.call(
         this,
-        async (...args2) => {
-          return !await fn(...args2);
+        async (...args) => {
+          return !await fn(...args);
         },
         options
       );
@@ -44472,11 +44472,11 @@ var require_stream = __commonJS({
     Stream.isWritable = utils.isWritable;
     Stream.Readable = require_readable();
     for (const key of ObjectKeys(streamReturningOperators)) {
-      let fn = function(...args2) {
+      let fn = function(...args) {
         if (new.target) {
           throw ERR_ILLEGAL_CONSTRUCTOR();
         }
-        return Stream.Readable.from(ReflectApply(op, this, args2));
+        return Stream.Readable.from(ReflectApply(op, this, args));
       };
       const op = streamReturningOperators[key];
       ObjectDefineProperty(fn, "name", {
@@ -44496,11 +44496,11 @@ var require_stream = __commonJS({
       });
     }
     for (const key of ObjectKeys(promiseReturningOperators)) {
-      let fn = function(...args2) {
+      let fn = function(...args) {
         if (new.target) {
           throw ERR_ILLEGAL_CONSTRUCTOR();
         }
-        return ReflectApply(op, this, args2);
+        return ReflectApply(op, this, args);
       };
       const op = promiseReturningOperators[key];
       ObjectDefineProperty(fn, "name", {
@@ -45282,9 +45282,9 @@ var require_message_io = __commonJS({
         this.socket.pipe(this.incomingMessageStream);
         this.outgoingMessageStream.pipe(this.socket);
       }
-      packetSize(...args2) {
-        if (args2.length > 0) {
-          const packetSize = args2[0];
+      packetSize(...args) {
+        if (args.length > 0) {
+          const packetSize = args[0];
           this.debug.log("Packet size changed from " + this.outgoingMessageStream.packetSize + " to " + packetSize);
           this.outgoingMessageStream.packetSize = packetSize;
         }
@@ -47486,7 +47486,7 @@ var require_js_joda = __commonJS({
         function TemporalAccessor2() {
         }
         var _proto = TemporalAccessor2.prototype;
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           if (_query === TemporalQueries.zoneId() || _query === TemporalQueries.chronology() || _query === TemporalQueries.precision()) {
             return null;
           }
@@ -47624,7 +47624,7 @@ var require_js_joda = __commonJS({
         _proto.minus = function minus(days) {
           return this.plus(-1 * MathUtil.floorMod(days, 7));
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           if (_query === TemporalQueries.precision()) {
             return ChronoUnit.DAYS;
           } else if (_query === TemporalQueries.localDate() || _query === TemporalQueries.localTime() || _query === TemporalQueries.chronology() || _query === TemporalQueries.zone() || _query === TemporalQueries.zoneId() || _query === TemporalQueries.offset()) {
@@ -47811,7 +47811,7 @@ var require_js_joda = __commonJS({
               return Month2.OCTOBER;
           }
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           assert(_query != null, "query() parameter must not be null", DateTimeException);
           if (_query === TemporalQueries.chronology()) {
             return IsoChronology.INSTANCE;
@@ -48359,7 +48359,7 @@ var require_js_joda = __commonJS({
           }
           return fieldOrUnit != null && fieldOrUnit.isSupportedBy(this);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           if (_query === TemporalQueries.chronology()) {
             return this.chronology();
           } else if (_query === TemporalQueries.precision()) {
@@ -48751,7 +48751,7 @@ var require_js_joda = __commonJS({
           }
           return field.getFrom(this);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           if (_query === TemporalQueries.offset() || _query === TemporalQueries.zone()) {
             return this;
@@ -49098,7 +49098,7 @@ var require_js_joda = __commonJS({
           }
           return value;
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           if (_query === TemporalQueries.zoneId()) {
             return this.zone;
           } else if (_query === TemporalQueries.chronology()) {
@@ -49279,7 +49279,7 @@ var require_js_joda = __commonJS({
           assert(val2 != null);
           return val2;
         };
-        _proto2.query = function query2(_query) {
+        _proto2.query = function query(_query) {
           if (_query === TemporalQueries.chronology()) {
             return this.chrono;
           }
@@ -49329,8 +49329,8 @@ var require_js_joda = __commonJS({
         _proto.endOptional = function endOptional() {
           this._optional--;
         };
-        _proto.getValueQuery = function getValueQuery(query2) {
-          var result = this._temporal.query(query2);
+        _proto.getValueQuery = function getValueQuery(query) {
+          var result = this._temporal.query(query);
           if (result == null && this._optional === 0) {
             throw new DateTimeException("Unable to extract value: " + this._temporal);
           }
@@ -50664,8 +50664,8 @@ var require_js_joda = __commonJS({
         return ZoneRegion2;
       }(ZoneId);
       var ZoneIdPrinterParser = function() {
-        function ZoneIdPrinterParser2(query2, description) {
-          this.query = query2;
+        function ZoneIdPrinterParser2(query, description) {
+          this.query = query;
           this.description = description;
         }
         var _proto = ZoneIdPrinterParser2.prototype;
@@ -51870,7 +51870,7 @@ var require_js_joda = __commonJS({
           }
           return MonthDay2.of(this._month, dayOfMonth);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           requireInstance(_query, TemporalQuery, "query");
           if (_query === TemporalQueries.chronology()) {
@@ -52164,7 +52164,7 @@ var require_js_joda = __commonJS({
         _proto.minusMonths = function minusMonths(monthsToSubtract) {
           return monthsToSubtract === MathUtil.MIN_SAFE_INTEGER ? this.plusMonths(Math.MAX_SAFE_INTEGER).plusMonths(1) : this.plusMonths(-monthsToSubtract);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           requireInstance(_query, TemporalQuery, "query");
           if (_query === TemporalQueries.chronology()) {
@@ -52465,7 +52465,7 @@ var require_js_joda = __commonJS({
           requireInstance(monthDay, MonthDay, "monthDay");
           return monthDay.atYear(this._year);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query()");
           requireInstance(_query, TemporalQuery, "query()");
           if (_query === TemporalQueries.chronology()) {
@@ -52996,7 +52996,7 @@ var require_js_joda = __commonJS({
         _proto.plusNanos = function plusNanos(nanos) {
           return this._withLocalTimeOffset(this._time.plusNanos(nanos), this._offset);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           if (_query === TemporalQueries.precision()) {
             return ChronoUnit.NANOS;
@@ -53151,7 +53151,7 @@ var require_js_joda = __commonJS({
           return _Temporal.apply(this, arguments) || this;
         }
         var _proto = ChronoZonedDateTime2.prototype;
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           if (_query === TemporalQueries.zoneId() || _query === TemporalQueries.zone()) {
             return this.zone();
           } else if (_query === TemporalQueries.chronology()) {
@@ -53609,7 +53609,7 @@ var require_js_joda = __commonJS({
         _proto.minusNanos = function minusNanos(nanos) {
           return this.plusNanos(-1 * nanos);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           if (_query === TemporalQueries.localDate()) {
             return this.toLocalDate();
           }
@@ -53785,7 +53785,7 @@ var require_js_joda = __commonJS({
         _proto.atZoneSimilarLocal = function atZoneSimilarLocal(zone) {
           return ZonedDateTime.ofLocal(this._dateTime, zone, this._offset);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           if (_query === TemporalQueries.chronology()) {
             return IsoChronology.INSTANCE;
@@ -54488,7 +54488,7 @@ var require_js_joda = __commonJS({
         _proto.minusDays = function minusDays(daysToSubtract) {
           return this.plusDays(daysToSubtract * -1);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           if (_query === TemporalQueries.localDate()) {
             return this;
@@ -54718,7 +54718,7 @@ var require_js_joda = __commonJS({
         _proto.chronology = function chronology() {
           return this.toLocalDate().chronology();
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           if (_query === TemporalQueries.chronology()) {
             return this.chronology();
           } else if (_query === TemporalQueries.precision()) {
@@ -55071,7 +55071,7 @@ var require_js_joda = __commonJS({
           var newTime = newNoD === curNoD ? this._time : LocalTime.ofNanoOfDay(newNoD);
           return this._withDateTime(newDate.plusDays(totDays), newTime);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           if (_query === TemporalQueries.localDate()) {
             return this.toLocalDate();
@@ -55575,7 +55575,7 @@ var require_js_joda = __commonJS({
         _proto.minusNanos = function minusNanos(nanosToSubtract) {
           return this.plusNanos(-1 * MathUtil.intMod(nanosToSubtract, LocalTime2.NANOS_PER_DAY));
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           if (_query === TemporalQueries.precision()) {
             return ChronoUnit.NANOS;
@@ -55930,7 +55930,7 @@ var require_js_joda = __commonJS({
         _proto.minusMicros = function minusMicros(microsToSubtract) {
           return this.plusMicros(-1 * microsToSubtract);
         };
-        _proto.query = function query2(_query) {
+        _proto.query = function query(_query) {
           requireNonNull(_query, "query");
           if (_query === TemporalQueries.precision()) {
             return ChronoUnit.NANOS;
@@ -67227,8 +67227,8 @@ var require_connection = __commonJS({
       /**
        * @private
        */
-      emit(event, ...args2) {
-        return super.emit(event, ...args2);
+      emit(event, ...args) {
+        return super.emit(event, ...args);
       }
       /**
        * Closes the connection to the database.
@@ -67376,9 +67376,9 @@ var require_connection = __commonJS({
           port: this.routingData ? this.routingData.port : port,
           localAddress: this.config.options.localAddress
         };
-        const connect2 = customConnector || (multiSubnetFailover ? _connector.connectInParallel : _connector.connectInSequence);
+        const connect = customConnector || (multiSubnetFailover ? _connector.connectInParallel : _connector.connectInSequence);
         (async () => {
-          let socket = await connect2(connectOpts, _dns.default.lookup, signal);
+          let socket = await connect(connectOpts, _dns.default.lookup, signal);
           if (this.config.options.encrypt === "strict") {
             try {
               socket = await this.wrapWithTls(socket, signal);
@@ -67558,10 +67558,10 @@ var require_connection = __commonJS({
       /**
        * @private
        */
-      dispatchEvent(eventName, ...args2) {
+      dispatchEvent(eventName, ...args) {
         const handler = this.state.events[eventName];
         if (handler) {
-          handler.apply(this, args2);
+          handler.apply(this, args);
         } else {
           this.emit("error", new Error(`No event '${eventName}' in state '${this.state.name}'`));
           this.close();
@@ -68226,23 +68226,23 @@ var require_connection = __commonJS({
         }
         const useSavepoint = this.inTransaction;
         const name = "_tedious_" + _crypto.default.randomBytes(10).toString("hex");
-        const txDone = (err, done, ...args2) => {
+        const txDone = (err, done, ...args) => {
           if (err) {
             if (this.inTransaction && this.state === this.STATE.LOGGED_IN) {
               this.rollbackTransaction((txErr) => {
-                done(txErr || err, ...args2);
+                done(txErr || err, ...args);
               }, name);
             } else {
-              done(err, ...args2);
+              done(err, ...args);
             }
           } else if (useSavepoint) {
             if (this.config.options.tdsVersion < "7_2") {
               this.transactionDepth--;
             }
-            done(null, ...args2);
+            done(null, ...args);
           } else {
             this.commitTransaction((txErr) => {
-              done(txErr, ...args2);
+              done(txErr, ...args);
             }, name);
           }
         };
@@ -68673,10 +68673,10 @@ var require_connection = __commonJS({
                   credentials = new _identity.ManagedIdentityCredential(...msiArgs);
                   break;
                 case "azure-active-directory-default":
-                  const args2 = authentication.options.clientId ? {
+                  const args = authentication.options.clientId ? {
                     managedIdentityClientId: authentication.options.clientId
                   } : {};
-                  credentials = new _identity.DefaultAzureCredential(args2);
+                  credentials = new _identity.DefaultAzureCredential(args);
                   break;
                 case "azure-active-directory-service-principal-secret":
                   credentials = new _identity.ClientSecretCredential(authentication.options.tenantId, authentication.options.clientId, authentication.options.clientSecret);
@@ -68939,7 +68939,7 @@ var require_tedious = __commonJS({
         return _dataType.TYPES;
       }
     });
-    exports.connect = connect2;
+    exports.connect = connect;
     exports.library = void 0;
     var _bulkLoad = _interopRequireDefault(require_bulk_load());
     var _connection = _interopRequireDefault(require_connection());
@@ -68955,7 +68955,7 @@ var require_tedious = __commonJS({
     var library = exports.library = {
       name: _library.name
     };
-    function connect2(config, connectListener) {
+    function connect(config, connectListener) {
       const connection = new _connection.default(config);
       connection.connect(connectListener);
       return connection;
@@ -68977,14 +68977,18 @@ var DIR = path3.dirname(fileURLToPath2(import.meta.url));
 var CONFIG = path3.join(DIR, "config.json");
 var WORK = path3.join(DIR, "work");
 var LOGS = path3.join(DIR, "logs");
-var VERSION = "2026-11-23";
+var COPY = path3.join(WORK, "erp.sqlite");
+var STATE = path3.join(WORK, "state.json");
+var VERSION = "2026-11-23b";
 fs6.mkdirSync(WORK, { recursive: true });
 fs6.mkdirSync(LOGS, { recursive: true });
-var logFile = path3.join(LOGS, `agent-${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.log`);
+var ARGS = process.argv.slice(2);
+var opt = (k) => (ARGS.find((a) => a.startsWith(`--${k}=`)) || "").slice(k.length + 3) || null;
+var logFile = () => path3.join(LOGS, `agent-${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.log`);
 var log = (...a) => {
   const line = `${(/* @__PURE__ */ new Date()).toISOString()} ${a.join(" ")}`;
   console.log(line);
-  fs6.appendFileSync(logFile, line + "\n");
+  fs6.appendFileSync(logFile(), line + "\n");
 };
 var cfg = () => {
   if (!fs6.existsSync(CONFIG)) throw new Error("config.json not found. Run setup.ps1 first.");
@@ -69009,58 +69013,159 @@ function assertSelectOnly(sql) {
   if (!ok || /;\s*\S/.test(s) || /\b(INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|EXEC|EXECUTE|TRUNCATE|GRANT|DENY|INTO)\b/i.test(s.replace(/'[^']*'/g, ""))) throw new Error("Refused, not a plain SELECT: " + s.slice(0, 120));
   return sql;
 }
-function connect(c) {
+var IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+var ident = (x) => {
+  if (!IDENT.test(x)) throw new Error("Bad name: " + x);
+  return x;
+};
+var DT = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+var pad = (x) => String(x).padStart(2, "0");
+var fmtDate = (v) => `${v.getUTCFullYear()}-${pad(v.getUTCMonth() + 1)}-${pad(v.getUTCDate())} ${pad(v.getUTCHours())}:${pad(v.getUTCMinutes())}:${pad(v.getUTCSeconds())}`;
+var val = (v) => v == null ? null : v instanceof Date ? fmtDate(v) : typeof v === "boolean" ? v ? 1 : 0 : typeof v === "bigint" ? Number(v) : Buffer.isBuffer(v) ? null : v;
+var SKIP_TYPES = /* @__PURE__ */ new Set(["image", "varbinary", "binary", "timestamp", "rowversion", "xml", "geography", "geometry", "hierarchyid", "sql_variant"]);
+function whereSql(w, q, lit = (d) => d) {
+  if (!w) return "";
+  if (w.since) {
+    if (!DT.test(w.since)) throw new Error("Bad date " + w.since);
+    return ` WHERE ${w.cols.map((c) => `${q(ident(c))} >= '${lit(w.since)}'`).join(" OR ")}`;
+  }
+  const vals = w.in.map((v) => typeof v === "number" && Number.isFinite(v) ? String(v) : /^[A-Za-z0-9 _./-]{1,60}$/.test(String(v)) ? `'${v}'` : (() => {
+    throw new Error("Bad key value");
+  })());
+  return ` WHERE ${q(ident(w.col))} IN (${vals.join(",")})`;
+}
+function mssqlSource(c) {
   const [host, instance] = String(c.server).split("\\");
   const auth = c.auth === "windows" ? { type: "ntlm", options: { userName: c.user.split("\\").pop(), domain: c.user.includes("\\") ? c.user.split("\\")[0] : c.domain || "", password: secret("sql.sec") } } : { type: "default", options: { userName: c.user, password: secret("sql.sec") } };
   const options = { database: c.database || "Casting_DB", encrypt: !!c.encrypt, trustServerCertificate: true, tdsVersion: c.tdsVersion || "7_3_B", connectTimeout: 3e4, requestTimeout: 0, rowCollectionOnDone: false, rowCollectionOnRequestCompletion: false, useUTC: true, readOnlyIntent: true };
   if (instance) options.instanceName = instance;
   else options.port = +(c.port || 1433);
-  return new Promise((resolve, reject) => {
-    const conn = new import_tedious.Connection({ server: host, authentication: auth, options });
-    conn.on("connect", (e) => e ? reject(e) : resolve(conn));
-    conn.connect();
-  });
-}
-function query(conn, sql, onRow) {
-  assertSelectOnly(sql);
-  return new Promise((resolve, reject) => {
-    let cols = null;
-    let n = 0;
-    const req = new import_tedious.Request(sql, (err) => err ? reject(err) : resolve(n));
-    req.on("columnMetadata", (m) => {
-      cols = m.map((x) => x.colName);
+  let conn;
+  const q = (x) => `[${x}]`;
+  const run = (sql, onRow) => {
+    assertSelectOnly(sql);
+    return new Promise((resolve, reject) => {
+      let n = 0;
+      const req = new import_tedious.Request(sql, (err) => err ? reject(err) : resolve(n));
+      req.on("row", (row) => {
+        n++;
+        onRow && onRow(row.map((x) => x.value));
+      });
+      conn.execSql(req);
     });
-    req.on("row", (row) => {
-      n++;
-      onRow && onRow(row.map((x) => x.value), cols);
-    });
-    conn.execSql(req);
-  });
+  };
+  return {
+    kind: "SQL Server",
+    async open() {
+      conn = await new Promise((resolve, reject) => {
+        const k = new import_tedious.Connection({ server: host, authentication: auth, options });
+        k.on("connect", (e) => e ? reject(e) : resolve(k));
+        k.connect();
+      });
+      await new Promise((resolve, reject) => {
+        const s = "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED";
+        assertSelectOnly(s);
+        conn.execSqlBatch(new import_tedious.Request(s, (e) => e ? reject(e) : resolve()));
+      });
+    },
+    close() {
+      conn?.close();
+    },
+    async version() {
+      let v = "";
+      await run("SELECT @@VERSION", (r) => {
+        v = String(r[0]).split("\n")[0];
+      });
+      return v;
+    },
+    async now() {
+      let v;
+      await run("SELECT GETDATE()", (r) => {
+        v = val(r[0]);
+      });
+      return v;
+    },
+    async columns(t) {
+      const out = [];
+      await run(`SELECT c.name, ty.name FROM sys.columns c JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE c.object_id = OBJECT_ID(N'dbo.${ident(t)}') ORDER BY c.column_id`, (r) => {
+        if (!SKIP_TYPES.has(String(r[1]).toLowerCase())) out.push(r[0]);
+      });
+      return out;
+    },
+    async key(t) {
+      const out = [];
+      await run(`SELECT c.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE i.is_primary_key = 1 AND i.object_id = OBJECT_ID(N'dbo.${ident(t)}') ORDER BY ic.key_ordinal`, (r) => out.push(r[0]));
+      if (!out.length) await run(`SELECT name FROM sys.identity_columns WHERE object_id = OBJECT_ID(N'dbo.${ident(t)}')`, (r) => out.push(r[0]));
+      return out;
+    },
+    async count(t) {
+      let n = 0;
+      await run(`SELECT COUNT(*) FROM [dbo].${q(ident(t))}`, (r) => {
+        n = r[0];
+      });
+      return n;
+    },
+    // dates as 'YYYY-MM-DDTHH:MM:SS': read the same whatever the server's date format setting
+    select(t, cols, w, onRow) {
+      return run(`SELECT ${cols.map((x) => q(ident(x))).join(", ")} FROM [dbo].${q(ident(t))}${whereSql(w, q, (d) => d.replace(" ", "T"))}`, (r) => onRow(r.map(val)));
+    }
+  };
 }
-var exec = (conn, sql) => new Promise((resolve, reject) => {
-  assertSelectOnly(sql);
-  conn.execSqlBatch(new import_tedious.Request(sql, (e) => e ? reject(e) : resolve()));
-});
-var SKIP_TYPES = /* @__PURE__ */ new Set(["image", "varbinary", "binary", "timestamp", "rowversion", "xml", "geography", "geometry", "hierarchyid", "sql_variant"]);
-var pad = (x) => String(x).padStart(2, "0");
-var val = (v) => v == null ? null : v instanceof Date ? `${v.getUTCFullYear()}-${pad(v.getUTCMonth() + 1)}-${pad(v.getUTCDate())} ${pad(v.getUTCHours())}:${pad(v.getUTCMinutes())}:${pad(v.getUTCSeconds())}` : typeof v === "boolean" ? v ? 1 : 0 : typeof v === "bigint" ? Number(v) : Buffer.isBuffer(v) ? null : v;
+function sqliteSource(file) {
+  let db;
+  const q = (x) => `"${x}"`;
+  return {
+    kind: "SQLite " + file,
+    async open() {
+      db = new DatabaseSync(file, { readOnly: true });
+    },
+    close() {
+      db?.close();
+    },
+    async version() {
+      return "SQLite stand-in";
+    },
+    async now() {
+      return fmtDate(new Date(Date.now() + 330 * 6e4));
+    },
+    async columns(t) {
+      return db.prepare(`PRAGMA table_info(${q(ident(t))})`).all().map((r) => r.name);
+    },
+    async key(t) {
+      const k = db.prepare(`PRAGMA table_info(${q(ident(t))})`).all().filter((r) => r.pk).map((r) => r.name);
+      return k.length ? k : [db.prepare(`PRAGMA table_info(${q(ident(t))})`).all()[0]?.name].filter(Boolean);
+    },
+    async count(t) {
+      return db.prepare(`SELECT COUNT(*) n FROM ${q(ident(t))}`).get().n;
+    },
+    async select(t, cols, w, onRow) {
+      const sql = assertSelectOnly(`SELECT ${cols.map((x) => q(ident(x))).join(", ")} FROM ${q(ident(t))}${whereSql(w, q)}`);
+      let n = 0;
+      for (const r of db.prepare(sql).iterate()) {
+        n++;
+        onRow(cols.map((c) => r[c]));
+      }
+      return n;
+    }
+  };
+}
+var source = () => opt("server-sqlite") ? sqliteSource(opt("server-sqlite")) : mssqlSource(cfg());
 var TABLES = () => JSON.parse(fs6.readFileSync(path3.join(DIR, "tables.json"), "utf8"));
-async function extract(dbFile) {
-  const c = cfg();
-  const conn = await connect(c);
+var DATE_COLS = ["modified_date", "created_date"];
+async function extractAll() {
+  const src = source();
+  await src.open();
   const t0 = Date.now();
   let total = 0;
+  const tmp = COPY + ".new";
+  if (fs6.existsSync(tmp)) fs6.unlinkSync(tmp);
+  const state = { fullAt: null, since: null, tables: {} };
   try {
-    await exec(conn, "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
-    if (fs6.existsSync(dbFile)) fs6.unlinkSync(dbFile);
-    const db = new DatabaseSync(dbFile);
+    state.since = await src.now();
+    const db = new DatabaseSync(tmp);
     db.exec("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;");
     for (const t of TABLES()) {
-      if (!/^tbl_[a-z0-9_]+$/i.test(t)) throw new Error("Bad table name in tables.json: " + t);
-      const cols = [];
-      await query(conn, `SELECT c.name, ty.name FROM sys.columns c JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE c.object_id = OBJECT_ID(N'dbo.${t}') ORDER BY c.column_id`, (r) => {
-        if (!SKIP_TYPES.has(String(r[1]).toLowerCase())) cols.push(r[0]);
-      });
+      const cols = await src.columns(t);
       if (!cols.length) {
         log(`  ${t}: not found, skipped`);
         continue;
@@ -69068,16 +69173,116 @@ async function extract(dbFile) {
       db.exec(`CREATE TABLE "${t}" (${cols.map((x) => `"${x}"`).join(", ")})`);
       const ins = db.prepare(`INSERT INTO "${t}" VALUES (${cols.map(() => "?").join(", ")})`);
       db.exec("BEGIN");
-      const n = await query(conn, `SELECT ${cols.map((x) => `[${x}]`).join(", ")} FROM [dbo].[${t}]`, (r) => ins.run(...r.map(val)));
+      const n = await src.select(t, cols, null, (r) => ins.run(...r));
       db.exec("COMMIT");
       total += n;
+      state.tables[t] = { cols, key: await src.key(t), dates: DATE_COLS.filter((d) => cols.includes(d)) };
       log(`  ${t}: ${n} rows`);
     }
+    const keyOwner = new Map(Object.entries(state.tables).filter(([, v]) => v.key.length === 1).map(([t, v]) => [v.key[0], t]));
+    for (const [t, v] of Object.entries(state.tables)) {
+      if (v.dates.length) continue;
+      const own = v.key[0];
+      const p = v.cols.map((c) => c !== own && keyOwner.has(c) && keyOwner.get(c) !== t ? [c, keyOwner.get(c)] : null).filter(Boolean);
+      const best = p[0];
+      if (best) {
+        v.parent = best[1];
+        v.fk = best[0];
+        db.exec(`CREATE INDEX IF NOT EXISTS "fx_${t}" ON "${t}"("${v.fk}")`);
+      }
+    }
+    for (const [t, v] of Object.entries(state.tables)) for (const k of v.key) db.exec(`CREATE INDEX IF NOT EXISTS "kx_${t}_${k}" ON "${t}"("${k}")`);
     db.close();
   } finally {
-    conn.close();
+    src.close();
   }
-  log(`read ${total} rows from SQL Server in ${Math.round((Date.now() - t0) / 1e3)} s`);
+  if (fs6.existsSync(COPY)) fs6.unlinkSync(COPY);
+  fs6.renameSync(tmp, COPY);
+  state.fullAt = (/* @__PURE__ */ new Date()).toISOString();
+  fs6.writeFileSync(STATE, JSON.stringify(state, null, 1));
+  const follow = Object.entries(state.tables).filter(([, v]) => !v.dates.length).map(([t, v]) => `${t}${v.parent ? " <- " + v.parent : " (re-read whole)"}`);
+  log(`read ${total} rows from ${src.kind} in ${Math.round((Date.now() - t0) / 1e3)} s; tables without dates: ${follow.join(", ")}`);
+}
+async function extractChanges() {
+  if (!fs6.existsSync(COPY) || !fs6.existsSync(STATE)) {
+    log("no working copy yet: reading everything");
+    await extractAll();
+    return -1;
+  }
+  const state = JSON.parse(fs6.readFileSync(STATE, "utf8"));
+  const src = source();
+  await src.open();
+  const t0 = Date.now();
+  let total = 0;
+  const db = new DatabaseSync(COPY);
+  db.exec("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;");
+  try {
+    const now = await src.now();
+    const since = fmtDate(new Date(Date.parse(state.since.replace(" ", "T") + "Z") - 10 * 6e4));
+    const changed = /* @__PURE__ */ new Map();
+    const take = async (t, v, w, dropWhere) => {
+      const rows = [];
+      await src.select(t, v.cols, w, (r) => rows.push(r));
+      db.exec("BEGIN");
+      if (dropWhere) {
+        const vals = dropWhere.in;
+        for (let i = 0; i < vals.length; i += 500) {
+          const part = vals.slice(i, i + 500);
+          db.prepare(`DELETE FROM "${t}" WHERE "${dropWhere.col}" IN (${part.map(() => "?").join(",")})`).run(...part);
+        }
+      } else if (v.key.length) {
+        const del = db.prepare(`DELETE FROM "${t}" WHERE ${v.key.map((k) => `"${k}" = ?`).join(" AND ")}`);
+        const ki = v.key.map((k) => v.cols.indexOf(k));
+        for (const r of rows) del.run(...ki.map((i) => r[i]));
+      }
+      const ins = db.prepare(`INSERT INTO "${t}" VALUES (${v.cols.map(() => "?").join(", ")})`);
+      for (const r of rows) ins.run(...r);
+      db.exec("COMMIT");
+      if (v.key.length === 1) {
+        const ki = v.cols.indexOf(v.key[0]);
+        const s = changed.get(t) || changed.set(t, /* @__PURE__ */ new Set()).get(t);
+        for (const r of rows) s.add(r[ki]);
+      }
+      total += rows.length;
+      return rows.length;
+    };
+    for (const [t, v] of Object.entries(state.tables)) if (v.dates.length) {
+      const n = await take(t, v, { since, cols: v.dates });
+      if (n) log(`  ${t}: ${n} changed`);
+    }
+    for (let round = 0; round < 4; round++) {
+      let any = false;
+      for (const [t, v] of Object.entries(state.tables)) {
+        if (v.dates.length || !v.parent || v.done) continue;
+        const ids = [...changed.get(v.parent) || []];
+        const parentDone = state.tables[v.parent].dates.length || state.tables[v.parent].done;
+        if (!parentDone) continue;
+        v.done = true;
+        any = true;
+        if (!ids.length) continue;
+        let n = 0;
+        for (let i = 0; i < ids.length; i += 800) {
+          const part = ids.slice(i, i + 800);
+          n += await take(t, v, { col: v.fk, in: part }, { col: v.fk, in: part });
+        }
+        if (n) log(`  ${t}: ${n} rows under ${ids.length} changed ${v.parent} rows`);
+      }
+      if (!any) break;
+    }
+    for (const [t, v] of Object.entries(state.tables)) if (!v.dates.length && !v.parent) {
+      db.exec(`DELETE FROM "${t}"`);
+      const n = await take(t, v, null);
+      log(`  ${t}: re-read whole (${n})`);
+    }
+    for (const v of Object.values(state.tables)) delete v.done;
+    state.since = now;
+    state.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+    fs6.writeFileSync(STATE, JSON.stringify(state, null, 1));
+  } finally {
+    db.close();
+    src.close();
+  }
+  log(`took in ${total} changed rows in ${Math.round((Date.now() - t0) / 1e3)} s`);
   return total;
 }
 var api = async (method, p, body, headers = {}) => {
@@ -69094,6 +69299,7 @@ var api = async (method, p, body, headers = {}) => {
     h["Content-Type"] = "application/json";
   }
   const r = await fetch(url, { method, headers: h, body: b });
+  if (r.status === 204) return null;
   const t = await r.text();
   let j;
   try {
@@ -69104,28 +69310,62 @@ var api = async (method, p, body, headers = {}) => {
   if (!r.ok) throw new Error(`${method} ${p}: ${r.status} ${j.error || j.raw || ""}`);
   return j;
 };
+async function buildAndSend(kind, dbFile) {
+  log("building the dashboard dataset");
+  execFileSync2(process.execPath, ["--no-warnings", path3.join(DIR, "build-v15.mjs")], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, SUMANGAL_DB: dbFile, SUMANGAL_WORK: WORK }, maxBuffer: 64 * 1024 * 1024 });
+  const json = fs6.readFileSync(path3.join(WORK, "v15.json"));
+  const gz = zlib.gzipSync(json, { level: 9 });
+  fs6.writeFileSync(path3.join(DIR, "last-sent.json.gz"), gz);
+  log(`sending ${Math.round(gz.length / 1024)} KB (${Math.round(json.length / 1024 / 1024)} MB unpacked)`);
+  const r = await api("POST", "/agent/push", gz, { "Content-Type": "application/octet-stream", "X-Run-Kind": kind });
+  if (!ARGS.includes("--keep")) for (const f of ["v15.json", "v13-data.js", "supp.json", "hist.json"]) {
+    const p = path3.join(WORK, f);
+    if (fs6.existsSync(p)) fs6.unlinkSync(p);
+  }
+  return { kb: Math.round(gz.length / 1024), chunks: r.chunks };
+}
+async function approvedOrThrow() {
+  const st = await api("GET", "/agent/status");
+  if (st.status !== "approved") throw new Error(`this agent is ${st.status}; an admin has to approve it first`);
+}
+async function oneRun(kind, work) {
+  const t0 = Date.now();
+  try {
+    await approvedOrThrow();
+    const note = await work();
+    const sent = await buildAndSend(kind, opt("source")?.startsWith("sqlite:") ? opt("source").slice(7) : COPY);
+    const secs = Math.round((Date.now() - t0) / 1e3);
+    log(`${kind}: stored on the dashboard in ${secs} s`);
+    await api("POST", "/agent/report", { ok: true, kind, message: `${kind}: ${note ? note + ", " : ""}sent ${sent.kb} KB`, seconds: secs });
+    return true;
+  } catch (e) {
+    log(`FAILED (${kind}): ` + e.message);
+    try {
+      await api("POST", "/agent/report", { ok: false, kind, message: `${kind}: ${e.message}`.slice(0, 480), seconds: Math.round((Date.now() - t0) / 1e3) });
+    } catch {
+    }
+    return false;
+  }
+}
 async function cmdTest() {
-  const c = cfg();
-  log(`agent ${VERSION}: testing ${c.server} / ${c.database || "Casting_DB"} as ${c.user}`);
-  const conn = await connect(c);
+  const src = source();
+  log(`agent ${VERSION}: testing ${src.kind}`);
+  await src.open();
   let missing = 0;
   try {
-    await query(conn, "SELECT @@VERSION", (r) => log("  SQL Server: " + String(r[0]).split("\n")[0]));
+    log("  " + await src.version());
+    log("  server clock " + await src.now());
     for (const t of TABLES()) {
-      let n = null;
       try {
-        await query(conn, `SELECT COUNT(*) FROM [dbo].[${t}]`, (r) => {
-          n = r[0];
-        });
+        const [n, k] = [await src.count(t), await src.key(t)];
+        log(`  ${t}: ${n} rows, key ${k.join("+") || "none"}`);
       } catch (e) {
         missing++;
         log(`  ${t}: ${e.message}`);
-        continue;
       }
-      log(`  ${t}: ${n} rows`);
     }
   } finally {
-    conn.close();
+    src.close();
   }
   log(missing ? `${missing} tables could not be read` : "all tables readable");
   if (missing) process.exitCode = 1;
@@ -69148,45 +69388,64 @@ async function cmdStatus() {
   const r = await api("GET", "/agent/status");
   log(`agent ${r.id}: ${r.status}`);
 }
-async function cmdRun(args2) {
-  const t0 = Date.now();
-  const keep = args2.includes("--keep");
-  const src = (args2.find((a) => a.startsWith("--source=sqlite:")) || "").slice("--source=sqlite:".length);
-  const dbFile = src || path3.join(WORK, "erp.sqlite");
-  try {
-    log(`agent ${VERSION}: nightly run`);
-    const st = await api("GET", "/agent/status");
-    if (st.status !== "approved") throw new Error(`this agent is ${st.status}; an admin has to approve it first`);
-    if (!src) await extract(dbFile);
-    else log("using existing copy " + dbFile);
-    log("building the dashboard dataset");
-    execFileSync2(process.execPath, ["--no-warnings", path3.join(DIR, "build-v15.mjs")], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, SUMANGAL_DB: dbFile, SUMANGAL_WORK: WORK }, maxBuffer: 64 * 1024 * 1024 });
-    const json = fs6.readFileSync(path3.join(WORK, "v15.json"));
-    const gz = zlib.gzipSync(json, { level: 9 });
-    fs6.writeFileSync(path3.join(DIR, "last-sent.json.gz"), gz);
-    log(`sending ${Math.round(gz.length / 1024)} KB (${Math.round(json.length / 1024 / 1024)} MB unpacked)`);
-    const r = await api("POST", "/agent/push", gz, { "Content-Type": "application/octet-stream" });
-    const secs = Math.round((Date.now() - t0) / 1e3);
-    log(`stored on the dashboard (${r.chunks} chunks) in ${secs} s`);
-    await api("POST", "/agent/report", { ok: true, message: `sent ${Math.round(gz.length / 1024)} KB`, seconds: secs });
-  } catch (e) {
-    log("FAILED: " + e.message);
-    try {
-      await api("POST", "/agent/report", { ok: false, message: e.message.slice(0, 480), seconds: Math.round((Date.now() - t0) / 1e3) });
-    } catch {
+async function cmdRun() {
+  log(`agent ${VERSION}: nightly run`);
+  const ok = await oneRun("nightly", async () => {
+    if (opt("source")) {
+      log("using existing copy " + opt("source"));
+      return "existing copy";
     }
-    process.exitCode = 1;
-  } finally {
-    if (!keep) for (const f of ["erp.sqlite", "v15.json", "v13-data.js", "supp.json", "hist.json"]) {
-      const p = path3.join(WORK, f);
-      if (p !== src && fs6.existsSync(p)) fs6.unlinkSync(p);
+    await extractAll();
+    return "full read";
+  });
+  if (!ok) process.exitCode = 1;
+}
+async function cmdUpdate() {
+  log(`agent ${VERSION}: day update`);
+  const ok = await oneRun("update", async () => {
+    const n = await extractChanges();
+    return n < 0 ? "full read" : `${n} changed rows`;
+  });
+  if (!ok) process.exitCode = 1;
+}
+async function cmdDay() {
+  const until = opt("until") || "21:00";
+  const every = +(opt("every") || 15) * 6e4;
+  const [hh, mm] = until.split(":").map(Number);
+  const end = /* @__PURE__ */ new Date();
+  end.setHours(hh, mm, 0, 0);
+  log(`agent ${VERSION}: day mode until ${until}, an update every ${every / 6e4} min and on request`);
+  let last = 0;
+  while (Date.now() < end.getTime()) {
+    let job = null;
+    try {
+      job = await api("GET", "/agent/jobs?wait=25");
+    } catch (e) {
+      log("waiting for requests failed: " + e.message);
+      await new Promise((r) => setTimeout(r, 3e4));
+    }
+    if (job?.id || Date.now() - last >= every) {
+      if (job?.id) log(`refresh requested (job ${job.id})`);
+      const ok = await oneRun("update", async () => {
+        const n = await extractChanges();
+        return n < 0 ? "full read" : `${n} changed rows`;
+      });
+      last = Date.now();
+      if (job?.id) {
+        try {
+          await api("POST", `/agent/jobs/${job.id}/done`, { ok });
+        } catch (e) {
+          log("could not close job: " + e.message);
+        }
+      }
     }
   }
+  log("day mode ends");
 }
-var [cmd, ...args] = process.argv.slice(2);
-var cmds = { test: cmdTest, register: cmdRegister, status: cmdStatus, run: () => cmdRun(args) };
+var [cmd] = ARGS;
+var cmds = { test: cmdTest, register: cmdRegister, status: cmdStatus, run: cmdRun, update: cmdUpdate, day: cmdDay };
 if (!cmds[cmd]) {
-  console.log("Usage: node agent.mjs test | register | status | run [--source=sqlite:<file>] [--keep]");
+  console.log("Usage: node agent.mjs test | register | status | run | update | day [--until=21:00] [--every=15]   (tests: --source=sqlite:<file>, --server-sqlite=<file>, --keep)");
   process.exit(cmd ? 1 : 0);
 }
 cmds[cmd]().catch((e) => {
