@@ -15,7 +15,9 @@ param(
   [string]$Company = 'sumangal',
   [string]$Dir = 'C:\SumangalDashboardAgent',
   [string]$NodeVersion = 'v22.17.0',
-  [string]$At = '02:00'
+  [string]$At = '02:00',
+  [string]$DayFrom = '08:00',
+  [string]$DayUntil = '21:00'
 )
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -70,7 +72,7 @@ Step "Registering this agent with the dashboard"
 Pop-Location
 
 Step "Nightly task"
-$yes = Read-Host "Create the scheduled task 'Sumangal dashboard agent' daily at $At under $env:USERDOMAIN\$env:USERNAME? (y/n)"
+$yes = Read-Host "Create the scheduled tasks (nightly at $At, and working hours $DayFrom-$DayUntil) under $env:USERDOMAIN\$env:USERNAME? (y/n)"
 if ($yes -match '^[yY]') {
   $tp = Read-Host "Windows password of $env:USERDOMAIN\$env:USERNAME (so the task runs when nobody is signed in)" -AsSecureString
   $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($tp))
@@ -78,7 +80,13 @@ if ($yes -match '^[yY]') {
   $trigger = New-ScheduledTaskTrigger -Daily -At $At
   $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew
   Register-ScheduledTask -TaskName 'Sumangal dashboard agent' -Action $action -Trigger $trigger -Settings $settings -User "$env:USERDOMAIN\$env:USERNAME" -Password $plain -RunLevel Limited -Force | Out-Null
+  # working hours: an update every 15 minutes and on "Refresh now", from $DayFrom to $DayUntil (Wednesday is the weekly off)
+  $dayAction = New-ScheduledTaskAction -Execute $node -Argument "--no-warnings `"$Dir\agent.mjs`" day --until=$DayUntil" -WorkingDirectory $Dir
+  $dayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Tuesday, Thursday, Friday, Saturday, Sunday -At $DayFrom
+  $daySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 15) -MultipleInstances IgnoreNew
+  Register-ScheduledTask -TaskName 'Sumangal dashboard agent (day)' -Action $dayAction -Trigger $dayTrigger -Settings $daySettings -User "$env:USERDOMAIN\$env:USERNAME" -Password $plain -RunLevel Limited -Force | Out-Null
   $plain = $null
-  Write-Host "  Task created. Run it now from Task Scheduler, or: & '$node' --no-warnings '$Dir\agent.mjs' run"
+  Write-Host "  Tasks created: nightly at $At, and working hours $DayFrom-$DayUntil (not Wednesdays)."
+  Write-Host "  Run the nightly one now from Task Scheduler, or: & '$node' --no-warnings '$Dir\agent.mjs' run"
 }
 Write-Host "`nDone. Logs: $Dir\logs. The dashboard shows the data after an admin approves this agent and the first run finishes." -ForegroundColor Green
