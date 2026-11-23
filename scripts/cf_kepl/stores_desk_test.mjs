@@ -129,6 +129,27 @@ try {
   await D.stockCountApprovalHandler.onReject(db, c, { subject_id: c3.id }, 'Count it again');
   ok('sent back: rejected, the book does not move', (await D.getCount(db, COMPANY, c3.id)).status === 'rejected' && (await row()).balance === 6);
 
+  console.log('5a. the monthly audit lists what has run out too');
+  {
+    const [[z]] = await db.query(
+      `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog'
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND i.tracked_by = 'batch'
+          AND NOT EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.item_id = m.id AND k.stocking_area_id = ?) LIMIT 1`, [COMPANY, area.id]);
+    if (!z) console.log('  (no lot-kept item without stock here: skipped)');
+    else {
+      await db.query('INSERT INTO cf_stock_balances (company_id, stocking_area_id, item_id, batch_id, quantity) VALUES (?, ?, ?, NULL, 0)', [COMPANY, area.id, z.id]);
+      const ml = await D.countList(db, COMPANY, { areaId: area.id, kind: 'monthly' });
+      const zl = ml.lines.filter((l) => l.item.id === z.id);
+      ok('an item kept here at zero: one line, book 0, no lot', zl.length === 1 && zl[0].book === 0 && zl[0].lot === null, JSON.stringify(zl));
+      ok('a used-up lot is not listed again', !ml.lines.some((l) => l.lot && l.book === 0));
+      ok('found stock of a lot-kept item with no lot here is refused in words', /kept by lot/.test(said(await refusal(D.postCount(db, c, { areaId: area.id, kind: 'monthly', lines: [{ itemId: z.id, counted: 3, reason: 'found' }] })))));
+      const zc = await D.postCount(db, c, { areaId: area.id, kind: 'monthly', lines: [{ itemId: z.id, counted: 0 }] });
+      ok('counted 0 as the book says: matched', zc.status === 'matched');
+      ok('and it shows as audited this month', (await D.countList(db, COMPANY, { areaId: area.id, kind: 'monthly' })).lines.find((l) => l.item.id === z.id)?.audited === true);
+      await db.query('DELETE FROM cf_stock_balances WHERE company_id = ? AND stocking_area_id = ? AND item_id = ? AND quantity = 0 AND last_movement_id IS NULL', [COMPANY, area.id, z.id]);
+    }
+  }
+
   console.log('5b. take back what was given out');
   {
     const [[cz]] = await db.query(

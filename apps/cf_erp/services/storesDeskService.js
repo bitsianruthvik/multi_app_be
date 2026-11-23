@@ -744,7 +744,7 @@ export async function countList(db, companyId, q = {}) {
       `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog'
          LEFT JOIN cf_classification_nodes v ON v.id = m.classification_id
         WHERE m.company_id = ? AND m.deleted_at IS NULL ${blank(q.subfamilyId) ? '' : 'AND v.parent_id = ?'}
-          AND (EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = m.company_id AND k.item_id = m.id AND k.stocking_area_id = ? AND k.quantity <> 0)
+          AND (EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = m.company_id AND k.item_id = m.id AND k.stocking_area_id = ?)
             OR EXISTS (SELECT 1 FROM cf_stock_ledger l JOIN cf_stock_movements mm ON mm.id = l.movement_id
                         WHERE l.company_id = m.company_id AND l.item_id = m.id AND l.stocking_area_id = ? AND l.deleted_at IS NULL AND mm.movement_date >= ?))
         ORDER BY m.name LIMIT 5000`, [companyId, ...(blank(q.subfamilyId) ? [] : [Number(q.subfamilyId)]), areaId, areaId, monthStart]);
@@ -768,9 +768,22 @@ export async function countList(db, companyId, q = {}) {
          LEFT JOIN cf_stock_balances k ON k.company_id = m.company_id AND k.item_id = m.id AND k.stocking_area_id = ?
          LEFT JOIN cf_stock_batches b ON b.id = k.batch_id
         WHERE m.company_id = ? AND m.id IN (?) ORDER BY m.name, k.batch_id`, [areaId, companyId, itemIds]);
-    lines = rows.filter((r) => r.tracked_by !== 'batch' || r.batch_id).map((r) => ({
-      item: { id: r.id, code: r.code, name: r.name, uom: r.uom }, lot: r.batch_id ? { id: r.batch_id, code: r.batch_code } : null, book: round6(r.q),
-    }));
+    const line = (r, lot = true) => ({
+      item: { id: r.id, code: r.code, name: r.name, uom: r.uom, trackedBy: r.tracked_by }, lot: lot && r.batch_id ? { id: r.batch_id, code: r.batch_code } : null, book: lot ? round6(r.q) : 0,
+    });
+    if (kind === 'monthly') {
+      // everything the store keeps (user, 2026-11-23: "include zeros"): the lots with stock, and an item that has run out
+      // as ONE line at 0 — not every used-up lot again
+      const byItem = new Map();
+      for (const r of rows) { if (!byItem.has(r.id)) byItem.set(r.id, []); byItem.get(r.id).push(r); }
+      for (const rs of byItem.values()) {
+        const live = rs.filter((r) => Math.abs(Number(r.q)) > 1e-9 && (r.tracked_by !== 'batch' || r.batch_id));
+        if (live.length) lines.push(...live.map((r) => line(r)));
+        else lines.push(line(rs[0], false));
+      }
+    } else {
+      lines = rows.filter((r) => r.tracked_by !== 'batch' || r.batch_id).map((r) => line(r));
+    }
   }
   let month = null;
   if (kind === 'monthly') {
@@ -824,6 +837,11 @@ export async function postCount(db, c, input = {}) {
     const counted = Number(l.counted);
     if (!Number.isFinite(counted) || counted < 0) { problems.push(`Line ${n + 1}: the quantity on the shelf is a number, zero or more.`); continue; }
     const lotId = blank(l.lotId) ? null : Number(l.lotId);
+    if (lotId == null && counted > 0) {
+      // a lot-kept item that has run out is listed once at 0; stock found for it has no lot to go into
+      const [[t]] = await db.query('SELECT tracked_by FROM cf_item_details WHERE master_id = ?', [Number(l.itemId)]);
+      if (t?.tracked_by === 'batch') { problems.push(`Line ${n + 1}: this item is kept by lot and has none here — take what was found into a lot first (with its brand), then audit it.`); continue; }
+    }
     const [[k]] = await db.query('SELECT quantity FROM cf_stock_balances WHERE company_id = ? AND stocking_area_id = ? AND item_id = ? AND batch_key = ? FOR UPDATE',
       [c.companyId, area.id, Number(l.itemId), lotId ?? 0]);
     const book = k ? Number(k.quantity) : 0;
