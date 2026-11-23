@@ -455,7 +455,40 @@ export function planImport(bom, catalog) {
   const fam = familyTools(catalog);
   const active = (catalog.defs ?? []).filter((d) => d.status === 'active');
   const inFamily = (d, hint) => { const f = fam.familyFor(hint); return f == null || fam.familyOf(d.classification_id) === f; };
-  const exact = (n, type) => (defsByNorm.get(normName(n)) ?? []).find((d) => d.definition_type === type) ?? null;
+  // 2026-11-23: a PART's name must also be the right kind — a channel whose role is "web" is not the plate "Web plate"
+  // (RDSO/B-17081 D1W1..D3W2), a plate is not a section definition (TLB-BP). Assemblies keep matching by name alone.
+  const PART_HINTS = new Set(['plate', 'profile']);
+  // Plates and sections share their family (Parts): the test is the class itself (Plate part / Profile part), where known.
+  // A part never takes a definition of the OTHER kind (a plate's class for a section, a section's for a plate).
+  const rightKind = (d, hint) => {
+    if (!PART_HINTS.has(hint)) return true;
+    const other = fam.anchor[hint === 'plate' ? 'profile' : 'plate'];
+    return other == null || Number(d.classification_id) !== Number(other);
+  };
+  const exact = (n, type, hint = null) => (defsByNorm.get(normName(n)) ?? [])
+    .find((d) => d.definition_type === type && rightKind(d, hint)) ?? null;
+  /** The catalog's bar of a designation ("ISMC 400" → CHAN-400X100X8.6…): { depth, width, web } | null. */
+  const BAR_PREFIX = { ISMC: 'CHAN', MC: 'CHAN', ISMB: 'ISMB', ISLB: 'ISLB', ISJB: 'ISJB', ISHB: 'ISHB', WB: 'WB' };
+  function sectionBar(profile) {
+    const m = /^(ISMC|MC|ISMB|ISLB|ISJB|ISHB|WB)\s*(\d+(?:\.\d+)?)$/i.exec(String(profile ?? '').trim());
+    if (!m) return null;
+    const pre = `${BAR_PREFIX[m[1].toUpperCase()]}-${Number(m[2])}X`;
+    const code = (catalog.sectionBars ?? []).find((c) => String(c).toUpperCase().startsWith(pre));
+    const n = code ? /^[A-Z]+-([\d.]+)X([\d.]+)X([\d.]+)X/.exec(String(code).toUpperCase()) : null;
+    return n ? { depth: Number(n[1]), width: Number(n[2]), web: Number(n[3]), code } : null;
+  }
+  /** A section part's own names first: its role and what the profile is ("Web channel", "Vent pipe"). */
+  function sectionNames(it) {
+    if (it?.category !== 'section') return [];
+    const prof = String(it.profile ?? '');
+    const kind = /^(ISMC|MC)\b/i.test(prof) ? 'channel' : /^(ISMB|ISLB|ISJB|ISHB|WB)\b/i.test(prof) ? 'beam' : /^(CHS|PIPE)\b/i.test(prof) ? 'pipe' : null;
+    if (!kind) return [];
+    const out = [];
+    if (kind === 'pipe' && /vent/i.test(String(it.description ?? ''))) out.push('Vent pipe');
+    const role = String(it.role ?? '').replace(/_/g, ' ').trim();
+    if (role && !/plate|section/i.test(role)) out.push(`${role.charAt(0).toUpperCase()}${role.slice(1)} ${kind}`);
+    return out;
+  }
   /**
    * The definition a row takes (user, 2026-11-06: reuse what the catalog has; a new one only where nothing fits), tried
    * in this order: 1 a name exactly; 2 an OBSOLETE definition of that name → its successor (an active one in the same
@@ -464,7 +497,7 @@ export function planImport(bom, catalog) {
    * → { def, asked, how: 'exact' | 'successor' | 'synonym' | 'similar', note? } | null
    */
   const pick = (names, type, { hint = null, hints = [] } = {}) => {
-    for (const n of names) { const d = exact(n, type); if (d) return { def: d, asked: n, how: 'exact' }; }
+    for (const n of names) { const d = exact(n, type, hint); if (d) return { def: d, asked: n, how: 'exact' }; }
     const rowWords = new Set(hints.flatMap(wordsOf));
     for (const n of names) {
       const old = (catalog.defs ?? []).find((d) => d.status === 'obsolete' && d.definition_type === type && normName(d.name) === normName(n));
@@ -480,12 +513,12 @@ export function planImport(bom, catalog) {
       const k = normName(n);
       for (const rule of SYNONYMS) {
         if (!rule.re.test(k)) continue;
-        for (const t of rule.to) { const d = exact(t, type); if (d && inFamily(d, hint)) return { def: d, asked: n, how: 'synonym' }; }
+        for (const t of rule.to) { const d = exact(t, type); if (d && inFamily(d, hint) && rightKind(d, hint)) return { def: d, asked: n, how: 'synonym' }; }
       }
     }
     if (hint) {
       for (const n of names) {
-        const best = active.filter((d) => d.definition_type === type && inFamily(d, hint)).map((d) => ({ d, l: likeness(n, d.name) }))
+        const best = active.filter((d) => d.definition_type === type && inFamily(d, hint) && rightKind(d, hint)).map((d) => ({ d, l: likeness(n, d.name) }))
           .filter((x) => x.l.subset && x.l.j >= 0.67).sort((a, b) => b.l.j - a.l.j);
         if (best.length && (best.length === 1 || best[0].l.j > best[1].l.j)) return { def: best[0].d, asked: n, how: 'similar', note: `words ${best[0].l.shared.join(', ')}` };
       }
@@ -581,11 +614,18 @@ export function planImport(bom, catalog) {
     } else if (it.category === 'section') {
       // An angle "ISA a x b x t": legs a and b, gross section t (a + b - t) (IMPORT_FORMAT.md, no root fillet).
       // Any other section (a channel "ISMC 250x80"): depth and width from the profile, its area from bom.json's weight.
-      const p = /(\d+(?:\.\d+)?)\s*[x×*]\s*(\d+(?:\.\d+)?)(?:\s*[x×*]\s*(\d+(?:\.\d+)?))?/.exec(String(it.profile ?? ''));
-      const isAngle = it.role === 'angle' || /\bISA\b|^L\s?\d/i.test(String(it.profile ?? ''));
-      const a = p ? Number(p[1]) : Number(it.widthMm); const b = p ? Number(p[2]) : Number(it.widthMm);
-      const t = p?.[3] ? Number(p[3]) : Number(it.thicknessMm);
+      const prof = String(it.profile ?? '').trim();
+      // 2026-11-23 (45.7 m, Khajaguda): a pipe "CHS 114.3x5.4" is a diameter and a wall — not depth x width; a section named
+      // only by its designation ("ISMC 400") takes depth, width and web from the catalog's bar of that designation.
+      const chs = /^(?:CHS|PIPE)\s*(\d+(?:\.\d+)?)\s*[x×*]\s*(\d+(?:\.\d+)?)/i.exec(prof);
+      const bar = !chs && !/\d\s*[x×*]\s*\d/.test(prof) ? sectionBar(prof) : null;
+      const p = chs || bar ? null : /(\d+(?:\.\d+)?)\s*[x×*]\s*(\d+(?:\.\d+)?)(?:\s*[x×*]\s*(\d+(?:\.\d+)?))?/.exec(prof);
+      const isAngle = it.role === 'angle' || /\bISA\b|^L\s?\d/i.test(prof);
+      const a = chs ? Number(chs[1]) : bar ? bar.depth : p ? Number(p[1]) : Number(it.widthMm);
+      const b = chs ? Number(chs[1]) : bar ? bar.width : p ? Number(p[2]) : Number(it.widthMm);
+      const t = chs ? Number(chs[2]) : bar ? bar.web : p?.[3] ? Number(p[3]) : Number(it.thicknessMm);
       let area = isAngle && a > 0 && b > 0 && t > 0 ? t * (a + b - t) : null;
+      if (chs) area = (Math.PI / 4) * (a ** 2 - (a - 2 * t) ** 2);
       if (!area && Number(it.unitWeightKg) > 0 && L > 0) area = (Number(it.unitWeightKg) * 1e9) / (L * density);
       v.push(num('THICKNESS', t > 0 ? t : null), num('WIDTH', isAngle ? a : b), num('DEPTH', isAngle ? b : a), num('LENGTH', it.lengthMm), num('SECTION_AREA', area));
       if (area && L > 0) kg = (area * L * density) / 1e9;
@@ -680,7 +720,8 @@ export function planImport(bom, catalog) {
     const v = [txt('DRAWING_MARK', mark)].filter(Boolean);
     if (node.kind === 'span') {
       const layout = (bom.assembly?.children ?? []).flatMap((c) => c.layoutMm ?? []);
-      const span = layout.length ? Math.max(...layout.map((s) => Number(s.toMm) || 0)) : null;
+      // 2026-11-23: the drawing's own span (drawing.spanM) when the set has no layout — 50 spans had none before
+      const span = layout.length ? Math.max(...layout.map((s) => Number(s.toMm) || 0)) : (typeof dw.spanM === 'number' && dw.spanM > 0 ? Math.round(dw.spanM * 1000) : null);
       const sl = num('SPAN_LENGTH', span); if (sl) v.push(sl);
     }
     const row = {
@@ -745,7 +786,7 @@ export function planImport(bom, catalog) {
       const splitNote = horizontal ? `Top or bottom is not told apart on the drawing: the ${q} split evenly (${top} top, ${q - top} bottom).` : null;
       const parts = split
         ? [{ names: ['X-frame top angle'], quantity: top, role: 'Top angle' }, { names: ['X-frame bottom angle'], quantity: q - top, role: 'Bottom angle' }]
-        : [{ names: partCandidates(it, { endDiaphragm, single: q === 1, bowstring, has }), quantity: q, role: roleText(it.description) }];
+        : [{ names: [...sectionNames(it), ...partCandidates(it, { endDiaphragm, single: q === 1, bowstring, has })], quantity: q, role: roleText(it.description) }];
       for (const [i, p] of parts.entries()) {
         const d = mapDef(p.names, 'template', split ? `${what2} (${p.role.toLowerCase()})` : what2, it.category === 'section' ? 'profile' : 'plate');
         const { values: pv, kg, gradeNote, bronze } = partValues(it, it.mark);

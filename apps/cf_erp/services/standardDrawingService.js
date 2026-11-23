@@ -651,16 +651,22 @@ export async function importCatalog(db, companyId) {
     ),
     db.query(
       `SELECT m.id, m.code, m.name FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog' AND i.deleted_at IS NULL
-        WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' AND (LOWER(m.name) LIKE '%stud%' OR LOWER(m.name) LIKE '%bolt set m%')`,
+        WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active'
+          AND (LOWER(m.name) LIKE '%stud%' OR LOWER(m.name) LIKE '%bolt set m%' OR m.code REGEXP '^(CHAN|ISMB|ISLB|ISJB|ISHB|WB)-[0-9]')`,
       [companyId],
     ),
     db.query('SELECT id, number FROM cf_standard_drawings WHERE company_id = ? AND deleted_at IS NULL', [companyId]),
   ]);
+  // 2026-11-23, in the same read: the section bars the catalog stocks (CHAN-400X100X8.6X12000-E250BO) — a drawing that names a
+  // section only by its designation ("ISMC 400") takes its depth, width and web from the bar of that designation (IS 808 as stocked).
+  const BAR = /^(CHAN|ISMB|ISLB|ISJB|ISHB|WB)-[0-9]/i;
+  const bars = bought.filter((r) => BAR.test(String(r.code ?? '')));
+  const bought2 = bought.filter((r) => !BAR.test(String(r.code ?? '')));
   // The classes the definitions sit in, each with its parent (every family test asks about a definition's own class).
   const classes = [...new Map(defs.map((d) => [Number(d.classification_id), { id: Number(d.classification_id), parent_id: d.class_parent_id == null ? null : Number(d.class_parent_id) }])).values()];
   // The studs the Shear stud selection takes, and the bolt sets the "Bolt set" selection chooses from (bolts-load.mjs makes them) — one read.
-  const bolts = bought.filter((r) => /bolt set m/i.test(r.name));
-  const studs = bought.filter((r) => !/bolt set m/i.test(r.name));
+  const bolts = bought2.filter((r) => /bolt set m/i.test(r.name));
+  const studs = bought2.filter((r) => !/bolt set m/i.test(r.name));
 
   const optionMap = (code) => {
     const m = new Map();
@@ -680,6 +686,7 @@ export async function importCatalog(db, companyId) {
     bolts: bolts.map((b) => ({ id: Number(b.id), code: b.code, name: b.name })),
     standards: new Map(existing.map((s) => [String(s.number).toLowerCase(), Number(s.id)])),
     classes,
+    sectionBars: (bars ?? []).map((b) => b.code),
   };
 }
 
