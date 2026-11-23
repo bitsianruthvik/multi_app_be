@@ -39,6 +39,7 @@ try {
     `SELECT m.id, m.name FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id
       WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.status = 'active' AND i.item_type = 'catalog' AND i.tracked_by = 'quantity'
         AND NOT EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.item_id = m.id AND k.quantity <> 0)
+        AND NOT EXISTS (SELECT 1 FROM cf_stock_ledger l WHERE l.item_id = m.id) -- 2026-11-23: the checks read In/Out from zero, so no history either
       ORDER BY m.id DESC LIMIT 1`, [COMPANY]);
   const [[area]] = await db.query("SELECT id, name FROM cf_stocking_areas WHERE company_id = ? AND purpose = 'storage' AND status = 'active' AND deleted_at IS NULL ORDER BY id LIMIT 1", [COMPANY]);
   if (!item || !area) throw new Error('This company needs an active catalog item counted by quantity and a storage area.');
