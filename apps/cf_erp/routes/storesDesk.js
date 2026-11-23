@@ -34,6 +34,7 @@ import {
 } from '../services/storesDeskService.js';
 import { dashboard } from '../services/storesDashboardService.js';
 import { entryList, saveEntry, entryWindow } from '../services/stockEntryService.js';
+import { orderStock, orderStockEntries } from '../services/orderStockService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -59,6 +60,9 @@ router.get('/stores-desk/people', view, handle((req) => listPeople(pool, company
 router.post('/stores-desk/people', manage, handle((req) => tx(req, (db, c) => addPerson(db, c, req.body ?? {}))));
 router.get('/stores-desk/ledger', view, handle((req) => ledger(pool, company(req), req.query)));
 router.get('/stores-desk/ledger/:id', view, handle((req) => itemLedger(pool, company(req), id(req), req.query)));
+// 2026-11-23 (user): one sales order's stock as the ledger shows it — its customer's lots, holds, reserved, issued, its WIP pieces; and every entry
+router.get('/stores-desk/orders/:id/stock', view, handle((req) => orderStock(pool, company(req), id(req))));
+router.get('/stores-desk/orders/:id/stock/entries', view, handle((req) => orderStockEntries(pool, company(req), id(req), req.query)));
 router.post('/stores-desk/give-out', manage, handle((req) => tx(req, (db, c) => giveOut(db, c, req.body ?? {}))));
 // 2026-11-22: some of what was given out comes back unused.
 router.post('/stores-desk/take-back', manage, handle((req) => tx(req, (db, c) => takeBack(db, c, req.body ?? {}))));

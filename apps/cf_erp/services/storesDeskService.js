@@ -159,9 +159,11 @@ export async function ledger(db, companyId, q = {}) {
     where.push(`(${ors.join(' OR ')})`);
   }
   const show = ['stock', 'low', 'out', 'reserved'].includes(q.show) ? q.show : 'all';
-  const owner = ['ours', 'customer'].includes(q.owner) ? q.owner : null;
-  const ownBal = owner === 'ours' ? 'AND ob.owner_party_id IS NULL' : owner === 'customer' ? 'AND ob.owner_party_id IS NOT NULL' : '';
-  const ownLed = owner === 'ours' ? 'AND l.owner_party_id IS NULL' : owner === 'customer' ? 'AND l.owner_party_id IS NOT NULL' : '';
+  // 2026-11-23 (user: "add a customer filter to see by customer their stocks"): customerId = that customer's own material only
+  const customerId = Number.isInteger(Number(q.customerId)) && Number(q.customerId) > 0 ? Number(q.customerId) : null;
+  const owner = customerId ? 'customer' : ['ours', 'customer'].includes(q.owner) ? q.owner : null;
+  const ownBal = customerId ? `AND ob.owner_party_id = ${customerId}` : owner === 'ours' ? 'AND ob.owner_party_id IS NULL' : owner === 'customer' ? 'AND ob.owner_party_id IS NOT NULL' : '';
+  const ownLed = customerId ? `AND l.owner_party_id = ${customerId}` : owner === 'ours' ? 'AND l.owner_party_id IS NULL' : owner === 'customer' ? 'AND l.owner_party_id IS NOT NULL' : '';
   if (owner === 'customer') where.push('(COALESCE(bal.q, 0) <> 0 OR COALESCE(mv.in_q, 0) <> 0 OR COALESCE(mv.out_q, 0) <> 0)');
   if (show === 'stock') where.push('(COALESCE(bal.q, 0) <> 0 OR COALESCE(mv.in_q, 0) <> 0 OR COALESCE(mv.out_q, 0) <> 0 OR COALESCE(cu.q, 0) <> 0)');
   if (show === 'low') where.push('ps.min_qty IS NOT NULL AND COALESCE(bal.q, 0) < ps.min_qty');
@@ -198,7 +200,7 @@ export async function ledger(db, companyId, q = {}) {
   const fromParams = [companyId, areaIds, to, to, to, companyId, areaIds, from, companyId, companyId, companyId];
   const sort = { name: 'm.name', balance: 'balance', out: 'out_q' }[q.sort] ?? null;
   const dir = String(q.dir).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-  const [[rows], [[{ n: total }]], [groups]] = await Promise.all([
+  const [[rows], [[{ n: total }]], [groups], [owners]] = await Promise.all([
     db.query(
       `SELECT m.id, m.code, m.name, m.status, i.uom, i.tracked_by, i.stores_kind, i.issue_conditions,
               f.id AS family_id, f.name AS family_name, s.id AS subfamily_id, s.name AS subfamily_name, v.id AS variant_id, v.name AS variant_name,
@@ -221,6 +223,11 @@ export async function ledger(db, companyId, q = {}) {
          JOIN cf_classification_nodes f ON f.id = s.parent_id
         WHERE m.company_id = ? AND m.deleted_at IS NULL AND m.record_kind = 'item' AND i.item_type = 'catalog'
         GROUP BY f.id, f.name, s.id, s.name, v.id, v.name ORDER BY f.name, s.name, v.name`, [companyId]),
+    // the customers whose material is in the store now (the customer filter's choices)
+    db.query(
+      `SELECT p.id, p.name, COUNT(DISTINCT k.item_id) AS items, COUNT(DISTINCT b.id) AS lots
+         FROM cf_stock_balances k JOIN cf_stock_batches b ON b.id = k.batch_id JOIN cf_parties p ON p.id = b.owner_party_id
+        WHERE k.company_id = ? AND k.stocking_area_id IN (?) AND k.quantity > 0 GROUP BY p.id, p.name ORDER BY p.name`, [companyId, areaIds]),
   ]);
   return pageOf(rows.map((r) => ({
     item: { id: r.id, code: r.code, name: r.name, uom: r.uom, trackedBy: r.tracked_by, returnable: r.stores_kind === 'returnable', status: r.status, issueConditions: r.issue_conditions ?? null },
@@ -232,7 +239,8 @@ export async function ledger(db, companyId, q = {}) {
   })), total, page, {
     // beside the page, as every paged list carries its chips (lib/listing.js)
     counts: {
-      period: { from, to }, owner: owner ?? 'all',
+      period: { from, to }, owner: owner ?? 'all', customerId,
+      customers: owners.map((o) => ({ id: Number(o.id), name: o.name, items: Number(o.items), lots: Number(o.lots) })),
       areas: areas.all,
       // one row a variant (2026-11-23); a sub-family's items = its variants' added up
       groups: groups.map((g) => ({ familyId: g.family_id, family: g.family_name, subfamilyId: g.subfamily_id, subfamily: g.subfamily_name, variantId: g.variant_id, variant: g.variant_name, items: Number(g.n) })),
