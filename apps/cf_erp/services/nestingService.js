@@ -1776,6 +1776,13 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
   if (!rule) return planNestingOnce(db, companyId, orderLineId, input);
   const pool = await savedLotsOfOrder(db, companyId, stored, orderLineId);
   const removed = new Set();
+  // ONE BUDGET FOR ALL THE PASSES (2026-11-24): each long pass gets what is left of the run's budget, not the whole of it
+  // again — five passes of a 1-hour run took 5 hours (AWS run 450005). A pass past the budget still gets the short
+  // (in-request) search of its effort, so the run ends with a plan. Tests (an injected packer) keep their own figure.
+  const t0 = Date.now();
+  const effort = input.effort ?? 'standard';
+  const total = input.pack ? null : Number(input.budgetMs ?? (input.background === true ? runBudgetMs(effort) : 0)) || null;
+  const left = () => (total == null ? {} : { budgetMs: Math.max(Math.min(syncBudgetMs(effort), total), total - (Date.now() - t0)) });
   for (let pass = 1; pass <= 10; pass++) {
     // A PROBE pass (which custom sizes hold their lot): no length combiner, no pairing (nestExtras.js) — the passes below do.
     const plan = await planNestingOnce(db, companyId, orderLineId, { ...input, lotPass: true, lotProbe: true, lotRemoved: removed, effort: 'quick', budgetMs: Math.min(input.budgetMs ?? 120000, 120000) });
@@ -1785,13 +1792,13 @@ export async function planNesting(db, companyId, orderLineId, input = {}) {
     if (input.onProgress) { try { input.onProgress({ text: `Custom sizes that miss the mill's lot left out: ${bad.length} (pass ${pass})`, phase: 'lots' }); } catch { /* progress only */ } }
   }
   for (let pass = 1; pass <= 4; pass++) {
-    const plan = await planNestingOnce(db, companyId, orderLineId, { ...input, lotPass: true, lotRemoved: removed });
+    const plan = await planNestingOnce(db, companyId, orderLineId, { ...input, ...left(), lotPass: true, lotRemoved: removed });
     const bad = failingLots(plan, pool, rule);
     if (!bad.length) { plan.customLots = lotSummary(plan, pool, rule); return plan; }
     for (const k of bad) removed.add(k);
   }
   // Still short after four long searches: standard sizes and the catalog's own only.
-  return planNestingOnce(db, companyId, orderLineId, { ...input, lotPass: true, lotRemoved: removed, lotNoNew: true });
+  return planNestingOnce(db, companyId, orderLineId, { ...input, ...left(), lotPass: true, lotRemoved: removed, lotNoNew: true });
 }
 
 /** The custom-size plates of a plan by size: lotKey → { thickness, length, width, plates, kg }. */
