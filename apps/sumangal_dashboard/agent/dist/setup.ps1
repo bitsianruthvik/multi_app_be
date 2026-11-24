@@ -15,7 +15,7 @@
   password and the "Log on as a batch job" right.
 #>
 param(
-  [string]$Api = 'https://multi-app-be-svpc.onrender.com',
+  [string]$Api = 'https://api.ceofactory.vc',
   [string]$Company = 'sumangal',
   [string]$Dir = 'C:\SumangalDashboardAgent',
   [string]$NodeVersion = 'v22.17.0',

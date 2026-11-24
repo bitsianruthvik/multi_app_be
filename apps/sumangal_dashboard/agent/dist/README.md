@@ -27,7 +27,7 @@ Only outgoing HTTPS. Nothing is opened to the internet. The agent sends only gen
 Sign in to that machine **as the Windows user that will run the nightly task**. The secrets are encrypted for that user and nobody else can read them. Then, in PowerShell:
 
 ```powershell
-Invoke-WebRequest https://multi-app-be-svpc.onrender.com/api/sumangal/sumangal_dashboard/agent/files/setup.ps1 -OutFile setup.ps1 -UseBasicParsing
+Invoke-WebRequest https://api.ceofactory.vc/api/sumangal/sumangal_dashboard/agent/files/setup.ps1 -OutFile setup.ps1 -UseBasicParsing
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
@@ -43,6 +43,13 @@ Runs never overlap: a run waits for the one before it (`work\run.lock`).
 ```
 node apps/sumangal_dashboard/scripts/v15/approve-agent.mjs --company=sumangal [--target=prod]
 node apps/sumangal_dashboard/scripts/v15/approve-agent.mjs --company=sumangal --id=<id> --apply [--target=prod]
+```
+
+The agent reports to the AWS server (from 2026-11-24), so approve it THERE, where its database is:
+
+```
+ssh -i .lightsail-tm-trial.pem ubuntu@32.237.65.43 "cd /srv/tm/multi_app_be && node apps/sumangal_dashboard/scripts/v15/approve-agent.mjs --company=sumangal --target=server"
+ssh -i .lightsail-tm-trial.pem ubuntu@32.237.65.43 "cd /srv/tm/multi_app_be && node apps/sumangal_dashboard/scripts/v15/approve-agent.mjs --company=sumangal --id=<id> --apply --target=server"
 ```
 
 Then run it once by hand and check the dashboard:
