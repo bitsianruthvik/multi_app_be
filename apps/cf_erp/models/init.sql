@@ -9263,3 +9263,16 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND INDEX_NAME = 'uq_cbr_req') = 0
           AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_buy_requests' AND COLUMN_NAME = 'picked') = 1,
           'S118-OK', 'S118-MISSING') AS result;
+
+-- §119 DRAWINGS: FIND A REVISION'S FILE BY INDEX (2026-11-24). An order line's drawings list took ~11 s on
+-- AWS MySQL and ~16 s on TiDB: partDrawingService.registerRefs asks which register revisions have a file
+-- ("text IS NOT NULL" on cf_part_drawings and cf_standard_drawing_files), and with no usable index on
+-- drawing_id the database read the full DXF text of every drawing in the company. This key, with an index
+-- hint in the query, makes it read only the rows of the drawings asked for.
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_standard_drawing_files' AND INDEX_NAME = 'idx_csdf_drawing');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_standard_drawing_files ADD KEY idx_csdf_drawing (company_id, drawing_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_standard_drawing_files' AND INDEX_NAME = 'idx_csdf_drawing') > 0
+          AND (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND INDEX_NAME = 'idx_cpd_drawing') > 0,
+          'S119-OK', 'S119-MISSING') AS result;

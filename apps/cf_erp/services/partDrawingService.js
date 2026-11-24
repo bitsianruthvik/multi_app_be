@@ -333,11 +333,13 @@ async function registerRefs(db, companyId, ids) {
   const [revs] = roots.length ? await db.query('SELECT id, revision, status, root_id FROM cf_drawings WHERE company_id = ? AND deleted_at IS NULL AND root_id IN (?) ORDER BY id', [companyId, roots]) : [[]];
   const revIds = [...new Set([...revs.map((r) => Number(r.id)), ...want])];
   // Where a revision's file is: uploaded on an order line, or held by a standard drawing (its sheet, a version's part file).
+  // FORCE INDEX on (company_id, drawing_id): without it MySQL picked the company-only key and TiDB a full scan,
+  // reading the DXF text of every drawing in the company to test IS NOT NULL (~11 s / ~16 s; init.sql §119).
   const [filed] = await db.query(
     `SELECT drawing_id, file_name, file_kind FROM (
-       SELECT drawing_id, file_name, file_kind, deleted_at IS NULL AS live, id, 0 AS std FROM cf_part_drawings WHERE company_id = ? AND drawing_id IN (?) AND dxf_text IS NOT NULL
+       SELECT drawing_id, file_name, file_kind, deleted_at IS NULL AS live, id, 0 AS std FROM cf_part_drawings FORCE INDEX (idx_cpd_drawing) WHERE company_id = ? AND drawing_id IN (?) AND dxf_text IS NOT NULL
        UNION ALL
-       SELECT drawing_id, file_name, file_kind, deleted_at IS NULL AS live, id, 1 AS std FROM cf_standard_drawing_files WHERE company_id = ? AND drawing_id IN (?) AND file_text IS NOT NULL
+       SELECT drawing_id, file_name, file_kind, deleted_at IS NULL AS live, id, 1 AS std FROM cf_standard_drawing_files FORCE INDEX (idx_csdf_drawing) WHERE company_id = ? AND drawing_id IN (?) AND file_text IS NOT NULL
      ) f ORDER BY std DESC, live, id`,
     [companyId, revIds, companyId, revIds],
   );
