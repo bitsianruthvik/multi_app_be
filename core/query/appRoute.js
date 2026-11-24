@@ -1,11 +1,10 @@
 import express from "express";
+import { protect } from "../middleware/authmiddleware.js";
 import { getAppQuery } from "./appController.js";
 
 const router = express.Router();
 
-// Public route that returns app/company info. Keep it public so landing pages
-// can fetch logo before login. If you want it protected, move to protected
-// middleware or apply auth middleware here.
-router.get("/query", getAppQuery);
+// Signed in only (2026-11-24): it was public and told anyone which companies and apps exist.
+router.get("/query", protect, getAppQuery);
 
 export default router;

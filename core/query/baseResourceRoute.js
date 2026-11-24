@@ -6,6 +6,8 @@ import { resolveWriteTarget } from "./resourceRegistry.js";
 import { pool } from "../../db.js";
 import { protect } from "../middleware/authmiddleware.js";
 import bcrypt from "bcryptjs";
+import { getResource } from "./resourceRegistry.js";
+import { SCOPE_VIA, companyOf, writeMode, foreignReference } from "./tenantScope.js";
 
 // Router
 const router = express.Router();
@@ -60,24 +62,7 @@ const validateRequest = (req, res, next) => {
   return next();
 };
 
-// Allow public access to specific resources without JWT
-const isPublicResource = (req) => {
-  const { resource, operation } = req.body || {};
-  logger.info("Checking if public resource:", { resource, operation });
-  // Allow public access to companies and apps for query operations
-  // Also allow public access to utility paths (transcribe/debug) which do
-  // not follow the base_resource JSON contract.
-  try {
-    const p = req.path || req.url || "";
-    if (p && (p.startsWith("/transcribe") || p.startsWith("/debug")))
-      return true;
-  } catch (e) {}
-  return (
-    (resource === "companies" || resource === "apps") && operation === "query"
-  );
-};
-
-// Only verify token for non-public resources
+// Every request: the worker token, or a signed-in person
 router.use((req, res, next) => {
   // Allow a dedicated worker/service token to bypass normal company scoping.
   try {
@@ -98,10 +83,8 @@ router.use((req, res, next) => {
     // fallback to normal auth flow
   }
 
-  if (isPublicResource(req)) {
-    logger.info("Allowing public access for:", req.body && req.body.resource);
-    return next();
-  }
+  // No resource is public (2026-11-24): "companies" and "apps" reads used to pass without a token here (index.js
+  // puts protect in front of /api/query/v1 anyway, so that bypass was dead and misleading).
   logger.info("Requiring auth for:", req.body && req.body.resource);
   // Use the protect middleware for authentication
   protect(req, res, next);
@@ -249,6 +232,26 @@ router.post("/base_resource", async (req, res) => {
           ? req.user.company_id || req.user.companyId || null
           : null;
 
+      // A PERSON WRITES ONLY THEIR OWN COMPANY'S ROWS (tenantScope.js, 2026-11-24). Before: an update kept a
+      // `company_id` sent by the caller (a user or app grant could be moved into another company — an admin could
+      // make themselves an admin there), tables with no company_id (companies, features, fab_nodes, …) were
+      // written by id alone, and the ids a row points at (role, app, plan, parent…) could be another company's.
+      let viaScope = null; // a table tied to its company through a parent row (tenantScope.SCOPE_VIA)
+      if (!req.user?.is_service) {
+        const cid = companyOf(req.user);
+        const mode = await writeMode(table);
+        if (!cid || mode === "none") {
+          return res.status(403).json({ success: false, error: `'${resource}' cannot be changed here.` });
+        }
+        if (data && typeof data === "object") delete data.company_id;
+        if (mode === "company" && !scopeCompanyId) {
+          return res.status(403).json({ success: false, error: `'${resource}' cannot be changed here.` });
+        }
+        if (mode === "via") viaScope = { sql: SCOPE_VIA[table]("t"), cid };
+        const bad = await foreignReference(getResource(resource), data, cid);
+        if (bad) return res.status(404).json({ success: false, error: `Not found: ${bad}` });
+      }
+
       switch (operation) {
         case "insert":
           // Auto-inject company_id from the caller's JWT for new records
@@ -275,6 +278,10 @@ router.post("/base_resource", async (req, res) => {
               success: false,
               error: "No insertable fields provided",
             });
+          }
+          // A row tied through a parent must name one (foreignReference made sure it is this company's).
+          if (viaScope && !(filtered.project_plan_id ?? filtered.import_batch_id)) {
+            return res.status(400).json({ success: false, error: "The plan (or import batch) is required." });
           }
           query = `INSERT INTO \`${table}\` SET ?`;
           params = [filtered];
@@ -313,6 +320,9 @@ router.post("/base_resource", async (req, res) => {
           if (scopeCompanyId) {
             query = `UPDATE \`${table}\` SET ? WHERE id = ? AND company_id = ?`;
             params = [filteredUpd, targetId, scopeCompanyId];
+          } else if (viaScope) {
+            query = `UPDATE \`${table}\` t SET ? WHERE t.id = ? AND ${viaScope.sql}`;
+            params = [filteredUpd, targetId, viaScope.cid];
           } else {
             query = `UPDATE \`${table}\` SET ? WHERE id = ?`;
             params = [filteredUpd, targetId];
@@ -329,6 +339,9 @@ router.post("/base_resource", async (req, res) => {
           if (scopeCompanyId) {
             query = `UPDATE \`${table}\` SET deleted_at = NOW() WHERE id = ? AND company_id = ? AND deleted_at IS NULL`;
             params = [data.id, scopeCompanyId];
+          } else if (viaScope) {
+            query = `UPDATE \`${table}\` t SET t.deleted_at = NOW() WHERE t.id = ? AND ${viaScope.sql} AND t.deleted_at IS NULL`;
+            params = [data.id, viaScope.cid];
           } else {
             query = `UPDATE \`${table}\` SET deleted_at = NOW() WHERE id = ? AND deleted_at IS NULL`;
             params = [data.id];

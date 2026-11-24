@@ -1,3 +1,5 @@
+import { readScope } from "../tenantScope.js";
+
 // Injects mandatory company/team scoping and soft-delete filter into WHERE clause.
 // Takes and returns { sql, params } so the full query stays parameterized.
 //
@@ -25,14 +27,16 @@ export function injectSecurity(whereSql, whereParams, jwt, resource, options = {
   // the second job stopped existing.
   const hasCompanyId = options.hasCompanyId !== false;
 
-  if (hasCompanyId) {
-    const companyId = jwt?.company_id || jwt?.companyId;
-    if (companyId !== undefined && companyId !== null) {
-      const companyCol = alias ? `${alias}.company_id` : "company_id";
-      conditions.push(`${companyCol} = ?`);
-      extraParams.push(companyId);
-    }
+  // THE COMPANY (tenantScope.readScope, 2026-11-24): fails CLOSED. A read with no company used to simply leave the
+  // filter out and return every company's rows (the public "companies"/"apps" reads did exactly that), and a table
+  // without company_id was read across all of them.
+  const scope = readScope(options.table || resource, alias, hasCompanyId, jwt);
+  if (scope) {
+    conditions.push(scope.sql);
+    extraParams.push(...scope.params);
+  }
 
+  if (hasCompanyId) {
     if (jwt?.team_ids && jwt.team_ids.length > 0) {
       conditions.push(`team_id IN (${jwt.team_ids.map(() => "?").join(",")})`);
       extraParams.push(...jwt.team_ids);

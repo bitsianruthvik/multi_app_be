@@ -1,129 +1,76 @@
 ﻿import { pool } from "../../db.js";
 import { logger } from "../utils/logger.js";
-import { buildQuery } from "../query/queryBuilder/queryBuilder.js";
 
-const DEFAULT_LIMIT = 200;
-
-export const getPublicData = (req, res) => {
-  res.json({ message: "This is a public route accessible without login." });
+/** The signed-in person's company id (the token; /api/public has no company in its address). */
+const ownCompany = (req) => Number(req.user?.companyId ?? req.user?.company_id) || null;
+const fail = (res, what) => (err) => {
+  logger.error({ err }, `public ${what} error`);
+  res.status(500).json({ message: `Failed to load ${what}` });
 };
 
-// GET /api/public/companies
+// GET /api/public/companies/:companySlug — the sign-in page. It answers the same for every address, so it tells nobody
+// whether a company is there (the name comes after sign-in, from the login answer).
+export const getCompanyBySlug = (req, res) => {
+  const slug = String(req.params.companySlug ?? "").toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 64);
+  res.json({ slug, name: null });
+};
+
+// GET /api/public/companies — the signed-in person's own company only.
 export const getCompanies = async (req, res) => {
+  const cid = ownCompany(req);
+  if (!cid) return res.json([]);
   try {
-    const { sql, params } = await buildQuery({
-      resource: "companies",
-      pagination: { limit: DEFAULT_LIMIT },
-      jwt: null,
-      includeDeleted: false,
-    });
-    const [rows] = await pool.query(sql, params);
-    return res.json(rows);
-  } catch (err) {
-    logger.error("getCompanies error:", err);
-    return res.status(500).json({ message: "Failed to load companies" });
-  }
+    const [rows] = await pool.query("SELECT id, name, slug FROM companies WHERE id = ? AND deleted_at IS NULL", [cid]);
+    res.json(rows);
+  } catch (err) { fail(res, "companies")(err); }
 };
 
-// GET /api/public/companies/:companySlug — single company by slug
-export const getCompanyBySlug = async (req, res) => {
-  const { companySlug } = req.params;
-  try {
-    const [rows] = await pool.query(
-      "SELECT id, name, slug FROM companies WHERE slug = ? AND deleted_at IS NULL LIMIT 1",
-      [companySlug]
-    );
-    if (!rows.length) return res.status(404).json({ message: "Company not found" });
-    return res.json(rows[0]);
-  } catch (err) {
-    logger.error("getCompanyBySlug error:", err);
-    return res.status(500).json({ message: "Failed to load company" });
-  }
-};
-
-// GET /api/public/companies/:companySlug/apps — only public apps
+// GET /api/public/companies/:companySlug/apps — the apps of the signed-in person's own company, and only when the
+// address names it (any other answers like an empty company).
 export const getCompanyApps = async (req, res) => {
-  const { companySlug } = req.params;
+  const cid = ownCompany(req);
+  if (!cid || String(req.user?.company ?? "").toLowerCase() !== String(req.params.companySlug ?? "").toLowerCase()) return res.json([]);
   try {
-    const [companyRows] = await pool.query(
-      "SELECT id FROM companies WHERE slug = ? AND deleted_at IS NULL LIMIT 1",
-      [companySlug]
-    );
-    if (!companyRows || companyRows.length === 0) {
-      return res.status(404).json({ message: "Company not found" });
-    }
-    const companyId = companyRows[0].id;
     const [apps] = await pool.query(
       "SELECT id, name, slug, settings FROM apps WHERE company_id = ? AND is_public = 1 AND deleted_at IS NULL ORDER BY name ASC",
-      [companyId]
+      [cid]
     );
-    return res.json(apps);
-  } catch (err) {
-    logger.error("getCompanyApps error:", err);
-    return res.status(500).json({ message: "Failed to load apps for company" });
-  }
+    res.json(apps);
+  } catch (err) { fail(res, "apps")(err); }
 };
 
-// GET /api/public/teams
+// GET /api/public/teams — own company only.
 export const getTeams = async (req, res) => {
+  const cid = ownCompany(req);
+  if (!cid) return res.json([]);
   try {
-    const { sql, params } = await buildQuery({
-      resource: "teams",
-      pagination: { limit: DEFAULT_LIMIT },
-      jwt: null,
-      includeDeleted: false,
-    });
-    const [rows] = await pool.query(sql, params);
-    return res.json(rows);
-  } catch (err) {
-    logger.error("getTeams error:", err);
-    return res.status(500).json({ message: "Failed to load teams" });
-  }
+    const [rows] = await pool.query("SELECT * FROM teams WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 500", [cid]);
+    res.json(rows);
+  } catch (err) { fail(res, "teams")(err); }
 };
 
-// GET /api/public/roles
+// GET /api/public/roles — own company only.
 export const getRoles = async (req, res) => {
+  const cid = ownCompany(req);
+  if (!cid) return res.json([]);
   try {
-    const { sql, params } = await buildQuery({
-      resource: "roles",
-      pagination: { limit: DEFAULT_LIMIT },
-      jwt: null,
-      includeDeleted: false,
-    });
-    const [rows] = await pool.query(sql, params);
-    return res.json(rows);
-  } catch (err) {
-    logger.error("getRoles error:", err);
-    return res.status(500).json({ message: "Failed to load roles" });
-  }
+    const [rows] = await pool.query("SELECT * FROM roles WHERE company_id = ? AND deleted_at IS NULL ORDER BY id LIMIT 500", [cid]);
+    res.json(rows);
+  } catch (err) { fail(res, "roles")(err); }
 };
 
-// GET /api/public/capabilities
+// GET /api/public/capabilities — the platform's capability ids (no company data).
 export const getCapabilities = async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      "SELECT DISTINCT capability_id AS id, capability_id AS name FROM features_capability"
-    );
-    return res.json(rows);
-  } catch (err) {
-    logger.error("getCapabilities error:", err);
-    return res.status(500).json({ message: "Failed to load capabilities" });
-  }
+    const [rows] = await pool.query("SELECT DISTINCT capability_id AS id, capability_id AS name FROM features_capability");
+    res.json(rows);
+  } catch (err) { fail(res, "capabilities")(err); }
 };
 
-// GET /api/public/features
+// GET /api/public/features — the platform's feature catalogue (no company data).
 export const getFeatures = async (req, res) => {
   try {
-    const { sql, params } = await buildQuery({
-      resource: "features",
-      pagination: { limit: DEFAULT_LIMIT },
-      jwt: null,
-      includeDeleted: false,
-    });
-    const [rows] = await pool.query(sql, params);
-    return res.json(rows);
-  } catch (err) {
-    logger.error("getFeatures error:", err);
-    return res.status(500).json({ message: "Failed to load features" });
-  }
+    const [rows] = await pool.query("SELECT * FROM features WHERE deleted_at IS NULL ORDER BY id LIMIT 1000");
+    res.json(rows);
+  } catch (err) { fail(res, "features")(err); }
 };

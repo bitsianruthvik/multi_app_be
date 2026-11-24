@@ -498,7 +498,7 @@ export async function takeBack(db, c, input = {}) {
   if (!m || m.movement_type !== 'issue') throw notFound('This give-out');
   if (m.reversed_by_id || m.reversal_of_id) throw invalid('REVERSED', `${m.code} was already undone.`);
   const full = await getMovement(db, c.companyId, m.id);
-  const [[kind]] = await db.query('SELECT stores_kind FROM cf_item_details WHERE master_id = ?', [Number(input.itemId)]);
+  const [[kind]] = await db.query('SELECT stores_kind FROM cf_item_details WHERE company_id = ? AND master_id = ?', [c.companyId, Number(input.itemId)]);
   if (kind?.stores_kind === 'returnable') throw invalid('HAS_TOOLS', 'A tool comes back on Stores › Out with, not here.');
   const mine = full.lines.filter((l) => Number(l.item.id) === Number(input.itemId));
   const had = round6(mine.reduce((a, l) => a + l.quantity, 0));
@@ -831,6 +831,20 @@ export async function postCount(db, c, input = {}) {
   if (asked.length > 500) problems.push('Up to 500 lines an audit.');
   assertNoProblems(problems, 'The audit cannot be saved.');
 
+  // Own company's items and lots only (2026-11-24 isolation audit): another company's ids were stored and the audit
+  // then showed their codes and names.
+  const askedItems = [...new Set(asked.map((l) => Number(l.itemId)).filter((x) => x > 0))];
+  const askedLots = [...new Set(asked.map((l) => (blank(l.lotId) ? null : Number(l.lotId))).filter((x) => x > 0))];
+  const [ownItems] = askedItems.length ? await db.query('SELECT id FROM cf_master_records WHERE company_id = ? AND id IN (?)', [c.companyId, askedItems]) : [[]];
+  const [ownLots] = askedLots.length ? await db.query('SELECT id, item_id FROM cf_stock_batches WHERE company_id = ? AND id IN (?)', [c.companyId, askedLots]) : [[]];
+  const itemOk = new Set(ownItems.map((r) => Number(r.id)));
+  const lotItem = new Map(ownLots.map((r) => [Number(r.id), Number(r.item_id)]));
+  for (const [n, l] of asked.entries()) {
+    if (!itemOk.has(Number(l.itemId))) problems.push(`Line ${n + 1}: no such item.`);
+    else if (!blank(l.lotId) && lotItem.get(Number(l.lotId)) !== Number(l.itemId)) problems.push(`Line ${n + 1}: no such lot of this item.`);
+  }
+  assertNoProblems(problems, 'The audit cannot be saved.');
+
   const costs = await costsOf(db, c.companyId, [...new Set(asked.map((l) => Number(l.itemId)))]);
   const lines = [];
   for (const [n, l] of asked.entries()) {
@@ -839,7 +853,7 @@ export async function postCount(db, c, input = {}) {
     const lotId = blank(l.lotId) ? null : Number(l.lotId);
     if (lotId == null && counted > 0) {
       // a lot-kept item that has run out is listed once at 0; stock found for it has no lot to go into
-      const [[t]] = await db.query('SELECT tracked_by FROM cf_item_details WHERE master_id = ?', [Number(l.itemId)]);
+      const [[t]] = await db.query('SELECT tracked_by FROM cf_item_details WHERE company_id = ? AND master_id = ?', [c.companyId, Number(l.itemId)]);
       if (t?.tracked_by === 'batch') { problems.push(`Line ${n + 1}: this item is kept by lot and has none here — take what was found into a lot first (with its brand), then audit it.`); continue; }
     }
     const [[k]] = await db.query('SELECT quantity FROM cf_stock_balances WHERE company_id = ? AND stocking_area_id = ? AND item_id = ? AND batch_key = ? FOR UPDATE',
@@ -893,7 +907,9 @@ export async function getCount(db, companyId, id) {
   if (!h) throw notFound('Audit');
   const [lines] = await db.query(
     `SELECT l.*, m.code AS item_code, m.name AS item_name, i.uom, b.code AS batch_code FROM cf_stock_count_lines l
-       JOIN cf_master_records m ON m.id = l.item_id JOIN cf_item_details i ON i.master_id = l.item_id LEFT JOIN cf_stock_batches b ON b.id = l.batch_id
+       JOIN cf_master_records m ON m.company_id = l.company_id AND m.id = l.item_id
+       JOIN cf_item_details i ON i.company_id = l.company_id AND i.master_id = l.item_id
+       LEFT JOIN cf_stock_batches b ON b.company_id = l.company_id AND b.id = l.batch_id
       WHERE l.company_id = ? AND l.count_id = ? ORDER BY (ABS(l.diff) > 0) DESC, m.name`, [companyId, h.id]);
   return {
     ...shapeCount(h),

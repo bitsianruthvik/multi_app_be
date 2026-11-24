@@ -82,6 +82,7 @@ import { WEEKDAYS } from '../services/shiftService.js';
 import { ORDER_TYPES, TRANSITIONS } from '../services/salesOrderService.js';
 import { RELATIONS } from '../services/flowService.js';
 import { WO_STATUSES } from '../services/workOrderService.js';
+import { protect as protectHealth } from '../../../core/middleware/authmiddleware.js';
 
 const router = Router();
 
@@ -105,7 +106,8 @@ const router = Router();
  *     moved, so a generic UPDATE of `revision` would rewrite history;
  *   - code sequences — only the generator moves them.
  */
-router.get('/health', (req, res) => res.json({ ok: true, app: 'cf_erp' }));
+// signed in only (2026-11-24): answered under a company's address, it told anyone which companies use this app
+router.get('/health', protectHealth, (req, res) => res.json({ ok: true, app: 'cf_erp' }));
 
 /** The vocabulary the screens build their pickers from. */
 router.get('/meta', guard(PERM.view), handle(async () => ({

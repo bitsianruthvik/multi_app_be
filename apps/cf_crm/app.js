@@ -5,6 +5,7 @@ import dataRoutes from './routes/data.js';
 import setupRoutes from './routes/setup.js';
 import commsRoutes from './routes/comms.js';
 import { startDigest } from './lib/digest.js';
+import { protect as protectHealth } from '../../core/middleware/authmiddleware.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -33,7 +34,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * scripts/seed_northeast.mjs.
  */
 const router = Router({ mergeParams: true });
-router.get('/health', (req, res) => res.json({ ok: true, app: 'cf_crm' }));
+// signed in only (2026-11-24): answered under a company's address, it told anyone which companies use this app
+router.get('/health', protectHealth, (req, res) => res.json({ ok: true, app: 'cf_crm' }));
 router.use(dataRoutes);
 router.use(setupRoutes);
 router.use(commsRoutes);

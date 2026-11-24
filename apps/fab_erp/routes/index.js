@@ -25,10 +25,12 @@ import marksRouter       from './marks.js';
 import shiftLogRouter    from './shiftLog.js';
 import workersRouter     from './workers.js';
 import gapsRouter        from './gaps.js';
+import { protect as protectHealth } from '../../../core/middleware/authmiddleware.js';
 
 const router = Router();
 
-router.get('/health', (req, res) => res.json({ ok: true, app: 'fab_erp' }));
+// signed in only (2026-11-24): answered under a company's address, it told anyone which companies use this app
+router.get('/health', protectHealth, (req, res) => res.json({ ok: true, app: 'fab_erp' }));
 
 router.use(mutateRouter);
 router.use(processTemplateStepsRouter);

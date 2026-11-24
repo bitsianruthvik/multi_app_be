@@ -151,17 +151,14 @@ export const uploadDocument = async (req, res) => {
     if (existingId) {
       // Update doc_path and uploader/uploaded_at; scope by company
       try {
-        if (companyId) {
-          await pool.query(
-            `UPDATE ${resource} SET doc_path = ?, uploader_id = ?, uploaded_at = NOW() WHERE id = ? AND company_id = ?`,
-            [docPath, uploaderId, existingId, companyId]
-          );
-        } else {
-          await pool.query(
-            `UPDATE ${resource} SET doc_path = ?, uploader_id = ?, uploaded_at = NOW() WHERE id = ?`,
-            [docPath, uploaderId, existingId]
-          );
-        }
+        // Own company's document only (2026-11-24 isolation audit): the update was scoped, but another company's id
+        // was still queued for text extraction (overwriting that document's text) and its row returned.
+        if (!companyId) return res.status(403).json({ success: false, error: "A signed-in person of a company is required." });
+        const [upd] = await pool.query(
+          `UPDATE ${resource} SET doc_path = ?, uploader_id = ?, uploaded_at = NOW() WHERE id = ? AND company_id = ?`,
+          [docPath, uploaderId, existingId, companyId]
+        );
+        if (!upd.affectedRows) return res.status(404).json({ success: false, error: "Document not found" });
         enqueue(
           "audio_intelligence",
           "docIntelligence",
@@ -172,8 +169,8 @@ export const uploadDocument = async (req, res) => {
           logger.warn("Failed to enqueue docIntelligence job:", e && e.message)
         );
         const [rows] = await pool.query(
-          `SELECT * FROM ${resource} WHERE id = ? LIMIT 1`,
-          [existingId]
+          `SELECT * FROM ${resource} WHERE id = ? AND company_id = ? LIMIT 1`,
+          [existingId, companyId]
         );
         return res.json({
           success: true,

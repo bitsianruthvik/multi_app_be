@@ -4,7 +4,7 @@ import { signToken, verifyToken } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import crypto from "crypto";
 import { getAppAccessForUser } from "../routes/appsRoutes.js";
-import { validLogin, findLoginUser, loginRefusal, loginFlags, touchLogin, userState } from "./loginRules.js";
+import { validLogin, findLoginUser, loginRefusal, loginFlags, touchLogin, userState, LOGIN_FAILED, burnPasswordCheck, SIGNUP_CLOSED } from "./loginRules.js";
 // LOGIN controller
 export const loginUser = async (req, res) => {
   try {
@@ -29,17 +29,13 @@ export const loginUser = async (req, res) => {
       [companySlug]
     );
 
-    if (!companySlug || companys.length === 0) {
-      return res.status(404).json({ message: "Company not found" });
+    // One answer for every failure (loginRules.LOGIN_FAILED): no company, no such login here, wrong password.
+    const found = companySlug && companys.length ? await findLoginUser(email, companys[0].id) : null;
+    if (!found || found.company_id !== companys[0].id) {
+      await burnPasswordCheck(bcrypt, password);
+      return res.status(LOGIN_FAILED.status).json({ message: LOGIN_FAILED.message });
     }
-
     const correctCompanySlug = companys[0].slug;
-    const companyName = companys[0].name;
-
-    const found = await findLoginUser(email, companys[0].id);
-    if (!found)
-      return res.status(404).json({ message: "User not found" });
-
     const user = found;
 
     // Fetch the role name and team name from their respective tables
@@ -58,12 +54,7 @@ export const loginUser = async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch)
-      return res.status(401).json({ message: "Invalid credentials" });
-
-    // H01: Compare user's company_id against the company resolved from the URL
-    if (user.company_id !== companys[0].id) {
-      return res.status(403).json({ message: "User not in this company" });
-    }
+      return res.status(LOGIN_FAILED.status).json({ message: LOGIN_FAILED.message });
     const refused = loginRefusal(user);
     if (refused) return res.status(403).json({ message: refused });
     void touchLogin(user.id);
@@ -266,45 +257,7 @@ export const logoutUser = async (req, res) => {
 };
 
 // POST /api/:company/:appSlug/auth/register
-export const registerUser = async (req, res) => {
-  try {
-    const { name, email, password } = req.body || {};
-    if (!name || !email || !password)
-      return res.status(400).json({ message: "Name, email, and password are required" });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
-      return res.status(400).json({ message: "Invalid email format" });
-    if (password.length < 8)
-      return res.status(400).json({ message: "Password must be at least 8 characters" });
-
-    const company = req.company;
-    if (!company) return res.status(404).json({ message: "Company not found" });
-
-    const [existing] = await pool.query("SELECT id FROM users WHERE email = ? LIMIT 1", [email]);
-    if (existing.length) return res.status(409).json({ message: "Email already registered" });
-
-    const [roles] = await pool.query(
-      "SELECT id FROM roles WHERE company_id = ? AND LOWER(name) != 'admin' ORDER BY id ASC LIMIT 1",
-      [company.id]
-    );
-    const [teams] = await pool.query(
-      "SELECT id FROM teams WHERE company_id = ? ORDER BY id ASC LIMIT 1",
-      [company.id]
-    );
-    if (!roles.length || !teams.length)
-      return res.status(400).json({ message: "Company is not set up for self-registration yet. Please contact your admin." });
-
-    const hashed = await bcrypt.hash(password, 10);
-    const [result] = await pool.query(
-      "INSERT INTO users (name, email, password, role_id, team_id, company_id) VALUES (?, ?, ?, ?, ?, ?)",
-      [name, email, hashed, roles[0].id, teams[0].id, company.id]
-    );
-
-    return res.status(201).json({ message: "Registration successful", userId: result.insertId });
-  } catch (err) {
-    logger.error({ err }, "registerUser error");
-    return res.status(500).json({ message: "Server error during registration" });
-  }
-};
+export const registerUser = async (req, res) => res.status(SIGNUP_CLOSED.status).json({ message: SIGNUP_CLOSED.message }); // closed: loginRules.SIGNUP_CLOSED
 
 // POST /api/:company/:appSlug/auth/forgot-password
 export const requestOtp = async (req, res) => {

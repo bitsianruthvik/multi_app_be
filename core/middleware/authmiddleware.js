@@ -117,12 +117,10 @@ export const protect = async (req, res, next) => {
         req.user.companyId &&
         req.company.id &&
         req.user.companyId === req.company.id;
+      // The same words as an address naming no company (appContext.NO_ACCESS), so this answer does not tell whether
+      // the other company exists.
       if (!companyMatchesBySlug && !companyMatchesById) {
-        return res.status(403).json({
-          message: "Access denied: User does not belong to this company",
-          userCompany: req.user.company,
-          requestedCompany: req.company.slug,
-        });
+        return res.status(403).json({ message: "You do not have access to this company" });
       }
 
       // If there's an app context, verify the user has a row in app_user_access

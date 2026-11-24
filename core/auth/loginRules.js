@@ -17,14 +17,28 @@ const missing = (e) => e?.errno === 1054 || e?.errno === 1146;
 /** Is this text a login at all? (An email, or a username.) */
 export const validLogin = (text) => EMAIL_RE.test(String(text ?? "")) || USERNAME_RE.test(String(text ?? ""));
 
-/** The user a login names in a company: by email (anywhere — the caller checks the company), else by username there. */
+/**
+ * THE ONE ANSWER A FAILED SIGN-IN GETS (2026-11-24): an unknown company, an unknown login, a login of ANOTHER company and
+ * a wrong password all read the same, so a sign-in page tells nobody which emails or companies exist. (They said "User
+ * not found", "User not in this company" and "Invalid credentials" before.)
+ */
+export const LOGIN_FAILED = { status: 401, message: "Invalid email or password" };
+/** Sign-up is closed (companyAuthController.selfRegister): people are added by their company's admin. */
+export const SIGNUP_CLOSED = { status: 403, message: "Accounts are created by your company's admin. Ask them to add you." };
+let dummyHash = null; // made once, at the same cost as the users' own
+/** Spends a password check's time when there is no user, so the answer's timing does not tell either. */
+export async function burnPasswordCheck(bcrypt, password) {
+  try { dummyHash ??= await bcrypt.hash("not-a-password", 10); await bcrypt.compare(String(password ?? ""), dummyHash); } catch { /* timing only */ }
+}
+
+/** The user a login names in THIS company — by email or by username — never one of another company. */
 export async function findLoginUser(login, companyId) {
   const text = String(login ?? "").trim();
+  if (!companyId) return null;
   if (text.includes("@")) {
-    const [rows] = await pool.query("SELECT * FROM users WHERE email = ? LIMIT 1", [text]);
+    const [rows] = await pool.query("SELECT * FROM users WHERE email = ? AND company_id = ? ORDER BY deleted_at IS NULL DESC, id LIMIT 1", [text, companyId]);
     return rows[0] ?? null;
   }
-  if (!companyId) return null;
   try {
     const [rows] = await pool.query("SELECT * FROM users WHERE company_id = ? AND username = ? AND deleted_at IS NULL LIMIT 1", [companyId, text.toLowerCase()]);
     return rows[0] ?? null;

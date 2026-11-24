@@ -4,6 +4,7 @@ import { Router } from 'express';
 import connectorRoutes from './routes/connector.js';
 import reportRoutes from './routes/reports.js';
 import { startAlertCron } from './services/alertService.js';
+import { protect as protectHealth } from '../../core/middleware/authmiddleware.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -18,7 +19,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Schema: models/init.sql — apply by hand. App row + access: scripts/setup.mjs.
  */
 const router = Router({ mergeParams: true });
-router.get('/health', (req, res) => res.json({ ok: true, app: 'karni_dashboard' }));
+// signed in only (2026-11-24): answered under a company's address, it told anyone which companies use this app
+router.get('/health', protectHealth, (req, res) => res.json({ ok: true, app: 'karni_dashboard' }));
 router.use(connectorRoutes);
 router.use(reportRoutes);
 

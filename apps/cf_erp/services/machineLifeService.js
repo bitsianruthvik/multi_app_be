@@ -802,11 +802,11 @@ export async function machineLog(db, companyId, id, q = {}) {
     db.query("SELECT id, code, source, status, title, raised_at, done_at FROM cf_maintenance_orders WHERE company_id = ? AND machine_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT ?", [companyId, m.id, limit]),
     db.query(
       `SELECT DATE(ws.started_at) AS day, rel.order_id, o.code AS order_code, SUM(TIMESTAMPDIFF(MINUTE, ws.started_at, COALESCE(ws.ended_at, ws.started_at))) AS minutes,
-              GROUP_CONCAT(DISTINCT u.name ORDER BY u.name SEPARATOR ', ') AS operators, MAX(COALESCE(ws.ended_at, ws.started_at)) AS last_at
+              GROUP_CONCAT(DISTINCT op.name ORDER BY op.name SEPARATOR ', ') AS operators, MAX(COALESCE(ws.ended_at, ws.started_at)) AS last_at
          FROM cf_work_sessions ws
          JOIN cf_production_steps st ON st.id = ws.step_id JOIN cf_production_items pi ON pi.id = st.production_item_id
          JOIN cf_production_releases rel ON rel.id = pi.release_id JOIN cf_sales_orders o ON o.id = rel.order_id
-         LEFT JOIN users u ON u.id = ws.operator_id
+         LEFT JOIN cf_operators op ON op.company_id = ws.company_id AND op.id = ws.operator_id -- an operator, not a platform user (2026-11-24: it joined users by that id and showed other companies' people)
         WHERE ws.company_id = ? AND ws.machine_id = ? AND ws.deleted_at IS NULL
         GROUP BY DATE(ws.started_at), rel.order_id, o.code ORDER BY day DESC LIMIT ?`, [companyId, m.id, limit]),
   ]).catch((e) => { if (missing(e)) return [[[]], [[]], [[]]]; throw e; });

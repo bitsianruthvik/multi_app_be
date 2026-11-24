@@ -74,7 +74,9 @@ export async function buildSelectQuery(parsedResource, aggregate) {
   const fromClause = `FROM ${table} ${alias}`;
 
   // JOIN clause — pass the projected field names so mapJoins only joins what is needed
-  const joinClause = mapJoins(parsedResource, Object.keys(filteredFields));
+  // The aliases whose tables carry company_id: a join between two of them also matches the company (joinMapper).
+  const companyAliases = new Set(Object.entries(tableColumns).filter(([, cols]) => cols?.has?.("company_id")).map(([a]) => a));
+  const joinClause = mapJoins(parsedResource, Object.keys(filteredFields), companyAliases);
 
   // When aggregate is provided, replace the SELECT clause with aggregate expressions
   if (aggregate) {

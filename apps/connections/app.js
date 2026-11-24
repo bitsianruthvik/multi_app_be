@@ -2,6 +2,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Router } from 'express';
 import connectionRoutes from './routes/connections.js';
+import { protect as protectHealth } from '../../core/middleware/authmiddleware.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -17,7 +18,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Secrets are encrypted with CONNECTIONS_KEY (lib/secrets.js).
  */
 const router = Router({ mergeParams: true });
-router.get('/health', (req, res) => res.json({ ok: true, app: 'connections' }));
+// signed in only (2026-11-24): answered under a company's address, it told anyone which companies use this app
+router.get('/health', protectHealth, (req, res) => res.json({ ok: true, app: 'connections' }));
 router.use(connectionRoutes);
 
 export default {

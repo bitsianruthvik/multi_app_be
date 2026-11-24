@@ -239,9 +239,10 @@ export const uploadAudio = async (req, res) => {
     // Attempt DB insert, respecting idempotency if requested
     try {
       if (idempotencyKey) {
+        // own company's earlier upload only (another company's key returned that company's row)
         const [existingRows] = await pool.query(
-          "SELECT * FROM audio_recordings WHERE idempotency_key = ? LIMIT 1",
-          [idempotencyKey]
+          "SELECT * FROM audio_recordings WHERE idempotency_key = ? AND company_id <=> ? LIMIT 1",
+          [idempotencyKey, insertData.company_id ?? null]
         );
         if (Array.isArray(existingRows) && existingRows.length > 0) {
           return res.json({ success: true, data: [existingRows[0]] });
@@ -379,24 +380,31 @@ export const transcribe = async (req, res) => {
     // example a timestamp-based filename id), try resolving it to the actual
     // `audio_recordings.id` before spawning the worker. This prevents the
     // worker from attempting to update a non-existent PK.
+    // Own company's recordings only (2026-11-24 isolation audit): the id — or any text found in a URL — was looked
+    // up across all companies, so another company's recording was transcribed and its transcript returned.
+    const cid = req.user?.is_service ? null : Number(req.user?.companyId ?? req.user?.company_id) || 0;
+    const own = cid === null ? "" : " AND company_id = ?";
+    const ownP = cid === null ? [] : [cid];
+    let found = false;
     try {
       let resolved = null;
       const maybeNum = Number(audioId);
       if (maybeNum && Number.isFinite(maybeNum)) {
         const [r] = await pool.query(
-          "SELECT id FROM audio_recordings WHERE id = ? LIMIT 1",
-          [maybeNum]
+          `SELECT id FROM audio_recordings WHERE id = ?${own} LIMIT 1`,
+          [maybeNum, ...ownP]
         );
         if (Array.isArray(r) && r.length > 0) resolved = r[0];
       }
       if (!resolved) {
         // Try to find a row where the provided identifier appears in the
         // processed_url or audio_url (covers filename-based ids embedded in URLs)
-        const likePattern = `%${String(audioId)}%`;
+        // LIKE wildcards in the given text are taken literally ("_" matched any recording)
+        const likePattern = `%${String(audioId).replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
         try {
           const [r2] = await pool.query(
-            "SELECT id FROM audio_recordings WHERE processed_url LIKE ? OR audio_url LIKE ? LIMIT 1",
-            [likePattern, likePattern]
+            `SELECT id FROM audio_recordings WHERE (processed_url LIKE ? OR audio_url LIKE ?)${own} LIMIT 1`,
+            [likePattern, likePattern, ...ownP]
           );
           if (Array.isArray(r2) && r2.length > 0) resolved = r2[0];
         } catch (e) {
@@ -410,10 +418,12 @@ export const transcribe = async (req, res) => {
           resolved: resolved.id,
         });
         audioId = resolved.id;
+        found = true;
       }
     } catch (e) {
       logger.warn("Failed to resolve audio id to DB id:", e && e.message);
     }
+    if (!found) return res.status(404).json({ success: false, error: "Recording not found" });
     // Dispatch transcription to the managed queue (falls back to inline spawn).
     let scriptResult = { started: false, queued: false, error: null };
     try {

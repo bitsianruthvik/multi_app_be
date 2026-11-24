@@ -18,11 +18,8 @@ export const handleDBQuery = async (req, res) => {
       include_deleted,
     } = req.body;
 
-    // Build JWT-like security payload from logged-in user if available
-    const jwtPayload = req.user || {
-      company_id: company,
-      team_ids: team ? [team] : [],
-    };
+    // The signed-in person only — never a company named in the request (it used to fall back to the body's `company`).
+    const jwtPayload = req.user || null;
 
     const { sql, params } = await buildQuery({
       resource,

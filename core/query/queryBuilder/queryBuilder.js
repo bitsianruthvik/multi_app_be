@@ -50,6 +50,7 @@ export async function buildQuery(config) {
     includeDeleted: !!includeDeleted,
     alias: mainAlias,
     hasCompanyId,
+    table: parsedResource.table,
   });
   whereSql = secured.sql;
   whereParams = secured.params;

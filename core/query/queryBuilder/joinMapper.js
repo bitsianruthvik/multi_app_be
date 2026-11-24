@@ -8,15 +8,22 @@
  * @param {Array} requestedFields - List of requested field names
  * @returns {String} SQL JOIN clause string
  */
-export function mapJoins(parsedResource, requestedFields = []) {
+export function mapJoins(parsedResource, requestedFields = [], companyAliases = null) {
   const { alias, fields, relations } = parsedResource || {};
   if (!relations || Object.keys(relations).length === 0) return "";
 
+  // A JOIN NEVER REACHES ANOTHER COMPANY (2026-11-24): when both the base table and the joined one carry company_id,
+  // the join also matches it. The relations join on id alone, so a row pointing at another company's id (an order's
+  // customer, a plan's approver) showed that company's names and codes.
+  const joinOf = (rel) => {
+    const sameCompany = companyAliases && companyAliases.has(alias) && companyAliases.has(rel.alias)
+      ? ` AND ${rel.alias}.company_id = ${alias}.company_id` : "";
+    return `LEFT JOIN ${rel.table} ${rel.alias} ON (${rel.on})${sameCompany}`;
+  };
+
   // If no specific fields are requested → join all relations (legacy fallback)
   if (!requestedFields || requestedFields.length === 0) {
-    return Object.values(relations)
-      .map((rel) => `LEFT JOIN ${rel.table} ${rel.alias} ON ${rel.on}`)
-      .join(" ");
+    return Object.values(relations).map(joinOf).join(" ");
   }
 
   // Derive base-table field names from the resourceDef: any field whose expression
@@ -45,7 +52,7 @@ export function mapJoins(parsedResource, requestedFields = []) {
           (j) => j.includes(` ${rel.alias} `) || j.includes(`${rel.alias}.`)
         );
         if (!alreadyJoined) {
-          joinClauses.push(`LEFT JOIN ${rel.table} ${rel.alias} ON ${rel.on}`);
+          joinClauses.push(joinOf(rel));
         }
         resolvedFields.add(field);
         found = true;

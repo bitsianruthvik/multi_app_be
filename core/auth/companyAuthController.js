@@ -4,7 +4,7 @@ import { pool } from "../../db.js";
 import { signToken, verifyToken } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import { getAppAccessForUser } from "../routes/appsRoutes.js";
-import { validLogin, findLoginUser, loginRefusal, loginFlags, touchLogin, userState } from "./loginRules.js";
+import { validLogin, findLoginUser, loginRefusal, loginFlags, touchLogin, userState, LOGIN_FAILED, burnPasswordCheck, SIGNUP_CLOSED } from "./loginRules.js";
 
 const resolveCompany = async (slug) => {
   const [rows] = await pool.query(
@@ -73,17 +73,15 @@ export const companyLogin = async (req, res) => {
     if (password.length < 8)
       return res.status(400).json({ message: "Password must be at least 8 characters" });
 
+    // One answer for every failure (loginRules.LOGIN_FAILED): no company, no such login here, wrong password.
     const company = await resolveCompany(req.params.company);
-    if (!company) return res.status(404).json({ message: "Company not found" });
-
-    const user = await findLoginUser(email, company.id);
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    if (user.company_id !== company.id)
-      return res.status(403).json({ message: "User does not belong to this company" });
-
+    const user = company ? await findLoginUser(email, company.id) : null;
+    if (!user || user.company_id !== company.id) {
+      await burnPasswordCheck(bcrypt, password);
+      return res.status(LOGIN_FAILED.status).json({ message: LOGIN_FAILED.message });
+    }
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(401).json({ message: "Invalid credentials" });
+    if (!isMatch) return res.status(LOGIN_FAILED.status).json({ message: LOGIN_FAILED.message });
     const refused = loginRefusal(user);
     if (refused) return res.status(403).json({ message: refused });
     void touchLogin(user.id);
@@ -170,55 +168,23 @@ export const companyLogout = async (req, res) => {
   return res.json({ message: "Logged out" });
 };
 
+/**
+ * SIGN-UP IS CLOSED (2026-11-24): anyone could make themselves a member of ANY company here (first non-admin role and
+ * team), and "Email already registered" told them which emails exist in other companies. People are added by their
+ * company's admin (the admin panel). Both sign-up routes answer this.
+ */
+
 // POST /api/:company/auth/register
-export const selfRegister = async (req, res) => {
-  try {
-    const { name, email, password } = req.body || {};
-    if (!name || !email || !password)
-      return res.status(400).json({ message: "Name, email, and password are required" });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
-      return res.status(400).json({ message: "Invalid email format" });
-    if (password.length < 8)
-      return res.status(400).json({ message: "Password must be at least 8 characters" });
-
-    const company = await resolveCompany(req.params.company);
-    if (!company) return res.status(404).json({ message: "Company not found" });
-
-    const [existing] = await pool.query("SELECT id FROM users WHERE email = ? LIMIT 1", [email]);
-    if (existing.length) return res.status(409).json({ message: "Email already registered" });
-
-    const [roles] = await pool.query(
-      "SELECT id FROM roles WHERE company_id = ? AND LOWER(name) != 'admin' ORDER BY id ASC LIMIT 1",
-      [company.id]
-    );
-    const [teams] = await pool.query(
-      "SELECT id FROM teams WHERE company_id = ? ORDER BY id ASC LIMIT 1",
-      [company.id]
-    );
-    if (!roles.length || !teams.length)
-      return res.status(400).json({ message: "Company is not set up for self-registration yet. Please contact your admin." });
-
-    const hashed = await bcrypt.hash(password, 10);
-    const [result] = await pool.query(
-      "INSERT INTO users (name, email, password, role_id, team_id, company_id) VALUES (?, ?, ?, ?, ?, ?)",
-      [name, email, hashed, roles[0].id, teams[0].id, company.id]
-    );
-
-    return res.status(201).json({ message: "Registration successful", userId: result.insertId });
-  } catch (err) {
-    logger.error({ err }, "selfRegister error");
-    return res.status(500).json({ message: "Server error during registration" });
-  }
-};
-
+export const selfRegister = async (req, res) => res.status(SIGNUP_CLOSED.status).json({ message: SIGNUP_CLOSED.message });
 // POST /api/:company/auth/forgot-password
 export const forgotPassword = async (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ message: "Email is required" });
 
+    // An unknown company reads like an unknown email (no "company not found").
     const company = await resolveCompany(req.params.company);
-    if (!company) return res.status(404).json({ message: "Company not found" });
+    if (!company) return res.json({ message: "If your email is registered, a reset link has been sent." });
 
     const [userRows] = await pool.query(
       "SELECT id FROM users WHERE email = ? AND company_id = ? LIMIT 1",

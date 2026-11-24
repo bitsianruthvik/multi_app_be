@@ -192,7 +192,8 @@ export async function assertInPick(exec, companyId, pick, itemIds, what = 'the c
   const ok = new Set(rows.map((r) => Number(r.id)));
   const missing = ids.filter((id) => !ok.has(id));
   if (missing.length) {
-    const [named] = await exec.query('SELECT name FROM fab_item_catalog WHERE id IN (?)', [missing]);
+    // Own company's names only: another company's id reads as "Item #id" (2026-11-24 isolation audit).
+    const [named] = await exec.query('SELECT name FROM fab_item_catalog WHERE company_id = ? AND id IN (?)', [companyId, missing]);
     const e = new Error(
       `${named.map((n) => n.name).join(', ') || `Item #${missing[0]}`} is not one of the catalog items this line picks from, so it cannot be ${what}.`,
     );

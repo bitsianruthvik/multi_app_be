@@ -131,20 +131,7 @@ app.use("/uploads", express.static(uploadsDir, { maxAge: "1d" }));
 // =====================
 // Debug Endpoints
 // =====================
-app.get("/debug/data", protect, requireAdmin, async (req, res) => {
-  try {
-    const [companies] = await pool.query(
-      "SELECT id, name, slug FROM companies",
-    );
-    const [roles] = await pool.query("SELECT id, name, company_id FROM roles");
-    const [teams] = await pool.query("SELECT id, name, company_id FROM teams");
-    const [users] = await pool.query("SELECT id, name, email FROM users");
-    res.json({ companies, roles, teams, users });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
+// /debug/data is gone (2026-11-24): it gave ANY company's admin every company, role, team and user (name, email).
 app.get("/debug/jwt", protect, requireAdmin, (req, res) => {
   const token = req.cookies.token;
   if (!token)

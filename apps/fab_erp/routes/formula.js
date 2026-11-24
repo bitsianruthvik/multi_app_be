@@ -135,6 +135,16 @@ router.post('/formula/validate', protect, requirePerm('fab_erp_operations_view')
     if (typeof formula !== 'string' || !formula.trim()) {
       return res.status(400).json({ message: '"formula" (string) is required.' });
     }
+    // Own company's resource type and sample item only (2026-11-24 isolation audit): the machine values were read by
+    // the type's id alone, so another company's type id answered with that company's machine values.
+    if (resourceTypeId) {
+      const [[rt]] = await pool.query('SELECT id FROM fab_resource_types WHERE id = ? AND company_id = ? AND deleted_at IS NULL', [resourceTypeId, companyId]);
+      if (!rt) return res.status(404).json({ message: 'Resource type not found.' });
+    }
+    if (sampleItemId) {
+      const [[it]] = await pool.query('SELECT id FROM fab_items WHERE id = ? AND company_id = ?', [sampleItemId, companyId]);
+      if (!it) return res.status(404).json({ message: 'Item not found.' });
+    }
 
     const parsed = parseFormula(formula);
     if (!parsed.valid) {

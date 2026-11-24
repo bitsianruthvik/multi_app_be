@@ -1,5 +1,7 @@
 import { pool } from "../../db.js";
 import { logger } from "../utils/logger.js";
+import { verifyToken } from "../utils/jwt.js";
+import { LOGIN_FAILED, SIGNUP_CLOSED } from "../auth/loginRules.js";
 
 // In-process TTL cache for company + app records. These records change at
 // human cadence (rarely) but every API request resolves them, so caching them
@@ -24,6 +26,27 @@ function cacheSet(key, company, app) {
     app,
     expiresAt: Date.now() + CONTEXT_TTL_MS,
   });
+}
+
+/**
+ * AN ADDRESS THAT NAMES NO COMPANY (or no app of it) ANSWERS LIKE ONE THAT DOES (2026-11-24). It said "Company not
+ * found: x" / "App not found: y for company z", while a real company answered "Not authenticated" — so anyone could
+ * test which companies and apps exist. Now: a sign-in reads as a failed sign-in, a password reset as one for an
+ * unknown email, a sign-up as closed, and anything else as "Not authenticated" (no valid token) or the same "no access"
+ * that protect gives a person of another company.
+ */
+export const NO_ACCESS = { status: 403, message: "You do not have access to this company" };
+function answerAsIfThere(req, res) {
+  const p = String(req.originalUrl || "").split("?")[0].replace(/\/+$/, "");
+  if (/\/(auth\/)?login$/.test(p) && req.method === "POST") return res.status(LOGIN_FAILED.status).json({ message: LOGIN_FAILED.message });
+  if (/\/auth\/forgot-password$/.test(p)) return res.json({ message: "If your email is registered, an OTP has been sent." });
+  if (/\/auth\/reset-password$/.test(p)) return res.status(400).json({ message: "Invalid request" });
+  if (/\/auth\/register$/.test(p)) return res.status(SIGNUP_CLOSED.status).json({ message: SIGNUP_CLOSED.message });
+  let token = req.cookies?.token ?? null;
+  const auth = req.headers?.authorization;
+  if (!token && typeof auth === "string" && auth.startsWith("Bearer ")) token = auth.slice(7);
+  if (token && verifyToken(token)) return res.status(NO_ACCESS.status).json({ message: NO_ACCESS.message });
+  return res.status(401).json({ message: "Not authenticated" });
 }
 
 /**
@@ -119,14 +142,10 @@ export const appContext = async (req, res, next) => {
 
     // Load company record
     const [companyRows] = await pool.query(
-      "SELECT * FROM companies WHERE slug = ?",
+      "SELECT * FROM companies WHERE slug = ? AND deleted_at IS NULL",
       [companySlug]
     );
-    if (!companyRows || companyRows.length === 0) {
-      return res
-        .status(404)
-        .json({ message: `Company not found: ${companySlug}` });
-    }
+    if (!companyRows || companyRows.length === 0) return answerAsIfThere(req, res);
     const company = companyRows[0];
     try {
       if (company.settings && typeof company.settings === "string")
@@ -145,11 +164,7 @@ export const appContext = async (req, res, next) => {
         "SELECT * FROM apps WHERE slug = ? AND company_id = ? LIMIT 1",
         [appSlug, company.id]
       );
-      if (!appRows || appRows.length === 0) {
-        return res.status(404).json({
-          message: `App not found: ${appSlug} for company ${companySlug}`,
-        });
-      }
+      if (!appRows || appRows.length === 0) return answerAsIfThere(req, res);
       appRow = appRows[0];
       try {
         if (appRow.settings && typeof appRow.settings === "string")
