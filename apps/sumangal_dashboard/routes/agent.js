@@ -77,7 +77,13 @@ router.post('/agent/push', express.raw({ type: 'application/octet-stream', limit
     const data = JSON.parse(text);
     if (!data.D || !Array.isArray(data.D.items) || !data.S || !data.H) return res.status(400).json({ error: 'Not an ERP dashboard dataset (D, S, H).' });
     const kind = req.get('x-run-kind') === 'update' ? 'update' : 'nightly';
-    const out = await storeV15(req.company.id, text, { source: `agent ${a.id} ${kind}`, end: data.D.end });
+    // D.end is the dashboard's "today" (every age is measured from it) and is the latest date in the
+    // ERP. One mistyped record (Sumangal has a 2424 date, 2026-11-24) would put "today" centuries
+    // ahead and push all WIP into "over 90 days". Nothing can be newer than the day it arrives.
+    const today = new Date(Date.now() + 330 * 60_000).toISOString().slice(0, 10); // IST
+    let body = text;
+    if (typeof data.D.end === 'string' && data.D.end > today) { data.D.end = today; body = JSON.stringify(data); }
+    const out = await storeV15(req.company.id, body, { source: `agent ${a.id} ${kind}`, end: data.D.end });
     res.json({ ok: true, ...out });
   } catch (err) { req.log?.error?.({ err }, 'sumangal agent push'); res.status(500).json({ error: err.message }); }
 });
