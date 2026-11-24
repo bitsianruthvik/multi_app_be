@@ -84,7 +84,8 @@ $pw = Read-Host 'Password of that login (not shown)' -AsSecureString
 ($pw | ConvertFrom-SecureString) | Set-Content "$Dir\sql.sec" -Encoding ASCII
 $out = [ordered]@{ api = $Api; company = $Company; server = $server; port = [int]$port; database = $database; auth = $auth; user = $user; encrypt = $false; tdsVersion = '7_3_B' }
 if ($cfg.agentUid) { $out.agentUid = $cfg.agentUid }
-$out | ConvertTo-Json | Set-Content $cfgFile -Encoding UTF8
+# UTF-8 WITHOUT a BOM: PowerShell 4/5 add one with -Encoding UTF8 and node's JSON.parse rejects it
+[IO.File]::WriteAllText($cfgFile, ($out | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
 
 Step "Testing the connection (read-only)"
 Push-Location $Dir
