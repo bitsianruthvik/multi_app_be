@@ -112,10 +112,12 @@ export async function resolveCodes(db, companyId, masters, codes) {
      UNION ALL
      SELECT 'v', NULL, v.id, NULL, NULL, NULL, v.subject_type, v.subject_id, NULL, NULL, NULL, NULL,
             UPPER(s.code), v.value_number, v.value_text, v.value_bool, v.value_date, v.option_id, v.source, v.uom, s.data_type, o.value
-       FROM cf_spec_values v
+       FROM cf_spec_values v FORCE INDEX (idx_csv_subject)
        JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL AND s.code IN (?)
        LEFT JOIN cf_spec_options o ON o.id = v.option_id
       WHERE v.company_id = ? AND v.deleted_at IS NULL
+        -- by subject (2026-11-24): left alone the optimizer read every value of the asked codes (20k a code) through
+        -- idx_csv_text; classification values are few, so the subject index reads only what is asked (0.18 s -> 0.03 s)
         AND ((v.subject_type = 'classification' AND v.subject_id IN (SELECT id FROM up)) OR (v.subject_type = 'master' AND v.subject_id IN (?)))`,
     [companyId, clsIds.length ? clsIds : [0], companyId, CHAIN_HOPS,
       upper, companyId, masterIds.length ? masterIds : [0],

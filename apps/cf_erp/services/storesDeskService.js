@@ -177,7 +177,7 @@ export async function ledger(db, companyId, q = {}) {
   if (show === 'reserved') where.push('COALESCE(rs.q, 0) > 0');   // locked for a sales order (2026-11-22)
   const FROM = `
       FROM cf_master_records m
-      JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+      JOIN cf_item_details i ON i.master_id = m.id AND i.company_id = m.company_id AND i.deleted_at IS NULL
       LEFT JOIN cf_classification_nodes v ON v.id = m.classification_id
       LEFT JOIN cf_classification_nodes s ON s.id = v.parent_id
       LEFT JOIN cf_classification_nodes f ON f.id = s.parent_id
@@ -223,7 +223,7 @@ export async function ledger(db, companyId, q = {}) {
     db.query(`SELECT COUNT(*) AS n ${FROM} WHERE ${where.join(' AND ')}`, [...fromParams, ...params]),
     db.query(
       `SELECT f.id AS family_id, f.name AS family_name, s.id AS subfamily_id, s.name AS subfamily_name, v.id AS variant_id, v.name AS variant_name, COUNT(*) AS n
-         FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.deleted_at IS NULL
+         FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.company_id = m.company_id AND i.deleted_at IS NULL
          JOIN cf_classification_nodes v ON v.id = m.classification_id
          JOIN cf_classification_nodes s ON s.id = v.parent_id
          JOIN cf_classification_nodes f ON f.id = s.parent_id
@@ -741,7 +741,7 @@ export async function countList(db, companyId, q = {}) {
     itemIds = moved.map((r) => Number(r.item_id));
   } else if (kind === 'monthly') {
     const [all] = await db.query(
-      `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog'
+      `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.company_id = m.company_id AND i.item_type = 'catalog'
          LEFT JOIN cf_classification_nodes v ON v.id = m.classification_id
         WHERE m.company_id = ? AND m.deleted_at IS NULL ${blank(q.subfamilyId) ? '' : 'AND v.parent_id = ?'}
           AND (EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = m.company_id AND k.item_id = m.id AND k.stocking_area_id = ?)
@@ -752,7 +752,7 @@ export async function countList(db, companyId, q = {}) {
   } else {
     if (blank(q.subfamilyId)) throw invalid('INVALID', 'Choose the group to audit this week.');
     const [inGroup] = await db.query(
-      `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.item_type = 'catalog'
+      `SELECT m.id FROM cf_master_records m JOIN cf_item_details i ON i.master_id = m.id AND i.company_id = m.company_id AND i.item_type = 'catalog'
          JOIN cf_classification_nodes v ON v.id = m.classification_id
         WHERE m.company_id = ? AND m.deleted_at IS NULL AND v.parent_id = ?
           AND (EXISTS (SELECT 1 FROM cf_stock_balances k WHERE k.company_id = m.company_id AND k.item_id = m.id AND k.stocking_area_id = ? AND k.quantity <> 0)

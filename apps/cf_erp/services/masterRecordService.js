@@ -766,7 +766,7 @@ export async function listRecords(db, companyId, q = {}) {
             (SELECT b.status FROM cf_boms b WHERE b.company_id = m.company_id AND b.parent_id = m.id AND b.deleted_at IS NULL LIMIT 1) AS bom_status,
             -- The list shows how big a BOM is, not just that there is one, so a
             -- user can see at a glance which records are built and which are bare.
-            (SELECT COUNT(*) FROM cf_bom_lines bl JOIN cf_boms b2 ON b2.id = bl.bom_id
+            (SELECT COUNT(*) FROM cf_bom_lines bl JOIN cf_boms b2 ON b2.id = bl.bom_id AND bl.company_id = b2.company_id
               WHERE b2.company_id = m.company_id AND b2.parent_id = m.id AND b2.deleted_at IS NULL
                 AND bl.deleted_at IS NULL) AS bom_line_count
        ${from}

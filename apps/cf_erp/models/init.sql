@@ -9276,3 +9276,16 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 SELECT IF((SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_standard_drawing_files' AND INDEX_NAME = 'idx_csdf_drawing') > 0
           AND (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_part_drawings' AND INDEX_NAME = 'idx_cpd_drawing') > 0,
           'S119-OK', 'S119-MISSING') AS result;
+
+-- §120 PRODUCTION ITEMS BY RELEASE (2026-11-24). About 39 reads join cf_production_items to their release as
+-- "pi.release_id = r.id" without pi.company_id, so the (company_id, release_id, sort_order) key could not serve
+-- them and MySQL walked every step of the company instead. Measured on the AWS copy: the MD dashboard
+-- (mdDashboardService) 1.39 s -> 0.06 s, the sandbox orders list 0.81 s -> 0.01 s, an order's production
+-- 0.11 s -> 0.05 s, billing's step totals 0.12 s -> 0.06 s; rows identical. The planner's step read now also
+-- names the company on both joins (plannerV3Service), which keeps it from scanning other companies' releases.
+SET @ix = (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND INDEX_NAME = 'idx_cpri_rel');
+SET @sql = IF(@ix = 0, 'ALTER TABLE cf_production_items ADD KEY idx_cpri_rel (release_id)', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND INDEX_NAME = 'idx_cpri_rel') > 0,
+          'S120-OK', 'S120-MISSING') AS result;

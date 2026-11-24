@@ -127,8 +127,8 @@ async function readFacts(db, companyId, clock) {
          FROM cf_production_steps s
          JOIN cf_production_orders po ON po.id = s.production_order_id AND po.company_id = s.company_id
          JOIN cf_sales_orders o ON o.id = po.order_id AND o.company_id = po.company_id
-         JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
-         JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
+         JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.company_id = s.company_id AND pi.deleted_at IS NULL
+         JOIN cf_production_releases r ON r.id = pi.release_id AND r.company_id = pi.company_id AND r.deleted_at IS NULL
          JOIN cf_master_records m ON m.id = pi.item_id
          JOIN cf_operations op ON op.id = s.operation_id
         WHERE s.company_id = ? AND s.deleted_at IS NULL AND ${OPEN_PO}

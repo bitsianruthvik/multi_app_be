@@ -1457,10 +1457,10 @@ async function loadOrderContext(db, companyId, order, lines) {
       `SELECT r.id, r.order_line_id,
               (SELECT COUNT(*) FROM cf_production_steps s
                  JOIN cf_production_items pi ON pi.id = s.production_item_id
-                WHERE pi.release_id = r.id AND s.deleted_at IS NULL) AS steps,
+                WHERE s.company_id = r.company_id AND pi.release_id = r.id AND s.deleted_at IS NULL) AS steps,
               (SELECT COUNT(*) FROM cf_production_steps s
                  JOIN cf_production_items pi ON pi.id = s.production_item_id
-                WHERE pi.release_id = r.id AND s.deleted_at IS NULL AND s.state = 'done') AS done_steps
+                WHERE s.company_id = r.company_id AND pi.release_id = r.id AND s.deleted_at IS NULL AND s.state = 'done') AS done_steps
          FROM cf_production_releases r
         WHERE r.company_id = ? AND r.order_line_id IN (?) AND r.deleted_at IS NULL`,
       [companyId, lineIds],

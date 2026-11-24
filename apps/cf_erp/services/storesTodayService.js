@@ -95,12 +95,19 @@ async function afterHours(db, companyId, settings) {
     db.query(
       `SELECT mm.id, mm.code, mm.movement_type, mm.given_type, mm.used_for, UNIX_TIMESTAMP(mm.created_at) AS ts, u.name AS by_name,
               so.code AS order_code, dp.name AS department_name, gp.name AS given_party_name, sp.name AS supplier_name, pe.name AS person_name,
-              (SELECT COUNT(*) FROM cf_stock_ledger l WHERE l.movement_id = mm.id AND l.deleted_at IS NULL) AS lines_n,
-              (SELECT mr.name FROM cf_stock_ledger l JOIN cf_master_records mr ON mr.id = l.item_id WHERE l.movement_id = mm.id ORDER BY l.id LIMIT 1) AS first_item
+              COALESCE(lc.n, 0) AS lines_n, fmr.name AS first_item
          FROM cf_stock_movements mm ${GIVEN_JOINS}
          LEFT JOIN users u ON u.id = mm.created_by
+         -- the week's ledger lines counted once, not two lookups a movement (2026-11-24: the per-movement subqueries
+         -- had no company_id, so MySQL scanned the whole ledger for each: 0.55 s -> 0.01 s; TiDB 0.48 s -> 0.1 s)
+         LEFT JOIN (SELECT l.movement_id, SUM(l.deleted_at IS NULL) AS n, MIN(l.id) AS first_id
+                      FROM cf_stock_ledger l JOIN cf_stock_movements m2 ON m2.id = l.movement_id AND m2.company_id = l.company_id
+                     WHERE l.company_id = ? AND m2.created_at >= NOW() - INTERVAL 7 DAY
+                     GROUP BY l.movement_id) lc ON lc.movement_id = mm.id
+         LEFT JOIN cf_stock_ledger fl ON fl.id = lc.first_id
+         LEFT JOIN cf_master_records fmr ON fmr.id = fl.item_id
         WHERE mm.company_id = ? AND mm.created_at >= NOW() - INTERVAL 7 DAY
-        ORDER BY mm.id DESC LIMIT 500`, [companyId]),
+        ORDER BY mm.id DESC LIMIT 500`, [companyId, companyId]),
   ]);
   const since = Number(last?.ts) || 0;
   // A movement's created_at is an instant; "after hours" is the plant's wall clock (cf_floor_settings.timezone).

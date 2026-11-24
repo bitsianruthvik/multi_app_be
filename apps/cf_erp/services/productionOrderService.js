@@ -526,9 +526,9 @@ export async function listProductionOrders(db, companyId, q = {}) {
   const [legacy] = await db.query(
     `SELECT r.id, r.order_id, o.code AS order_code, r.order_line_id, l.line_no, m.name AS item_name, r.created_at,
             (SELECT COUNT(*) FROM cf_production_steps s JOIN cf_production_items pi ON pi.id = s.production_item_id
-              WHERE pi.release_id = r.id AND s.deleted_at IS NULL) AS steps,
+              WHERE s.company_id = r.company_id AND pi.release_id = r.id AND s.deleted_at IS NULL) AS steps,
             (SELECT COUNT(*) FROM cf_production_steps s JOIN cf_production_items pi ON pi.id = s.production_item_id
-              WHERE pi.release_id = r.id AND s.deleted_at IS NULL AND s.state = 'done') AS done
+              WHERE s.company_id = r.company_id AND pi.release_id = r.id AND s.deleted_at IS NULL AND s.state = 'done') AS done
        FROM cf_production_releases r
        JOIN cf_sales_orders o ON o.id = r.order_id
        JOIN cf_sales_order_lines l ON l.id = r.order_line_id
