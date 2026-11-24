@@ -33,7 +33,13 @@ function Step($t) { Write-Host "`n== $t" -ForegroundColor Cyan }
 Step "This PC"
 $v = [Environment]::OSVersion.Version
 Write-Host "  $((Get-CimInstance Win32_OperatingSystem).Caption) ($v), $env:COMPUTERNAME, user $env:USERDOMAIN\$env:USERNAME"
-if ($v.Major -lt 10) { throw "This Windows is too old for the agent (it needs Windows 10/11 or Server 2016 or later). Use another PC on the same network." }
+if ($v.Major -lt 10 -and -not ($v.Major -eq 6 -and $v.Minor -eq 3)) { throw "This Windows is too old for the agent (it needs Windows 10/11, Server 2016 or later, or Server 2012 R2). Use another PC on the same network." }
+if ($v.Major -lt 10) {
+  # Server 2012 R2 / Windows 8.1 (6.3): Node 22 runs there once told to skip its own OS check.
+  $env:NODE_SKIP_PLATFORM_CHECK = "1"
+  [Environment]::SetEnvironmentVariable("NODE_SKIP_PLATFORM_CHECK", "1", "User")
+  Write-Host "  Windows 8.1 / Server 2012 R2: Node.js runs with NODE_SKIP_PLATFORM_CHECK=1" -ForegroundColor Yellow
+}
 if (-not [Environment]::Is64BitOperatingSystem) { throw "The agent needs 64-bit Windows. Use another PC on the same network." }
 $free = [math]::Round((Get-PSDrive ($Dir.Substring(0, 1))).Free / 1GB, 1)
 Write-Host "  free disk on $($Dir.Substring(0, 2)) $free GB"
@@ -51,7 +57,8 @@ if (-not (Test-Path $node)) {
   $want = ($sums -split "`n" | Where-Object { $_ -match [regex]::Escape($zip) } | Select-Object -First 1).Split(' ')[0]
   $have = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
   if (-not $want -or $have -ne $want.ToLower()) { throw "Node.js download does not match nodejs.org's checksum. Stopped." }
-  Expand-Archive $tmp -DestinationPath "$Dir\work" -Force
+  if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) { Expand-Archive $tmp -DestinationPath "$Dir\work" -Force }
+  else { Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($tmp, "$Dir\work") }  # PowerShell 4 (Server 2012 R2)
   Move-Item "$Dir\work\node-$NodeVersion-win-x64" "$Dir\node"
   Remove-Item $tmp
 }
