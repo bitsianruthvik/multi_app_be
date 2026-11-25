@@ -259,7 +259,10 @@ function customView(v) {
   let o = v;
   if (typeof o === 'string') { try { o = JSON.parse(o); } catch { o = null; } }
   const n = (x) => (x == null || x === '' || !(Number(x) > 0) ? null : Number(x));
-  return { on: !!(o && (o.on === true || o.on === 1)), maxLength: n(o?.maxLength), maxWidth: n(o?.maxWidth), minLength: n(o?.minLength), minWidth: n(o?.minWidth), step: n(o?.step) };
+  // The mill's lot and the standard sizes too (2026-11-25): the card shows and saves them, so a save keeps them.
+  const list = (x) => (Array.isArray(x) && x.length ? x.map(Number).filter((v) => v > 0) : null);
+  return { on: !!(o && (o.on === true || o.on === 1)), maxLength: n(o?.maxLength), maxWidth: n(o?.maxWidth), minLength: n(o?.minLength), minWidth: n(o?.minWidth), step: n(o?.step),
+    minLotPieces: n(o?.minLotPieces), minLotTonnes: n(o?.minLotTonnes), standardWidths: list(o?.standardWidths), standardLengths: list(o?.standardLengths) };
 }
 
 /**

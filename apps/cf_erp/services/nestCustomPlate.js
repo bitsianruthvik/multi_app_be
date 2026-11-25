@@ -41,7 +41,7 @@ export function customPlateSetting(v) {
   if (o == null) return null;
   if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
   if (!o || typeof o !== 'object' || !(o.on === true || o.on === 1 || o.on === '1')) return null;
-  return { on: true, maxLength: pos(o.maxLength), maxWidth: pos(o.maxWidth), minLength: pos(o.minLength), minWidth: pos(o.minWidth), step: pos(o.step), ...lotOf(o) };
+  return { on: true, maxLength: pos(o.maxLength), maxWidth: pos(o.maxWidth), minLength: pos(o.minLength), minWidth: pos(o.minWidth), step: pos(o.step), ...lotOf(o), ...stdOf(o) };
 }
 
 /** What a setting is saved as, checked: → { value (JSON text or null), problems }. */
@@ -61,10 +61,42 @@ export function customPlateInput(input) {
     if (raw != null && raw !== '' && !(Number(raw) > 0)) problems.push(`${words}: a number above 0, or blank.`);
   }
   if (L.maxWidth && L.maxLength && L.maxWidth > L.maxLength) problems.push('The widest width is more than the longest length (a plate\'s length is its long side).');
+  for (const [k, words] of [['standardWidths', 'Standard widths'], ['standardLengths', 'Standard lengths']]) {
+    const raw = input[k];
+    if (raw == null || raw === '' || (Array.isArray(raw) && !raw.length)) continue;
+    const all = Array.isArray(raw) ? raw : String(raw).split(/[,\s/]+/).filter(Boolean);
+    if (all.some((x) => !(Number(x) > 0 && Number(x) <= 30000))) problems.push(`${words}: sizes in mm between 1 and 30 000, separated by commas, or blank.`);
+  }
+  if ((L.standardWidths && !L.standardLengths) || (!L.standardWidths && L.standardLengths)) problems.push('Give both the standard widths and the standard lengths, or neither.');
   return { value: JSON.stringify({ on: true, ...L }), problems };
 }
 function limitsOf(o) {
-  return { maxLength: pos(o?.maxLength), maxWidth: pos(o?.maxWidth), minLength: pos(o?.minLength), minWidth: pos(o?.minWidth), step: pos(o?.step), ...lotOf(o) };
+  return { maxLength: pos(o?.maxLength), maxWidth: pos(o?.maxWidth), minLength: pos(o?.minLength), minWidth: pos(o?.minWidth), step: pos(o?.step), ...lotOf(o), ...stdOf(o) };
+}
+
+/**
+ * THE STANDARD SIZES (user, 2026-11-25: "Standard plates - 1500/2000/2500mm width, 10000/12000mm length. These are the
+ * standard measures for all widths and all qualities … instead of depending on the plates in the items, use these
+ * standard and custom rules"). When the setting states them, nesting offers every steel its pieces need in exactly these
+ * sizes (standard) and the sizes the custom limits allow (custom, at the custom premium) — the catalog's plates are not
+ * the list any more; a size the nesting uses that the catalog lacks is added to it when the nesting is used.
+ * Read whether custom sizes are on or off. → { widths, lengths } | null
+ */
+export function standardSizesOf(v) {
+  let o = v;
+  if (o == null) return null;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
+  const s = stdOf(o);
+  return s.standardWidths && s.standardLengths ? { widths: s.standardWidths, lengths: s.standardLengths } : null;
+}
+function sizeList(v) {
+  const raw = Array.isArray(v) ? v : typeof v === 'string' ? v.split(/[,\s/]+/) : [];
+  const out = [...new Set(raw.map(pos).filter((n) => n != null && n <= 30000))].sort((a, b) => a - b);
+  return out.length ? out : null;
+}
+function stdOf(o) {
+  const w = sizeList(o?.standardWidths); const l = sizeList(o?.standardLengths);
+  return { ...(w ? { standardWidths: w } : {}), ...(l ? { standardLengths: l } : {}) };
 }
 /** The mill's lot, only when one is stated. */
 function lotOf(o) {

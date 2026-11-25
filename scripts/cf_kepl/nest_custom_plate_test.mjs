@@ -239,7 +239,11 @@ try {
   section('Setup › Cutting');
   {
     const saved = await S.saveShopRules(conn, c, { customPlates: { on: true, maxLength: 12500, maxWidth: 2500, minLength: '', step: 100 } });
-    ok('saved and read back: on, the limits, blank = null', J(saved.customPlates) === J({ on: true, maxLength: 12500, maxWidth: 2500, minLength: null, minWidth: null, step: 100 }), J(saved.customPlates));
+    ok('saved and read back: on, the limits, blank = null', J(saved.customPlates) === J({ on: true, maxLength: 12500, maxWidth: 2500, minLength: null, minWidth: null, step: 100, minLotPieces: null, minLotTonnes: null, standardWidths: null, standardLengths: null }), J(saved.customPlates));
+    const withStd = await S.saveShopRules(conn, c, { customPlates: { on: true, maxLength: 12500, maxWidth: 2500, minLotPieces: 5, standardWidths: '1500, 2000, 2500', standardLengths: [12000, 10000] } });
+    ok('the lot and the standard sizes are saved and read back (2026-11-25)', J(withStd.customPlates.standardWidths) === J([1500, 2000, 2500]) && J(withStd.customPlates.standardLengths) === J([10000, 12000]) && withStd.customPlates.minLotPieces === 5, J(withStd.customPlates));
+    ok('nesting reads the standard sizes', J((await N.cutSettingRows(conn, COMPANY)).standardSizes) === J({ widths: [1500, 2000, 2500], lengths: [10000, 12000] }));
+    await S.saveShopRules(conn, c, { customPlates: { on: true, maxLength: 12500, maxWidth: 2500, minLength: '', step: 100 } });
     ok('nesting reads it', J(N.cutSettingRows ? (await N.cutSettingRows(conn, COMPANY)).customPlates : null) === J({ on: true, maxLength: 12500, maxWidth: 2500, minLength: null, minWidth: null, step: 100 }));
     const bad = await refusal(() => S.saveShopRules(conn, c, { customPlates: { on: true, maxLength: 2000, maxWidth: 2500 } }));
     ok('limits that contradict each other are refused in words', said(bad, 'Custom plate sizes:', 'widest width is more than the longest length'), textOf(bad));
