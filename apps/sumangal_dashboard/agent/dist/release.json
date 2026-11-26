@@ -1,8 +1,8 @@
 {
- "version": "2026-11-26b",
+ "version": "2026-11-26c",
  "settings": {},
  "files": {
-  "agent.mjs": "67ab836cdb098cbd7e2831ab4961f1f95b935ed8127c3b27702f1a272d22b7ba",
+  "agent.mjs": "5b67dc11d8517e51e1a1d341fd89e994b9c42cef5875b42db62f4635ffe91678",
   "build-d.mjs": "a90bead952c5a60ed8f1eda6203f04dbb2a8923a90dc807c68ace3e9d57b70b9",
   "supp.mjs": "86f221a1505eac031f35c83211016466238fdf403052baf06d06d892d6c4e052",
   "hist.mjs": "4e917bc82aa6b52ff6d3a001865ba5e61684dacbc4a6c78da09715da1c3085a2",

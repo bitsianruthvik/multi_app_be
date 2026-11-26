@@ -42,7 +42,7 @@ const WORK = path.join(DIR, 'work');
 const LOGS = path.join(DIR, 'logs');
 const COPY = path.join(WORK, 'erp.sqlite');
 const STATE = path.join(WORK, 'state.json');
-const VERSION = '2026-11-26b';
+const VERSION = '2026-11-26c';
 // The platform team's Ed25519 public key: a new version is installed only when its file list carries their signature.
 const RELEASE_KEY = 'MCowBQYDK2VwAyEAhTOWDagwzCp2/dPOPd4Tdf8HlOI2+2c5aP5grwWCdmM=';
 fs.mkdirSync(WORK, { recursive: true }); fs.mkdirSync(LOGS, { recursive: true });
@@ -229,7 +229,17 @@ const api = async (method, p, body, headers = {}) => {
   const c = cfg(); const url = `${c.api.replace(/\/$/, '')}/api/${c.company}/sumangal_dashboard${p}`;
   const h = { ...headers }; if (c.agentUid && p !== '/agent/register') { h['X-Agent-Uid'] = c.agentUid; h.Authorization = `Bearer ${secret('agent.sec')}`; }
   let b = body; if (body && !Buffer.isBuffer(body)) { b = JSON.stringify(body); h['Content-Type'] = 'application/json'; }
-  const r = await fetch(url, { method, headers: h, body: b }); if (r.status === 204) return null;
+  // A network failure is tried again on a fresh connection (3 tries): after a long build the kept-alive connection has
+  // been closed by the server (nginx drops idle ones after ~65 s) and Node does not resend a POST on its own.
+  let r;
+  for (let attempt = 1; ; attempt++) {
+    try { r = await fetch(url, { method, headers: h, body: b }); break; } catch (e) {
+      let why = e.message; for (let x = e.cause; x; x = x.cause) why += ` (${x.code || x.name || ''} ${x.message || ''})`;
+      if (attempt >= 3) throw new Error(`${method} ${p}: ${why}`);
+      log(`${method} ${p}: ${why}; trying again`); await new Promise((ok) => setTimeout(ok, attempt * 3000));
+    }
+  }
+  if (r.status === 204) return null;
   const t = await r.text(); let j; try { j = JSON.parse(t); } catch { j = { raw: t.slice(0, 200) }; }
   if (!r.ok) throw new Error(`${method} ${p}: ${r.status} ${j.error || j.raw || ''}`);
   return j;

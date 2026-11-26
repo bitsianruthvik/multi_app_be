@@ -68979,7 +68979,7 @@ var WORK = path3.join(DIR, "work");
 var LOGS = path3.join(DIR, "logs");
 var COPY = path3.join(WORK, "erp.sqlite");
 var STATE = path3.join(WORK, "state.json");
-var VERSION = "2026-11-26b";
+var VERSION = "2026-11-26c";
 var RELEASE_KEY = "MCowBQYDK2VwAyEAhTOWDagwzCp2/dPOPd4Tdf8HlOI2+2c5aP5grwWCdmM=";
 fs6.mkdirSync(WORK, { recursive: true });
 fs6.mkdirSync(LOGS, { recursive: true });
@@ -69337,7 +69337,19 @@ var api = async (method, p, body, headers = {}) => {
     b = JSON.stringify(body);
     h["Content-Type"] = "application/json";
   }
-  const r = await fetch(url, { method, headers: h, body: b });
+  let r;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      r = await fetch(url, { method, headers: h, body: b });
+      break;
+    } catch (e) {
+      let why = e.message;
+      for (let x = e.cause; x; x = x.cause) why += ` (${x.code || x.name || ""} ${x.message || ""})`;
+      if (attempt >= 3) throw new Error(`${method} ${p}: ${why}`);
+      log(`${method} ${p}: ${why}; trying again`);
+      await new Promise((ok) => setTimeout(ok, attempt * 3e3));
+    }
+  }
   if (r.status === 204) return null;
   const t = await r.text();
   let j;
