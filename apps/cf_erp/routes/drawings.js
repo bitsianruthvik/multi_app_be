@@ -36,6 +36,7 @@ import {
 import { registerFile } from '../services/partDrawingService.js';
 import { lineModel3d, placeAddedRow } from '../services/model3dService.js';
 import { linePhysicsInfo, linePhysicsPage } from '../services/physicsService.js';
+import { lineReviewInfo, lineReviewFile, sendReviewFile } from '../services/reviewService.js';
 import { lineRowProgress, productionOrderLines } from '../services/rowProgressService.js';
 import { lineCurve, setLineCurve } from '../services/curveService.js';
 
@@ -56,6 +57,12 @@ router.get('/orders/:orderId/lines/:lineId/physics/page', guard(PERM.ordersView)
   const html = await linePhysicsPage(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'));
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');   // shown only inside a sandboxed frame, never as a page of this origin
   res.send(html);
+}));
+// THE DRAWING REVIEW kept with the line's standard (view permission; reviewService): its facts, and its page, data and images for a sandboxed frame.
+router.get('/orders/:orderId/lines/:lineId/review', guard(PERM.ordersView),
+  handle((req) => lineReviewInfo(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'))));
+router.get('/orders/:orderId/lines/:lineId/review/file', guard(PERM.ordersView), handle(async (req, res) => {
+  sendReviewFile(res, await lineReviewFile(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'), req.query?.name));
 }));
 // WHERE EVERY ROW IS IN ITS FLOW, per unit, for the 3D progress view (rowProgressService); ?productionOrderId= marks what that order holds.
 router.get('/orders/:orderId/lines/:lineId/row-progress', guard(PERM.ordersView),

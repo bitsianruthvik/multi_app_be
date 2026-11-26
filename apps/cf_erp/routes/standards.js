@@ -32,6 +32,7 @@ import { standardModel3d } from '../services/model3dService.js';
 import { applyModel } from '../services/modelValueService.js';
 import { invalid } from '../lib/errors.js';
 import { standardPhysicsInfo, standardPhysicsPage } from '../services/physicsService.js';
+import { standardReviewInfo, standardReviewFile, sendReviewFile } from '../services/reviewService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -55,6 +56,8 @@ router.get('/standard-drawings/:id/physics/page', view, handle(async (req, res) 
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');   // shown only inside a sandboxed frame
   res.send(html);
 }));
+router.get('/standard-drawings/:id/review', view, handle((req) => standardReviewInfo(pool, company(req), id(req))));
+router.get('/standard-drawings/:id/review/file', view, handle(async (req, res) => { sendReviewFile(res, await standardReviewFile(pool, company(req), id(req), req.query?.name)); }));
 router.get('/standard-drawings/:id', view, handle((req) => getStandard(pool, company(req), id(req), req.query)));
 router.post('/standard-drawings', manage, handle((req) => tx(req, (db, c) => createStandard(db, c, req.body ?? {}))));
 router.put('/standard-drawings/:id', manage, handle((req) => tx(req, (db, c) => updateStandard(db, c, id(req), req.body ?? {}))));
