@@ -35,6 +35,7 @@ import { normMark } from './partDrawingService.js';
 import { WORKED_OUT_SPECS, DRAWING_FACT_SPECS, AFTER_LOCK_SPECS, LIVE_WHEN_FROZEN, LOCKED_ORDER_STATUSES } from './records.js';
 import { planImport, normName } from '../lib/standardImport.js';
 import { modelLevelsOfStandard } from '../lib/modelLevels.js';
+import { together } from '../lib/together.js';
 
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const COPY_CHUNK = 1000;
@@ -467,15 +468,23 @@ export async function lineStandard(db, companyId, lineId) {
   const line = await requireLine(db, companyId, lineId);
   const lineView = { id: Number(line.id), lineNo: line.line_no, orderId: Number(line.order_id), orderCode: line.order_code, hasBom: line.line_type === 'custom' && !!line.item_id, locked: !!line.locked_at };
   if (!line.standard_id) return { line: lineView, standard: null, version: null, latest: null, edited: false, kept: false, offer: null, canCreate: lineView.hasBom };
-  const s = await requireStandard(db, companyId, line.standard_id);
-  const [vers] = await db.query('SELECT * FROM cf_standard_drawing_versions WHERE company_id = ? AND standard_id = ? AND deleted_at IS NULL ORDER BY version_no DESC', [companyId, s.id]);
+  // Side by side (lib/together.js; speed, 2026-11-26): the standard, its versions and the cut nodes need only the line;
+  // the two signatures (a level-by-level walk each) need only the cut nodes.
+  const [s, [vers], cutNodes] = await together(
+    requireStandard(db, companyId, line.standard_id),
+    db.query('SELECT * FROM cf_standard_drawing_versions WHERE company_id = ? AND standard_id = ? AND deleted_at IS NULL ORDER BY version_no DESC', [companyId, Number(line.standard_id)]),
+    lineView.hasBom && line.standard_version_id ? cutPlateNodes(db, companyId) : null,
+  );
   const version = vers.find((v) => Number(v.id) === Number(line.standard_version_id)) ?? null;
   const latest = vers[0] ?? null;
   let edited = false; let kept = false; let signature = null;
   if (version && lineView.hasBom) {
-    const cutNodes = await cutPlateNodes(db, companyId);
-    signature = await designSignature(db, companyId, line.item_id, { cutNodes });
-    edited = signature !== await designSignature(db, companyId, version.root_item_id, { cutNodes });
+    const [mine, theirs] = await together(
+      designSignature(db, companyId, line.item_id, { cutNodes }),
+      designSignature(db, companyId, version.root_item_id, { cutNodes }),
+    );
+    signature = mine;
+    edited = signature !== theirs;
     kept = edited && line.standard_kept_sig === signature;
   }
   const offer = !lineView.hasBom ? null : !version ? 'save' : edited && !kept ? 'update' : null;

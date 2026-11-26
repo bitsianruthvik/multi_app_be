@@ -70,6 +70,7 @@ import { CfError, invalid, notFound } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
 import { cutPlaces } from '../lib/cutPlaces.js';
 import { memoized } from '../lib/requestMemo.js';
+import { together } from '../lib/together.js';
 import { cutFromOf } from '../lib/cutFrom.js';
 import { explode } from './bomService.js';
 import { readPartDrawing, orientTo } from './partGeometry.js';
@@ -109,10 +110,8 @@ async function requireLine(db, companyId, orderId, lineId) {
  */
 export async function rowsOfLine(db, companyId, line) {
   if (line.line_type !== 'custom' || !line.item_id) return [];
-  const places = await cutPlaces(db, companyId);
-  const cutNodes = new Set([...(places.plate?.blanksIds ?? []), ...(places.plate?.offcutIds ?? []), ...(places.section?.blanksIds ?? []), ...(places.section?.offcutIds ?? [])].map(Number));
-  const plateNodes = [...(places.plate?.blanksIds ?? [])];
-  const [rows] = await db.query(
+  // Reads that do not need each other's answers go side by side (lib/together.js; speed, 2026-11-26).
+  const [places, [rows]] = await together(cutPlaces(db, companyId), db.query(
     `SELECT m.id, m.code, m.name, m.classification_id, n.name AS level, m.created_at,
             m.record_kind, i.item_type, i.source_definition_id, d.code AS def_code, d.name AS def_name
        FROM cf_master_records m
@@ -121,27 +120,36 @@ export async function rowsOfLine(db, companyId, line) {
        LEFT JOIN cf_master_records d ON d.id = i.source_definition_id AND d.deleted_at IS NULL
       WHERE m.company_id = ? AND m.deleted_at IS NULL`,
     [line.id, companyId],
-  );
+  ));
+  const cutNodes = new Set([...(places.plate?.blanksIds ?? []), ...(places.plate?.offcutIds ?? []), ...(places.section?.blanksIds ?? []), ...(places.section?.offcutIds ?? [])].map(Number));
+  const plateNodes = [...(places.plate?.blanksIds ?? [])];
   const mine = rows.filter((r) => !cutNodes.has(Number(r.classification_id)));
   if (!mine.length) return [];
   const ids = mine.map((r) => Number(r.id));
-  const [cuts] = plateNodes.length ? await db.query(
+  const [[cuts], cutFrom, [vals], tree, [links]] = await together(plateNodes.length ? db.query(
     `SELECT b.parent_id, bl.child_id FROM cf_boms b
        JOIN cf_bom_lines bl ON bl.company_id = b.company_id AND bl.bom_id = b.id AND bl.deleted_at IS NULL
        JOIN cf_master_records cp ON cp.id = bl.child_id AND cp.deleted_at IS NULL AND cp.classification_id IN (?)
       WHERE b.company_id = ? AND b.deleted_at IS NULL AND b.parent_id IN (?)`,
     [plateNodes, companyId, ids],
-  ) : [[]];
+  ) : [[]],
   // How each row is cut, resolved for all of them at once (one round trip) — the derive's own test.
-  const cutFrom = await cutFromOf(db, companyId, ids, { masters: mine });
-  const [vals] = await db.query(
+  cutFromOf(db, companyId, ids, { masters: mine }),
+  db.query(
     `SELECT v.subject_id, UPPER(s.code) AS code, v.value_number, v.value_text
        FROM cf_spec_values v JOIN cf_specifications s ON s.id = v.specification_id
       WHERE v.company_id = ? AND v.subject_type = 'master' AND v.deleted_at IS NULL AND v.subject_id IN (?)
         AND s.code IN ('LENGTH', 'WIDTH', 'THICKNESS', 'DENSITY', 'DRAWING_MARK')`,
     [companyId, ids],
-  );
-  const tree = await explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity) });
+  ),
+  explode(db, companyId, line.item_id, { rootQuantity: Number(line.quantity) }),
+  // The register drawings (in play: draft or issued) each row is linked to.
+  db.query(
+    `SELECT l.subject_id, l.drawing_id FROM cf_drawing_links l
+       JOIN cf_drawings d ON d.id = l.drawing_id AND d.deleted_at IS NULL AND d.status IN ('draft', 'issued')
+      WHERE l.company_id = ? AND l.subject_type = 'master_record' AND l.deleted_at IS NULL AND l.subject_id IN (?)`,
+    [companyId, ids],
+  ));
   const pieces = new Map();
   const depth = new Map([[Number(line.item_id), 0]]);
   const parentOf = new Map();   // node id -> the node above it (first met), for the drawing tree
@@ -170,13 +178,6 @@ export async function rowsOfLine(db, companyId, line) {
     for (let hops = 0; up != null && !out.has(up) && hops < 50; hops++) up = parentOf.get(up);
     p.parentId = up != null && out.has(up) ? up : null;
   }
-  // The register drawings (in play: draft or issued) each row is linked to.
-  const [links] = await db.query(
-    `SELECT l.subject_id, l.drawing_id FROM cf_drawing_links l
-       JOIN cf_drawings d ON d.id = l.drawing_id AND d.deleted_at IS NULL AND d.status IN ('draft', 'issued')
-      WHERE l.company_id = ? AND l.subject_type = 'master_record' AND l.deleted_at IS NULL AND l.subject_id IN (?)`,
-    [companyId, ids],
-  );
   for (const k of links) { const p = out.get(Number(k.subject_id)); if (p && !p.drawingIds.includes(Number(k.drawing_id))) p.drawingIds.push(Number(k.drawing_id)); }
   for (const c of cuts) { const p = out.get(Number(c.parent_id)); if (p) { p.isPlatePart = true; p.cutPlateIds.push(Number(c.child_id)); } }
   for (const v of vals) {
@@ -193,10 +194,15 @@ export async function platePartsOfLine(db, companyId, line) {
   return (await rowsOfLine(db, companyId, line)).filter((r) => r.isPlatePart);
 }
 
+/**
+ * FORCE INDEX (idx_cpd_line) here and on every read of a line's files (speed, 2026-11-26): TiDB, without statistics,
+ * scanned the WHOLE table for them — 9,367 rows, 459 MB with their DXF text and shapes, ~1.5–2 s and 7,363 RU for one
+ * line's 149 files; by the line's index it is ~40 ms and 278 RU. MySQL already used the index.
+ */
 async function liveDrawings(db, companyId, lineId) {
   const [rows] = await db.query(
     `SELECT id, drawing_id, mark, mark_norm, file_name, file_kind, length_mm, width_mm, area_mm2, cut_length_mm, piercings, holes, inner_cuts, geometry_json, warnings_json, created_at
-       FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL ORDER BY mark_norm`,
+       FROM cf_part_drawings FORCE INDEX (idx_cpd_line) WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL ORDER BY mark_norm`,
     [companyId, lineId],
   );
   return rows.map((r) => ({ ...r, geometry: parseJson(r.geometry_json), warnings: parseJson(r.warnings_json) ?? [] }));
@@ -300,7 +306,7 @@ export async function shapesAfterCutPieces(db, c, lineId) {
   const companyId = c.companyId;
   const [[n]] = await db.query(
     `SELECT COALESCE(SUM(geometry_json IS NULL AND dxf_text IS NOT NULL), 0) AS bare, COALESCE(SUM(geometry_json IS NOT NULL), 0) AS shaped
-       FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf'`,
+       FROM cf_part_drawings FORCE INDEX (idx_cpd_line) WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf'`,
     [companyId, lineId],
   );
   const out = { drawings: Number(n.bare) + Number(n.shaped), read: 0, notOnePlate: 0, written: 0 };
@@ -442,10 +448,11 @@ function viewOf(line, rows, drawings, refs = new Map(), levels = new Set()) {
  */
 export async function drawingTree(db, companyId, orderId, lineId) {
   const line = await requireLine(db, companyId, orderId, lineId);
-  const rows = await rowsOfLine(db, companyId, line);
-  const drawings = await liveDrawings(db, companyId, line.id);
+  // Side by side (lib/together.js; speed, 2026-11-26).
+  const [rows, drawings, levels] = await together(
+    rowsOfLine(db, companyId, line), liveDrawings(db, companyId, line.id), modelDrawsOfStandard(db, companyId, line.standard_id),
+  );
   const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
-  const levels = await modelDrawsOfStandard(db, companyId, line.standard_id);
   // A row with no file on the line may still be covered by a register drawing: one whose file a standard holds (it
   // opens with GET /drawings/:id/file), else one kept elsewhere (its link — an RDSO series sheet). Its file first.
   const sheetOf = (p) => {
@@ -475,11 +482,14 @@ export async function drawingTree(db, companyId, orderId, lineId) {
 
 export async function getDrawings(db, companyId, orderId, lineId) {
   const line = await requireLine(db, companyId, orderId, lineId);
-  const [rows, drawings] = [await rowsOfLine(db, companyId, line), await liveDrawings(db, companyId, line.id)];
+  // Side by side (lib/together.js; speed, 2026-11-26): the rows, the files and the model's levels need only the line.
+  const [rows, drawings, levels] = await together(
+    rowsOfLine(db, companyId, line), liveDrawings(db, companyId, line.id), modelDrawsOfStandard(db, companyId, line.standard_id),
+  );
   // The safety net: a plate part's drawing saved without a shape is read now, shown, and kept.
   await readMissingShapes(db, companyId, rows, drawings);
   const refs = await registerRefs(db, companyId, [...drawings.map((d) => d.drawing_id), ...rows.flatMap((p) => p.drawingIds)]);
-  return viewOf(line, rows, drawings, refs, await modelDrawsOfStandard(db, companyId, line.standard_id));
+  return viewOf(line, rows, drawings, refs, levels);
 }
 
 /**
@@ -491,7 +501,7 @@ export async function drawingShapes(db, companyId, orderId, lineId, ids = []) {
   const line = await requireLine(db, companyId, orderId, lineId);
   const want = [...new Set((ids ?? []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
   const [rows] = await db.query(
-    `SELECT id, geometry_json FROM cf_part_drawings
+    `SELECT id, geometry_json FROM cf_part_drawings FORCE INDEX (idx_cpd_line)
       WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL${want.length ? ' AND id IN (?)' : ''} ORDER BY id`,
     want.length ? [companyId, line.id, want] : [companyId, line.id],
   );
@@ -1113,7 +1123,7 @@ export function drawingFactsOfLine(db, companyId, lineId) {
 
 async function readDrawingFacts(db, companyId, lineId) {
   // A DXF without a shape counts too: it may be a plate part's, saved before the row was known as one.
-  const [has] = await db.query("SELECT COUNT(*) AS n FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND (geometry_json IS NOT NULL OR (file_kind = 'dxf' AND dxf_text IS NOT NULL))", [companyId, lineId]);
+  const [has] = await db.query("SELECT COUNT(*) AS n FROM cf_part_drawings FORCE INDEX (idx_cpd_line) WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND (geometry_json IS NOT NULL OR (file_kind = 'dxf' AND dxf_text IS NOT NULL))", [companyId, lineId]);
   const out = new Map();
   if (!Number(has[0].n)) return out;
   const line = await requireLine(db, companyId, null, lineId);

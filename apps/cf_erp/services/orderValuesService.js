@@ -389,9 +389,12 @@ export async function loadContext(db, companyId, lineId, { lock = false, rootIte
         WHERE a.company_id = ? AND a.deleted_at IS NULL AND (${scopeA.sql})`,
       [companyId, ...scopeA.params],
     ),
+    // FORCE INDEX (speed, 2026-11-26): TiDB, with no statistics on cf_specifications, drove this from the specs and
+    // scanned every value of every spec in the company by uq_csv_value (652,146 keys for SO260026's 3,935 values,
+    // ~0.7 s of TiKV time whenever its cache missed); by subject it reads the 4,262 keys it needs. MySQL already did.
     db.query(
       `SELECT v.*, s.code AS spec_code, s.name AS spec_name, s.data_type, s.decimals
-         FROM cf_spec_values v
+         FROM cf_spec_values v FORCE INDEX (idx_csv_subject)
          JOIN cf_specifications s ON s.id = v.specification_id AND s.deleted_at IS NULL
         WHERE v.company_id = ? AND v.deleted_at IS NULL AND (${scopeV.sql})`,
       [companyId, ...scopeV.params],
