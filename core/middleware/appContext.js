@@ -1,6 +1,6 @@
 import { pool } from "../../db.js";
 import { logger } from "../utils/logger.js";
-import { verifyToken } from "../utils/jwt.js";
+import { verifyToken, tokenFrom } from "../utils/jwt.js";
 import { LOGIN_FAILED, SIGNUP_CLOSED } from "../auth/loginRules.js";
 
 // In-process TTL cache for company + app records. These records change at
@@ -42,9 +42,7 @@ function answerAsIfThere(req, res) {
   if (/\/auth\/forgot-password$/.test(p)) return res.json({ message: "If your email is registered, an OTP has been sent." });
   if (/\/auth\/reset-password$/.test(p)) return res.status(400).json({ message: "Invalid request" });
   if (/\/auth\/register$/.test(p)) return res.status(SIGNUP_CLOSED.status).json({ message: SIGNUP_CLOSED.message });
-  let token = req.cookies?.token ?? null;
-  const auth = req.headers?.authorization;
-  if (!token && typeof auth === "string" && auth.startsWith("Bearer ")) token = auth.slice(7);
+  const token = tokenFrom(req);
   if (token && verifyToken(token)) return res.status(NO_ACCESS.status).json({ message: NO_ACCESS.message });
   return res.status(401).json({ message: "Not authenticated" });
 }

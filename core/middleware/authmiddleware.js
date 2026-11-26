@@ -1,6 +1,6 @@
 // Middleware to protect routes and verify JWT tokens
 
-import { verifyToken } from "../utils/jwt.js";
+import { verifyToken, tokenFrom, tokenFitsUrl } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import { pool } from "../../db.js";
 import { userState } from "../auth/loginRules.js";
@@ -66,19 +66,10 @@ export const protect = async (req, res, next) => {
       }
     }
 
-    // Read JWT from cookies or Authorization header only.
+    // Read JWT from the Authorization header, else the cookie (tokenFrom: the page's own company's sign-in first).
     // Tokens are deliberately NOT accepted from request body or query string —
     // those locations end up in access logs and request tracing tools.
-    let token = req.cookies && req.cookies.token ? req.cookies.token : null;
-    if (!token && req.headers && req.headers.authorization) {
-      const auth = req.headers.authorization;
-      if (typeof auth === "string" && auth.startsWith("Bearer ")) {
-        token = auth.substring("Bearer ".length);
-        logger.debug("Token found in Authorization header");
-      }
-    } else if (token) {
-      logger.debug("Token found in cookies");
-    }
+    const token = tokenFrom(req);
 
     if (!token) {
       logger.debug("No token found - returning 401");
@@ -98,6 +89,13 @@ export const protect = async (req, res, next) => {
     }, "Token decoded successfully");
 
     req.user = decoded; // Attach decoded payload (user info + permissions)
+
+    // A company-level address (/api/<company>/apps, /admin-panel, …: appContext sets no req.company for these) is
+    // answered only for a sign-in of that company (2026-11-26). Before, another company's sign-in got its OWN
+    // company's answer under this address. The same words as below and as appContext.NO_ACCESS.
+    if (!req.company && !tokenFitsUrl(decoded, req)) {
+      return res.status(403).json({ message: "You do not have access to this company" });
+    }
 
     // Company admin panel (2026-11-19): a person deactivated since they signed in is stopped here, and one whose
     // password was set by an admin changes it before anything else (loginRules.js; the state is re-read every 30 s).

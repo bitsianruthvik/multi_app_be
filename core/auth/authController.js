@@ -1,6 +1,6 @@
 import bcrypt from "bcryptjs";
 import { pool } from "../../db.js";
-import { signToken, verifyToken } from "../utils/jwt.js";
+import { signToken, verifyToken, tokenFrom, tokenFitsUrl } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import crypto from "crypto";
 import { getAppAccessForUser } from "../routes/appsRoutes.js";
@@ -207,17 +207,13 @@ export const loginUser = async (req, res) => {
 // Verify token from cookie and return user payload (if valid)
 export const verifyUser = async (req, res) => {
   try {
-    let token = req.cookies?.token;
-    if (!token && req.headers && req.headers.authorization) {
-      const auth = req.headers.authorization;
-      if (typeof auth === "string" && auth.startsWith("Bearer ")) {
-        token = auth.substring("Bearer ".length);
-      }
-    }
+    const token = tokenFrom(req);
     if (!token) return res.status(401).json({ message: "Not authenticated" });
     const decoded = verifyToken(token);
     if (!decoded)
       return res.status(403).json({ message: "Invalid or expired token" });
+    // A sign-in of another company is no sign-in here (2026-11-26: one sign-in per company in a browser).
+    if (!tokenFitsUrl(decoded, req)) return res.status(401).json({ message: "Not authenticated" });
     let appRoles = {};
     try {
       const userId = decoded.id;

@@ -1,7 +1,7 @@
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { pool } from "../../db.js";
-import { signToken, verifyToken } from "../utils/jwt.js";
+import { signToken, verifyToken, tokenFrom, tokenFitsUrl } from "../utils/jwt.js";
 import { logger } from "../utils/logger.js";
 import { getAppAccessForUser } from "../routes/appsRoutes.js";
 import { validLogin, findLoginUser, loginRefusal, loginFlags, touchLogin, userState, LOGIN_FAILED, burnPasswordCheck, SIGNUP_CLOSED } from "./loginRules.js";
@@ -133,12 +133,12 @@ export const companyLogin = async (req, res) => {
 // GET /api/:company/auth/verify
 export const companyVerify = async (req, res) => {
   try {
-    let token = req.cookies?.token;
-    if (!token && req.headers?.authorization?.startsWith("Bearer "))
-      token = req.headers.authorization.substring(7);
+    const token = tokenFrom(req);
     if (!token) return res.status(401).json({ message: "Not authenticated" });
     const decoded = verifyToken(token);
     if (!decoded) return res.status(403).json({ message: "Invalid or expired token" });
+    // A sign-in of another company is no sign-in here (2026-11-26: one sign-in per company in a browser).
+    if (!tokenFitsUrl(decoded, req)) return res.status(401).json({ message: "Not authenticated" });
     let appRoles = {};
     try {
       const appAccess = await getAppAccessForUser(decoded.id, decoded.companyId ?? decoded.company_id);

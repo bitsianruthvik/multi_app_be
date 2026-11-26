@@ -81,6 +81,16 @@ r = await call('POST', '/api/query/v1/base_resource', { token: tokA, body: { ope
 const [[after2]] = await pool.query('SELECT role_id FROM users WHERE id = ?', [ua.id]);
 ok(r.s === 404 && after2.role_id === before.role_id, "taking another company's role is refused", `${r.s} ${JSON.stringify(r.j)}`);
 
+console.log('\n5b. One sign-in per company in a browser (2026-11-26): a sign-in answers only for its own company');
+const [[ubAdmin]] = await pool.query("SELECT u.id, u.email, u.name FROM users u WHERE u.company_id = ? AND u.deleted_at IS NULL ORDER BY u.id LIMIT 1", [B.id]);
+const tokB = jwt.sign({ id: ubAdmin.id, name: ubAdmin.name, email: ubAdmin.email, role: 'admin', company: B.slug, companyId: B.id, company_id: B.id, uiPermissions: [] }, process.env.JWT_SECRET, { expiresIn: 600 });
+const raw = async (path, headers) => { const x = await fetch(BASE + path, { headers }); return x.status; };
+ok(await raw(`/api/${A.slug}/auth/verify`, { Authorization: `Bearer ${tokB}` }) === 401, "A's sign-in check with B's sign-in → not signed in");
+ok(await raw(`/api/${A.slug}/apps`, { Authorization: `Bearer ${tokB}` }) === 403, "A's app list with B's sign-in → no access (was B's own list)");
+ok(await raw(`/api/${A.slug}/admin-panel/brand`, { Authorization: `Bearer ${tokB}` }) === 403, "A's admin panel with B's sign-in → no access");
+ok(await raw(`/api/${A.slug}/apps`, { Authorization: `Bearer ${tokA}`, Cookie: `token=${tokB}` }) === 200, "the page's own sign-in wins over another company's cookie");
+ok(await raw(`/api/${A.slug}/apps`, { Cookie: `token=${tokB}` }) === 403, "another company's cookie alone → no access");
+
 console.log('\n6. Normal use still works');
 r = await call('GET', `/api/${A.slug}/apps`, { token: tokA }); ok(r.s === 200 && Array.isArray(r.j), 'own app list', r.s);
 r = await call('GET', `/api/${A.slug}/cf_erp/health`, { token: tokA }); ok(r.s === 200 || r.s === 403, 'own app health (200, or 403 if this admin has no cf_erp grant)', `${r.s} ${JSON.stringify(r.j)}`);
