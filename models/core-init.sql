@@ -223,3 +223,18 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
           AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'roles' AND COLUMN_NAME = 'standard_key') = 1
           AND (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'admin_audit') = 1,
           'ADMIN-PANEL-OK', 'ADMIN-PANEL-MISSING') AS result;
+
+-- ============================================================================
+-- COMPANY BRAND (user, 2026-11-26): "3-6 colors for every company to make the products … very close to their company
+-- colors, and the company logos shown where possible." Shown only AFTER sign-in (the sign-in pages stay CEOFactory's:
+-- nobody learns which companies exist). Set by the company's admin (admin panel › Branding) or by us
+-- (scripts/core/company-brand.mjs). colors = ["#RRGGBB", …] 3-6, in order: primary, secondary, accent, then extras.
+-- logo = a data: URL (png/jpeg/webp/svg, ≤ 300 KB), always shown as <img>, so an SVG cannot run script.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS company_brand (
+  company_id  INT          NOT NULL PRIMARY KEY,
+  colors      JSON         NULL,
+  logo        MEDIUMTEXT   NULL,
+  updated_by  INT          NULL,
+  updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);

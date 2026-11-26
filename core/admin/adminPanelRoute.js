@@ -11,6 +11,8 @@
  *   GET  /roles/:id                   PUT  { name?, apps: { appId: { tags } } }     DELETE
  *   POST /roles/:id/reset             { appId }
  *   GET  /history
+ *   GET  /brand                       { company, colors, logo } — anyone signed in to the company (the apps paint with it)
+ *   PUT  /brand                       { colors: 3-6 #RRGGBB | [], logo: data URL | "" } — admin (core/brand/companyBrand.js)
  *
  * The company is the signed-in person's own (the token) — the :company in the address only has to agree with it.
  */
@@ -19,11 +21,13 @@ import { pool } from "../../db.js";
 import { logger } from "../utils/logger.js";
 import { clearUserState } from "../auth/loginRules.js";
 import * as S from "./adminPanelService.js";
+import { getBrand, setBrand, BrandError } from "../brand/companyBrand.js";
 
 const router = Router({ mergeParams: true });
 
 const ctx = (req) => ({ companyId: Number(req.user.companyId ?? req.user.company_id), userId: Number(req.user.id), userName: req.user.name ?? null });
 const fail = (res, e) => {
+  if (e instanceof BrandError) return res.status(e.status).json({ error: e.code, message: e.message, problems: e.problems ?? undefined });
   if (e instanceof S.AdminError) return res.status(e.status).json({ error: e.code, message: e.message, problems: e.problems ?? undefined });
   if (e?.code === "ER_DUP_ENTRY") return res.status(422).json({ error: "DUPLICATE", message: "That login or name is already in use." });
   logger.error({ err: e }, "admin panel error");
@@ -52,6 +56,8 @@ router.use((req, res, next) => {
 
 router.get("/me", read(async (req) => ({ admin: await S.isCompanyAdmin(pool, req.user) })));
 router.post("/me/password", write((db, req) => S.changeOwnPassword(db, ctx(req), req.body ?? {})));
+// The company's colours and logo: every signed-in person of the company paints the apps with them (2026-11-26).
+router.get("/brand", read((req) => getBrand(pool, ctx(req).companyId)));
 
 // Everything below is the admin's.
 router.use(async (req, res, next) => {
@@ -77,5 +83,6 @@ router.put("/roles/:id", write((db, req) => S.saveRole(db, ctx(req), req.params.
 router.delete("/roles/:id", write((db, req) => S.deleteRole(db, ctx(req), req.params.id)));
 router.post("/roles/:id/reset", write((db, req) => S.resetRole(db, ctx(req), req.params.id, req.body ?? {})));
 router.get("/history", read((req) => S.history(pool, ctx(req).companyId, req.query)));
+router.put("/brand", write((db, req) => setBrand(db, ctx(req), req.body ?? {})));
 
 export default router;
