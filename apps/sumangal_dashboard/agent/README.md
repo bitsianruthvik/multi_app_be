@@ -61,6 +61,8 @@ cd C:\SumangalDashboardAgent
 
 **Updates:** `release.json` lists every file with its SHA-256 and `release.sig` signs it with the platform team's Ed25519 key (private half only on the platform team's PC, `TM\.sumangal-agent-release.pem`; `node build.mjs` signs). The agent installs a version only when the signature and every checksum match, keeps the old files in `work\previous-version`, and restarts.
 
+**Settings from our side (`settings.json`, signed into `release.json`):** change a value there, `node build.mjs`, push; the agent applies it within an hour (`checkMinutes`), so the customer is not asked. Allowed: `api` (kept only if the agent's key works at the new address), `server`, `port`, `database`, `auth`, `user`, `encrypt`, `tdsVersion` (kept only if a test read works), `nightlyAt` ("HH:MM", changes the scheduled task), `every` (minutes of a timer while listening, 0 = only on request), `checkMinutes` (5–1440). Anything else, and any password, is refused. A key left out keeps what the machine has. The result shows as the agent's last message (sd_agents.last_message).
+
 ## Commands
 
 | | |

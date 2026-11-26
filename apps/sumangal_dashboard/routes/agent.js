@@ -93,7 +93,9 @@ router.post('/agent/push', express.raw({ type: 'application/octet-stream', limit
 router.post('/agent/report', async (req, res) => {
   try {
     const a = await agentOf(req, res, false); if (!a) return;
-    const { ok, message, seconds } = req.body || {};
+    const { ok, message, seconds, kind } = req.body || {};
+    // a new version or changed settings is a note, not a data run: the last run's time stays
+    if (kind === 'version' || kind === 'settings') { await pool.query('UPDATE sd_agents SET last_message = ? WHERE id = ?', [String(message || '').slice(0, 500), a.id]); return res.json({ ok: true }); }
     await pool.query('UPDATE sd_agents SET last_run_at = UTC_TIMESTAMP(), last_ok = ?, last_message = ?, last_seconds = ? WHERE id = ?', [ok ? 1 : 0, String(message || '').slice(0, 500), Number.isFinite(+seconds) ? Math.round(+seconds) : null, a.id]);
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }

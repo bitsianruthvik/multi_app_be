@@ -42,7 +42,7 @@ const WORK = path.join(DIR, 'work');
 const LOGS = path.join(DIR, 'logs');
 const COPY = path.join(WORK, 'erp.sqlite');
 const STATE = path.join(WORK, 'state.json');
-const VERSION = '2026-11-26a';
+const VERSION = '2026-11-26b';
 // The platform team's Ed25519 public key: a new version is installed only when its file list carries their signature.
 const RELEASE_KEY = 'MCowBQYDK2VwAyEAhTOWDagwzCp2/dPOPd4Tdf8HlOI2+2c5aP5grwWCdmM=';
 fs.mkdirSync(WORK, { recursive: true }); fs.mkdirSync(LOGS, { recursive: true });
@@ -315,6 +315,7 @@ async function selfUpdate() {
     const pub = crypto.createPublicKey({ key: Buffer.from(RELEASE_KEY, 'base64'), format: 'der', type: 'spki' });
     if (!crypto.verify(null, rel, pub, sig)) { log('update check: the release is not signed by the platform team, ignored'); return false; }
     const r = JSON.parse(rel.toString('utf8'));
+    await applySettings(r.settings);
     if (!r.version || r.version === VERSION) return false;
     const files = {};
     for (const [name, sha] of Object.entries(r.files || {})) {
@@ -335,9 +336,59 @@ async function selfUpdate() {
       }
     } finally { unlock(); }
     log(`updated ${VERSION} -> ${r.version} (${Object.keys(files).length} files; the old ones are in work\\previous-version)`);
-    try { await api('POST', '/agent/report', { ok: true, kind: 'update', message: `agent updated ${VERSION} -> ${r.version}`, seconds: 0 }); } catch { /* the log keeps it */ }
+    try { await api('POST', '/agent/report', { ok: true, kind: 'version', message: `agent updated ${VERSION} -> ${r.version}`, seconds: 0 }); } catch { /* the log keeps it */ }
     return true;
   } catch (e) { log(`update check failed (keeping ${VERSION}): ${e.message}`); return false; }
+}
+/**
+ * Settings the platform team changes from its side (agent/settings.json, carried in the signed release.json), so the
+ * customer is not asked again: only these keys, only with the signature, each checked before it is kept. Passwords and
+ * the agent's key never travel this way. A setting left out of settings.json keeps what this machine has.
+ *   api          the dashboard's address (kept only if the agent's own key works there)
+ *   server, port, database, auth, user, encrypt, tdsVersion   the ERP's SQL Server (kept only if a test read works)
+ *   nightlyAt    "HH:MM" of the full read (changes the scheduled task)
+ *   every        minutes between updates while listening, besides the dashboard's requests (0 = only on request)
+ *   checkMinutes how often the listener looks for a new version or settings (5–1440, default 60)
+ */
+const SETTINGS = {
+  api: (v) => /^https:\/\/[a-z0-9.-]+(:\d+)?$/i.test(v),
+  server: (v) => typeof v === 'string' && /^[A-Za-z0-9.\\_-]{1,120}$/.test(v), port: (v) => Number.isInteger(v) && v > 0 && v < 65536,
+  database: (v) => typeof v === 'string' && /^[A-Za-z0-9_]{1,120}$/.test(v), auth: (v) => v === 'sql' || v === 'windows',
+  user: (v) => typeof v === 'string' && /^[A-Za-z0-9.\\_@-]{1,120}$/.test(v), encrypt: (v) => typeof v === 'boolean',
+  tdsVersion: (v) => /^7_[1-4](_[AB])?$/.test(v), nightlyAt: (v) => /^([01]\d|2[0-3]):[0-5]\d$/.test(v),
+  every: (v) => Number.isInteger(v) && v >= 0 && v <= 1440, checkMinutes: (v) => Number.isInteger(v) && v >= 5 && v <= 1440,
+};
+const SQL_KEYS = ['server', 'port', 'database', 'auth', 'user', 'encrypt', 'tdsVersion'];
+async function applySettings(want) {
+  if (!want || typeof want !== 'object') return;
+  const c = cfg(); const changed = []; const refused = [];
+  const diff = Object.keys(want).filter((k) => JSON.stringify(c[k]) !== JSON.stringify(want[k]));
+  if (!diff.length) return;
+  for (const k of diff) if (!SETTINGS[k] || !SETTINGS[k](want[k])) refused.push(`${k} (not allowed or bad value)`);
+  const ok = diff.filter((k) => SETTINGS[k] && SETTINGS[k](want[k]));
+  if (ok.includes('api')) {
+    // the new address must know this agent (same key) before the agent moves there; otherwise it stays where it is
+    try {
+      const r = await fetch(`${want.api}/api/${c.company}/sumangal_dashboard/agent/status`, { headers: { 'X-Agent-Uid': c.agentUid, Authorization: `Bearer ${secret('agent.sec')}` } });
+      const j = await r.json(); if (!r.ok || j.status !== 'approved') throw new Error(`${r.status} ${j.status || j.error || ''}`);
+      c.api = want.api; changed.push('api');
+    } catch (e) { refused.push(`api ${want.api} (${e.message})`); }
+  }
+  const sql = ok.filter((k) => SQL_KEYS.includes(k));
+  if (sql.length) {
+    const before = JSON.parse(JSON.stringify(c)); for (const k of sql) c[k] = want[k]; saveCfg(c);
+    try { const src = source(); await src.open(); try { await src.version(); } finally { src.close(); } changed.push(...sql); }
+    catch (e) { for (const k of sql) c[k] = before[k]; refused.push(`${sql.join(', ')} (test read failed: ${e.message})`); }
+  }
+  if (ok.includes('nightlyAt')) {
+    try { ps(`Set-ScheduledTask -TaskName 'Sumangal dashboard agent' -Trigger (New-ScheduledTaskTrigger -Daily -At '${want.nightlyAt}') | Out-Null`); c.nightlyAt = want.nightlyAt; changed.push('nightlyAt'); }
+    catch (e) { refused.push(`nightlyAt (${e.message})`); }
+  }
+  for (const k of ['every', 'checkMinutes']) if (ok.includes(k)) { c[k] = want[k]; changed.push(k); }
+  saveCfg(c);
+  const msg = `settings: ${changed.length ? 'changed ' + changed.map((k) => `${k}=${JSON.stringify(c[k])}`).join(', ') : 'nothing changed'}${refused.length ? '; kept as they were: ' + refused.join('; ') : ''}`;
+  log(msg);
+  try { await api('POST', '/agent/report', { ok: !refused.length, kind: 'settings', message: msg.slice(0, 480), seconds: 0 }); } catch { /* the log keeps it */ }
 }
 /** Runs this same command again with the files now on disk (after a self-update). */
 function relaunch(more = []) {
@@ -368,15 +419,18 @@ async function cmdUpdate() {
 }
 async function cmdDay() {
   // any hour, every day, until stopped; --until=HH:MM only if asked (the old 'day' task passed 21:00)
-  const until = ARGS[0] === 'listen' ? opt('until') : null; const every = +(opt('every') || 0) * 60000; // 0: only when the dashboard asks
+  const until = ARGS[0] === 'listen' ? opt('until') : null;
+  const everyMs = () => +(opt('every') || cfg().every || 0) * 60000; // 0: only when the dashboard asks; settings can change it
+  const checkMs = () => Math.max(5, +(cfg().checkMinutes || 60)) * 60000; const every = everyMs();
   const end = new Date(8.64e15); if (until) { const [hh, mm] = until.split(':').map(Number); end.setTime(Date.now()); end.setHours(hh, mm, 0, 0); }
   log(`agent ${VERSION}: listening${until ? ` until ${until}` : ' (any hour, every day)'}, an update when the dashboard asks${every ? `, and every ${every / 60000} min` : ''}`);
   let last = 0; let checked = 0;
   while (Date.now() < end.getTime()) {
-    if (Date.now() - checked > 3600e3) { checked = Date.now(); if (await selfUpdate()) { log('restarting with the new version'); return relaunch(); } }
+    if (Date.now() - checked > checkMs()) { checked = Date.now(); if (await selfUpdate()) { log('restarting with the new version'); return relaunch(); } }
     let job = null;
     try { job = await api('GET', '/agent/jobs?wait=25'); } catch (e) { log('waiting for requests failed: ' + e.message); await new Promise((r) => setTimeout(r, 30000)); }
-    if (job?.id || (every && Date.now() - last >= every)) {
+    const ev = everyMs();
+    if (job?.id || (ev && Date.now() - last >= ev)) {
       if (job?.id) log(`refresh requested (job ${job.id})`);
       const ok = await oneRun('update', async () => { const n = await extractChanges(); return n < 0 ? 'full read' : `${n} changed rows`; });
       last = Date.now();

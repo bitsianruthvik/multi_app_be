@@ -68979,7 +68979,7 @@ var WORK = path3.join(DIR, "work");
 var LOGS = path3.join(DIR, "logs");
 var COPY = path3.join(WORK, "erp.sqlite");
 var STATE = path3.join(WORK, "state.json");
-var VERSION = "2026-11-26a";
+var VERSION = "2026-11-26b";
 var RELEASE_KEY = "MCowBQYDK2VwAyEAhTOWDagwzCp2/dPOPd4Tdf8HlOI2+2c5aP5grwWCdmM=";
 fs6.mkdirSync(WORK, { recursive: true });
 fs6.mkdirSync(LOGS, { recursive: true });
@@ -69499,6 +69499,7 @@ async function selfUpdate() {
       return false;
     }
     const r = JSON.parse(rel.toString("utf8"));
+    await applySettings(r.settings);
     if (!r.version || r.version === VERSION) return false;
     const files = {};
     for (const [name, sha] of Object.entries(r.files || {})) {
@@ -69523,13 +69524,87 @@ async function selfUpdate() {
     }
     log(`updated ${VERSION} -> ${r.version} (${Object.keys(files).length} files; the old ones are in work\\previous-version)`);
     try {
-      await api("POST", "/agent/report", { ok: true, kind: "update", message: `agent updated ${VERSION} -> ${r.version}`, seconds: 0 });
+      await api("POST", "/agent/report", { ok: true, kind: "version", message: `agent updated ${VERSION} -> ${r.version}`, seconds: 0 });
     } catch {
     }
     return true;
   } catch (e) {
     log(`update check failed (keeping ${VERSION}): ${e.message}`);
     return false;
+  }
+}
+var SETTINGS = {
+  api: (v) => /^https:\/\/[a-z0-9.-]+(:\d+)?$/i.test(v),
+  server: (v) => typeof v === "string" && /^[A-Za-z0-9.\\_-]{1,120}$/.test(v),
+  port: (v) => Number.isInteger(v) && v > 0 && v < 65536,
+  database: (v) => typeof v === "string" && /^[A-Za-z0-9_]{1,120}$/.test(v),
+  auth: (v) => v === "sql" || v === "windows",
+  user: (v) => typeof v === "string" && /^[A-Za-z0-9.\\_@-]{1,120}$/.test(v),
+  encrypt: (v) => typeof v === "boolean",
+  tdsVersion: (v) => /^7_[1-4](_[AB])?$/.test(v),
+  nightlyAt: (v) => /^([01]\d|2[0-3]):[0-5]\d$/.test(v),
+  every: (v) => Number.isInteger(v) && v >= 0 && v <= 1440,
+  checkMinutes: (v) => Number.isInteger(v) && v >= 5 && v <= 1440
+};
+var SQL_KEYS = ["server", "port", "database", "auth", "user", "encrypt", "tdsVersion"];
+async function applySettings(want) {
+  if (!want || typeof want !== "object") return;
+  const c = cfg();
+  const changed = [];
+  const refused = [];
+  const diff = Object.keys(want).filter((k) => JSON.stringify(c[k]) !== JSON.stringify(want[k]));
+  if (!diff.length) return;
+  for (const k of diff) if (!SETTINGS[k] || !SETTINGS[k](want[k])) refused.push(`${k} (not allowed or bad value)`);
+  const ok = diff.filter((k) => SETTINGS[k] && SETTINGS[k](want[k]));
+  if (ok.includes("api")) {
+    try {
+      const r = await fetch(`${want.api}/api/${c.company}/sumangal_dashboard/agent/status`, { headers: { "X-Agent-Uid": c.agentUid, Authorization: `Bearer ${secret("agent.sec")}` } });
+      const j = await r.json();
+      if (!r.ok || j.status !== "approved") throw new Error(`${r.status} ${j.status || j.error || ""}`);
+      c.api = want.api;
+      changed.push("api");
+    } catch (e) {
+      refused.push(`api ${want.api} (${e.message})`);
+    }
+  }
+  const sql = ok.filter((k) => SQL_KEYS.includes(k));
+  if (sql.length) {
+    const before = JSON.parse(JSON.stringify(c));
+    for (const k of sql) c[k] = want[k];
+    saveCfg(c);
+    try {
+      const src = source();
+      await src.open();
+      try {
+        await src.version();
+      } finally {
+        src.close();
+      }
+      changed.push(...sql);
+    } catch (e) {
+      for (const k of sql) c[k] = before[k];
+      refused.push(`${sql.join(", ")} (test read failed: ${e.message})`);
+    }
+  }
+  if (ok.includes("nightlyAt")) {
+    try {
+      ps(`Set-ScheduledTask -TaskName 'Sumangal dashboard agent' -Trigger (New-ScheduledTaskTrigger -Daily -At '${want.nightlyAt}') | Out-Null`);
+      c.nightlyAt = want.nightlyAt;
+      changed.push("nightlyAt");
+    } catch (e) {
+      refused.push(`nightlyAt (${e.message})`);
+    }
+  }
+  for (const k of ["every", "checkMinutes"]) if (ok.includes(k)) {
+    c[k] = want[k];
+    changed.push(k);
+  }
+  saveCfg(c);
+  const msg = `settings: ${changed.length ? "changed " + changed.map((k) => `${k}=${JSON.stringify(c[k])}`).join(", ") : "nothing changed"}${refused.length ? "; kept as they were: " + refused.join("; ") : ""}`;
+  log(msg);
+  try {
+    await api("POST", "/agent/report", { ok: !refused.length, kind: "settings", message: msg.slice(0, 480), seconds: 0 });
+  } catch {
   }
 }
 function relaunch(more = []) {
@@ -69580,7 +69655,9 @@ async function cmdUpdate() {
 }
 async function cmdDay() {
   const until = ARGS[0] === "listen" ? opt("until") : null;
-  const every = +(opt("every") || 0) * 6e4;
+  const everyMs = () => +(opt("every") || cfg().every || 0) * 6e4;
+  const checkMs = () => Math.max(5, +(cfg().checkMinutes || 60)) * 6e4;
+  const every = everyMs();
   const end = /* @__PURE__ */ new Date(864e13);
   if (until) {
     const [hh, mm] = until.split(":").map(Number);
@@ -69591,7 +69668,7 @@ async function cmdDay() {
   let last = 0;
   let checked = 0;
   while (Date.now() < end.getTime()) {
-    if (Date.now() - checked > 36e5) {
+    if (Date.now() - checked > checkMs()) {
       checked = Date.now();
       if (await selfUpdate()) {
         log("restarting with the new version");
@@ -69605,7 +69682,8 @@ async function cmdDay() {
       log("waiting for requests failed: " + e.message);
       await new Promise((r) => setTimeout(r, 3e4));
     }
-    if (job?.id || every && Date.now() - last >= every) {
+    const ev = everyMs();
+    if (job?.id || ev && Date.now() - last >= ev) {
       if (job?.id) log(`refresh requested (job ${job.id})`);
       const ok = await oneRun("update", async () => {
         const n = await extractChanges();

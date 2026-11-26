@@ -32,7 +32,9 @@ if (!fs.existsSync(keyFile)) throw new Error(`release key not found (${keyFile})
 const version = fs.readFileSync(path.join(here, 'src', 'agent.mjs'), 'utf8').match(/const VERSION = '([^']+)'/)[1];
 const shipped = ['agent.mjs', 'build-d.mjs', 'supp.mjs', 'hist.mjs', 'build-v15.mjs', 'tables.json', 'run-hidden.vbs', 'setup.ps1', 'update.ps1', 'README.md'];
 const files = Object.fromEntries(shipped.map((f) => [f, crypto.createHash('sha256').update(Buffer.from(servedForm(f, fs.readFileSync(path.join(dist, f), 'utf8')), 'utf8')).digest('hex')]));
-const release = Buffer.from(JSON.stringify({ version, files }, null, 1) + '\n', 'utf8');
+// settings.json: what the platform team sets on the installed agent from here (agent.mjs applySettings; no secrets)
+const settings = JSON.parse(fs.readFileSync(path.join(here, 'settings.json'), 'utf8'));
+const release = Buffer.from(JSON.stringify({ version, settings, files }, null, 1) + '\n', 'utf8');
 fs.writeFileSync(path.join(dist, 'release.json'), release);
 fs.writeFileSync(path.join(dist, 'release.sig'), crypto.sign(null, release, crypto.createPrivateKey(fs.readFileSync(keyFile))).toString('base64') + '\n');
 console.log('dist:', fs.readdirSync(dist).map((f) => `${f} ${Math.round(fs.statSync(path.join(dist, f)).size / 1024)} KB`).join(', '), '| tables', tables.length);
