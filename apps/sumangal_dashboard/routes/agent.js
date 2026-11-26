@@ -13,7 +13,8 @@ import { storeV15, v15Status } from '../services/v15Service.js';
  * builds the ERP dashboard (V15) dataset there and pushes it here. It proves itself with the key it made at setup
  * (we keep the SHA-256 only) and is ignored until an admin approves it (scripts/v15/approve-agent.mjs).
  *
- *   GET  /agent/files/:name   the agent's files for setup (no secrets in them)
+ *   GET  /agent/files/:name   the agent's files for setup and self-update (no secrets in them). release.json lists
+ *                             them with their SHA-256; release.sig is its signature by the platform team's key.
  *   POST /agent/register      { agentUid, keyHash, machine, winUser }        → pending
  *   GET  /agent/status        → { status }                                    (headers below)
  *   POST /agent/push          body: the dataset JSON, gzipped (application/octet-stream)
@@ -26,7 +27,10 @@ import { storeV15, v15Status } from '../services/v15Service.js';
 const router = Router({ mergeParams: true });
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const AGENT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'agent', 'dist');
-const FILES = ['agent.mjs', 'build-d.mjs', 'supp.mjs', 'hist.mjs', 'build-v15.mjs', 'setup.ps1', 'README.md', 'tables.json', 'run-hidden.vbs'];
+const FILES = ['agent.mjs', 'build-d.mjs', 'supp.mjs', 'hist.mjs', 'build-v15.mjs', 'setup.ps1', 'update.ps1', 'README.md', 'tables.json', 'run-hidden.vbs', 'release.json', 'release.sig'];
+/** The bytes the agent gets, whatever line ends this checkout has: LF, and CRLF for .vbs (wscript wants it). release.json's
+ *  checksums (agent/build.mjs, same function) are of this form, so the agent can check each file against the signed list. */
+const servedForm = (name, text) => (name.endsWith('.vbs') ? text.replace(/\r?\n/g, '\r\n') : text.replace(/\r\n/g, '\n'));
 const MAX_PENDING = 3;
 
 router.get('/agent/files/:name', (req, res) => {
@@ -34,9 +38,7 @@ router.get('/agent/files/:name', (req, res) => {
   const f = path.join(AGENT_DIR, req.params.name);
   if (!fs.existsSync(f)) return res.status(404).end();
   res.set('Content-Type', 'text/plain; charset=utf-8').set('Cache-Control', 'no-cache');
-  // git keeps LF; wscript wants CRLF
-  if (f.endsWith('.vbs')) return res.send(fs.readFileSync(f, 'utf8').replace(/\r?\n/g, '\r\n'));
-  fs.createReadStream(f).pipe(res);
+  res.send(Buffer.from(servedForm(req.params.name, fs.readFileSync(f, 'utf8')), 'utf8'));
 });
 
 router.post('/agent/register', async (req, res) => {

@@ -1,0 +1,15 @@
+{
+ "version": "2026-11-26a",
+ "files": {
+  "agent.mjs": "fe2bea78b2ab4960abcd3c8355fbbdafe8b600c1fd92df0c4c87dbf5700e0a0e",
+  "build-d.mjs": "a90bead952c5a60ed8f1eda6203f04dbb2a8923a90dc807c68ace3e9d57b70b9",
+  "supp.mjs": "86f221a1505eac031f35c83211016466238fdf403052baf06d06d892d6c4e052",
+  "hist.mjs": "4e917bc82aa6b52ff6d3a001865ba5e61684dacbc4a6c78da09715da1c3085a2",
+  "build-v15.mjs": "33cc960f93b2b9ebd62075d2ec8ef56a8caff33b0b3537aa29b7756156fe13c6",
+  "tables.json": "d03177fc672007af820cc737cd035c7e9f9e147f73490d481126ccc5e256a6cf",
+  "run-hidden.vbs": "cef4a0aaebab8b4f03c6f239f8d050fae3450717bf910daba638ec3c8574ef1f",
+  "setup.ps1": "f96eb0fbfdb3d8bc8fd159ab12e0ad092f1501f4e31441e6caa8a36da3a359bf",
+  "update.ps1": "b353d671c11875d26bda1aa5db2350dfa458c4406bccf705a9856a98be2357e0",
+  "README.md": "c259d0e47d2f7b5363ae8e9c1df471df5251c9f6061ca72080057e7061f94932"
+ }
+}

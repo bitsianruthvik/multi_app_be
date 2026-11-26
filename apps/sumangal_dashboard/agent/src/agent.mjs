@@ -6,9 +6,11 @@
  *   node agent.mjs status      ask the dashboard whether this agent is approved
  *   node agent.mjs run         nightly: copy every table afresh (never password columns) into the local working copy
  *                              (work\erp.sqlite), build the dashboard dataset here, send it gzipped, report
- *   node agent.mjs day         working hours: whenever the dashboard asks (someone opens it or presses "Refresh now"),
- *                              read the dashboard's rows changed since the last read into the copy, rebuild, send.
- *                              Stops at --until=HH:MM (default 21:00)
+ *   node agent.mjs listen      any hour, every day, until stopped: whenever the dashboard asks (someone opens it or presses
+ *                              "Refresh now"), read the rows changed since the last read into the copy, rebuild, send.
+ *                              ('day' is the old name.) Hourly, and before the nightly run, it looks for a new version
+ *                              signed by the platform team (release.json + release.sig), installs it and restarts.
+ *   node agent.mjs self-update look for a new signed version now
  *   node agent.mjs update      one day-time update now (what "day" does each time)
  *     --source=sqlite:<file>   build from an existing SQLite copy instead of reading SQL Server (tests)
  *     --server-sqlite=<file>   read "the ERP" from an SQLite file instead of SQL Server (tests of run / update)
@@ -40,7 +42,9 @@ const WORK = path.join(DIR, 'work');
 const LOGS = path.join(DIR, 'logs');
 const COPY = path.join(WORK, 'erp.sqlite');
 const STATE = path.join(WORK, 'state.json');
-const VERSION = '2026-11-24b';
+const VERSION = '2026-11-26a';
+// The platform team's Ed25519 public key: a new version is installed only when its file list carries their signature.
+const RELEASE_KEY = 'MCowBQYDK2VwAyEAhTOWDagwzCp2/dPOPd4Tdf8HlOI2+2c5aP5grwWCdmM=';
 fs.mkdirSync(WORK, { recursive: true }); fs.mkdirSync(LOGS, { recursive: true });
 const ARGS = process.argv.slice(2);
 const opt = (k) => (ARGS.find((a) => a.startsWith(`--${k}=`)) || '').slice(k.length + 3) || null;
@@ -297,7 +301,62 @@ async function cmdRegister() {
   c.agentUid = uid; saveCfg(c); log(`registered as agent ${r.id} (${r.status}). Ask the dashboard admin to approve it.`);
 }
 async function cmdStatus() { const r = await api('GET', '/agent/status'); log(`agent ${r.id}: ${r.status}`); }
+// ---------- self-update: release.json ({ version, files: { name: SHA-256 } }) signed by the platform team (release.sig)
+const UPDATABLE = /^[A-Za-z0-9-]+\.(mjs|json|vbs|ps1|md)$/;
+async function fetchFile(name) {
+  const c = cfg(); const r = await fetch(`${c.api.replace(/\/$/, '')}/api/${c.company}/sumangal_dashboard/agent/files/${name}`, { headers: { 'Cache-Control': 'no-cache' } });
+  if (!r.ok) throw new Error(`file ${name}: ${r.status}`); return Buffer.from(await r.arrayBuffer());
+}
+/** true when a new version was installed (the caller then restarts). Never throws: a failed check keeps this version running. */
+async function selfUpdate() {
+  if (ARGS.includes('--no-update')) return false;
+  try {
+    const rel = await fetchFile('release.json'); const sig = Buffer.from((await fetchFile('release.sig')).toString('utf8').trim(), 'base64');
+    const pub = crypto.createPublicKey({ key: Buffer.from(RELEASE_KEY, 'base64'), format: 'der', type: 'spki' });
+    if (!crypto.verify(null, rel, pub, sig)) { log('update check: the release is not signed by the platform team, ignored'); return false; }
+    const r = JSON.parse(rel.toString('utf8'));
+    if (!r.version || r.version === VERSION) return false;
+    const files = {};
+    for (const [name, sha] of Object.entries(r.files || {})) {
+      if (!UPDATABLE.test(name)) throw new Error('bad file name in the release: ' + name);
+      const b = await fetchFile(name);
+      if (crypto.createHash('sha256').update(b).digest('hex') !== sha) throw new Error(`${name}: checksum does not match the signed list`);
+      files[name] = b;
+    }
+    // the new agent must call itself this version, or it would update itself again on every start
+    if (!files['agent.mjs'] || !files['agent.mjs'].toString('utf8').includes(`VERSION = "${r.version}"`)) throw new Error(`the release's agent.mjs is not version ${r.version}`);
+    const unlock = await takeLock();
+    try {
+      const old = path.join(WORK, 'previous-version'); fs.mkdirSync(old, { recursive: true });
+      // agent.mjs last: a half-done update leaves the old agent with new helpers, never a new agent with old ones
+      for (const name of Object.keys(files).sort((a, b) => (a === 'agent.mjs') - (b === 'agent.mjs'))) {
+        const p = path.join(DIR, name); if (fs.existsSync(p)) fs.copyFileSync(p, path.join(old, name));
+        fs.writeFileSync(p + '.new', files[name]); fs.renameSync(p + '.new', p);
+      }
+    } finally { unlock(); }
+    log(`updated ${VERSION} -> ${r.version} (${Object.keys(files).length} files; the old ones are in work\\previous-version)`);
+    try { await api('POST', '/agent/report', { ok: true, kind: 'update', message: `agent updated ${VERSION} -> ${r.version}`, seconds: 0 }); } catch { /* the log keeps it */ }
+    return true;
+  } catch (e) { log(`update check failed (keeping ${VERSION}): ${e.message}`); return false; }
+}
+/** Runs this same command again with the files now on disk (after a self-update). */
+function relaunch(more = []) {
+  const r = spawnSync(process.execPath, ['--no-warnings', path.join(DIR, 'agent.mjs'), ...ARGS, ...more], { stdio: 'inherit', windowsHide: true });
+  process.exitCode = r.status ?? 1;
+}
+/** update.ps1: the files beside this agent.mjs match release.json, and release.json carries the platform team's signature. */
+function cmdVerifyRelease() {
+  const rel = fs.readFileSync(path.join(DIR, 'release.json')); const sig = Buffer.from(fs.readFileSync(path.join(DIR, 'release.sig'), 'utf8').trim(), 'base64');
+  const pub = crypto.createPublicKey({ key: Buffer.from(RELEASE_KEY, 'base64'), format: 'der', type: 'spki' });
+  if (!crypto.verify(null, rel, pub, sig)) { console.log('  NOT signed by the platform team'); process.exitCode = 1; return; }
+  const r = JSON.parse(rel.toString('utf8'));
+  for (const [name, sha] of Object.entries(r.files)) if (crypto.createHash('sha256').update(fs.readFileSync(path.join(DIR, name))).digest('hex') !== sha) { console.log('  ' + name + ' does not match'); process.exitCode = 1; return; }
+  console.log(`  version ${r.version}: signed by the platform team, ${Object.keys(r.files).length} files match`);
+}
+async function cmdSelfUpdate() { log(`agent ${VERSION}: checking for a new version`); if (!(await selfUpdate())) log('no new version installed'); }
+
 async function cmdRun() {
+  if (await selfUpdate()) return relaunch(['--no-update']); // the night's run: no second check
   log(`agent ${VERSION}: nightly run`);
   const ok = await oneRun('nightly', async () => { if (opt('source')) { log('using existing copy ' + opt('source')); return 'existing copy'; } await extractAll(); return 'full read'; });
   if (!ok) process.exitCode = 1;
@@ -308,11 +367,13 @@ async function cmdUpdate() {
   if (!ok) process.exitCode = 1;
 }
 async function cmdDay() {
-  const until = opt('until') || '21:00'; const every = +(opt('every') || 0) * 60000; // 0: only when the dashboard asks (opened, or Refresh now)
-  const [hh, mm] = until.split(':').map(Number); const end = new Date(); end.setHours(hh, mm, 0, 0);
-  log(`agent ${VERSION}: day mode until ${until}, an update when the dashboard asks${every ? `, and every ${every / 60000} min` : ''}`);
-  let last = 0;
+  // any hour, every day, until stopped; --until=HH:MM only if asked (the old 'day' task passed 21:00)
+  const until = ARGS[0] === 'listen' ? opt('until') : null; const every = +(opt('every') || 0) * 60000; // 0: only when the dashboard asks
+  const end = new Date(8.64e15); if (until) { const [hh, mm] = until.split(':').map(Number); end.setTime(Date.now()); end.setHours(hh, mm, 0, 0); }
+  log(`agent ${VERSION}: listening${until ? ` until ${until}` : ' (any hour, every day)'}, an update when the dashboard asks${every ? `, and every ${every / 60000} min` : ''}`);
+  let last = 0; let checked = 0;
   while (Date.now() < end.getTime()) {
+    if (Date.now() - checked > 3600e3) { checked = Date.now(); if (await selfUpdate()) { log('restarting with the new version'); return relaunch(); } }
     let job = null;
     try { job = await api('GET', '/agent/jobs?wait=25'); } catch (e) { log('waiting for requests failed: ' + e.message); await new Promise((r) => setTimeout(r, 30000)); }
     if (job?.id || (every && Date.now() - last >= every)) {
@@ -322,10 +383,10 @@ async function cmdDay() {
       if (job?.id) { try { await api('POST', `/agent/jobs/${job.id}/done`, { ok }); } catch (e) { log('could not close job: ' + e.message); } }
     }
   }
-  log('day mode ends');
+  log('listening ends');
 }
 
 const [cmd] = ARGS;
-const cmds = { test: cmdTest, register: cmdRegister, status: cmdStatus, run: cmdRun, update: cmdUpdate, day: cmdDay };
-if (!cmds[cmd]) { console.log('Usage: node agent.mjs test | register | status | run | update | day [--until=21:00] [--every=<minutes>, default only on request]   (tests: --source=sqlite:<file>, --server-sqlite=<file>, --keep)'); process.exit(cmd ? 1 : 0); }
+const cmds = { test: cmdTest, register: cmdRegister, status: cmdStatus, run: cmdRun, update: cmdUpdate, listen: cmdDay, day: cmdDay, 'self-update': cmdSelfUpdate, 'verify-release': async () => cmdVerifyRelease() };
+if (!cmds[cmd]) { console.log('Usage: node agent.mjs test | register | status | run | update | listen [--until=HH:MM] [--every=<minutes>] | self-update   (tests: --source=sqlite:<file>, --server-sqlite=<file>, --keep)'); process.exit(cmd ? 1 : 0); }
 cmds[cmd]().catch((e) => { log('FAILED: ' + e.message); process.exit(1); });

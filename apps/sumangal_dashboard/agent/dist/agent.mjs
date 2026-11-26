@@ -68979,7 +68979,8 @@ var WORK = path3.join(DIR, "work");
 var LOGS = path3.join(DIR, "logs");
 var COPY = path3.join(WORK, "erp.sqlite");
 var STATE = path3.join(WORK, "state.json");
-var VERSION = "2026-11-24b";
+var VERSION = "2026-11-26a";
+var RELEASE_KEY = "MCowBQYDK2VwAyEAhTOWDagwzCp2/dPOPd4Tdf8HlOI2+2c5aP5grwWCdmM=";
 fs6.mkdirSync(WORK, { recursive: true });
 fs6.mkdirSync(LOGS, { recursive: true });
 var ARGS = process.argv.slice(2);
@@ -69480,7 +69481,84 @@ async function cmdStatus() {
   const r = await api("GET", "/agent/status");
   log(`agent ${r.id}: ${r.status}`);
 }
+var UPDATABLE = /^[A-Za-z0-9-]+\.(mjs|json|vbs|ps1|md)$/;
+async function fetchFile(name) {
+  const c = cfg();
+  const r = await fetch(`${c.api.replace(/\/$/, "")}/api/${c.company}/sumangal_dashboard/agent/files/${name}`, { headers: { "Cache-Control": "no-cache" } });
+  if (!r.ok) throw new Error(`file ${name}: ${r.status}`);
+  return Buffer.from(await r.arrayBuffer());
+}
+async function selfUpdate() {
+  if (ARGS.includes("--no-update")) return false;
+  try {
+    const rel = await fetchFile("release.json");
+    const sig = Buffer.from((await fetchFile("release.sig")).toString("utf8").trim(), "base64");
+    const pub = crypto.createPublicKey({ key: Buffer.from(RELEASE_KEY, "base64"), format: "der", type: "spki" });
+    if (!crypto.verify(null, rel, pub, sig)) {
+      log("update check: the release is not signed by the platform team, ignored");
+      return false;
+    }
+    const r = JSON.parse(rel.toString("utf8"));
+    if (!r.version || r.version === VERSION) return false;
+    const files = {};
+    for (const [name, sha] of Object.entries(r.files || {})) {
+      if (!UPDATABLE.test(name)) throw new Error("bad file name in the release: " + name);
+      const b = await fetchFile(name);
+      if (crypto.createHash("sha256").update(b).digest("hex") !== sha) throw new Error(`${name}: checksum does not match the signed list`);
+      files[name] = b;
+    }
+    if (!files["agent.mjs"] || !files["agent.mjs"].toString("utf8").includes(`VERSION = "${r.version}"`)) throw new Error(`the release's agent.mjs is not version ${r.version}`);
+    const unlock = await takeLock();
+    try {
+      const old = path3.join(WORK, "previous-version");
+      fs6.mkdirSync(old, { recursive: true });
+      for (const name of Object.keys(files).sort((a, b) => (a === "agent.mjs") - (b === "agent.mjs"))) {
+        const p = path3.join(DIR, name);
+        if (fs6.existsSync(p)) fs6.copyFileSync(p, path3.join(old, name));
+        fs6.writeFileSync(p + ".new", files[name]);
+        fs6.renameSync(p + ".new", p);
+      }
+    } finally {
+      unlock();
+    }
+    log(`updated ${VERSION} -> ${r.version} (${Object.keys(files).length} files; the old ones are in work\\previous-version)`);
+    try {
+      await api("POST", "/agent/report", { ok: true, kind: "update", message: `agent updated ${VERSION} -> ${r.version}`, seconds: 0 });
+    } catch {
+    }
+    return true;
+  } catch (e) {
+    log(`update check failed (keeping ${VERSION}): ${e.message}`);
+    return false;
+  }
+}
+function relaunch(more = []) {
+  const r = spawnSync2(process.execPath, ["--no-warnings", path3.join(DIR, "agent.mjs"), ...ARGS, ...more], { stdio: "inherit", windowsHide: true });
+  process.exitCode = r.status ?? 1;
+}
+function cmdVerifyRelease() {
+  const rel = fs6.readFileSync(path3.join(DIR, "release.json"));
+  const sig = Buffer.from(fs6.readFileSync(path3.join(DIR, "release.sig"), "utf8").trim(), "base64");
+  const pub = crypto.createPublicKey({ key: Buffer.from(RELEASE_KEY, "base64"), format: "der", type: "spki" });
+  if (!crypto.verify(null, rel, pub, sig)) {
+    console.log("  NOT signed by the platform team");
+    process.exitCode = 1;
+    return;
+  }
+  const r = JSON.parse(rel.toString("utf8"));
+  for (const [name, sha] of Object.entries(r.files)) if (crypto.createHash("sha256").update(fs6.readFileSync(path3.join(DIR, name))).digest("hex") !== sha) {
+    console.log("  " + name + " does not match");
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`  version ${r.version}: signed by the platform team, ${Object.keys(r.files).length} files match`);
+}
+async function cmdSelfUpdate() {
+  log(`agent ${VERSION}: checking for a new version`);
+  if (!await selfUpdate()) log("no new version installed");
+}
 async function cmdRun() {
+  if (await selfUpdate()) return relaunch(["--no-update"]);
   log(`agent ${VERSION}: nightly run`);
   const ok = await oneRun("nightly", async () => {
     if (opt("source")) {
@@ -69501,14 +69579,25 @@ async function cmdUpdate() {
   if (!ok) process.exitCode = 1;
 }
 async function cmdDay() {
-  const until = opt("until") || "21:00";
+  const until = ARGS[0] === "listen" ? opt("until") : null;
   const every = +(opt("every") || 0) * 6e4;
-  const [hh, mm] = until.split(":").map(Number);
-  const end = /* @__PURE__ */ new Date();
-  end.setHours(hh, mm, 0, 0);
-  log(`agent ${VERSION}: day mode until ${until}, an update when the dashboard asks${every ? `, and every ${every / 6e4} min` : ""}`);
+  const end = /* @__PURE__ */ new Date(864e13);
+  if (until) {
+    const [hh, mm] = until.split(":").map(Number);
+    end.setTime(Date.now());
+    end.setHours(hh, mm, 0, 0);
+  }
+  log(`agent ${VERSION}: listening${until ? ` until ${until}` : " (any hour, every day)"}, an update when the dashboard asks${every ? `, and every ${every / 6e4} min` : ""}`);
   let last = 0;
+  let checked = 0;
   while (Date.now() < end.getTime()) {
+    if (Date.now() - checked > 36e5) {
+      checked = Date.now();
+      if (await selfUpdate()) {
+        log("restarting with the new version");
+        return relaunch();
+      }
+    }
     let job = null;
     try {
       job = await api("GET", "/agent/jobs?wait=25");
@@ -69532,12 +69621,12 @@ async function cmdDay() {
       }
     }
   }
-  log("day mode ends");
+  log("listening ends");
 }
 var [cmd] = ARGS;
-var cmds = { test: cmdTest, register: cmdRegister, status: cmdStatus, run: cmdRun, update: cmdUpdate, day: cmdDay };
+var cmds = { test: cmdTest, register: cmdRegister, status: cmdStatus, run: cmdRun, update: cmdUpdate, listen: cmdDay, day: cmdDay, "self-update": cmdSelfUpdate, "verify-release": async () => cmdVerifyRelease() };
 if (!cmds[cmd]) {
-  console.log("Usage: node agent.mjs test | register | status | run | update | day [--until=21:00] [--every=<minutes>, default only on request]   (tests: --source=sqlite:<file>, --server-sqlite=<file>, --keep)");
+  console.log("Usage: node agent.mjs test | register | status | run | update | listen [--until=HH:MM] [--every=<minutes>] | self-update   (tests: --source=sqlite:<file>, --server-sqlite=<file>, --keep)");
   process.exit(cmd ? 1 : 0);
 }
 cmds[cmd]().catch((e) => {

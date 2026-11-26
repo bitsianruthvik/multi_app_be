@@ -22,9 +22,7 @@ param(
   [string]$Server = '',
   [string]$Port = '',
   [string]$User = '',
-  [string]$At = '02:00',
-  [string]$DayFrom = '08:00',
-  [string]$DayUntil = '21:00'
+  [string]$At = '02:00'
 )
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -65,7 +63,7 @@ if (-not (Test-Path $node)) {
 & $node --version
 
 Step "Agent files from the dashboard"
-foreach ($f in @('agent.mjs', 'build-d.mjs', 'supp.mjs', 'hist.mjs', 'build-v15.mjs', 'tables.json', 'README.md', 'run-hidden.vbs')) {
+foreach ($f in @('agent.mjs', 'build-d.mjs', 'supp.mjs', 'hist.mjs', 'build-v15.mjs', 'tables.json', 'README.md', 'run-hidden.vbs', 'update.ps1')) {
   Invoke-WebRequest "$Api/api/$Company/sumangal_dashboard/agent/files/$f" -OutFile "$Dir\$f" -UseBasicParsing
   Write-Host "  $f"
 }
@@ -105,27 +103,28 @@ if ($mode -match '^[12]$') {
   $who = "$env:USERDOMAIN\$env:USERNAME"
   # wscript runs node with no window, so nobody sees or closes a console while signed in
   $nightAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$Dir\run-hidden.vbs`" run" -WorkingDirectory $Dir
-  $dayAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$Dir\run-hidden.vbs`" day --until=$DayUntil" -WorkingDirectory $Dir
+  $dayAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$Dir\run-hidden.vbs`" listen" -WorkingDirectory $Dir
   $nightTrigger = New-ScheduledTaskTrigger -Daily -At $At
-  # working hours: an update whenever the dashboard asks (opened, or "Refresh now"); Wednesday is the weekly off
-  $dayTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday, Tuesday, Thursday, Friday, Saturday, Sunday -At $DayFrom
+  # the listener: an update whenever the dashboard asks (opened, or "Refresh now"), any hour, every day. Started at
+  # sign-in and every 10 minutes; IgnoreNew keeps one, so a stopped listener is back within 10 minutes.
+  $dayTrigger = @((New-ScheduledTaskTrigger -AtLogOn -User $who), (New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650)))
   # StartWhenAvailable: a run missed while the PC was off or nobody was signed in starts as soon as it can
   $nightSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-  $daySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 15) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+  $daySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
   if ($mode -eq '1') {
     $p = New-ScheduledTaskPrincipal -UserId $who -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName 'Sumangal dashboard agent' -Action $nightAction -Trigger $nightTrigger -Settings $nightSettings -Principal $p -Force | Out-Null
-    Register-ScheduledTask -TaskName 'Sumangal dashboard agent (day)' -Action $dayAction -Trigger $dayTrigger -Settings $daySettings -Principal $p -Force | Out-Null
+    Register-ScheduledTask -TaskName 'Sumangal dashboard agent (listen)' -Action $dayAction -Trigger $dayTrigger -Settings $daySettings -Principal $p -Force | Out-Null
     Write-Host "  Tasks created. They run while $env:USERNAME is signed in (locking the screen is fine; signing out stops them)."
   } else {
     $tp = Read-Host "Windows password of $who" -AsSecureString
     $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($tp))
     Register-ScheduledTask -TaskName 'Sumangal dashboard agent' -Action $nightAction -Trigger $nightTrigger -Settings $nightSettings -User $who -Password $plain -RunLevel Limited -Force | Out-Null
-    Register-ScheduledTask -TaskName 'Sumangal dashboard agent (day)' -Action $dayAction -Trigger $dayTrigger -Settings $daySettings -User $who -Password $plain -RunLevel Limited -Force | Out-Null
+    Register-ScheduledTask -TaskName 'Sumangal dashboard agent (listen)' -Action $dayAction -Trigger $dayTrigger -Settings $daySettings -User $who -Password $plain -RunLevel Limited -Force | Out-Null
     $plain = $null
     Write-Host "  Tasks created. They run signed in or not (if they fail with a logon error, the user lacks 'Log on as a batch job')."
   }
-  Write-Host "  Nightly at $At; working hours $DayFrom-$DayUntil, not Wednesdays."
+  Write-Host "  Nightly full read at $At; the listener answers the dashboard any hour, every day. New versions install themselves."
 }
 Write-Host "`nDone. Logs: $Dir\logs. First full run by hand:  & '$node' --no-warnings '$Dir\agent.mjs' run" -ForegroundColor Green
 Write-Host "The dashboard shows the data after an admin approves this agent and that run finishes." -ForegroundColor Green

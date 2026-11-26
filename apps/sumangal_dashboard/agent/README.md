@@ -8,7 +8,7 @@ Keeps the ERP dashboard (V15) up to date from Sumangal's ERP (SQL Server, `Casti
 2. builds the dashboard dataset there (`build-v15.mjs`, the same code as `multi_app_be/apps/sumangal_dashboard/scripts/v15`);
 3. sends it, gzipped (~2.3 MB), to `POST /api/<company>/sumangal_dashboard/agent/push` over HTTPS and reports the run. `last-sent.json.gz` keeps a copy of what was sent.
 
-**Working hours (08:00–21:00, not Wednesdays, `agent.mjs day`):** no timer. Whenever someone opens the dashboard or presses **Refresh now** (the agent waits on `GET /agent/jobs`), it reads the rows changed since its last read, for the dashboard's tables (`tables.json`) and the headers they hang from, rebuilds and sends. About a minute end to end. The other tables refresh nightly. `--every=<minutes>` adds a timer if ever wanted.
+**Any hour, every day (`agent.mjs listen`, started at sign-in and re-checked every 10 minutes):** no timer. Whenever someone opens the dashboard or presses **Refresh now** (the agent waits on `GET /agent/jobs`), it reads the rows changed since its last read, for the dashboard's tables (`tables.json`) and the headers they hang from, rebuilds and sends. About a minute end to end. The other tables refresh nightly. `--every=<minutes>` adds a timer if ever wanted.
 
 - Changed rows: tables with `modified_date` / `created_date` give the rows touched since the last read (by SQL Server's clock, less 10 minutes). A table without dates follows its header (the first key-named column after its own key, worked out at the nightly read and logged): its lines are re-read for every header that changed, which also drops lines deleted under it. `tbl_combobox_master` (no dates, no header) is re-read whole.
 - Rows deleted outright, or edited without their date changing, show after the next nightly read, which copies everything afresh.
@@ -59,6 +59,8 @@ cd C:\SumangalDashboardAgent
 .\node\node.exe --no-warnings agent.mjs run
 ```
 
+**Updates:** `release.json` lists every file with its SHA-256 and `release.sig` signs it with the platform team's Ed25519 key (private half only on the platform team's PC, `TM\.sumangal-agent-release.pem`; `node build.mjs` signs). The agent installs a version only when the signature and every checksum match, keeps the old files in `work\previous-version`, and restarts.
+
 ## Commands
 
 | | |
@@ -68,7 +70,9 @@ cd C:\SumangalDashboardAgent
 | `agent.mjs status` | pending, approved or revoked |
 | `agent.mjs run` | the nightly run (full read) |
 | `agent.mjs update` | one day-time update now (changed rows only) |
-| `agent.mjs day [--until=21:00] [--every=<min>]` | working hours: an update whenever the dashboard asks |
+| `agent.mjs listen [--until=HH:MM] [--every=<min>]` | an update whenever the dashboard asks, any hour, every day (`day` is the old name) |
+| `agent.mjs self-update` | install a newer version if the platform team signed one (the listener checks hourly, the nightly run before it starts) |
+| `update.ps1` | once, on an agent installed before 2026-11-26: new files, the any-hour listener task, self-update from then on |
 | tests | `--server-sqlite=<file>` reads "the ERP" from an SQLite file instead of SQL Server; `--source=sqlite:<file>` builds from an existing copy; `--keep` keeps the intermediate files |
 
 Logs: `logs\agent-YYYY-MM-DD.log`. On the dashboard side, `GET /api/<company>/sumangal_dashboard/agent/runs` (platform login) lists the agents and their last runs.
