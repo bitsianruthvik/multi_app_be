@@ -51,6 +51,7 @@ const { explode, updateLine } = await imp('apps/cf_erp/services/bomService.js');
 const { applyBomChanges } = await imp('apps/cf_erp/services/bomChangeService.js');
 const { withCutPieces } = await imp('apps/cf_erp/services/cutPlateService.js');
 const { uploadDrawings, normMark } = await imp('apps/cf_erp/services/partDrawingService.js');
+const { aimSplitTwins, aimedFile, dropTwinLinks } = await import(pathToFileURL(path.join(__dir, 'lib', 'splitTwins.mjs')).href);
 const { removeLink } = await imp('apps/cf_erp/services/drawingService.js');
 const { importCatalog, saveLineToStandard } = await imp('apps/cf_erp/services/standardDrawingService.js');
 const { planImport, normName } = await imp('apps/cf_erp/lib/standardImport.js');
@@ -437,9 +438,17 @@ async function stepDrawings(line) {
     for (const f of files) { const m = normMark(f.split('_')[0]); report.drawings.push({ name: f, status: live.has(m) ? 'would be the next revision of its drawing' : 'would be a new drawing' }); }
     return;
   }
+  // SPLIT TWINS (2026-11-27, OWG V2-SPI / V2-SPO): rows pasted from one source row are linked copies, so a file would go on
+  // its twin too and the twin's own file be refused — such a file goes on its own rows only (lib/splitTwins.mjs).
+  const read = (f) => ({ name: f, content: fs.readFileSync(path.join(dir, f)).toString('base64') });
+  const { rows, aim } = await aimSplitTwins(db, c, { ...line, id: LINE }, files.map(read));
   for (let i = 0; i < files.length; i += 5) await step(async () => {
-    const batch = files.slice(i, i + 5).map((f) => ({ name: f, content: fs.readFileSync(path.join(dir, f)).toString('base64') }));
+    const batch = files.slice(i, i + 5).map((f) => aimedFile(read(f), aim));
     const up = await uploadDrawings(db, c, line.order_id, LINE, { files: batch, dryRun: false });
+    for (const f of batch.filter((b) => aim.has(b.name))) {
+      const off = await dropTwinLinks(db, c, rows, f.name, aim);
+      report.drawings.push({ name: f.name, status: `on its own rows only (split from ${[...aim.get(f.name).twins].join(', ')})${off ? `; ${off} link(s) to the twin's drawing taken off` : ''}` });
+    }
     for (const x of up.files ?? []) {
       const reg = x.register ? `${x.register.action} ${x.register.number} rev ${x.register.fromRevision ? `${x.register.fromRevision} → ` : ''}${x.register.revision}` : '';
       report.drawings.push({ name: x.name, status: x.status, reg, rows: (x.rows ?? []).length, problems: x.problems ?? [], warnings: x.warnings ?? [] });
