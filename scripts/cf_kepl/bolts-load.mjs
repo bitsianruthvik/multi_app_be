@@ -18,6 +18,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { useProdDb } from '../lib/prodDb.mjs';
+/** A bolt row's note: what was assumed and the grip — only what is known (2026-11-28: "Grip undefined." was written on rows with no grip). */
+const boltNote = (g) => [g.assumed ? `Assumed: ${g.assumed}.` : null, g.grip != null && g.grip !== '' ? `Grip ${g.grip}.` : null].filter(Boolean).join(' ') || null;
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const imp = (p) => import(pathToFileURL(path.join(__dir, '..', '..', p)).href);
 
@@ -185,7 +187,7 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
     const bom = await bomOfParent(db, COMPANY, r.id);
     if (!bom) {
       for (const g of groups) {
-        await addLine(db, c, r.id, { childId: sel.id, quantity: g.qty, role: `${g.where}`.slice(0, 100), notes: g.assumed ? `Assumed: ${g.assumed}. Grip ${g.grip}.` : `Grip ${g.grip}.` });
+        await addLine(db, c, r.id, { childId: sel.id, quantity: g.qty, role: `${g.where}`.slice(0, 100), notes: boltNote(g) });
         const [nl] = await q(`SELECT l.id FROM cf_boms b JOIN cf_bom_lines l ON l.bom_id = b.id AND l.deleted_at IS NULL WHERE b.parent_id = ? AND b.deleted_at IS NULL ORDER BY l.id DESC LIMIT 1`, [r.id]);
         await resolveLine(db, c, nl.id, { itemId: itemOf.get(g.name) });
         added++;
@@ -196,7 +198,7 @@ export async function loadBolts(db, c, { line: LINE, bolts: BOLTS, match: MATCH 
       let lineNo = (await nextLineNo(db, COMPANY, bom.id)) - 10;
       let pos = (await nextPosition(db, COMPANY, bom.id, sel.id)) - 1;
       const vals = groups.map((g) => [COMPANY, bom.id, (lineNo += 10), itemOf.get(g.name), sel.id, ++pos, `${g.where}`.slice(0, 100), g.qty, sel.id, null, null,
-        g.assumed ? `Assumed: ${g.assumed}. Grip ${g.grip}.` : `Grip ${g.grip}.`, c.userId, 0]);
+        boltNote(g), c.userId, 0]);
       if (vals.length) await q(`INSERT INTO cf_bom_lines (company_id, bom_id, line_no, child_id, design_id, position, role, quantity, selection_definition_id, source_line_id, operation_flow_id, notes, created_by, auto_chosen) VALUES ?`, [vals]);
       added += vals.length;
     }
