@@ -194,7 +194,7 @@ async function loadFactsNow(db, companyId, { month, from = null } = {}) {
     getPlanner(db, companyId, { from: first }),
     fabricationMachines(db, companyId),
     db.query(
-      `SELECT p.id, p.code, p.order_id, p.order_line_id, p.lines_json, p.level, p.status, p.label FROM cf_production_orders p
+      `SELECT p.* FROM cf_production_orders p
         WHERE p.company_id = ? AND p.deleted_at IS NULL AND p.status IN (?) ORDER BY p.order_id, p.seq`, [companyId, PLAN_PO_STATUSES]),
   ]);
   const calendars = await machinesCalendar(db, companyId, { from: start, to: horizonEnd, machineIds: machines.map((m) => m.id) });
@@ -204,7 +204,7 @@ async function loadFactsNow(db, companyId, { month, from = null } = {}) {
   for (const p of pos) {
     const lines = p.order_line_id ? [Number(p.order_line_id)] : (json(p.lines_json) ?? []).map(Number).filter(Boolean);
     const cover = lines.length ? lines : linesOfOrder.get(Number(p.order_id)) ?? [];
-    for (const l of cover) { if (!poOfLine.has(l)) poOfLine.set(l, []); poOfLine.get(l).push({ id: p.id, code: p.code, status: p.status }); }
+    for (const l of cover) { if (!poOfLine.has(l)) poOfLine.set(l, []); poOfLine.get(l).push({ id: Number(p.id), code: p.code, status: p.status, seq: Number(p.seq ?? 0), members: memberIndexes(p.members_json) }); }
   }
   const fnName = new Map(snapshot.functions.map((f) => [String(f.key), f.name]));
   const fnArea = new Map(snapshot.functions.map((f) => [String(f.key), (f.path ?? []).find((p) => p.depth === 1)?.name ?? null]));
@@ -217,9 +217,14 @@ async function loadFactsNow(db, companyId, { month, from = null } = {}) {
     const covering = poOfLine.get(Number(lineId));
     if (!covering) continue;
     const marks = list.filter((u) => u.isMark && u.level !== 'line');
-    const ship = marks.length ? marks : list.filter((u) => u.level === 'line');
-    const order = orderById.get(Number(ship[0]?.orderId));
-    ship.forEach((u, i) => {
+    const all = marks.length ? marks : list.filter((u) => u.level === 'line');
+    // A production order of some of the line's units (a batch: members L<line>U<n>) holds only those units; a unit no
+    // production order in planning holds (a later batch not yet released) is not planned.
+    const batches = covering.every((p) => p.members) && all.length > 1;
+    const poOf = (i) => (batches ? covering.find((p) => p.members.has(i + 1)) : covering[0]) ?? null;
+    const ship = all.map((u, i) => ({ u, i, po: poOf(i) })).filter((x) => x.po);
+    const order = orderById.get(Number(ship[0]?.u.orderId));
+    ship.forEach(({ u, i, po }) => {
       const mat = u.material ?? null;
       let earliest = 0; let materialDate = null; let materialAssumed = false;
       if (mat && mat.state !== 'ready') {
@@ -231,7 +236,8 @@ async function loadFactsNow(db, companyId, { month, from = null } = {}) {
         key: u.key, orderId: Number(u.orderId), lineId: Number(lineId), code: u.code ?? u.name, name: u.name, tonnes: Number(u.tonnes ?? 0),
         done: !!u.done, progress: Number(u.progress ?? 0), seq: i, steps: u.done ? [] : stepsOf(u),
         earliest, materialDate, materialAssumed, materialState: mat?.state ?? 'ready', materialText: mat?.text ?? null,
-        committedDate: u.committedDate ?? order?.committedDate ?? null, productionOrders: covering.map((p) => p.code),
+        committedDate: u.committedDate ?? order?.committedDate ?? null, productionOrders: batches ? [po.code] : covering.map((p) => p.code),
+        poId: po.id, poSeq: po.seq,
       });
     });
   }
@@ -248,6 +254,14 @@ async function loadFactsNow(db, companyId, { month, from = null } = {}) {
   for (const u of units) for (const s of u.steps) if (!fns[s.fn]) fns[s.fn] = { key: s.fn, name: s.fn === CONTRACTOR ? 'Contractors' : s.fn === UNASSIGNED ? 'No machine type' : fnName.get(s.fn) ?? `Machine type ${s.fn}`, area: fnArea.get(s.fn) ?? null };
   for (const m of machines) if (!fns[m.typeId]) fns[m.typeId] = { key: m.typeId, name: m.typeName, area: m.areaName };
   return { month, first, from: start, last, horizonEnd, days, monthEndDay: daysBetween(start, last), today, orders, units, machines, calendars, fns, assumed };
+}
+
+/** The unit numbers a batch production order holds (members_json ["L12U1", "L12U2"] → {1, 2}); null for a whole line. */
+function memberIndexes(raw) {
+  const list = json(raw);
+  if (!Array.isArray(list) || !list.length) return null;
+  const set = new Set(list.map((m) => Number(/U(\d+)$/.exec(String(m))?.[1])).filter(Boolean));
+  return set.size ? set : null;
 }
 
 /** Orders in the planner's order: the ranks given, then the order's own priority, then its committed date. */
@@ -272,17 +286,20 @@ export function poolsOf(facts, machineIds) {
 }
 
 /** The engine's input from the facts and the planner's choices. */
-export function engineInput(facts, { machineIds, ranks = null, toleranceDays = 3 }) {
+export function engineInput(facts, { machineIds, ranks = null, poRanks = null, toleranceDays = 3 }) {
   const ranked = rankOrders(facts.orders, ranks);
   const rankOf = new Map(ranked.map((o, i) => [o.id, i]));
+  // poRanks (production order ids): within an order, its production orders in this order (else their own sequence).
+  const poPos = new Map((poRanks ?? []).map((id, i) => [Number(id), i]));
+  const seqOf = (u) => (poPos.has(u.poId) ? poPos.get(u.poId) : 1000 + (u.poSeq ?? 0)) * 10000 + u.seq;
   const pools = poolsOf(facts, machineIds);
   // A type some unit needs and no machine in the plan gives: an empty pool, so the unit waits (and the plan says why).
   for (const u of facts.units) for (const s of u.steps) if (s.fn !== CONTRACTOR && s.fn !== UNASSIGNED && !pools[s.fn]) pools[s.fn] = new Array(facts.days).fill(0);
   return {
     days: facts.days, monthEndDay: facts.monthEndDay, toleranceDays,
     pools, unlimited: { [CONTRACTOR]: UNLIMITED_MINUTES, [UNASSIGNED]: UNLIMITED_MINUTES },
-    units: facts.units.filter((u) => !u.done).map((u) => ({ key: u.key, orderId: u.orderId, rank: rankOf.get(u.orderId) ?? 1e6, seq: u.seq, tonnes: u.tonnes, earliest: u.earliest, steps: u.steps })),
-    ranked: ranked.map((o) => o.id),
+    units: facts.units.filter((u) => !u.done).map((u) => ({ key: u.key, orderId: u.orderId, rank: rankOf.get(u.orderId) ?? 1e6, seq: seqOf(u), tonnes: u.tonnes, earliest: u.earliest, steps: u.steps })),
+    ranked: ranked.map((o) => o.id), poRanks: (poRanks ?? []).map(Number),
   };
 }
 
@@ -358,7 +375,7 @@ export function describePlan(facts, input, plan, machineIds) {
 }
 
 /** Optimise a month from the planner's choices (nothing is written). */
-export async function planMonth(db, companyId, { month, machineIds = null, ranks = null, toleranceDays = 3, from = null, suggest = true, iterations = 400, startOrder = null, materialAsKnown = null } = {}) {
+export async function planMonth(db, companyId, { month, machineIds = null, ranks = null, poRanks = null, toleranceDays = 3, from = null, suggest = true, iterations = 400, startOrder = null, materialAsKnown = null } = {}) {
   const facts = await loadFacts(db, companyId, { month, from });
   // materialAsKnown { orderId: 'YYYY-MM-DD' } — a plan made AS OF an earlier day (the demo's history, scripts/cf_kepl/
   // planning-demo.mjs): the date that order's material was promised for then. Never set from a request.
@@ -372,7 +389,7 @@ export async function planMonth(db, companyId, { month, machineIds = null, ranks
   }
   const ids = (machineIds ?? facts.machines.filter((m) => m.on).map((m) => m.id)).map(Number).filter((id) => facts.machines.some((m) => m.id === id));
   const tol = Math.max(0, Math.min(60, Number.isFinite(Number(toleranceDays)) ? Math.round(Number(toleranceDays)) : 3));
-  const input = engineInput(facts, { machineIds: ids, ranks, toleranceDays: tol });
+  const input = engineInput(facts, { machineIds: ids, ranks, poRanks, toleranceDays: tol });
   // The search runs in a worker thread (monthPlanWorker): the server keeps answering everyone else meanwhile.
   const inPlan = new Set(ids);
   const job = {
@@ -386,7 +403,7 @@ export async function planMonth(db, companyId, { month, machineIds = null, ranks
   const { plan, suggestions } = await runPlanJob(job);
   const result = describePlan(facts, input, plan, ids);
   result.suggestions = suggestions ?? { options: [], noSpare: [] };
-  return { facts, input, plan, result, machineIds: ids, toleranceDays: tol, ranks: input.ranked };
+  return { facts, input, plan, result, machineIds: ids, toleranceDays: tol, ranks: input.ranked, poRanks: input.poRanks };
 }
 
 /* ── The choices screen: machines by area ──────────────────────────────────────────────────────────── */
@@ -467,8 +484,8 @@ export async function getMonth(db, companyId, q = {}) {
  * not changed — withdraw it first).
  */
 export async function runMonth(db, c, input = {}) {
-  const run = await planMonth(db, c.companyId, { month: input.month, machineIds: input.machineIds ?? null, ranks: input.ranks ?? null, toleranceDays: input.toleranceDays ?? 3 });
-  const inputs = { machineIds: run.machineIds, ranks: run.ranks, toleranceDays: run.toleranceDays, from: run.facts.from };
+  const run = await planMonth(db, c.companyId, { month: input.month, machineIds: input.machineIds ?? null, ranks: input.ranks ?? null, poRanks: input.poRanks ?? null, toleranceDays: input.toleranceDays ?? 3 });
+  const inputs = { machineIds: run.machineIds, ranks: run.ranks, poRanks: run.poRanks, toleranceDays: run.toleranceDays, from: run.facts.from };
   let head = null;
   if (input.save) {
     const rows = await plansOfMonth(db, c.companyId, input.month);
