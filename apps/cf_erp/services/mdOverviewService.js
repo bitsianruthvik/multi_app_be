@@ -16,6 +16,7 @@
  */
 import { invalid, notFound } from '../lib/errors.js';
 import { listAlerts } from './alertService.js';
+import { queryOpening } from '../lib/schemaOpening.js';
 import { listApprovals } from './approvalService.js';
 import { getSettings, isStandIn } from './settingsService.js';
 import { deskSettings } from './storesDeskService.js';
@@ -84,11 +85,12 @@ async function departments(db, companyId, alerts, dec) {
   const one = (sql, params) => quiet(db.query(sql, params).then(([[r]]) => r ?? {}), {});
   const [inq, steps, late, stores, custody, maint, down, po, pr, billDue, unpaid] = await Promise.all([
     one("SELECT COUNT(*) AS n, MAX(DATEDIFF(CURDATE(), created_at)) AS oldest FROM cf_sales_orders WHERE company_id = ? AND deleted_at IS NULL AND status = 'inquiry'", [companyId]),
-    one(
-      `SELECT SUM(s.state = 'done' AND DATE(s.finished_at) = CURDATE()) AS done, SUM(s.state = 'in_progress') AS running,
+    // §121: a step done by an opening position is not today's work.
+    quiet(queryOpening(db, (has) =>
+      `SELECT SUM(s.state = 'done' AND DATE(s.finished_at) = CURDATE()${has ? ' AND s.opening = 0' : ''}) AS done, SUM(s.state = 'in_progress') AS running,
               SUM(p.step_id IS NOT NULL AND DATE(p.planned_start) <= CURDATE() AND DATE(p.planned_end) >= CURDATE()) AS planned
          FROM cf_production_steps s LEFT JOIN cf_plan3_steps p ON p.step_id = s.id AND p.company_id = s.company_id
-        WHERE s.company_id = ? AND s.deleted_at IS NULL AND (s.state = 'in_progress' OR DATE(s.finished_at) = CURDATE() OR p.step_id IS NOT NULL)`, [companyId]),
+        WHERE s.company_id = ? AND s.deleted_at IS NULL AND (s.state = 'in_progress' OR DATE(s.finished_at) = CURDATE() OR p.step_id IS NOT NULL)`, [companyId]).then(([[r]]) => r ?? {}), {}),
     one('SELECT COUNT(*) AS n, SUM(late = 1) AS late, MAX(run_at) AS run_at FROM cf_plan3_orders WHERE company_id = ?', [companyId]),
     one(
       `SELECT (SELECT COUNT(*) FROM cf_stock_counts WHERE company_id = ? AND deleted_at IS NULL AND count_date = ?) AS counted,

@@ -168,6 +168,8 @@ function operationOf(s, ctx) {
   const label = s._opLabel ?? s.op_name;
   if (label !== s.op_name) op.name = label;
   if (state === 'todo' && s._status === 'ready') op.ready = true;
+  // §121: done by an opening position, not on the floor — the screens tag it so nobody takes it for logged work.
+  if (Number(s.opening ?? 0) === 1 && state === 'done') op.opening = true;
   if (reason) op.reason = reason;
   // 2026-11-14 (the Tracker's timeline): when the floor started and finished it.
   // Sent only when there is one: most steps of a big line have not started, and the default read stays small.
@@ -700,6 +702,7 @@ function ownCell(ops) {
   const reason = ops.find((o) => o.state === 'blocked' && o.reason)?.reason;
   if (state === 'blocked' && reason) cell.reason = reason;
   if (ops.length > 1) cell.passes = ops.map((o) => ({ stepId: o.stepId, name: o.name ?? null, state: o.state, done: o.done, total: o.total }));
+  if (ops.some((o) => o.opening)) cell.opening = ops.filter((o) => o.opening).length;
   return cell;
 }
 

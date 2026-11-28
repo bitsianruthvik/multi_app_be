@@ -14,6 +14,7 @@
  * The plan is the planner's (cf_plan3_steps); an order it has not planned shows its steps and progress only.
  */
 import { listAlerts } from './alertService.js';
+import { queryOpening } from '../lib/schemaOpening.js';
 import { listApprovals } from './approvalService.js';
 
 const r1 = (n) => Math.round(Number(n) * 10) / 10;
@@ -24,7 +25,8 @@ export async function mdDashboard(db, companyId, can, q = {}) {
   const label = by === 'order' ? 'so.code' : 'o.name';
   const extra = by === 'order' ? ', MAX(so.committed_date) AS committed, MAX(p3.planned_end) AS plan_end, MAX(cu.name) AS customer' : ', MAX(o.code) AS op_code';
   const [today, plan, alerts, requests, planRun] = await Promise.all([
-    db.query(
+    // §121: steps done by an opening position (work before the system) are not today's work.
+    queryOpening(db, (has) =>
       `SELECT ${key} AS id, ${label} AS label,
               SUM(p.step_id IS NOT NULL AND DATE(p.planned_start) <= CURDATE() AND DATE(p.planned_end) >= CURDATE()) AS planned,
               SUM(DATE(s.started_at) = CURDATE()) AS started,
@@ -38,7 +40,7 @@ export async function mdDashboard(db, companyId, can, q = {}) {
          JOIN cf_sales_orders so ON so.id = r.order_id AND so.deleted_at IS NULL AND so.status = 'confirmed'
          JOIN cf_operations o ON o.id = s.operation_id
          LEFT JOIN cf_plan3_steps p ON p.step_id = s.id AND p.company_id = s.company_id
-        WHERE s.company_id = ? AND s.deleted_at IS NULL
+        WHERE s.company_id = ? AND s.deleted_at IS NULL${has ? ' AND s.opening = 0' : ''}
         GROUP BY ${key}, ${label}
        HAVING planned > 0 OR started > 0 OR done > 0 OR running > 0`,
       [companyId],

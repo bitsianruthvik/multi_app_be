@@ -1846,6 +1846,8 @@ export const shapeStep = (s, pieceLabel) => ({
   qtyScrap: Number(s.qty_scrap),
   state: s.state,
   status: s._status,
+  // §121: done by an OPENING POSITION (work before the system) — not floor work, never posted to stock.
+  opening: !!Number(s.opening ?? 0),
   machine: s.machine_id ? { id: s.machine_id, code: s.machine_code, name: s.machine_name } : null,
   // A step on a contractor work order (init.sql §30): the tracker shows it in place of the machine.
   workOrder: s.work_order_id ? { id: s.work_order_id, code: s.wo_code, status: s.wo_status, contractorId: s.wo_contractor_id, contractorName: s.wo_contractor_name } : null,

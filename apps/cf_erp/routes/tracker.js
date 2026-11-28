@@ -26,6 +26,10 @@
  *                                           (productionOrdersService). Was /production-orders until §76 — that
  *                                           path is now the production orders themselves (routes/productionOrders.js).
  *   GET    /tracker/plan-check?stepIds=1,2  (2026-10-17) which of these steps the plan has no ship week for
+ *   GET    /order-lines/:id/opening-position   (§121, 2026-11-28) the stages, the pieces to tick, the opening steps
+ *   POST   /order-lines/:id/opening-position   { stage, pieceIds?, units?, asOf?, dryRun? } — work done before the
+ *                                           system marked done up to a stage, with no stock / material / billing
+ *                                           posting (openingPositionService); dryRun says what it would do
  *
  * Every write below answers with the whole release (getRelease) unless asked
  * ?view=summary (its figures only) or ?view=none — the order page's grid asks
@@ -58,6 +62,7 @@ import { trackerTree, trackerTreeChildren, trackerTreeNode, lineGrid, lineGridCh
 import { listProductionOrders } from '../services/productionOrdersService.js';
 import { planCheck } from '../services/floorService.js';
 import { finishSteps } from '../services/stepBatchService.js';
+import { openingPositionView, setOpeningPosition } from '../services/openingPositionService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -110,6 +115,9 @@ router.post('/production-steps/:id/hold', manage, handle((req) => tx(req, (db, c
 router.post('/production-steps/:id/resume', manage, handle((req) => tx(req, (db, c) => resumeStep(db, c, id(req), body(req)))));
 // Catching up / go-live data entry (2026-10-31): one transaction PER STEP inside, so it is not wrapped in tx().
 router.post('/production-steps/finish', manage, handle((req) => finishSteps(ctx(req), req.body ?? {})));
+// §121: the opening position — the same permission that records progress (production manage; admins pass).
+router.get('/order-lines/:id/opening-position', view, handle((req) => openingPositionView(pool, company(req), id(req))));
+router.post('/order-lines/:id/opening-position', manage, handle((req) => tx(req, (db, c) => setOpeningPosition(db, c, id(req), req.body ?? {}))));
 router.get('/production-steps/:id/history', view, handle((req) => stepHistory(pool, company(req), id(req))));
 
 router.post('/requirements/:id/reserve', stock, handle((req) => tx(req, (db, c) => reserveRequirement(db, c, id(req), body(req)))));

@@ -79,6 +79,7 @@ import {
   scrapArea, scrapItem, scrapRate, scrapPerKg, customerScrapLots, writeLosses, reverseLosses,
 } from './scrapService.js';
 import { hasV67, missingV67 } from '../lib/schemaV67.js';
+import { queryOpening } from '../lib/schemaOpening.js';
 
 const EPS = 1e-6;
 const round6 = (n) => Math.round((Number(n) + Number.EPSILON) * 1e6) / 1e6;
@@ -598,11 +599,13 @@ export async function ledgerOnSteps(db, c, stepIds) {
   if (!ids.length) return { movements: 0 };
   let steps;
   try {
-    [steps] = await db.query(
+    // §121: a step done by an OPENING POSITION (openingPositionService) posts nothing, ever — the work was done before
+    // the system, so its steel, its WIP lots and its offcuts were never in this ledger.
+    [steps] = await queryOpening(db, (has) =>
       `SELECT s.id, s.production_item_id, s.sequence, s.state, s.held_from, s.quantity, s.qty_good, s.qty_scrap, s.ledger_in, s.ledger_out,
               s.ledger_scrap, s.ledger_remade, pi.release_id
          FROM cf_production_steps s JOIN cf_production_items pi ON pi.id = s.production_item_id
-        WHERE s.company_id = ? AND s.id IN (?) AND s.deleted_at IS NULL ORDER BY s.id FOR UPDATE`,
+        WHERE s.company_id = ? AND s.id IN (?) AND s.deleted_at IS NULL${has ? ' AND s.opening = 0' : ''} ORDER BY s.id FOR UPDATE`,
       [c.companyId, ids],
     );
   } catch (e) {

@@ -24,7 +24,71 @@ export const GROUPS = [
   { key: 'alerts', label: 'Alerts: when one is raised', help: 'How late something is before its own department hears of it.' },
   { key: 'md', label: 'Alerts: when it reaches the MD', help: 'How much later the same thing is put in front of the MD.' },
   { key: 'reports', label: 'MD dashboard and weekly reports', help: 'Which reports are made each week for the MD to verify, and who decides when the MD is away.' },
+  { key: 'production', label: 'Production: stages', help: 'The stages an order moves through on the floor, in order. "Set opening position" on the Tracker marks a released line done up to one of them.' },
 ];
+
+/**
+ * The stages of production (init.sql §121; user, 2026-11-28: "Most of the orders move by girders. And they all move
+ * to the same phase more or less. So give a way to easily set everything to a particular stage."). In order; each a
+ * name and the operation codes that belong to it. An operation in no stage belongs to the stage of the step before it
+ * in its flow (openingPositionService.stageOfSteps). Stored as JSON in cf_settings; shown and edited on Setup ›
+ * Settings as one line per stage, "Name: CODE, CODE".
+ */
+export const DEFAULT_STAGES = [
+  { name: 'Cut', ops: ['CNCP-CUT', 'GASCUT'] },
+  { name: 'Fit-up & weld', ops: ['HBFIT', 'SAWWELD', 'JACKBEND', 'STIFFFIT', 'MIGWELD', 'FLIPGIRDER', 'IDEDFIT', 'ARCWELD', 'XFRAMEFIT', 'STUDWELD', 'LINEMATCH', 'PARTQC', 'SETCHECK'] },
+  { name: 'Drill', ops: ['CNCDRILL', 'MANDRILL'] },
+  { name: 'Trial assembly', ops: ['TRIALASM', 'DISMANTLE'] },
+  { name: 'Blast & paint', ops: ['BLAST', 'METALLIZE', 'PAINT'] },
+  { name: 'Dispatched', ops: ['DISPATCH'] },
+];
+export const STAGES_MAX = 20;
+/** cf_settings.value holds at most this much (§121 widened it from 255). */
+export const STAGES_MAX_TEXT = 4000;
+
+/** "Name: A, B" lines (or an array, or its JSON) → { stages } or { problems }. Codes upper-cased; a code in one stage only. */
+export function parseStages(input) {
+  let list = input;
+  const problems = [];
+  if (typeof input === 'string') {
+    const t = input.trim();
+    if (t.startsWith('[')) {
+      try { list = JSON.parse(t); } catch { return { problems: ['Stages: that is not a list.'] }; }
+    } else {
+      list = t.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).map((l, i) => {
+        const at = l.indexOf(':');
+        if (at < 0) { problems.push(`Stages, line ${i + 1}: write it as "Name: CODE, CODE".`); return null; }
+        return { name: l.slice(0, at), ops: l.slice(at + 1).split(/[,\s]+/).filter(Boolean) };
+      }).filter(Boolean);
+    }
+  }
+  if (!Array.isArray(list)) return { problems: ['Stages: a list of stages, each a name and its operation codes.'] };
+  const stages = [];
+  const names = new Set();
+  const seen = new Map();
+  for (const [i, x] of list.entries()) {
+    const name = String(x?.name ?? '').trim().slice(0, 60);
+    if (!name) { problems.push(`Stages: stage ${i + 1} needs a name.`); continue; }
+    if (names.has(name.toLowerCase())) problems.push(`Stages: "${name}" is named twice.`);
+    names.add(name.toLowerCase());
+    const ops = [];
+    for (const raw of Array.isArray(x?.ops) ? x.ops : []) {
+      const code = String(raw ?? '').trim().toUpperCase().slice(0, 50);
+      if (!code || ops.includes(code)) continue;
+      if (seen.has(code)) { problems.push(`Stages: ${code} is in both "${seen.get(code)}" and "${name}" — an operation belongs to one stage.`); continue; }
+      seen.set(code, name);
+      ops.push(code);
+    }
+    stages.push({ name, ops });
+  }
+  if (!stages.length && !problems.length) problems.push('Stages: name at least one stage.');
+  if (stages.length > STAGES_MAX) problems.push(`Stages: at most ${STAGES_MAX}.`);
+  if (stages.length && !stages.some((s) => s.ops.length)) problems.push('Stages: give at least one stage its operation codes.');
+  if (JSON.stringify(stages).length > STAGES_MAX_TEXT) problems.push('Stages: the list is too long to keep.');
+  return problems.length ? { problems } : { stages };
+}
+/** The stages as the settings page shows them: one line per stage. */
+export const stagesText = (stages) => (stages ?? []).map((s) => `${s.name}: ${s.ops.join(', ')}`).join('\n');
 
 const I = (key, group, label, def, min, max, unit, help, extra = {}) => ({ key, group, label, type: 'int', def, min, max, unit, help, ...extra });
 export const SETTINGS = [
@@ -104,6 +168,9 @@ export const SETTINGS = [
   I('report_keep_weeks', 'reports', 'An unseen report stays on the page for', 6, 1, 52, 'weeks'),
   { key: 'md_standin_user', group: 'reports', label: 'Stand-in for the MD', type: 'user', def: null, help: 'One person who may decide everything the MD decides, while the switch below is on.' },
   { key: 'md_standin_on', group: 'reports', label: 'The stand-in decides now', type: 'bool', def: false, help: 'Switch on when the MD is away, off when back.' },
+
+  // --- production stages (init.sql §121)
+  { key: 'production_stages', group: 'production', label: 'Stages, in order', type: 'stages', def: DEFAULT_STAGES, help: 'One line per stage: its name, a colon, then its operation codes. An operation in no stage counts with the step before it in its flow. Codes this company does not use are ignored.' },
 ];
 const BY_KEY = new Map(SETTINGS.map((s) => [s.key, s]));
 
@@ -124,9 +191,12 @@ function read(def, raw) {
     case 'bool': return raw === true || raw === 1 || raw === '1' || raw === 'true';
     case 'date': return dateText(raw);
     case 'user': { const n = Number(raw); return Number.isInteger(n) && n > 0 ? n : null; }
+    case 'stages': { const r = parseStages(String(raw)); return r.stages ?? def.def; }
     default: return String(raw);
   }
 }
+/** Two values of a setting are the same (a list compares by its content). */
+const sameValue = (def, a, b) => (def.type === 'stages' ? JSON.stringify(a) === JSON.stringify(b) : a === b);
 
 /** Every setting of a company, by key. Reads at most twice, and not at all within 30 s of the last read. */
 export async function getSettings(db, companyId, { fresh = false } = {}) {
@@ -153,7 +223,9 @@ export async function settingsPage(db, companyId) {
       items: SETTINGS.filter((s) => s.group === g.key).map((s) => ({
         key: s.key, label: s.label, help: s.help ?? null, type: s.type, unit: s.unit ?? null, min: s.min ?? null, max: s.max ?? null,
         choices: s.choices ? s.choices.map(([value, label]) => ({ value, label })) : null,
-        default: s.def, value: values[s.key], changed: values[s.key] !== s.def,
+        ...(s.type === 'stages'
+          ? { default: stagesText(s.def), value: stagesText(values[s.key]), changed: !sameValue(s, values[s.key], s.def) }
+          : { default: s.def, value: values[s.key], changed: values[s.key] !== s.def }),
       })),
     })),
     users: users.map((u) => ({ id: u.id, name: u.name })),
@@ -196,6 +268,12 @@ function check(def, v, problems, ctx) {
       if (!ctx.userIds.has(n)) { problems.push(`${def.label}: that person is not in this company.`); return undefined; }
       return n;
     }
+    case 'stages': {
+      if (empty) return def.def;
+      const r = parseStages(v);
+      if (r.problems) { problems.push(...r.problems); return undefined; }
+      return r.stages;
+    }
     default: return empty ? def.def : String(v).slice(0, 255);
   }
 }
@@ -221,9 +299,9 @@ export async function saveSettings(db, c, input = {}) {
   for (const [k, v] of Object.entries(clean)) {
     const def = BY_KEY.get(k);
     if (def.col) { colSets[def.col] = v; continue; }
-    if (v === def.def || v == null) await db.query('DELETE FROM cf_settings WHERE company_id = ? AND skey = ?', [c.companyId, k]);
+    if (sameValue(def, v, def.def) || v == null) await db.query('DELETE FROM cf_settings WHERE company_id = ? AND skey = ?', [c.companyId, k]);
     else {
-      const text = def.type === 'bool' ? (v ? '1' : '0') : String(v);
+      const text = def.type === 'bool' ? (v ? '1' : '0') : def.type === 'stages' ? JSON.stringify(v) : String(v);
       await db.query('INSERT INTO cf_settings (company_id, skey, value, updated_by) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value), updated_by = VALUES(updated_by)', [c.companyId, k, text, c.userId ?? null]);
     }
   }

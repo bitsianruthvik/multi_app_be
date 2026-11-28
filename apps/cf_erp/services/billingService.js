@@ -37,6 +37,7 @@
  */
 import { invalid, notFound, assertNoProblems } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
+import { queryOpening } from '../lib/schemaOpening.js';
 import { measuresOf, round2, CURRENCY } from './priceService.js';
 import { companyTax, itemTaxOf, partyTaxOf, supplyOf, taxLines, amountInWords, stateName, financialYear, invoiceNumber, FOREIGN_STATE, INVOICE_NO_MAX } from './taxService.js';
 import { unitKgOf } from './valuationService.js';
@@ -116,15 +117,18 @@ export async function billingFacts(db, companyId, q = {}) {
       `SELECT l.id, l.order_id, l.line_no, l.item_id, l.quantity, l.delivered_qty, l.locked_at
          FROM cf_sales_order_lines l WHERE l.company_id = ? AND l.order_id IN (?) AND l.deleted_at IS NULL ORDER BY l.order_id, l.line_no, l.id`,
       [companyId, ids]),
-    db.query(
-      `SELECT r.order_id, r.order_line_id, s.operation_id, pi.item_id, (s.state = 'done') AS done, DATE(s.finished_at) AS finished_on,
-              SUM(s.quantity) AS quantity, MIN(s.started_at) AS first_start
+    // §121: a step done by an OPENING POSITION (work before the system) is no milestone — it counts as not done and
+    // never as a start; it stays in the totals, so what is billed from here is the work done from here.
+    queryOpening(db, (has) => {
+      const done = has ? "(s.state = 'done' AND s.opening = 0)" : "(s.state = 'done')";
+      return `SELECT r.order_id, r.order_line_id, s.operation_id, pi.item_id, ${done} AS done, IF(${done}, DATE(s.finished_at), NULL) AS finished_on,
+              SUM(s.quantity) AS quantity, MIN(${has ? 'IF(s.opening = 1, NULL, s.started_at)' : 's.started_at'}) AS first_start
          FROM cf_production_steps s
          JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
          JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
         WHERE s.company_id = ? AND r.order_id IN (?) AND s.deleted_at IS NULL
-        GROUP BY r.order_id, r.order_line_id, s.operation_id, pi.item_id, (s.state = 'done'), DATE(s.finished_at)`,
-      [companyId, ids]),
+        GROUP BY r.order_id, r.order_line_id, s.operation_id, pi.item_id, ${done}, IF(${done}, DATE(s.finished_at), NULL)`;
+    }, [companyId, ids]),
     db.query(
       `SELECT v.id, v.code, v.order_id, v.movement_date, v.order_line_id, -SUM(k.quantity) AS quantity
          FROM cf_stock_movements v

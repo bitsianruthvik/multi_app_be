@@ -9289,3 +9289,33 @@ PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
 SELECT IF((SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_items' AND INDEX_NAME = 'idx_cpri_rel') > 0,
           'S120-OK', 'S120-MISSING') AS result;
+
+-- §121 OPENING POSITION (user, 2026-11-28): "I want to get the sales orders to the levels of completion they are in
+--      production. Most of the orders move by girders. And they all move to the same phase more or less. So give a way to
+--      easily set everything to a particular stage." Work done before the system is marked on the released line's steps
+--      as an OPENING POSITION (openingPositionService): done, with no stock, material, finished-stock or billing posting.
+--   cf_production_steps.opening   1 = done by an opening position (never by the floor); the ledger, billing and the
+--                                 "done today" figures leave it out. Going back to a lower stage re-opens only these.
+--   cf_step_events.event/source   'opening' — the step's history says it was an opening position, by whom, as of when.
+--   cf_settings.value             widened to 4000 for the production_stages list (settingsService, JSON).
+-- =====================================================================================================================
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'opening');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_production_steps ADD COLUMN opening TINYINT(1) NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events'
+             AND COLUMN_NAME = 'event' AND COLUMN_TYPE LIKE '%''opening''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_step_events MODIFY COLUMN event ENUM('start','progress','hold','resume','opening') NOT NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @has = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events'
+             AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''opening''%');
+SET @sql = IF(@has = 0, "ALTER TABLE cf_step_events MODIFY COLUMN source ENUM('tracker','live','day_entry','opening') NULL", 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+SET @len = (SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_settings' AND COLUMN_NAME = 'value');
+SET @sql = IF(@len < 4000, 'ALTER TABLE cf_settings MODIFY COLUMN value VARCHAR(4000) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
+SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_production_steps' AND COLUMN_NAME = 'opening') = 1
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events' AND COLUMN_NAME = 'event' AND COLUMN_TYPE LIKE '%''opening''%') = 1
+          AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events' AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''opening''%') = 1
+          AND (SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_settings' AND COLUMN_NAME = 'value') >= 4000,
+          'S121-OK', 'S121-MISSING') AS result;
