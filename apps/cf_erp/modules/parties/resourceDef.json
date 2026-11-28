@@ -24,7 +24,8 @@
       "gstRegistration": "cpt.gst_registration",
       "stateCode": "cpt.state_code",
       "city": "cpt.city",
-      "pincode": "cpt.pincode"
+      "pincode": "cpt.pincode",
+      "pan": "cpt.pan"
     },
     "fieldTypes": {
       "id": "integer",
@@ -47,7 +48,8 @@
       "gstRegistration": "string",
       "stateCode": "string",
       "city": "string",
-      "pincode": "string"
+      "pincode": "string",
+      "pan": "string"
     },
     "relations": {}
   }

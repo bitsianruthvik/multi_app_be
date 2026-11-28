@@ -85,6 +85,12 @@ SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
 SET @sql = IF(@col = 0, 'ALTER TABLE cf_parties ADD COLUMN pincode VARCHAR(10) NULL', 'SELECT 1');
 PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
 
+-- PAN (2026-11-28, the sub-contractor master list): the party's PAN as given; a GSTIN carries one in characters 3-12.
+SET @col = (SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_parties' AND COLUMN_NAME = 'pan');
+SET @sql = IF(@col = 0, 'ALTER TABLE cf_parties ADD COLUMN pan VARCHAR(10) NULL', 'SELECT 1');
+PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;
+
 -- Ship-to addresses. A customer's site in another state can carry that state's
 -- GSTIN. is_default_ship: at most one per party — the service keeps it so (TiDB
 -- has no partial unique index). Place of supply of goods = the ship-to's state.

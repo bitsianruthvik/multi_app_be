@@ -10,6 +10,7 @@ import { validateGstin, readStateCode, stateName, FOREIGN_STATE } from './gstin.
 
 const CODE_RE = /^[A-Za-z0-9][A-Za-z0-9_\-./]*$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
 const ROLES = { customer: 'is_customer', supplier: 'is_supplier', subcontractor: 'is_subcontractor' };
 /** How a party is registered for GST (CF_ERP_GST_PLAN §1). */
 export const GST_REGISTRATIONS = ['regular', 'composition', 'unregistered', 'sez', 'overseas'];
@@ -40,6 +41,7 @@ function shape(p) {
     stateName: stateName(p.state_code),
     city: p.city ?? null,
     pincode: p.pincode ?? null,
+    pan: p.pan ?? null,
     contactName: p.contact_name,
     email: p.email,
     phone: p.phone,
@@ -73,6 +75,13 @@ function readBody(rawInput, existing = null) {
   text('email', 'email', 255);
   text('phone', 'phone', 50);
   text('city', 'city', 100);
+  // PAN (2026-11-28, the sub-contractor master list): upper case, 5 letters 4 digits 1 letter. A GSTIN carries a PAN in
+  // characters 3-12; a different one is kept as given (the list has one) — the screen shows both.
+  if (input.pan !== undefined) {
+    const pan = blank(input.pan) ? null : String(input.pan).replace(/\s+/g, '').toUpperCase();
+    if (pan && !PAN_RE.test(pan)) problems.push('PAN is 5 letters, 4 digits and a letter (ABCDE1234F).');
+    out.pan = pan;
+  }
   if (input.address !== undefined) out.address = blank(input.address) ? null : String(input.address);
   if (input.notes !== undefined) out.notes = blank(input.notes) ? null : String(input.notes);
   if (out.code && !CODE_RE.test(out.code)) problems.push('Code: letters, digits and - _ . /, no spaces.');
