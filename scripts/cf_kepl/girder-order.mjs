@@ -48,8 +48,11 @@ try {
   let [[party]] = await db.query('SELECT id, name FROM cf_parties WHERE company_id = ? AND (code = ? OR name = ?) AND deleted_at IS NULL ORDER BY id LIMIT 1', [COMPANY, cust.code, cust.name]);
   if (!party) { party = await createParty(db, c, { ...cust, roles: ['customer'] }); console.log(`customer made: #${party.id} ${party.name}`); } else console.log(`customer found: #${party.id} ${party.name}`);
 
-  const number = bom.drawing.number; const withRev = `${number}${bom.drawing.revision ?? ''}`;
-  const [[std]] = await db.query('SELECT id, number FROM cf_standard_drawings WHERE company_id = ? AND deleted_at IS NULL AND number IN (?, ?) ORDER BY id DESC LIMIT 1', [COMPANY, number, withRev]);
+  // --standard <id>: the imported standard itself (a set with no drawing number is imported under its set name).
+  const number = bom.drawing?.number ?? bom.set ?? SET; const withRev = `${number}${bom.drawing?.revision ?? ''}`;
+  const [[std]] = arg('standard')
+    ? await db.query('SELECT id, number FROM cf_standard_drawings WHERE company_id = ? AND deleted_at IS NULL AND id = ?', [COMPANY, Number(arg('standard'))])
+    : await db.query('SELECT id, number FROM cf_standard_drawings WHERE company_id = ? AND deleted_at IS NULL AND number IN (?, ?) ORDER BY id DESC LIMIT 1', [COMPANY, number, withRev]);
   if (!std) throw new Error(`No standard ${withRev}: import it first (standard-import.mjs).`);
 
   const into = Number(arg('into-order'));
