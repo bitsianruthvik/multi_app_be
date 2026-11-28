@@ -8,8 +8,8 @@
  * run is live on this instance, the server GETs its own PUBLIC health URL every few minutes: a
  * request that comes in through the front door counts as traffic (one to localhost does not).
  *
- *   base URL    KEEP_AWAKE_URL, else RENDER_EXTERNAL_URL (the platform sets it). Neither set
- *               (a developer's machine): this whole file does nothing.
+ *   base URL    KEEP_AWAKE_URL. Not set (a developer's machine, and the AWS server, which never sleeps;
+ *               Render's RENDER_EXTERNAL_URL fallback retired 2026-11-28): this whole file does nothing.
  *   what        GET <base>/health — no auth, no body, a 10 s timeout.
  *   when        once when the first run goes live, then every KEEP_AWAKE_MS (4 minutes) until the
  *               last one ends, fails or is cancelled. ONE timer for the process, not one per run.
@@ -30,7 +30,7 @@ let deps = { fetch: (...a) => globalThis.fetch(...a), setInterval: (...a) => set
 
 /** The URL pinged, or null when there is none to ping (then nothing here does anything). */
 export function keepAwakeUrl() {
-  const base = String(process.env.KEEP_AWAKE_URL ?? '').trim() || String(process.env.RENDER_EXTERNAL_URL ?? '').trim();
+  const base = String(process.env.KEEP_AWAKE_URL ?? '').trim();
   if (!base || !/^https?:\/\//i.test(base)) return null;
   const clean = base.replace(/\/+$/, '');
   return /\/health$/i.test(clean) ? clean : `${clean}/health`;

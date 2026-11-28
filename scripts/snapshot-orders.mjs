@@ -6,8 +6,8 @@
  *   node scripts/snapshot-orders.mjs --out <dir> [--company 6] [--order <id>]
  *
  * LOCAL ONLY. The connection comes from `../db.js`, which loads `.env`
- * (localhost:3306 sqldb) — never `.env.tidb`. This file must never be pointed
- * at TiDB; there is no flag that does that, on purpose.
+ * (localhost:3306 sqldb) — never production. This file must never be pointed
+ * at production; there is no flag that does that, on purpose.
  *
  * ── WHY THIS IMPORTS THE REAL SERVICES ───────────────────────────────────────
  * `weights`, `procurement`, `readiness` and `productionPlan` are computed by

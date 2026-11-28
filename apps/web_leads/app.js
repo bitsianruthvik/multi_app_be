@@ -16,7 +16,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * webhook, each retried until it goes through (lib/deliver.js). appContext skips /api/public.
  *
  * Environment (all optional except WEB_LEADS_KEY; a destination without its settings is skipped):
- *   WEB_LEADS_KEY                     shared with the website's Vercel project
+ *   WEB_LEADS_KEY                     shared with the website's contact form (TM/ceofactory_site on the AWS server)
  *   SMTP_URL, WEB_LEADS_NOTIFY_TO, WEB_LEADS_FROM            team email
  *   META_PIXEL_ID, META_CAPI_TOKEN, META_GRAPH_VERSION, META_TEST_EVENT_CODE   Meta CAPI
  *   WEB_LEADS_CRM_WEBHOOK_URL, WEB_LEADS_CRM_SECRET          CRM

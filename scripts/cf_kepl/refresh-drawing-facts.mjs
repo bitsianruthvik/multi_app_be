@@ -7,6 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { useProdDb } from '../lib/prodDb.mjs';
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const argv = process.argv;
 const COMPANY = Number(argv[argv.indexOf('--company') + 1]);
@@ -14,8 +15,7 @@ const LINES = argv.flatMap((a, i) => (a === '--line' ? [Number(argv[i + 1])] : [
 const APPLY = argv.includes('--apply');
 if (!COMPANY || !LINES.length) { console.error('Usage: --company <id> --line <id> [--line <id>] [--prod] [--apply]'); process.exit(2); }
 if (argv.includes('--prod')) {
-  const env = {}; fs.readFileSync(path.join(__dir, '..', '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => { l = l.trim(); if (!l || l.startsWith('#')) return; const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim(); });
-  Object.assign(process.env, { DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER, DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true' });
+  await useProdDb();
 }
 const imp = (p) => import(pathToFileURL(path.join(__dir, '..', '..', p)).href);
 const { pool } = await imp('db.js');

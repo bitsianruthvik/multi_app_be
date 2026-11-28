@@ -3,7 +3,7 @@
  *
  *   cd multi_app_be
  *   node scripts/cf_kepl/rdso-standard-check.mjs --company 2                      local
- *   node scripts/cf_kepl/rdso-standard-check.mjs --company 30005 --prod           production (TM/.env.tidb), SELECTs only
+ *   node scripts/cf_kepl/rdso-standard-check.mjs --company 30005 --prod           production (AWS), SELECTs only
  *        [--json <file>]        the whole result as JSON (rdso-standard-fix.mjs and TM/rdso_check/REPORT.md read it)
  *        [--standards A,B]      only these numbers
  *        [--all-versions]       every version, not only the current one
@@ -24,6 +24,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { useProdDb } from '../lib/prodDb.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const arg = (k) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : null; };
@@ -33,12 +34,7 @@ if (!Number.isInteger(COMPANY) || COMPANY <= 0) {
   process.exit(2);
 }
 if (process.argv.includes('--prod')) {
-  const env = {};
-  fs.readFileSync(path.join(__dir, '..', '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => {
-    l = l.trim(); if (!l || l.startsWith('#')) return;
-    const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-  });
-  Object.assign(process.env, { DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER, DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true' });
+  await useProdDb();
 }
 const BE = path.join(__dir, '..', '..');
 const imp = (p) => import(pathToFileURL(path.join(BE, p)).href);

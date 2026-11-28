@@ -197,7 +197,7 @@ Findings were produced by six parallel read-only audit agents (startup/entry, qu
 **File:** `index.js`
 **Lines:** 40–45 (CORS list), 180–186 (route mounts)
 **Problem:**
-1. CORS hardcodes `https://multi-app-fe.vercel.app` and a few localhost entries. `multi_app_fe/.env` references a different production host. Any FE deployed at a non-listed origin gets CORS errors on every credentialed request.
+1. (Fixed 2026-11-28: the list names `https://app.ceofactory.vc`, the AWS production frontend.) CORS hardcodes one production origin and a few localhost entries. Any FE deployed at a non-listed origin gets CORS errors on every credentialed request.
 2. `app.use("/api/:company/:appSlug/admin", adminRoutes)`, `.../user`, `.../app` are mounted **without** `protect` at the router boundary. Per `architecture/API_REFERENCE.md` these are JWT-required. Any controller that omits its own protect call is silently public.
 **Fix:**
 1. Drive `ALLOWED_ORIGINS` from `process.env.CORS_ORIGINS` (comma-separated). Document the contract.

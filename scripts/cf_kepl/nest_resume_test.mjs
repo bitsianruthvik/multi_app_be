@@ -16,7 +16,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 process.env.CF_NEST_BUDGET_SCALE = '0.1';
-delete process.env.KEEP_AWAKE_URL; delete process.env.RENDER_EXTERNAL_URL;
+delete process.env.KEEP_AWAKE_URL;
 const BE = process.cwd();
 const imp = (p) => import(pathToFileURL(path.join(BE, p)).href);
 const { pool } = await imp('db.js');
@@ -260,11 +260,13 @@ try {
     KA.holdAwake('a');
     ok('no URL configured (a developer\'s machine): nothing happens — no timer, no request', timers.length === 0 && calls.length === 0 && KA.keepAwakeState().on === false && KA.keepAwakeState().configured === false);
     KA._keepAwakeTest(stub);
-    process.env.RENDER_EXTERNAL_URL = 'https://example-app.onrender.com/';
-    ok('the URL is the platform\'s own (RENDER_EXTERNAL_URL) + /health; KEEP_AWAKE_URL overrides it', KA.keepAwakeUrl() === 'https://example-app.onrender.com/health' && ((process.env.KEEP_AWAKE_URL = 'https://other.example/health'), KA.keepAwakeUrl() === 'https://other.example/health') && (delete process.env.KEEP_AWAKE_URL));
+    process.env.KEEP_AWAKE_URL = 'https://other.example/health';
+    ok('a KEEP_AWAKE_URL that ends in /health is used as it is', KA.keepAwakeUrl() === 'https://other.example/health');
+    process.env.KEEP_AWAKE_URL = 'https://example-app.example/';
+    ok('the URL is KEEP_AWAKE_URL + /health', KA.keepAwakeUrl() === 'https://example-app.example/health');
     KA.holdAwake('a');
     await wait(20);
-    ok('the first live run starts ONE timer (4 minutes, unref\'d) and pings at once', timers.length === 1 && timers[0].ms === 240_000 && timers[0].unrefd === true && calls.length === 1 && calls[0] === 'https://example-app.onrender.com/health' && KA.keepAwakeState().on === true);
+    ok('the first live run starts ONE timer (4 minutes, unref\'d) and pings at once', timers.length === 1 && timers[0].ms === 240_000 && timers[0].unrefd === true && calls.length === 1 && calls[0] === 'https://example-app.example/health' && KA.keepAwakeState().on === true);
     KA.holdAwake('b');
     timers[0].fn(); await wait(20);
     ok('a second live run does not start a second timer; each tick is one ping', timers.length === 1 && calls.length === 2 && KA.keepAwakeState().runs === 2 && KA.keepAwakeState().lastOkAt != null);
@@ -285,7 +287,7 @@ try {
     await wait(300);
     R.cancelRun(COMPANY, LINE, {});
     ok('…and a cancelled run lets go at once', s9.status === 'running' && KA.keepAwakeState().on === false);
-    delete process.env.RENDER_EXTERNAL_URL;
+    delete process.env.KEEP_AWAKE_URL;
     KA._keepAwakeTest(null);
     await clearRuns(LINE);
   }

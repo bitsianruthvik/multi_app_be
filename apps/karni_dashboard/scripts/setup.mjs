@@ -4,7 +4,7 @@
  *
  *   node apps/karni_dashboard/scripts/setup.mjs                      dry run, local
  *   node apps/karni_dashboard/scripts/setup.mjs --apply              write, local
- *   node apps/karni_dashboard/scripts/setup.mjs --apply --target=prod   write, TiDB
+ *   node apps/karni_dashboard/scripts/setup.mjs --apply --target=prod   write, production (AWS)
  *   --company=<slug>  (default karni)   --all-users  (everyone in the company, not only admins)
  */
 import fs from 'fs';

@@ -4,7 +4,7 @@
  *
  *   node apps/connections/scripts/setup.mjs --company=<slug>                 dry run, local
  *   node apps/connections/scripts/setup.mjs --company=<slug> --apply         write, local
- *   node apps/connections/scripts/setup.mjs --company=<slug> --apply --target=prod   write, TiDB
+ *   node apps/connections/scripts/setup.mjs --company=<slug> --apply --target=prod   write, production (AWS)
  */
 import fs from 'fs';
 import path from 'path';

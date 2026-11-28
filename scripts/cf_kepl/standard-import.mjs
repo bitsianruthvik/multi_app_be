@@ -21,7 +21,7 @@
  *                               line copy (ON by default when the standard has a model; --no-model-values skips it)
  *        [--allow-new "A,B"]    the new definitions agreed to, by name; --apply refuses any other new one (2026-11-06)
  *        [--json]               the report as JSON
- *        [--prod]               the production database: DB_* from TM/.env.tidb (the same way the other cf_kepl scripts reach it)
+ *        [--prod]               the production database (AWS, scripts/lib/prodDb.mjs — the same way the other cf_kepl scripts reach it)
  *
  * Dry run reads only. --apply refuses a standard whose number is already there (nothing is written). A definition is
  * created only where no existing one fits, and the report lists each. Round trips are fixed: a handful of reads, the
@@ -31,6 +31,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { useProdDb } from '../lib/prodDb.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const arg = (k) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : null; };
@@ -49,12 +50,7 @@ if (!folder || !Number.isInteger(COMPANY) || COMPANY <= 0) {
   process.exit(2);
 }
 if (process.argv.includes('--prod')) {
-  const env = {};
-  fs.readFileSync(path.join(__dir, '..', '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => {
-    l = l.trim(); if (!l || l.startsWith('#')) return;
-    const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-  });
-  Object.assign(process.env, { DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER, DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true' });
+  await useProdDb();
 }
 
 const BE = path.join(__dir, '..', '..');
@@ -159,7 +155,7 @@ process.exit(code);
 
 function printReport(r, { host, co, trips }) {
   const line = (s = '') => console.log(s);
-  // DB_HOST, not @@hostname: TiDB Cloud answers "localhost" for that, which reads as the local database.
+  // DB_HOST, not @@hostname: @@hostname can read as the local database (on the laptop 127.0.0.1:3307 is the AWS tunnel).
   if (r.replaced) line(`LINE REPLACED${r.rehearsed ? ' (REHEARSED, ROLLED BACK)' : ''}: ${r.replaced.order} line ${r.replaced.line} — old tree soft-deleted (${JSON.stringify(r.replaced.gone)}), new tree from version ${r.replaced.versionNo}: ${r.replaced.rows} rows, root ${r.replaced.newRoot}; cut pieces ${JSON.stringify(r.replaced.cutPieces)}`);
   line(`${REHEARSE ? 'REHEARSED (rolled back)' : APPLY ? 'APPLIED' : 'DRY RUN (read-only)'} — database ${host.d} at ${process.env.DB_HOST ?? host.h}, company ${co.id} ${co.name}`);
   line(`\n${r.standard.number} — ${r.standard.name}`);

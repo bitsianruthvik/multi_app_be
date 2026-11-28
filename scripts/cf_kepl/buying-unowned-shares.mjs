@@ -7,7 +7,7 @@
  *   node scripts/cf_kepl/buying-unowned-shares.mjs --company <id>            live purchase orders with something still to come
  *   node scripts/cf_kepl/buying-unowned-shares.mjs --company <id> --all      …and the shares of received / cancelled POs (history)
  *   node scripts/cf_kepl/buying-unowned-shares.mjs --company <id> --json     the rows as JSON
- *   (reads the database the environment points at: export the TiDB variables first for production)
+ *   (reads the database the environment points at: export the production DB_* (AWS) first for production)
  *
  * IT WRITES NOTHING. Four SELECTs, whatever the number of shares; no transaction; the session is put in
  * READ ONLY mode first where the server allows it (said in the output), so a mistake could not write.

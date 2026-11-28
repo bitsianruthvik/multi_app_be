@@ -50,7 +50,7 @@ export async function recipientsOf(db, companyId) {
 }
 
 function companyLink(slug) {
-  const base = (process.env.FRONTEND_URL || 'https://multiappfe.vercel.app').replace(/\/+$/, '');
+  const base = (process.env.FRONTEND_URL || 'https://app.ceofactory.vc').replace(/\/+$/, '');
   return `${base}/${encodeURIComponent(slug)}/cf_hrms/compliance`;
 }
 

@@ -9,7 +9,7 @@
  * company -> app -> role -> user -> seed.
  *
  * Writes a known test password, so think before pointing it at production.
- * Local by default; --target=prod writes to TiDB.
+ * Local by default; --target=prod writes to production (AWS).
  *
  *   node setup-karni.mjs
  */

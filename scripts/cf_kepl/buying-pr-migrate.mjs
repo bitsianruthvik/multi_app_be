@@ -6,7 +6,7 @@
  *   cd multi_app_be
  *   node scripts/cf_kepl/buying-pr-migrate.mjs --company <id>            dry run: everything is done, counted, and ROLLED BACK
  *   node scripts/cf_kepl/buying-pr-migrate.mjs --company <id> --apply    the same, committed
- *   (reads the database the environment points at: export the TiDB variables first for production)
+ *   (reads the database the environment points at: export the production DB_* (AWS) first for production)
  *
  * WHAT IT DOES, for the company's open orders (inquiry / quoted / confirmed), in one transaction:
  *   1. every line whose material is known (released, or frozen) and that buys something gets a

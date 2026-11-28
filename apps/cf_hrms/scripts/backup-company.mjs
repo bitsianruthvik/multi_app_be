@@ -2,7 +2,7 @@
  * Snapshot one company's HR data to a JSON file, before something replaces it.
  *
  *   node backup-company.mjs --company=karni                 (local)
- *   node backup-company.mjs --company=karni --target=prod   (read-only against TiDB)
+ *   node backup-company.mjs --company=karni --target=prod   (read-only against production, AWS)
  *   node backup-company.mjs --company=karni --out=C:/path/file.json
  *
  * READ-ONLY. It issues SELECTs and nothing else, so it is safe to point at

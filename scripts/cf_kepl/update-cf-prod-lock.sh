@@ -19,8 +19,8 @@
 #   multi_app_be/scripts/cf_kepl/update-cf-prod-lock.sh --dry-run   # steps 2-4 rehearsed and rolled back; no schema
 #   multi_app_be/scripts/cf_kepl/update-cf-prod-lock.sh --yes       # does it
 #
-# CREDENTIALS live in TM/.env.tidb, deliberately OUTSIDE this repo and never
-# committed. Override with CF_ENV_FILE=/path/to/env.
+# CREDENTIALS: production is the AWS MySQL, reached through multi_app_be/scripts/lib/prodDb.mjs
+# (TM/.env.aws on the laptop, never committed). Override with CF_ENV_FILE=/path/to/env.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,15 +31,19 @@ MODE="${1:-}"
 [[ "$MODE" == "--yes" || "$MODE" == "--dry-run" ]] || { echo "This writes to PRODUCTION. Re-run with --dry-run to rehearse, or --yes to mean it."; exit 1; }
 DRY=$([[ "$MODE" == "--dry-run" ]] && echo 1 || echo 0)
 
-ENV_FILE="${CF_ENV_FILE:-$BE/../.env.tidb}"
-[[ -f "$ENV_FILE" ]] || { echo "No credentials file at $ENV_FILE (it is not in the repo on purpose; set CF_ENV_FILE)."; exit 1; }
-set -a; source "$ENV_FILE"; set +a
+# Production is the AWS MySQL (scripts/lib/prodDb.mjs): on the laptop through the ssh tunnel 127.0.0.1:3307
+# (open it first: node lightsail/prod.mjs tunnel, from TM), on the server its own .env. CF_ENV_FILE still overrides.
+if [[ -n "${CF_ENV_FILE:-}" ]]; then
+  set -a; source "$CF_ENV_FILE"; set +a
+else
+  eval "$(node --input-type=module -e "const { prodConfig } = await import('./scripts/lib/prodDb.mjs'); const { cfg } = prodConfig(); const q = (v) => \"'\" + String(v).replace(/'/g, \"'\\''\") + \"'\"; for (const [k, v] of Object.entries({ DB_HOST: cfg.host, DB_PORT: cfg.port, DB_USER: cfg.user, DB_PASSWORD: cfg.password, DB_NAME: cfg.database, DB_SSL: 'false' })) console.log('export ' + k + '=' + q(v));")"
+fi
 
 MYSQL="${CF_MYSQL:-/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe}"
 [[ -x "$MYSQL" ]] || { echo "No mysql client at $MYSQL — set CF_MYSQL."; exit 1; }
 mysql_run() {
   "$MYSQL" --host="$DB_HOST" --port="$DB_PORT" --user="$DB_USER" --password="$DB_PASSWORD" \
-    --ssl-mode=REQUIRED "$DB_NAME" "$@"
+    "$DB_NAME" "$@"
 }
 
 S=scripts/cf_kepl

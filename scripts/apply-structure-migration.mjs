@@ -16,6 +16,7 @@ import mysql from 'mysql2/promise';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { useProdDb } from './lib/prodDb.mjs';
 
 const APPLY = process.argv.includes('--apply');
 const __dir = path.dirname(fileURLToPath(import.meta.url));
@@ -58,24 +59,23 @@ if (!APPLY) {
 
 /**
  * `--local` runs against the dev database in multi_app_be/.env; the default is
- * TiDB. Explicit rather than inferred, because "which database am I dropping a
+ * production (AWS, scripts/lib/prodDb.mjs). Explicit rather than inferred, because "which database am I dropping a
  * column from" is not a question to answer by convention.
  */
 const LOCAL = process.argv.includes('--local');
-const envPath = LOCAL ? path.join(__dir, '..', '.env') : path.join(__dir, '..', '..', '.env.tidb');
-
 const env = {};
-fs.readFileSync(envPath, 'utf8').split('\n').forEach((l) => {
-  l = l.trim(); if (!l || l.startsWith('#')) return;
-  const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-});
+if (LOCAL) {
+  fs.readFileSync(path.join(__dir, '..', '.env'), 'utf8').split('\n').forEach((l) => {
+    l = l.trim(); if (!l || l.startsWith('#')) return;
+    const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
+  });
+}
+const prod = LOCAL ? null : await useProdDb();
 const conn = await mysql.createConnection({
-  host: env.DB_HOST, port: Number(env.DB_PORT) || (LOCAL ? 3306 : 4000), user: env.DB_USER,
-  password: env.DB_PASSWORD, database: env.DB_NAME,
-  ...(LOCAL ? {} : { ssl: { rejectUnauthorized: true } }),
+  ...(LOCAL ? { host: env.DB_HOST, port: Number(env.DB_PORT) || 3306, user: env.DB_USER, password: env.DB_PASSWORD, database: env.DB_NAME } : prod),
   multipleStatements: false,
 });
-console.log('connected:', LOCAL ? `${env.DB_HOST}/${env.DB_NAME} (local)` : env.DB_HOST, '\n');
+console.log('connected:', LOCAL ? `${env.DB_HOST}/${env.DB_NAME} (local)` : prod.label, '\n');
 
 let ok = 0;
 for (const [i, stmt] of statements.entries()) {

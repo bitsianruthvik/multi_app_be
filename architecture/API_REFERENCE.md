@@ -373,7 +373,7 @@ After login, `user.uiPermissions` is an array of feature slugs the user can acce
 Allowed origins (configured in `index.js`):
 - `http://localhost:5173`
 - `http://localhost:4000`
-- `https://multi-app-fe.vercel.app`
+- `https://app.ceofactory.vc` (production, AWS; plus `CORS_ORIGINS` from the server .env)
 - `*.trycloudflare.com`
 
 Requests must include `credentials: true` (axios: `withCredentials: true`) for cookie-based auth to work cross-origin.

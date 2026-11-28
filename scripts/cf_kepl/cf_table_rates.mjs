@@ -60,9 +60,9 @@
  * material was issued) -> write the derived inputs -> release again with the old
  * finished area and notes. A re-run changes nothing.
  *
- *   node scripts/cf_kepl/cf_table_rates.mjs [--line <id>]     # dry run (read-only transaction; TiDB stale read)
+ *   node scripts/cf_kepl/cf_table_rates.mjs [--line <id>]     # dry run (read-only transaction)
  *   node scripts/cf_kepl/cf_table_rates.mjs --commit
- *   CF_BRIDGE_COMPANY=30005 … for prod Placebo, TM/.env.tidb loaded by the caller (default company 2)
+ *   CF_BRIDGE_COMPANY=30005 … for prod Placebo, the production DB_* (AWS) exported by the caller (default company 2)
  */
 import { pathToFileURL } from 'url';
 import { pool } from '../../db.js';
@@ -719,9 +719,7 @@ async function main() {
   try {
     if (COMMIT) await conn.beginTransaction();
     else {
-      const [[{ v }]] = await conn.query('SELECT VERSION() AS v');
-      // TiDB's READ ONLY is a no-op; a stale read is genuinely read-only (it refuses writes).
-      await conn.query(/tidb/i.test(v) ? 'START TRANSACTION READ ONLY AS OF TIMESTAMP NOW() - INTERVAL 1 SECOND' : 'START TRANSACTION READ ONLY');
+      await conn.query('START TRANSACTION READ ONLY');
     }
     attachNodeCache(db);
     const out = await run(db, COMPANY, { lineId: LINE, commit: COMMIT, userId: USER });

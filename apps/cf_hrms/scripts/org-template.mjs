@@ -516,7 +516,7 @@ export async function exportWorkbook(conn, slug, target) {
     companyId: data.company.id,
     target: target.isProd ? 'prod' : 'local',
     // the host of a production database is not something to carry around in a file that gets e-mailed
-    targetName: target.isProd ? 'PRODUCTION (TiDB)' : target.name,
+    targetName: target.isProd ? 'PRODUCTION (AWS)' : target.name,
     exportedAt: new Date().toISOString(),
     contentHash: fingerprintOf(data),
     counts: {

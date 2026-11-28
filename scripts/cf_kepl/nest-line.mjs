@@ -12,7 +12,7 @@
  *   … --minutes 45            another budget than the level's (quick 5 · normal 10 · deep 20 · long 60)
  *
  * AGAINST PRODUCTION: the database is whatever DB_HOST / DB_USER / … say, exactly as for the
- * server. With the TiDB variables exported into the shell first (the values in TM/.env.tidb), the
+ * server. With the production DB_* exported into the shell first (AWS: scripts/lib/prodDb.mjs), the
  * line is read from production, nested here, and with --apply one row is written there. Nothing
  * else is touched: accepting it is done on the screen, by the server, which verifies every plate.
  *

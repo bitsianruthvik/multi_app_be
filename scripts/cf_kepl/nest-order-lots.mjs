@@ -17,14 +17,13 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { useProdDb } from '../lib/prodDb.mjs';
 
 const argv = process.argv;
 const arg = (k) => { const i = argv.indexOf(`--${k}`); return i > 0 ? argv[i + 1] : null; };
 const here = path.dirname(fileURLToPath(import.meta.url));
 if (argv.includes('--prod')) {
-  const env = {};
-  fs.readFileSync(path.join(here, '..', '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => { l = l.trim(); if (!l || l.startsWith('#')) return; const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim(); });
-  Object.assign(process.env, { DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER, DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true' });
+  await useProdDb();
 }
 const COMPANY = Number(arg('company')); const ORDER = arg('order'); const MINUTES = Number(arg('minutes') ?? 15); const WORKERS = arg('workers') ? Number(arg('workers')) : null; const APPLY = argv.includes('--apply');
 const { pool } = await import('../../db.js');

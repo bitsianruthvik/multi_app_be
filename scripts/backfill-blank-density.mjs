@@ -24,26 +24,19 @@
  * Usage:
  *   node scripts/backfill-blank-density.mjs            # local, dry run
  *   node scripts/backfill-blank-density.mjs --apply    # local, write
- *   node scripts/backfill-blank-density.mjs --prod [--apply]   # TiDB via ../.env.tidb
+ *   node scripts/backfill-blank-density.mjs --prod [--apply]   # production (AWS)
  */
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { useProdDb } from './lib/prodDb.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const APPLY = process.argv.includes('--apply');
 const PROD = process.argv.includes('--prod');
 
 if (PROD) {
-  const env = {};
-  fs.readFileSync(path.join(__dir, '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => {
-    l = l.trim(); if (!l || l.startsWith('#')) return;
-    const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-  });
-  Object.assign(process.env, {
-    DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER,
-    DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true',
-  });
+  await useProdDb();
 }
 const { pool } = await import('../db.js');
 const { resolveFields, setFields } = await import('../apps/fab_erp/services/fieldService.js');
@@ -53,7 +46,7 @@ const { DEFAULT_DENSITY } = await import('../apps/fab_erp/services/fieldDeriveSe
 
 const say = (s = '') => console.log(s);
 const would = (s) => console.log(`${APPLY ? '  ' : '  would '}${s}`);
-say(`${PROD ? 'PROD (TiDB)' : 'LOCAL'} — ${APPLY ? 'APPLYING' : 'dry run'}`);
+say(`${PROD ? 'PROD (AWS)' : 'LOCAL'} — ${APPLY ? 'APPLYING' : 'dry run'}`);
 
 const [blanks] = await pool.query(
   `SELECT id, company_id AS companyId, code, thickness_mm AS thickness, density_kg_m3 AS density

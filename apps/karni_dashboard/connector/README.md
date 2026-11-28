@@ -23,7 +23,7 @@ no change on this machine.
 
 ```powershell
 $d = "$env:USERPROFILE\karni_connector"; New-Item -ItemType Directory -Force $d | Out-Null
-curl.exe -s -o "$d\setup.ps1" https://multi-app-be-svpc.onrender.com/api/karni/karni_dashboard/connector/files/setup.ps1
+curl.exe -s -o "$d\setup.ps1" https://api.ceofactory.vc/api/karni/karni_dashboard/connector/files/setup.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File "$d\setup.ps1"
 ```
 
@@ -53,7 +53,7 @@ client; check with `Get-OdbcDriver`):
 
 ```powershell
 $d = "$env:USERPROFILE\karni_connector"
-curl.exe -s -o "$d\setup-db.ps1" https://multi-app-be-svpc.onrender.com/api/karni/karni_dashboard/connector/files/setup-db.ps1
+curl.exe -s -o "$d\setup-db.ps1" https://api.ceofactory.vc/api/karni/karni_dashboard/connector/files/setup-db.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File "$d\setup-db.ps1" -Server <hana-host>:<sql-port> -User <read-only user>
 ```
 

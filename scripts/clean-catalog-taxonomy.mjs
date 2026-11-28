@@ -34,20 +34,13 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { useProdDb } from './lib/prodDb.mjs';
 
 const APPLY = process.argv.includes('--apply');
 /** Parts keep their structure-type group unless this is passed. */
 const UNGROUP_PARTS = process.argv.includes('--ungroup-parts');
 const __dir = path.dirname(fileURLToPath(import.meta.url));
-const env = {};
-fs.readFileSync(path.join(__dir, '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => {
-  l = l.trim(); if (!l || l.startsWith('#')) return;
-  const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-});
-Object.assign(process.env, {
-  DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER,
-  DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true',
-});
+await useProdDb();
 const { pool } = await import('../db.js');
 const COMPANY = 30005;
 const STRUCTURE_TYPES = ['Composite Girder', 'BowString', 'Tub Girder', 'Openweb Girder', 'PEB'];

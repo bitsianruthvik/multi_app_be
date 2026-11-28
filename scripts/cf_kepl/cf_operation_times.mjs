@@ -81,7 +81,7 @@
  *   node scripts/cf_kepl/cf_operation_times.mjs --commit                       # rules, formulas, specs, flows (+ values on a live line)
  *   node scripts/cf_kepl/cf_operation_times.mjs --commit --locked-line-values  # + values on a locked line's items
  *   node scripts/cf_kepl/cf_operation_times.mjs --shifts                       # round-the-clock shifts only
- *   CF_BRIDGE_COMPANY=30005 … for prod Placebo, with TM/.env.tidb loaded by the caller (default company 2)
+ *   CF_BRIDGE_COMPANY=30005 … for prod Placebo, with the production DB_* (AWS) exported by the caller (default company 2)
  */
 import { pathToFileURL } from 'url';
 import { pool } from '../../db.js';
@@ -814,9 +814,7 @@ async function main() {
   try {
     if (write) await conn.beginTransaction();
     else {
-      const [[{ v }]] = await conn.query('SELECT VERSION() AS v');
-      // TiDB's READ ONLY is a no-op; a stale read is genuinely read-only (it refuses writes).
-      await conn.query(/tidb/i.test(v) ? 'START TRANSACTION READ ONLY AS OF TIMESTAMP NOW() - INTERVAL 1 SECOND' : 'START TRANSACTION READ ONLY');
+      await conn.query('START TRANSACTION READ ONLY');
     }
     attachNodeCache(db);
     const out = await run(db, COMPANY, {

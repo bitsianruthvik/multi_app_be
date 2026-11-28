@@ -88,14 +88,10 @@ const ENV_ORIGINS = (process.env.CORS_ORIGINS || "")
   .map(s => s.trim())
   .filter(Boolean);
 const ALLOWED_ORIGINS = [
-  // The production frontend. This list named `multi-app-fe.vercel.app` for a
-  // long time, which is NOT the domain in use — it is an abandoned deployment
-  // still serving a build old enough to predate fab_erp, pointed at the retired
-  // multi-app-be backend. The live app has only ever worked because the real
-  // domain arrives via CORS_ORIGINS on Render, so clearing that one env var
-  // would have failed every API call in production with nothing in the code to
-  // explain why. Naming it here is the point of a canonical list.
-  "https://multiappfe.vercel.app",
+  // The production frontend (AWS Lightsail, 2026-11-28; Vercel retired). The
+  // server's .env also sets CORS_ORIGINS, but naming it here means clearing that
+  // one env var cannot fail every API call in production.
+  "https://app.ceofactory.vc",
   "https://jewelry-shopping-dreams-learned.trycloudflare.com",
   "http://localhost:5173",
   "http://localhost:4000",

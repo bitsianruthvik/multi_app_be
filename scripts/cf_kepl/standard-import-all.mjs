@@ -13,7 +13,7 @@
  *        [--gap-fill]                      OLD SETS ONLY: the row-by-row gap fill (off by default since 2026-11-08 — the
  *                                          geometry comes from the 3D model, modelValueService.applyModel)
  *        [--out <folder>]                  default ../drawing_bom/out
- *        [--user <id>] [--prod]            as standard-import.mjs (--prod: DB_* from TM/.env.tidb)
+ *        [--user <id>] [--prod]            as standard-import.mjs (--prod: production, AWS — scripts/lib/prodDb.mjs)
  *        [--section-class BR]              as standard-import.mjs: the impact class of the section bars filled on --apply
  *
  * A set whose bom.json fails validation (schema, tree, the tree's quantities, a DXF it names that is missing) is
@@ -23,6 +23,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { useProdDb } from '../lib/prodDb.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const arg = (k) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : null; };
@@ -37,12 +38,7 @@ if (!Number.isInteger(COMPANY) || COMPANY <= 0) {
   process.exit(2);
 }
 if (process.argv.includes('--prod')) {
-  const env = {};
-  fs.readFileSync(path.join(__dir, '..', '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => {
-    l = l.trim(); if (!l || l.startsWith('#')) return;
-    const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-  });
-  Object.assign(process.env, { DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER, DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true' });
+  await useProdDb();
 }
 
 const BE = path.join(__dir, '..', '..');
@@ -84,7 +80,7 @@ try {
   if (!co) throw new Error(`No company ${COMPANY}.`);
   const userId = arg('user') ? Number(arg('user')) : ((await conn.query('SELECT id FROM users WHERE company_id = ? ORDER BY id LIMIT 1', [COMPANY]))[0][0]?.id ?? null);
   const c = { companyId: COMPANY, userId };
-  // DB_HOST, not @@hostname: TiDB Cloud answers "localhost" for that.
+  // DB_HOST, not @@hostname: it names the database this run was pointed at.
   console.log(`${APPLY ? 'APPLY' : 'DRY RUN (read-only)'} — database ${db.d} at ${process.env.DB_HOST ?? '?'}, company ${co.id} ${co.name}, ${wanted.length} sets from ${OUT}\n`);
   // THE SETUP STEP first, in its own transaction (options the standards need, labels put right). A dry run says what it would do.
   if (APPLY) await conn.beginTransaction();

@@ -18,7 +18,7 @@
  *   … --minutes 10              another budget than Standard's (10 min a line); --workers 6 fewer threads than cores − 1
  *
  * AGAINST PRODUCTION: the database is whatever DB_HOST / DB_USER / … say, exactly as for the server (the variables of
- * TM/.env.tidb exported into the shell first; without them, multi_app_be/.env — the local database). Only the host and
+ * production (AWS, see scripts/lib/prodDb.mjs) exported into the shell first; without them, multi_app_be/.env — the local database). Only the host and
  * the database name are printed, never a credential.
  *
  * IDEMPOTENT. A line whose upload already has AI's run stored (the server's own, or an earlier backfill) is not nested

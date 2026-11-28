@@ -4,7 +4,7 @@
  *   node setup-company.mjs --slug=karni-sandbox --name="Karni Sandbox" \
  *        --email=test@karni-sandbox.com --password-like=test@karni.com          DRY RUN
  *   ... --apply                                                                 writes (local)
- *   ... --apply --target=prod                                                   writes (TiDB)
+ *   ... --apply --target=prod                                                   writes (production, AWS)
  *
  *   --password-like=<email>  the new login gets THAT login's password: its bcrypt hash is copied
  *                            row to row. The password itself is never read, known or printed,

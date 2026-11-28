@@ -10,7 +10,7 @@
 # asks whether to replace the stored SAP password.
 
 param(
-  [string]$ApiBase = 'https://multi-app-be-svpc.onrender.com/api/karni/karni_dashboard',
+  [string]$ApiBase = 'https://api.ceofactory.vc/api/karni/karni_dashboard',
   [string]$SlUrl = 'https://10.0.0.10:50000/b1s/v1',
   [string]$CompanyDb = 'KPPL_LIVE',
   [string]$SapUser = 'manager'

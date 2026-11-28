@@ -15,27 +15,26 @@ import mysql from 'mysql2/promise';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { useProdDb } from './lib/prodDb.mjs';
 
 const LOCAL = process.argv.includes('--local');
 const __dir = path.dirname(fileURLToPath(import.meta.url));
-const envPath = LOCAL ? path.join(__dir, '..', '.env') : path.join(__dir, '..', '..', '.env.tidb');
-
 const env = {};
-fs.readFileSync(envPath, 'utf8').split('\n').forEach((l) => {
-  l = l.trim(); if (!l || l.startsWith('#')) return;
-  const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-});
-const conn = await mysql.createConnection({
-  host: env.DB_HOST, port: Number(env.DB_PORT) || (LOCAL ? 3306 : 4000),
-  user: env.DB_USER, password: env.DB_PASSWORD, database: env.DB_NAME,
-  ...(LOCAL ? {} : { ssl: { rejectUnauthorized: true } }),
-});
+if (LOCAL) {
+  fs.readFileSync(path.join(__dir, '..', '.env'), 'utf8').split('\n').forEach((l) => {
+    l = l.trim(); if (!l || l.startsWith('#')) return;
+    const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
+  });
+}
+const conn = await mysql.createConnection(LOCAL
+  ? { host: env.DB_HOST, port: Number(env.DB_PORT) || 3306, user: env.DB_USER, password: env.DB_PASSWORD, database: env.DB_NAME }
+  : await useProdDb());
 
 const stamp = new Date().toISOString().slice(0, 10);
 const out = path.join(__dir, '..', '..', `backup-dropped-tables-${LOCAL ? 'local' : 'prod'}-${stamp}.sql`);
 const lines = [
   `-- Tables dropped by the 2026-09-02 "structure without levels" migration.`,
-  `-- Source: ${LOCAL ? 'local' : 'TiDB production'}, taken ${new Date().toISOString()}`,
+  `-- Source: ${LOCAL ? 'local' : 'production (AWS)'}, taken ${new Date().toISOString()}`,
   '',
 ];
 

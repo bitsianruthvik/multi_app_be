@@ -5,24 +5,17 @@
  * Read-only. Each check prints OK or the offending rows.
  *
  *   node scripts/verify-cataloged.mjs          # local
- *   node scripts/verify-cataloged.mjs --prod   # TiDB
+ *   node scripts/verify-cataloged.mjs --prod   # production (AWS)
  */
 
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { useProdDb } from './lib/prodDb.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 if (process.argv.includes('--prod')) {
-  const env = {};
-  fs.readFileSync(path.join(__dir, '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => {
-    l = l.trim(); if (!l || l.startsWith('#')) return;
-    const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-  });
-  Object.assign(process.env, {
-    DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER,
-    DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true',
-  });
+  await useProdDb();
 }
 const { pool } = await import('../db.js');
 

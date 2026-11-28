@@ -9,17 +9,13 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { useProdDb } from '../lib/prodDb.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const TM = path.join(__dir, '..', '..', '..');
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
 const COMPANY = Number(arg('--company', 180005));
-const env = {};
-fs.readFileSync(path.join(TM, '.env.tidb'), 'utf8').split('\n').forEach((l) => {
-  if (!l.includes('=') || l.trim().startsWith('#')) return;
-  const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-});
-Object.assign(process.env, { DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER, DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true' });
+await useProdDb();
 const imp = (p) => import(pathToFileURL(path.join(__dir, '..', '..', p)).href);
 const { pool } = await imp('db.js');
 await imp('apps/cf_erp/services/codegenProvider.js');

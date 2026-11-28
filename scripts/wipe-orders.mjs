@@ -23,36 +23,26 @@
  *
  * DRY RUN BY DEFAULT. Pass --apply to write.
  *
- *   node scripts/wipe-orders.mjs                   # report only, TiDB
+ *   node scripts/wipe-orders.mjs                   # report only, production (AWS)
  *   node scripts/wipe-orders.mjs --apply           # do it
  *   node scripts/wipe-orders.mjs --company=30005   # one tenant only
- *   node scripts/wipe-orders.mjs --local           # local MySQL instead of TiDB
+ *   node scripts/wipe-orders.mjs --local           # local MySQL instead of production
  */
 import mysql from 'mysql2/promise';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { useProdDb } from './lib/prodDb.mjs';
 
 const APPLY = process.argv.includes('--apply');
 const LOCAL = process.argv.includes('--local');
 const COMPANY = Number((process.argv.find((a) => a.startsWith('--company=')) || '').split('=')[1]) || null;
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
-const env = {};
-if (!LOCAL) {
-  fs.readFileSync(path.join(__dir, '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => {
-    l = l.trim(); if (!l || l.startsWith('#')) return;
-    const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim();
-  });
-}
-
 const conn = LOCAL
   ? await mysql.createConnection({ host: 'localhost', port: 3306, user: 'root', password: '1234', database: 'sqldb' })
-  : await mysql.createConnection({
-    host: env.DB_HOST, port: Number(env.DB_PORT) || 4000, user: env.DB_USER,
-    password: env.DB_PASSWORD, database: env.DB_NAME, ssl: { rejectUnauthorized: true },
-  });
-console.log(`${APPLY ? 'APPLY' : 'DRY RUN'} — ${LOCAL ? 'local MySQL' : 'TiDB'} — ${COMPANY ? `company ${COMPANY}` : 'ALL companies'}\n`);
+  : await mysql.createConnection(await useProdDb());
+console.log(`${APPLY ? 'APPLY' : 'DRY RUN'} — ${LOCAL ? 'local MySQL' : 'production (AWS)'} — ${COMPANY ? `company ${COMPANY}` : 'ALL companies'}\n`);
 
 const CO = COMPANY ? ' AND company_id = ?' : '';
 const coArgs = COMPANY ? [COMPANY] : [];

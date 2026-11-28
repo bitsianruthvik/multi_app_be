@@ -26,6 +26,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { useProdDb } from '../lib/prodDb.mjs';
 
 /* ===========================================================================
  * The setup, as data
@@ -282,8 +283,7 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (!COMPANY) { console.error('Usage: --company <id> [--prod] [--apply]'); process.exit(2); }
   const here = path.dirname(fileURLToPath(import.meta.url));
   if (argv.includes('--prod')) {
-    const env = {}; fs.readFileSync(path.join(here, '..', '..', '..', '.env.tidb'), 'utf8').split('\n').forEach((l) => { l = l.trim(); if (!l || l.startsWith('#')) return; const [k, ...r] = l.split('='); env[k.trim()] = r.join('=').trim(); });
-    Object.assign(process.env, { DB_HOST: env.DB_HOST, DB_PORT: env.DB_PORT ?? '4000', DB_USER: env.DB_USER, DB_PASSWORD: env.DB_PASSWORD, DB_NAME: env.DB_NAME, DB_SSL: 'true' });
+    await useProdDb();
   }
   const { pool } = await import(pathToFileURL(path.join(here, '..', '..', 'db.js')).href);
   await import(pathToFileURL(path.join(here, '..', '..', 'apps', 'cf_erp', 'services', 'codegenProvider.js')).href);

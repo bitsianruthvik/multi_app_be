@@ -7,11 +7,11 @@
  * replaced: every field value in the system is resolved through it, and a
  * chain that differs by one rung silently changes which value wins.
  *
- * ALREADY LOCAL-ONLY (`../../db.js`, not `.env.tidb`) — despite living in
- * `scripts/kepl/`, this file has no TiDB-loading code anywhere in it, verified
+ * ALREADY LOCAL-ONLY (`../../db.js`, never `--prod`) — despite living in
+ * `scripts/kepl/`, this file has no production-loading code anywhere in it, verified
  * by grep. `--local` is required anyway, as a deliberate safety rail matching
  * the rest of this directory rather than because this particular file needs
- * it: a script that starts safe and later gains a `.env.tidb` import (as its
+ * it: a script that starts safe and later gains a `--prod` / prodDb.mjs import (as its
  * neighbours in this folder do) should not silently start running against
  * production the day that happens.
  */
@@ -20,7 +20,7 @@ import { chainFor, chainsFor } from '../../apps/fab_erp/services/fieldLadder.js'
 
 const args = process.argv.slice(2);
 if (!args.includes('--local')) {
-  console.error('Refusing to run without --local. See EU_BRIEF_COMMON.md: never touch .env.tidb / production from this script.');
+  console.error('Refusing to run without --local. See EU_BRIEF_COMMON.md: never touch production from this script.');
   process.exit(1);
 }
 // Default to the local fixture company (6, "placebo") — company 30005 (KEPL)

@@ -3,7 +3,7 @@
  *
  *   node restore-company.mjs --file=backup_karni_prod_....json             DRY RUN
  *   node restore-company.mjs --file=... --apply                            write (local)
- *   node restore-company.mjs --file=... --apply --target=prod              write (TiDB)
+ *   node restore-company.mjs --file=... --apply --target=prod              write (production, AWS)
  *   node restore-company.mjs --file=... --apply --schema=scratch_restore   somewhere else
  *
  * Dry run is the default. `--apply` is the opt-in and production needs

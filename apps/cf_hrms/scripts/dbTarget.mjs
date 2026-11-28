@@ -3,7 +3,9 @@
  * for by name, out loud, on the command line.
  *
  *   node <script>.mjs                 -> localhost/sqldb
- *   node <script>.mjs --target=prod   -> TiDB, credentials from TM/.env.tidb
+ *   node <script>.mjs --target=prod   -> production = the AWS MySQL (multi_app_be/scripts/lib/prodDb.mjs): on the
+ *                                        laptop the ssh tunnel 127.0.0.1:3307 (open it first: node lightsail/prod.mjs
+ *                                        tunnel), on the server its own .env
  *   node <script>.mjs --target=server -> this machine's backend database (multi_app_be/.env), e.g.
  *                                        run on the AWS Lightsail server over ssh
  *
@@ -14,6 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { prodConfig } from '../../../scripts/lib/prodDb.mjs';
 
 const TM_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
 
@@ -47,25 +50,8 @@ export function resolveTarget(argv = process.argv) {
     };
   }
 
-  const envPath = path.join(TM_ROOT, '.env.tidb');
-  if (!fs.existsSync(envPath)) throw new Error(`--target=prod but no .env.tidb at ${envPath}`);
-  const env = {};
-  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
-    const m = /^\s*([A-Z_]+)\s*=\s*(.*)\s*$/.exec(line);
-    if (m) env[m[1]] = m[2].replace(/^["']|["']$/g, '');
-  }
-  const missing = ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'].filter((k) => !env[k]);
-  if (missing.length) throw new Error(`.env.tidb is missing ${missing.join(', ')}`);
-
-  return {
-    name: `PRODUCTION TiDB (${env.DB_NAME} @ ${env.DB_HOST.split('.')[0]}…)`,
-    isProd: true,
-    cfg: {
-      host: env.DB_HOST, port: Number(env.DB_PORT), user: env.DB_USER,
-      password: env.DB_PASSWORD, database: env.DB_NAME,
-      ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: true },
-    },
-  };
+  const { cfg, label } = prodConfig();
+  return { name: label, isProd: true, cfg };
 }
 
 /** Say out loud which database is about to be written to. */

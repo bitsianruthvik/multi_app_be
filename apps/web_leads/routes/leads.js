@@ -2,7 +2,7 @@
  * POST /api/public/website/leads — the website's server code hands over one form submission.
  *
  * Only the website may call it: the request must carry X-Website-Key equal to WEB_LEADS_KEY (set on
- * both the backend and the website's Vercel project; never sent to a browser). The lead is saved,
+ * both the backend and the website (TM/ceofactory_site, on the AWS server); never sent to a browser). The lead is saved,
  * the response goes back at once, and sending to the destinations happens after (lib/deliver.js).
  * Posting the same event_id twice returns the first lead (the website may retry).
  *

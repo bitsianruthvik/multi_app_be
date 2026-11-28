@@ -90,7 +90,7 @@ async function deliver(companyId, settings, kind, area, items) {
   else if (!emailConfigured()) status = 'not_configured';
   else {
     try {
-      const base = (process.env.FRONTEND_URL || 'https://multiappfe.vercel.app').replace(/\/+$/, '');
+      const base = (process.env.FRONTEND_URL || 'https://app.ceofactory.vc').replace(/\/+$/, '');
       const link = `${base}/${await companySlug(companyId)}/karni_dashboard/attention`;
       const html = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#1A1C2E">
         <h2 style="font-size:17px">${esc(title)}</h2><ul>${items.map((i) => `<li style="margin:6px 0"><b>${esc(i.name)}</b>: ${esc(i.label)}${i.reason ? ` <span style="color:#8A8EA8">(${esc(i.reason)})</span>` : ''}</li>`).join('')}</ul>
