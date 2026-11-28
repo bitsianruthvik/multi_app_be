@@ -566,6 +566,16 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
     // ---- marks and groups over the laid-out tree ----------------------------
     const kids = nodes.map(() => []);
     for (const n of nodes) if (n.parentK != null) kids[n.parentK].push(n.k);
+    // A piece's weight when its item has none (a span imported without a rolled-up WEIGHT, 2026-11-28): the sum of its children's,
+    // each taken at the first level down that has a weight — never counted twice. n.quantity is the node's count on the line.
+    const deepW = new Array(nodes.length);
+    const deepWeight = (k) => {
+      if (deepW[k] !== undefined) return deepW[k];
+      const n = nodes[k]; const w = weightOf(n.itemId); let v = null;
+      if (w != null) v = w * Number(n.quantity);
+      else for (const ck of kids[k]) { const x = deepWeight(ck); if (x != null) v = (v ?? 0) + x; }
+      deepW[k] = v; return v;
+    };
     // A row the planner was told to plan "its parts separately" (cf_plan_splits,
     // §47) is no mark of its own; its made children are marks instead — for this
     // line only. The template's Ships-as-one-unit stays everyone else's default.
@@ -730,7 +740,9 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
     const doneOf = (a) => released && a.steps > 0 && a.doneSteps === a.steps;
 
     // The line unit.
-    const lineWeight = weightOf(line.item_id);
+    const lineOwnW = weightOf(line.item_id);
+    const rootsW = nodes.filter((n) => n.parentK == null).map((n) => deepWeight(n.k)).filter((x) => x != null);
+    const lineWeight = lineOwnW ?? (rootsW.length ? rootsW.reduce((t, x) => t + x, 0) / Math.max(1, Number(line.quantity)) : null);
     const lineDone = Number(line.made_qty ?? 0) >= Number(line.quantity) - 1e-9 || doneOf(lineAgg);
     unitShares.set(lineKey, shapeMaterials(lineAgg.materials));
     units.push({
@@ -810,7 +822,7 @@ async function buildSnapshot(db, companyId, q = {}, { overrides = null, rankOver
             depth: n.depth, parentKey: n.parentK == null ? lineKey : `p${nodes[n.parentK].lockedPieceId}`,
             groupKey: groupOf(n.k), isMark: isMark[n.k], marks: N > 1 ? 1 : marksBelow[n.k],
             quantity: Number(n.quantity) / N, itemId: n.itemId,
-            tonnes: w == null ? 0 : r3((w * Number(n.quantity) * weightToTonnes) / N), noWeight: w == null,
+            tonnes: w != null ? r3((w * Number(n.quantity) * weightToTonnes) / N) : (deepWeight(n.k) != null ? r3((deepWeight(n.k) * weightToTonnes) / N) : 0), noWeight: w == null && deepWeight(n.k) == null,
             work: N > 1 ? scaleW(a.work) : shapeWork(a.work), noRate: a.noRate.size, done: doneOf(a), progress: progressOf(a),
             materials: released ? [] : mats, committedDate,
             // Splitting changes something only on a mark with parts below it (they become the marks).

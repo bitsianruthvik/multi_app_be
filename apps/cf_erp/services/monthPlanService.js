@@ -185,6 +185,8 @@ function reloadFacts(key, companyId, opts) {
 async function loadFactsNow(db, companyId, { month, from = null } = {}) {
   const { first, last } = monthBounds(month);
   const { today } = await plantToday(db, companyId);
+  // Days assumed for material with no date: a company setting (default ASSUMED_DAYS).
+  const assumedDays = Number((await import('./settingsService.js').then((m) => m.getSettings(db, companyId)).catch(() => ({})))?.plan_assumed_material_days ?? ASSUMED_DAYS);
   const start = from ?? (today > first ? (today > last ? last : today) : first);
   const horizonEnd = addDays(last, SPILL_DAYS);
   const days = daysBetween(start, horizonEnd) + 1;
@@ -222,7 +224,7 @@ async function loadFactsNow(db, companyId, { month, from = null } = {}) {
       let earliest = 0; let materialDate = null; let materialAssumed = false;
       if (mat && mat.state !== 'ready') {
         if (mat.readyDate) materialDate = String(mat.readyDate).slice(0, 10);
-        else { materialDate = addDays(start, ASSUMED_DAYS); materialAssumed = true; assumed += 1; }
+        else { materialDate = addDays(start, assumedDays); materialAssumed = true; assumed += 1; }
         earliest = Math.max(0, daysBetween(start, materialDate));
       }
       units.push({

@@ -237,6 +237,8 @@ const addTo = (map, key, q) => { const b = map.get(key) ?? bucket(); b.q = round
  *   item names are read only when a need does not already carry them. Same rows, same supply.
  */
 export async function loadSupply(db, companyId, itemIds, { needs = new Map(), todayText = today(), lean = false, prLines: prGiven = null } = {}) {
+  // Company setting: requested / draft purchase orders count as dated on their expected date (planning ahead of ordering).
+  const askedDated = !!(await import('./settingsService.js').then((m) => m.getSettings(db, companyId)).catch(() => ({})))?.plan_asked_po_dated;
   const supply = {
     today: todayText,
     issued: new Map(), reserved: new Map(), heldLine: new Map(), heldOrder: new Map(),
@@ -335,7 +337,7 @@ export async function loadSupply(db, companyId, itemIds, { needs = new Map(), to
 
   const describe = (l) => {
     const due = dateOnly(l.due);
-    const dated = DATED_PO_STATUSES.includes(l.status);
+    const dated = DATED_PO_STATUSES.includes(l.status) || (askedDated && ASKED_PO_STATUSES.includes(l.status) && !!due);
     return {
       status: !dated ? 'asked' : due ? 'dated' : 'undated', date: dated ? due : null,
       late: dated && !!due && due < todayText, poId: l.po_id, poCode: l.code ?? `PO-${l.po_id}`, poLineId: l.id, poStatus: l.status,

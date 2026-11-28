@@ -173,6 +173,8 @@ export const SETTINGS = [
   // --- production stages (init.sql §121)
   { key: 'subcontractor_code_prefix', group: 'parties', label: 'Sub-contractor code series', type: 'text', def: 'SC-', help: 'A sub-contractor saved without a code gets the next number of this series, three digits: SC-001, SC-002 … A vendor code from accounts can still be typed instead.' },
   I('rollout_max_pieces', 'production', 'Most pieces a line rolls out into', 10000, 1000, 200000, 'pieces', 'A line whose pieces (every span, part and cut piece) come to more than this is refused at lock, so a mistake cannot make a huge plan. Raise it for long multi-span lines (SLR 36 m × 6 spans, 2026-11-28).'),
+  { key: 'plan_asked_po_dated', group: 'production', label: 'Plan with requested purchase order dates', type: 'bool', def: false, help: 'On: a purchase order that is requested or a draft (not ordered yet) counts in planning as arriving on its expected date. Off: only ordered purchase orders give material a date (user, 2026-11-28: "RM shows as if it is available from Dec 1").' },
+  I('plan_assumed_material_days', 'production', 'Material with no date: assume ready after', 14, 0, 90, 'days', 'The month plan starts a unit whose material has no date this many days after the first day of the plan, and says so.'),
   { key: 'production_stages', group: 'production', label: 'Stages, in order', type: 'stages', def: DEFAULT_STAGES, help: 'One line per stage: its name, a colon, then its operation codes. An operation in no stage counts with the step before it in its flow. Codes this company does not use are ignored.' },
 ];
 const BY_KEY = new Map(SETTINGS.map((s) => [s.key, s]));
