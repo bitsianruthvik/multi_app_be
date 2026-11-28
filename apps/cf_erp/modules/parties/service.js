@@ -335,7 +335,19 @@ export async function getParty(db, companyId, id) {
   return shape(await requireParty(db, companyId, id));
 }
 
+/** The next code of the sub-contractor series: the company's prefix (Setup › Settings) and one more than the highest number used. */
+export async function nextSubcontractorCode(db, companyId) {
+  const { getSettings } = await import('../../services/settingsService.js');
+  const prefix = (await getSettings(db, companyId)).subcontractor_code_prefix || 'SC-';
+  const [rows] = await db.query('SELECT code FROM cf_parties WHERE company_id = ? AND LEFT(code, ?) = ? AND deleted_at IS NULL', [companyId, prefix.length, prefix]);
+  const top = rows.reduce((m, r) => { const tail = String(r.code).slice(prefix.length); return /^\d+$/.test(tail) ? Math.max(m, Number(tail)) : m; }, 0);
+  return `${prefix}${String(top + 1).padStart(3, '0')}`;
+}
+
 export async function createParty(db, c, input = {}) {
+  // A sub-contractor saved without a code takes the next number of the company's series ("Sub-contractor code series",
+  // default SC-): SC-001, SC-002 … — user, 2026-11-28: "follow some contractor code formula".
+  if (blank(input.code) && Array.isArray(input.roles) && input.roles.includes('subcontractor')) input = { ...input, code: await nextSubcontractorCode(db, c.companyId) };
   const body = readBody(input);
   const cols = Object.keys(body);
   const [r] = await db.query(

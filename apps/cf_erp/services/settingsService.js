@@ -24,6 +24,7 @@ export const GROUPS = [
   { key: 'alerts', label: 'Alerts: when one is raised', help: 'How late something is before its own department hears of it.' },
   { key: 'md', label: 'Alerts: when it reaches the MD', help: 'How much later the same thing is put in front of the MD.' },
   { key: 'reports', label: 'MD dashboard and weekly reports', help: 'Which reports are made each week for the MD to verify, and who decides when the MD is away.' },
+  { key: 'parties', label: 'Parties: codes', help: 'How a new party is coded when it is saved without one.' },
   { key: 'production', label: 'Production: stages', help: 'The stages an order moves through on the floor, in order. "Set opening position" on the Tracker marks a released line done up to one of them.' },
 ];
 
@@ -170,6 +171,7 @@ export const SETTINGS = [
   { key: 'md_standin_on', group: 'reports', label: 'The stand-in decides now', type: 'bool', def: false, help: 'Switch on when the MD is away, off when back.' },
 
   // --- production stages (init.sql §121)
+  { key: 'subcontractor_code_prefix', group: 'parties', label: 'Sub-contractor code series', type: 'text', def: 'SC-', help: 'A sub-contractor saved without a code gets the next number of this series, three digits: SC-001, SC-002 … A vendor code from accounts can still be typed instead.' },
   { key: 'production_stages', group: 'production', label: 'Stages, in order', type: 'stages', def: DEFAULT_STAGES, help: 'One line per stage: its name, a colon, then its operation codes. An operation in no stage counts with the step before it in its flow. Codes this company does not use are ignored.' },
 ];
 const BY_KEY = new Map(SETTINGS.map((s) => [s.key, s]));
@@ -244,6 +246,12 @@ function check(def, v, problems, ctx) {
       return n;
     }
     case 'bool': return v === true || v === 1 || v === '1' || v === 'true';
+    case 'text': {
+      if (empty) return def.def;
+      const t = String(v).trim();
+      if (t.length > 20 || !/^[A-Za-z0-9][A-Za-z0-9_./-]*$/.test(t)) { problems.push(`${def.label}: up to 20 letters, digits and - _ . /, no spaces.`); return undefined; }
+      return t;
+    }
     case 'time': {
       if (empty) return def.def;
       const m = /^(\d{1,2}):(\d{2})$/.exec(String(v).trim());
