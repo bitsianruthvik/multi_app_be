@@ -355,6 +355,8 @@ async function cutPlatesAmong(db, companyId, everyNode) {
  */
 export async function rollOutPlan(db, companyId, line, { lockedBoth = null, frozenFlows = undefined, ensure = null } = {}) {
   const problems = [];
+  // The most pieces a line may roll out into: a company setting ("Most pieces a line rolls out into", default MAX_NODES).
+  const maxNodes = Number((await import('./settingsService.js').then((m) => m.getSettings(db, companyId)).catch(() => ({})))?.rollout_max_pieces) || MAX_NODES;
   const qty = Number(line.quantity);
   const tree = await explode(db, companyId, line.item_id, { rootQuantity: qty, maxDepth: MAX_DEPTH });
   if (ensure && line.locked_at) freezeTree(tree.root, (await ensureLineFlowCopies(db, ensure, line.id, { tree: tree.root })).flows);
@@ -506,7 +508,7 @@ export function layOutPieces(root, { quantity, lineRanges = new Map(), sourceDef
     }
   };
   const expand = (design, parentK, depth, count) => {
-    if (nodes.length > MAX_NODES) return;
+    if (nodes.length > maxNodes) return;
     if (madeKids(design).length) {
       if (!whole(count)) { problems.push(`${nameOf(design)} is made piece by piece, so it needs a whole number — ${fmt(count)} were asked for.`); return; }
       for (let i = 0; i < Math.round(count); i++) {
@@ -520,9 +522,9 @@ export function layOutPieces(root, { quantity, lineRanges = new Map(), sourceDef
   else if (rootAsMaterial) reqs.push({ nodeK: null, itemId: root.id, bomLineId: null, quantity: round6(qty), design: root });
   // Hitting the cap stops `expand` mid-tree, so everything past it was never
   // walked and its material never asked for — not a smaller answer, a WRONG one.
-  const truncated = nodes.length > MAX_NODES;
+  const truncated = nodes.length > maxNodes;
   if (truncated) {
-    problems.push(`The line would roll out into more than ${MAX_NODES} pieces — split it into smaller lines.`);
+    problems.push(`The line would roll out into more than ${maxNodes} pieces — split it into smaller lines, or raise "Most pieces a line rolls out into" in Setup › Settings.`);
     problems.push('Because of that, the piece and material figures below are incomplete — the rest of the structure was never worked out. Do not order from them.');
   }
   return { nodes, reqs, problems, truncated };

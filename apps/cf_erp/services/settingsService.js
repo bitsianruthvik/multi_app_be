@@ -172,6 +172,7 @@ export const SETTINGS = [
 
   // --- production stages (init.sql §121)
   { key: 'subcontractor_code_prefix', group: 'parties', label: 'Sub-contractor code series', type: 'text', def: 'SC-', help: 'A sub-contractor saved without a code gets the next number of this series, three digits: SC-001, SC-002 … A vendor code from accounts can still be typed instead.' },
+  I('rollout_max_pieces', 'production', 'Most pieces a line rolls out into', 10000, 1000, 200000, 'pieces', 'A line whose pieces (every span, part and cut piece) come to more than this is refused at lock, so a mistake cannot make a huge plan. Raise it for long multi-span lines (SLR 36 m × 6 spans, 2026-11-28).'),
   { key: 'production_stages', group: 'production', label: 'Stages, in order', type: 'stages', def: DEFAULT_STAGES, help: 'One line per stage: its name, a colon, then its operation codes. An operation in no stage counts with the step before it in its flow. Codes this company does not use are ignored.' },
 ];
 const BY_KEY = new Map(SETTINGS.map((s) => [s.key, s]));
