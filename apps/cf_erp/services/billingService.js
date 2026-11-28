@@ -117,17 +117,18 @@ export async function billingFacts(db, companyId, q = {}) {
       `SELECT l.id, l.order_id, l.line_no, l.item_id, l.quantity, l.delivered_qty, l.locked_at
          FROM cf_sales_order_lines l WHERE l.company_id = ? AND l.order_id IN (?) AND l.deleted_at IS NULL ORDER BY l.order_id, l.line_no, l.id`,
       [companyId, ids]),
-    // §121: a step done by an OPENING POSITION (work before the system) is no milestone — it counts as not done and
-    // never as a start; it stays in the totals, so what is billed from here is the work done from here.
+    // §121: a step done by an OPENING POSITION (work before the system) is no milestone and never a start; its rows
+    // come flagged `opening` and orderProgress leaves them out of the totals (see there).
     queryOpening(db, (has) => {
       const done = has ? "(s.state = 'done' AND s.opening = 0)" : "(s.state = 'done')";
       return `SELECT r.order_id, r.order_line_id, s.operation_id, pi.item_id, ${done} AS done, IF(${done}, DATE(s.finished_at), NULL) AS finished_on,
+              ${has ? 's.opening' : '0'} AS opening,
               SUM(s.quantity) AS quantity, MIN(${has ? 'IF(s.opening = 1, NULL, s.started_at)' : 's.started_at'}) AS first_start
          FROM cf_production_steps s
          JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.deleted_at IS NULL
          JOIN cf_production_releases r ON r.id = pi.release_id AND r.deleted_at IS NULL
         WHERE s.company_id = ? AND r.order_id IN (?) AND s.deleted_at IS NULL
-        GROUP BY r.order_id, r.order_line_id, s.operation_id, pi.item_id, ${done}, IF(${done}, DATE(s.finished_at), NULL)`;
+        GROUP BY r.order_id, r.order_line_id, s.operation_id, pi.item_id, ${done}, IF(${done}, DATE(s.finished_at), NULL)${has ? ', s.opening' : ''}`;
     }, [companyId, ids]),
     db.query(
       `SELECT v.id, v.code, v.order_id, v.movement_date, v.order_line_id, -SUM(k.quantity) AS quantity
@@ -197,7 +198,7 @@ export async function billingFacts(db, companyId, q = {}) {
       estimate: parseJson(o.estimate_json) ?? {},
       lines: myLines,
       steps: steps.filter((s) => Number(s.order_id) === o.id).map((s) => ({
-        lineId: Number(s.order_line_id), opId: Number(s.operation_id), itemId: Number(s.item_id), done: !!Number(s.done), finishedOn: dateText(s.finished_on),
+        lineId: Number(s.order_line_id), opId: Number(s.operation_id), itemId: Number(s.item_id), done: !!Number(s.done), finishedOn: dateText(s.finished_on), opening: !!Number(s.opening ?? 0),
         quantity: Number(s.quantity), kgEach: measures.get(Number(s.item_id))?.weightKg ?? null, firstStart: dateText(s.first_start),
       })),
       shipments: ships.filter((s) => Number(s.order_id) === o.id).map((s) => ({ id: Number(s.id), code: s.code, date: dateText(s.movement_date), lineId: Number(s.order_line_id), quantity: Number(s.quantity) })),
@@ -297,18 +298,30 @@ export function orderProgress(F) {
     return { ...s, frac, tonnes: l?.kgEach == null ? null : round3((l.kgEach * s.quantity) / 1000) };
   });
   // Operations: per line, the done weight of the operation's steps over all of them, times the line's share.
+  // §121 (review 2026-11-28): steps of an OPENING POSITION (work before the system) are left out of the totals
+  // altogether — the operation is complete when all its REAL steps are done (completeOn = the last of them), and the
+  // lines' shares are spread over the lines that have real steps of it (as much in all as the lines that have the
+  // operation at all carried before — nothing changes for an order with no opening steps). An operation whose steps are ALL opening is
+  // complete with no date ({ openingOnly: true }): it was done before the system, so this system never bills it (its
+  // card, and a days_after / retention chained on it, never falls due here).
   const ops = new Map();
   const opIds = [...new Set(F.steps.map((s) => s.opId))];
   for (const opId of opIds) {
-    const mine = F.steps.filter((s) => s.opId === opId);
+    const mine = F.steps.filter((s) => s.opId === opId && !s.opening);
+    if (!mine.length) { ops.set(opId, { steps: [], done: 1, completeOn: null, openingOnly: true }); continue; }
+    const lineIds = [...new Set(mine.map((s) => s.lineId))];
+    const sumOf = (ids) => ids.reduce((t, id) => t + (shares.get(id) ?? 0), 0);
+    const realSum = sumOf(lineIds);
+    const allSum = sumOf([...new Set(F.steps.filter((s) => s.opId === opId).map((s) => s.lineId))]);
+    const shareOf = (id) => (realSum > EPS ? (shares.get(id) ?? 0) * (allSum / realSum) : 0);
     const inc = [];
-    for (const lineId of new Set(mine.map((s) => s.lineId))) {
+    for (const lineId of lineIds) {
       const rows = mine.filter((s) => s.lineId === lineId);
       const useKg = rows.every((s) => s.kgEach != null && s.kgEach > 0);
       const w = (s) => s.quantity * (useKg ? s.kgEach : 1);
       const total = rows.reduce((t, s) => t + w(s), 0);
       if (total <= EPS) continue;
-      for (const s of rows.filter((x) => x.done && x.finishedOn)) inc.push({ date: s.finishedOn, frac: (shares.get(lineId) ?? 0) * (w(s) / total) });
+      for (const s of rows.filter((x) => x.done && x.finishedOn)) inc.push({ date: s.finishedOn, frac: shareOf(lineId) * (w(s) / total) });
     }
     ops.set(opId, progressFrom(inc));
   }

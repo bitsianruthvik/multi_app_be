@@ -236,12 +236,15 @@ async function storesWeek(db, companyId, from, to) {
 
 async function planWeek(db, companyId, from, to) {
   const q = (sql, p) => db.query(sql, p).then(([x]) => x);
+  // §121: a step done by an opening position (work before the system) is neither planned work done nor on time.
+  const qo = (make, p) => queryOpening(db, make, p).then(([x]) => x);
+  const op = (has) => (has ? ' AND s.opening = 0' : '');
   const [tot, byOrder, late, al] = await Promise.all([
-    q(`SELECT COUNT(*) AS planned, SUM(s.state = 'done') AS done, SUM(s.state = 'done' AND s.finished_at <= p.planned_end) AS on_time
-         FROM cf_plan3_steps p JOIN cf_production_steps s ON s.id = p.step_id AND s.deleted_at IS NULL
+    qo((has) => `SELECT COUNT(*) AS planned, SUM(s.state = 'done') AS done, SUM(s.state = 'done' AND s.finished_at <= p.planned_end) AS on_time
+         FROM cf_plan3_steps p JOIN cf_production_steps s ON s.id = p.step_id AND s.deleted_at IS NULL${op(has)}
         WHERE p.company_id = ? AND DATE(p.planned_end) BETWEEN ? AND ?`, [companyId, from, to]),
-    q(`SELECT so.code, COUNT(*) AS planned, SUM(s.state = 'done') AS done
-         FROM cf_plan3_steps p JOIN cf_production_steps s ON s.id = p.step_id AND s.deleted_at IS NULL
+    qo((has) => `SELECT so.code, COUNT(*) AS planned, SUM(s.state = 'done') AS done
+         FROM cf_plan3_steps p JOIN cf_production_steps s ON s.id = p.step_id AND s.deleted_at IS NULL${op(has)}
          JOIN cf_production_items pi ON pi.id = s.production_item_id JOIN cf_production_releases r ON r.id = pi.release_id JOIN cf_sales_orders so ON so.id = r.order_id
         WHERE p.company_id = ? AND DATE(p.planned_end) BETWEEN ? AND ?
         GROUP BY so.id, so.code HAVING planned > done ORDER BY planned - done DESC LIMIT 15`, [companyId, from, to]),

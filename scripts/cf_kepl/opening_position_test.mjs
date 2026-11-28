@@ -68,6 +68,24 @@ console.log('\n0. The stage rule');
   ok('a line without a colon is refused, in words', /Name: CODE/.test(SET.parseStages('Cut CNCP-CUT').problems?.[0] ?? ''));
   ok('the default stages are the six asked for', SET.DEFAULT_STAGES.map((s) => s.name).join('|') === 'Cut|Fit-up & weld|Drill|Trial assembly|Blast & paint|Dispatched');
   ok('an as-of day still to come is refused', (await refusal(() => OPEN.asOfOf('2999-01-01')))?.code === 'IN_FUTURE');
+
+  // Billing over opening steps (review 2026-11-28): left out of the totals, so an operation completes on its real work.
+  const line = (id) => ({ id, lineNo: id, itemId: 1, quantity: 1, delivered: 0, kgEach: 1000, tonnes: 1, lockedOn: '2026-10-01' });
+  const st = (lineId, opId, { done = false, on = null, opening = false, q = 1 } = {}) => ({ lineId, opId, itemId: 1, done, finishedOn: on, quantity: q, kgEach: 1000, firstStart: null, opening });
+  const F = {
+    lines: [line(1), line(2)], events: [], acceptance: { decidedOn: '2026-10-01' }, shipments: [], stages: [], customerMaterial: null,
+    steps: [
+      st(1, 7, { opening: true, q: 3 }), st(2, 7, { done: true, on: '2026-11-20' }),            // op 7: line 1 opening, line 2 real and done
+      st(1, 8, { opening: true }), st(2, 8, { opening: true }),                                // op 8: all opening
+      st(1, 9, { opening: true }), st(1, 9, { done: true, on: '2026-11-21' }), st(1, 9), st(2, 9), // op 9: real steps half done
+    ],
+  };
+  const P = BILL.orderProgress(F);
+  ok('billing: an operation is complete when all its REAL steps are done — on the day of the last one', P.ops.get(7).done > 0.999 && P.ops.get(7).completeOn === '2026-11-20', JSON.stringify(P.ops.get(7)));
+  ok('billing: an operation whose steps are all opening is complete with no date (never billed here)', P.ops.get(8).openingOnly === true && P.ops.get(8).completeOn == null);
+  ok('billing: opening steps are not in the totals (pro-rata share of the real work only)', Math.abs(P.ops.get(9).done - 0.25) < 1e-6 && P.ops.get(9).completeOn == null, JSON.stringify(P.ops.get(9)));
+  const noOpening = BILL.orderProgress({ ...F, steps: [st(1, 5, { done: true, on: '2026-11-01' }), st(2, 5)] });
+  ok('billing: an order with no opening steps is billed as before', Math.abs(noOpening.ops.get(5).done - 0.5) < 1e-6);
 }
 
 const conn = await pool.getConnection();
@@ -148,15 +166,20 @@ try {
   };
   const stageOf = new Map();
   SET.parseStages(stagesText).stages.forEach((s, i) => { for (const code of s.ops) stageOf.set(code, i); });
-  /** What stage x should leave done, per the rule, piece by piece. */
+  const [treeItems] = await conn.query('SELECT id, parent_id FROM cf_production_items WHERE company_id = ? AND release_id = ? AND deleted_at IS NULL', [COMPANY, releaseId]);
+  const parentOf = new Map(treeItems.map((i) => [i.id, i.parent_id]));
+  const ancestors = (id) => { const out = []; let p = parentOf.get(id); while (p != null) { out.push(p); p = parentOf.get(p); } return out; };
+  /** What stage x should leave done, worked out here independently: each piece by its own flow, and a piece under any
+   *  piece (in scope) with an opening step is done through its whole flow. */
   const expected = (rows, x, inScope = () => true) => {
     const want = new Set();
     const byItem = new Map();
     for (const s of rows) { if (!byItem.has(s.production_item_id)) byItem.set(s.production_item_id, []); byItem.get(s.production_item_id).push(s); }
+    const ownCut = new Map([...byItem].map(([id, own]) => [id, x < 0 ? 0 : OPEN.cutOf(OPEN.stagesOfSteps(own, stageOf), x)]));
     for (const [itemId, own] of byItem) {
       if (!inScope(itemId)) continue;
-      const cut = OPEN.cutOf(OPEN.stagesOfSteps(own, stageOf), x);
-      own.slice(0, cut).forEach((s) => want.add(s.id));
+      const assembled = ancestors(itemId).some((a) => inScope(a) && (ownCut.get(a) ?? 0) > 0);
+      own.slice(0, assembled ? own.length : ownCut.get(itemId)).forEach((s) => want.add(s.id));
     }
     return want;
   };
@@ -170,6 +193,20 @@ try {
   ok('it says what it would mark, per stage and per row', dry.dryRun === true && dry.counts.mark === want2.size && dry.byStage.length > 0 && dry.rows.length > 0, JSON.stringify(dry.counts));
   ok('…in a sentence naming the rows', /^Would mark \d+ steps? done on /.test(dry.message), dry.message);
   ok('…and changes nothing', rows0.every((s) => s.state === 'pending' && Number(s.opening) === 0));
+  {
+    // Pieces cut from one nested plate: ticking one without the others is said in the preview (review item 4).
+    const [nest] = await conn.query(
+      `SELECT a.production_item_id AS a, b.production_item_id AS b FROM cf_step_dependencies d
+         JOIN cf_production_steps a ON a.id = d.step_id JOIN cf_production_steps b ON b.id = d.target_step_id
+         JOIN cf_production_items pa ON pa.id = a.production_item_id
+        WHERE d.company_id = ? AND d.origin = 'nest' AND d.deleted_at IS NULL AND pa.release_id = ? AND a.production_item_id <> b.production_item_id LIMIT 1`, [COMPANY, releaseId]);
+    if (nest.length) {
+      const w = await OPEN.setOpeningPosition(conn, c, LINE, { stage: 1, pieceIds: [nest[0].a], dryRun: true });
+      ok('ticking a piece cut from a nested plate without the others warns, naming them', w.warnings.length === 1 && /same nested plate/.test(w.warnings[0]), JSON.stringify(w.warnings));
+      console.log(`    ${w.warnings[0] ?? ''}`);
+    } else console.log('    (the line has no nest waits — the nest warning is not exercised)');
+    ok('the whole line warns of nothing', dry.warnings.length === 0);
+  }
   console.log(`    ${dry.message}`);
 
   // --- 3. apply ------------------------------------------------------------------------------------------------
@@ -182,7 +219,16 @@ try {
   ok('exactly the steps the rule names are done', marked.length === want2.size && marked.every((s) => want2.has(s.id)), `${marked.length} vs ${want2.size}`);
   ok('…each with its whole quantity good, flagged opening', marked.every((s) => Number(s.opening) === 1 && Math.abs(Number(s.qty_good) - Number(s.quantity)) < 1e-6 && s.finished_at != null));
   ok('steps after the stage are left as they were', rows1.filter((s) => !want2.has(s.id)).every((s) => s.state === 'pending' && Number(s.opening) === 0));
-  ok('a piece with drilling after its welding is done through its welding only', rows1.some((s) => s.op_code === 'DRILL' && s.state === 'pending'));
+  ok('a piece not inside an assembled one is done through its welding only (its later steps wait)', rows1.some((s) => s.state === 'pending' && ['DRILL', 'BLAST', 'PAINT', 'FQC'].includes(s.op_code)));
+  // Review 2026-11-28: under a piece whose first (joining) step is opening, nothing is left pending.
+  const firstOf = new Map();
+  for (const s of rows1) if (!firstOf.has(s.production_item_id)) firstOf.set(s.production_item_id, s);
+  const assembledIds = [...firstOf.values()].filter((s) => Number(s.opening) === 1).map((s) => s.production_item_id);
+  const assembledSet = new Set(assembledIds);
+  const pendingUnder = rows1.filter((s) => s.state === 'pending' && ancestors(s.production_item_id).some((a) => assembledSet.has(a)));
+  ok('no pending step remains under any piece whose first step is opening (a parent assembled = everything under it done)', assembledIds.length > 0 && pendingUnder.length === 0, `${pendingUnder.length} pending, e.g. ${pendingUnder.slice(0, 3).map((s) => s.op_code).join(',')}`);
+  ok('…and the answer counts what the parent rule added', done.counts.markedUnderAssembled >= 0 && typeof done.counts.markedUnderAssembled === 'number');
+  console.log(`    ${done.counts.markedUnderAssembled} steps marked because a piece above them is assembled`);
   const [ev] = await conn.query("SELECT step_id, event, source, qty_good FROM cf_step_events WHERE company_id = ? AND step_id IN (?)", [COMPANY, marked.map((s) => s.id)]);
   ok('every marked step has one opening event (event and source "opening"), and no start or progress', ev.length === marked.length && ev.every((e) => e.event === 'opening' && e.source === 'opening'));
   const after = await counts();
@@ -260,6 +306,16 @@ try {
   ok('allowed, said, and the steps carry that date', asOf.beforeRelease === true && asOf.asOf === '2026-01-15' && (otherTop ? asOf.counts.mark > 0 : true) && (asOf.counts.mark === 0 || Number(t.n) === asOf.counts.mark), JSON.stringify({ mark: asOf.counts.mark, n: t.n }));
   const [[evAt]] = await conn.query("SELECT COUNT(*) AS n FROM cf_step_events WHERE company_id = ? AND event = 'opening' AND DATE(at) = '2026-01-15'", [COMPANY]);
   ok('…and so do their opening events', Number(evAt.n) === asOf.counts.mark);
+
+  // --- 6b. a step on hold before it started is not floor work ---------------------------------------------------
+  console.log('\n6b. A step on hold that never started');
+  const [[pend]] = await conn.query(
+    `SELECT s.id FROM cf_production_steps s JOIN cf_production_items pi ON pi.id = s.production_item_id
+      WHERE s.company_id = ? AND pi.release_id = ? AND s.state = 'pending' AND s.deleted_at IS NULL ORDER BY s.id DESC LIMIT 1`, [COMPANY, releaseId]);
+  await conn.query("UPDATE cf_production_steps SET state = 'on_hold', held_from = 'pending' WHERE id = ?", [pend.id]);
+  const last = await OPEN.setOpeningPosition(conn, c, LINE, { stage: 5, dryRun: true });
+  ok('a step on hold that never started is left on hold and counted on its own, not as started', last.counts.leftHeld === 1 && /on hold before starting/.test(last.message), JSON.stringify(last.counts));
+  await conn.query("UPDATE cf_production_steps SET state = 'pending', held_from = NULL WHERE id = ?", [pend.id]);
 
   // --- 7. no company learns of another -------------------------------------------------------------------------
   console.log('\n7. Another company');

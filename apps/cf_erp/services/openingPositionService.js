@@ -28,9 +28,12 @@
  * … JACKBEND > MANDRILL > STIFFFIT … MANDRILL > STUDWELD > BLAST …), so "done up to stage X" means EVERY step of the
  * flow up to and including the LAST step whose stage is X or earlier, in flow order (sequence, then id) — a girder at
  * "Drill" has every fit/weld pass before its last drill done too, and its blasting not. Same flow, same cut: the rule
- * is decided per piece from its own steps, which are its flow's.
+ * is decided per piece from its own steps, which are its flow's. ONE MORE RULE ON TOP: a parent assembled means
+ * everything under it is done — once any step of a piece is in the opening position, every piece under it is done
+ * through its whole flow (a plate's own drilling or QC never stays pending inside an assembled girder).
  *
- * WHAT IS LEFT ALONE. A step the floor has started, put on hold or finished stays as it is (counted in the answer).
+ * WHAT IS LEFT ALONE. A step the floor has started or finished stays as it is (counted in the answer); a step put on
+ * hold before it started is left on hold and counted on its own (leftHeld).
  * GOING BACK (a lower stage, or stage 0 = none) re-opens only steps an opening position set, and only while nothing
  * real has started after them — a later step of the same piece, or any step that waits for them (the next level's
  * join, a rule); otherwise it is refused in words and nothing changes.
@@ -138,12 +141,12 @@ async function readRelease(db, companyId, releaseId, { lock }) {
   const [[items], [steps]] = await Promise.all([
     db.query(
       `SELECT pi.id, pi.parent_id, pi.piece_no, pi.quantity, pi.code, pi.depth, pi.sort_order, m.code AS item_code, m.name AS item_name
-         FROM cf_production_items pi JOIN cf_master_records m ON m.id = pi.item_id
+         FROM cf_production_items pi JOIN cf_master_records m ON m.id = pi.item_id AND m.company_id = pi.company_id
         WHERE pi.company_id = ? AND pi.release_id = ? AND pi.deleted_at IS NULL ORDER BY pi.sort_order, pi.id`,
       [companyId, releaseId],
     ),
     db.query(
-      `SELECT s.id, s.production_item_id, s.sequence, s.state, s.quantity, s.qty_good, s.opening, o.code AS op_code
+      `SELECT s.id, s.production_item_id, s.sequence, s.state, s.held_from, s.quantity, s.qty_good, s.opening, o.code AS op_code
          FROM cf_production_steps s
          JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.company_id = s.company_id AND pi.deleted_at IS NULL
          JOIN cf_operations o ON o.id = s.operation_id AND o.company_id = s.company_id
@@ -248,22 +251,39 @@ export async function setOpeningPosition(db, c, lineId, input = {}) {
   stages.forEach((s, i) => { for (const code of s.ops) stageOf.set(code.toUpperCase(), i); });
   const stepsOf = new Map();
   for (const s of steps) { if (!stepsOf.has(s.production_item_id)) stepsOf.set(s.production_item_id, []); stepsOf.get(s.production_item_id).push(s); }
-  const real = (s) => Number(s.opening) !== 1 && s.state !== 'pending';
+  // Real work = the floor has started it (a hold of a step never started is not work).
+  const real = (s) => Number(s.opening) !== 1
+    && (s.state === 'in_progress' || s.state === 'done' || (s.state === 'on_hold' && s.held_from === 'in_progress'));
   const toMark = [];
   const toReopen = [];
-  const counts = { steps: 0, mark: 0, alreadyOpening: 0, alreadyDone: 0, leftStarted: 0, reopen: 0 };
+  const counts = { steps: 0, mark: 0, markedUnderAssembled: 0, alreadyOpening: 0, alreadyDone: 0, leftStarted: 0, leftHeld: 0, reopen: 0 };
   const stageCount = stages.map(() => ({ mark: 0, reopen: 0 }));
   const refusedPieces = [];
-  for (const id of scope) {
+  // A PARENT ASSEMBLED ⇒ EVERYTHING UNDER IT DONE (review, 2026-11-28): the cut is per piece's own flow, so a part
+  // with a later-stage operation of its own (a plate's drilling, a part's QC) would stay pending under a girder whose
+  // joining is now opening — a job the floor could start on a piece already inside an assembly (and the ledger would
+  // then make its WIP lot from nothing). So once any step of a piece is in the opening position, every piece under it
+  // is done through its WHOLE flow. Parents first (by level), so the rule runs down the tree.
+  const fullUnder = new Set();
+  const ordered = [...scope].sort((a, b) => (level.get(a) ?? 0) - (level.get(b) ?? 0) || a - b);
+  for (const id of ordered) {
     const own = stepsOf.get(id) ?? [];
-    if (!own.length) continue;
     const idx = stagesOfSteps(own, stageOf);
-    const cut = x < 0 ? 0 : cutOf(idx, x);
+    const ownCut = x < 0 ? 0 : cutOf(idx, x);
+    const full = fullUnder.has(id);
+    const cut = full ? own.length : ownCut;
+    if (full || cut > 0) for (const k of kids.get(id) ?? []) if (scope.has(k)) fullUnder.add(k);
+    if (!own.length) continue;
     counts.steps += own.length;
     own.forEach((s, i) => {
       if (i < cut) {
-        if (s.state === 'pending') { toMark.push({ s, stage: idx[i], item: id }); stageCount[idx[i]].mark += 1; } else if (Number(s.opening) === 1) counts.alreadyOpening += 1;
+        if (s.state === 'pending') {
+          toMark.push({ s, stage: idx[i], item: id });
+          stageCount[idx[i]].mark += 1;
+          if (i >= ownCut) counts.markedUnderAssembled += 1;
+        } else if (Number(s.opening) === 1) counts.alreadyOpening += 1;
         else if (s.state === 'done') counts.alreadyDone += 1;
+        else if (s.state === 'on_hold' && s.held_from !== 'in_progress') counts.leftHeld += 1;
         else counts.leftStarted += 1;
       } else if (Number(s.opening) === 1) {
         toReopen.push({ s, stage: idx[i], item: id, i });
@@ -294,6 +314,17 @@ export async function setOpeningPosition(db, c, lineId, input = {}) {
       const [rows] = await db.query(
         'SELECT step_id FROM cf_step_dependencies WHERE company_id = ? AND deleted_at IS NULL AND target_item_id IN (?)', [c.companyId, part]);
       waiting.push(...rows);
+    }
+    // The waiting step may be in another release (another line's piece waits for this one): read those too.
+    const elsewhere = [...new Set(waiting.map((w) => w.step_id).filter((sid) => !stepById.has(sid)))];
+    for (const part of chunks(elsewhere)) {
+      const [rows] = await db.query(
+        `SELECT s.id, s.production_item_id, s.state, s.held_from, s.opening, pi.code, m.code AS item_code, m.name AS item_name
+           FROM cf_production_steps s
+           JOIN cf_production_items pi ON pi.id = s.production_item_id AND pi.company_id = s.company_id
+           JOIN cf_master_records m ON m.id = pi.item_id AND m.company_id = pi.company_id
+          WHERE s.company_id = ? AND s.id IN (?) AND s.deleted_at IS NULL`, [c.companyId, part]);
+      for (const r of rows) { stepById.set(r.id, r); if (!byId.has(r.production_item_id)) byId.set(r.production_item_id, { id: r.production_item_id, code: r.code, item_code: r.item_code, item_name: r.item_name }); }
     }
     const blockedBy = new Set();
     for (const w of waiting) { const s = stepById.get(w.step_id); if (s && real(s)) blockedBy.add(s.production_item_id); }
@@ -326,7 +357,8 @@ export async function setOpeningPosition(db, c, lineId, input = {}) {
   const parts = [];
   if (toMark.length) parts.push(`${dryRun ? 'mark' : 'Marked'} ${toMark.length} step${toMark.length === 1 ? '' : 's'} done`);
   if (toReopen.length) parts.push(`${dryRun ? 're-open' : (toMark.length ? 're-opened' : 'Re-opened')} ${toReopen.length} opening step${toReopen.length === 1 ? '' : 's'}`);
-  const left = counts.leftStarted ? ` ${counts.leftStarted} step${counts.leftStarted === 1 ? '' : 's'} the floor has started are left as they are.` : '';
+  const left = (counts.leftStarted ? ` ${counts.leftStarted} step${counts.leftStarted === 1 ? '' : 's'} the floor has started are left as they are.` : '')
+    + (counts.leftHeld ? ` ${counts.leftHeld} step${counts.leftHeld === 1 ? ' is' : 's are'} on hold before starting — left on hold; resume ${counts.leftHeld === 1 ? 'it' : 'them'} and set the position again to include ${counts.leftHeld === 1 ? 'it' : 'them'}.` : '');
 
   // Reservations held by requirements on the steps being marked (a cut plate's plate): counted, not touched.
   let held = 0;
@@ -341,6 +373,27 @@ export async function setOpeningPosition(db, c, lineId, input = {}) {
       held += Number(r?.n ?? 0);
     }
   }
+  // A NEST shared across the scope (review item 4): pieces cut from one plate wait on its cut (origin 'nest'). Ticking
+  // some of them and not the others marks the plate's cut done for one side only — said, not refused.
+  const warnings = [];
+  if ((asked.length || units.length) && toMark.length) {
+    const markIds = toMark.map((m) => m.s.id);
+    const itemOfStep = new Map(steps.map((s) => [s.id, s.production_item_id]));
+    const outside = new Set();
+    for (const part of chunks(markIds)) {
+      const [rows] = await db.query(
+        `SELECT step_id, target_step_id FROM cf_step_dependencies
+          WHERE company_id = ? AND deleted_at IS NULL AND origin = 'nest' AND (step_id IN (?) OR target_step_id IN (?))`, [c.companyId, part, part]);
+      for (const r of rows) for (const sid of [r.step_id, r.target_step_id]) {
+        const it = itemOfStep.get(sid);
+        if (it != null && !scope.has(it)) outside.add(it);
+      }
+    }
+    if (outside.size) {
+      const names = [...outside].slice(0, 6).map((id) => nameOf(byId.get(id)));
+      warnings.push(`Some pieces chosen are cut from the same nested plate as ${outside.size} piece${outside.size === 1 ? '' : 's'} not chosen (${names.join(', ')}${outside.size > 6 ? ', …' : ''}). Their plate's cut is marked for the chosen ones only — choose those too if the whole plate was cut.`);
+    }
+  }
   const heldText = held ? ` ${held} material requirement${held === 1 ? '' : 's'} of those steps still hold reserved stock — let it go on the Material tab if that stock is really free.` : '';
   const answer = {
     dryRun,
@@ -350,6 +403,7 @@ export async function setOpeningPosition(db, c, lineId, input = {}) {
     asOf: at.text,
     beforeRelease: at.params.length > 0 && at.text != null && Date.parse(at.text.length === 10 ? `${at.text}T23:59:59` : at.text) / 1000 < Number(rel.release_epoch),
     counts: { ...counts, heldReservations: held },
+    warnings,
     byStage: stages.map((s, i) => ({ number: i + 1, name: s.name, ...stageCount[i] })).filter((s) => s.mark || s.reopen),
     rows,
     message: parts.length
