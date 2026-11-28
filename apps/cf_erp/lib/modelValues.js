@@ -24,6 +24,8 @@
  *   weldSizeFor     a weld size the drawing set's bom.json `welds` gives for an assembly, by its name
  */
 
+import { realPlateSize } from './realSize.js';
+
 const r3 = (n) => Math.round(Number(n) * 1000) / 1000;
 const up = (s) => String(s ?? '').trim().toUpperCase();
 /** partDrawingService.normMark's rule (kept here so this file stays pure): "BC1 F1.dxf" → "BC1-F1". */
@@ -103,6 +105,10 @@ export function pieceShape(parts, els = null) {
     return { kind: 'section', lengthMm: r3(fs.reduce((s, f) => s + f.t, 0)), widthMm: null, t: null, areaMm2: null, cutLengthMm: null, holes: null, holeDiameters: [], how: 'profile' };
   }
   if (fs.length === 1) {
+    // A web cut to the camber or the slope (lib/realSize.js 'band', user 2026-11-28): its depth × its bottom edge, not
+    // the rectangle round it — the blank is nesting's, from the outline.
+    const real = realPlateSize(parts[0]?.pts);
+    if (real?.kind === 'band') return { kind: 'plate', lengthMm: r3(real.lengthMm), widthMm: r3(real.widthMm), cutLengthMm: per, ...base, how: 'band', blank: real.blank };
     const [L, W] = sorted(fs[0].dx, fs[0].dy);
     return { kind: 'plate', lengthMm: r3(L), widthMm: r3(W), cutLengthMm: per, ...base, how: 'one' };
   }

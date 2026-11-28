@@ -88,6 +88,7 @@
  */
 import { CfError, invalid, notFound, translateDbError } from '../lib/errors.js';
 import { insertRows } from '../lib/db.js';
+import { realPlateSize } from '../lib/realSize.js';
 import { LOCKED_ORDER_STATUSES, lockedLineMessage, revisedOrderMessage, latestRevisionSql } from './records.js';
 import { ancestors } from './tree.js';
 import { resolve as resolveSpecs, rawOf, dateText } from './resolutionService.js';
@@ -355,6 +356,39 @@ function sizeOf(values) {
   return { thickness: num('THICKNESS'), length: num('LENGTH'), width: num('WIDTH'), gradeId, gradeText };
 }
 
+/**
+ * THE BLANK OF A WEB CUT TO THE CAMBER OR THE SLOPE (user, 2026-11-28: "show the real width. Let the blank size come from
+ * nesting anyways"). Such a part's LENGTH × WIDTH is its REAL size (depth × bottom edge, lib/realSize.js 'band'); the steel
+ * it is cut from is the rectangle round its drawing's outline. So when a plate part's own drawing (its DRAWING_MARK's DXF on
+ * the line) is a band whose real size is the part's, the part is pooled and cut as that rectangle: the cut piece is the same
+ * whether the row states the real size or (as before 2026-11-28) the blank, and a nest laid out on it stands. One query,
+ * only the outline ring of each drawing. Sets p.size.length / width (the part's own values are not touched).
+ */
+async function blankOfDrawnBands(db, companyId, lineId, plateParts) {
+  const marks = new Map();
+  for (const p of plateParts) {
+    const r = p.values.get('DRAWING_MARK'); const t = r?.value_text ?? (r?.value_number != null ? String(Number(r.value_number)) : null);
+    if (t && p.size.length > 0 && p.size.width > 0) marks.set(p.id, t.replace(/\.(dxf|pdf)$/i, '').trim().replace(/[\s_-]+/g, '-').toUpperCase());
+  }
+  if (!marks.size) return;
+  const [rows] = await db.query(
+    `SELECT mark_norm, length_mm, width_mm, JSON_EXTRACT(geometry_json, '$.rings[0]') AS outline FROM cf_part_drawings
+      WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf' AND geometry_json IS NOT NULL AND mark_norm IN (?)
+      ORDER BY id DESC`, [companyId, lineId, [...new Set(marks.values())]]);
+  const byMark = new Map();
+  for (const d of rows) if (!byMark.has(d.mark_norm)) byMark.set(d.mark_norm, d);
+  for (const p of plateParts) {
+    const d = byMark.get(marks.get(p.id)); if (!d) continue;
+    const real = realPlateSize(typeof d.outline === 'string' ? JSON.parse(d.outline) : d.outline);
+    if (real?.kind !== 'band') continue;
+    const [L, W] = [Math.max(p.size.length, p.size.width), Math.min(p.size.length, p.size.width)];
+    if (Math.abs(L - real.lengthMm) > 1 || Math.abs(W - real.widthMm) > 1) continue;
+    const bl = Math.max(Number(d.length_mm), Number(d.width_mm)); const bw = Math.min(Number(d.length_mm), Number(d.width_mm));
+    if (!(bl > 0 && bw > 0)) continue;
+    p.size = { ...p.size, length: round6(bl), width: round6(bw), realLength: p.size.length, realWidth: p.size.width };
+  }
+}
+
 /** What is missing, in the words of the specification codes. */
 function missingOf(size) {
   const gone = [];
@@ -474,6 +508,7 @@ async function survey(db, companyId, line, places) {
     m.values = values.get(m.id) ?? new Map();
     m.size = sizeOf(m.values);
   }
+  await blankOfDrawnBands(db, companyId, line.id, plateParts);
   // CUTTING ALLOWANCE (init.sql §64, cutAllowanceService): on an OPEN line a plate part is pooled and cut at
   // drawn + its allowance (the customer's, the order's or its own rule for its part name). Its own LENGTH stays as
   // drawn (`drawnLength`); only the cut piece is longer. A frozen line is never re-planned, so it reads the parts

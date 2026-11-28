@@ -73,7 +73,7 @@ import { memoized } from '../lib/requestMemo.js';
 import { together } from '../lib/together.js';
 import { cutFromOf } from '../lib/cutFrom.js';
 import { explode } from './bomService.js';
-import { readPartDrawing, orientTo } from './partGeometry.js';
+import { readPartDrawing, orientTo, realSizeOf } from './partGeometry.js';
 import { createDrawing, reviseDrawing } from './drawingService.js';
 import { nextRevision } from '../lib/revision.js';
 import { parseDrawingName, matchCodePattern, codeWithNumbers } from '../lib/drawingName.js';
@@ -916,7 +916,9 @@ export async function uploadDrawings(db, c, orderId, lineId, input = {}) {
     // What the file can say about its rows' values (written into empty cells only, below).
     const offers = [];
     if (g && plate.length) {
-      const [long, short] = [Math.max(g.lengthMm, g.widthMm), Math.min(g.lengthMm, g.widthMm)].map(r2);
+      // its REAL size (a web cut to the camber or the slope: depth × bottom edge; else the rectangle round it)
+      const rs = realSizeOf(g) ?? g;
+      const [long, short] = [Math.max(rs.lengthMm, rs.widthMm), Math.min(rs.lengthMm, rs.widthMm)].map(r2);
       offers.push({ specCode: 'LENGTH', value: long, from: 'drawing', plateOnly: true, quiet: true, pairWith: { specCode: 'WIDTH', value: short } });
       offers.push({ specCode: 'WIDTH', value: short, from: 'drawing', plateOnly: true, quiet: true, pairWith: { specCode: 'LENGTH', value: long } });
     }
@@ -1144,7 +1146,12 @@ async function readDrawingFacts(db, companyId, lineId) {
       if (d && p.lengthMm > 0 && p.widthMm > 0) {
         const o = orientTo(d.geometry, p.lengthMm, p.widthMm);
         a.cut += w * d.geometry.cutLengthMm; a.pierce += w * d.geometry.piercings;
-        a.aL += w * o.alongLength; a.aW += w * o.alongWidth; a.drawn += w; a.marks.add(d.id); a.d = d; a.o = o; a.partLength = p.lengthMm;
+        // a web cut to the camber or the slope holds its REAL size (depth × bottom edge) and is cut as the rectangle round
+        // its outline (cutPlateService.blankOfDrawnBands): that rectangle's length is the drawn length its cut piece is held to
+        const rs = realSizeOf(d.geometry);
+        const band = rs && Math.abs(rs.lengthMm - Math.max(p.lengthMm, p.widthMm)) <= 1 && Math.abs(rs.widthMm - Math.min(p.lengthMm, p.widthMm)) <= 1;
+        a.aL += w * o.alongLength; a.aW += w * o.alongWidth; a.drawn += w; a.marks.add(d.id); a.d = d; a.o = o;
+        a.partLength = band ? (o.swap ? d.geometry.widthMm : d.geometry.lengthMm) : p.lengthMm;
       } else {
         a.cut += w * 2 * ((p.lengthMm ?? 0) + (p.widthMm ?? 0)); a.pierce += w; a.aL += w; a.aW += w; a.marks.add(null);
       }

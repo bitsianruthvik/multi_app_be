@@ -27,6 +27,7 @@
  *   rings                outline, cut-outs, holes as polygons, origin at the rectangle's corner
  * A binary DXF or a DWG is refused in words.
  */
+import { realPlateSize } from '../lib/realSize.js';
 
 export const DRILL_MAX_DIA_MM = 50;
 const JOIN_TOL = 0.05;           // mm: segment ends closer than this are one point
@@ -331,12 +332,25 @@ export function readPartDrawing(text) {
   };
 }
 
+/**
+ * A drawing's REAL size (lib/realSize.js): a web cut to the camber or the slope is its depth × its bottom edge — the row's
+ * LENGTH × WIDTH (user, 2026-11-28) — while lengthMm × widthMm stay the rectangle round the outline (the blank nesting
+ * works from). → { lengthMm, widthMm } in the drawing's own axes' order (long, short), or null when it is not such a strip.
+ */
+export function realSizeOf(geometry) {
+  const r = realPlateSize(geometry?.rings?.[0]);
+  return r?.kind === 'band' ? { lengthMm: r.lengthMm, widthMm: r.widthMm } : null;
+}
+
 /** A drawing's facts in the part's own orientation: x along its LENGTH. `swap` when the drawing is drawn the other way round. */
 export function orientTo(geometry, lengthMm, widthMm) {
   const g = geometry;
   const swap = lengthMm != null && widthMm != null && Math.abs(g.lengthMm - widthMm) + Math.abs(g.widthMm - lengthMm) < Math.abs(g.lengthMm - lengthMm) + Math.abs(g.widthMm - widthMm);
+  // the row holds the drawing's REAL size: a strip along a cambered or sloped line matches by its depth and bottom edge
+  const real = lengthMm == null || widthMm == null ? null : realSizeOf(g);
   const sizeMatches = lengthMm == null || widthMm == null ? null
-    : (swap ? Math.abs(g.lengthMm - widthMm) <= 1 && Math.abs(g.widthMm - lengthMm) <= 1 : Math.abs(g.lengthMm - lengthMm) <= 1 && Math.abs(g.widthMm - widthMm) <= 1);
+    : (swap ? Math.abs(g.lengthMm - widthMm) <= 1 && Math.abs(g.widthMm - lengthMm) <= 1 : Math.abs(g.lengthMm - lengthMm) <= 1 && Math.abs(g.widthMm - widthMm) <= 1)
+      || (!!real && Math.abs(real.lengthMm - Math.max(lengthMm, widthMm)) <= 1 && Math.abs(real.widthMm - Math.min(lengthMm, widthMm)) <= 1);
   const c = g.sideCover ?? { bottom: 1, top: 1, left: 1, right: 1 };
   // Cover of the sides that run along the part's LENGTH, and along its WIDTH.
   const alongLength = swap ? (c.left + c.right) / 2 : (c.bottom + c.top) / 2;

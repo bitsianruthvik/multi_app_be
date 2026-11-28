@@ -39,6 +39,7 @@ import { holeSetOf, sameList } from '../lib/listSpec.js';
 import { factsOfShape } from './drawingValueService.js';
 import { DRAWING_FACT_SPECS, LIST_FACT_SPECS, LOCKED_ORDER_STATUSES } from './records.js';
 import { isWorkedDefault } from './resolutionService.js';
+import { realPlateSize } from '../lib/realSize.js';
 
 const r3 = (n) => Math.round(Number(n) * 1000) / 1000;
 const parseJson = (v) => { if (v == null) return null; if (typeof v !== 'string') return v; try { return JSON.parse(v); } catch { return null; } };
@@ -104,19 +105,24 @@ export async function modelFileOf(db, companyId, standardId, { text = true } = {
   return f ?? null;
 }
 
-/** The target's part files, lean (never the geometry megabytes): Map markNorm → { lengthMm, widthMm, areaMm2, cutLengthMm, holes, holeDiameters }. */
+/**
+ * The target's part files, lean (never the geometry megabytes): Map markNorm → { lengthMm, widthMm, areaMm2, cutLengthMm, holes,
+ * holeDiameters }. LENGTH × WIDTH is the file's REAL size (lib/realSize.js): a web cut to the camber or the slope is its depth ×
+ * its bottom edge, anything else the rectangle round its outline (only the outline ring is read, for that).
+ */
 async function partFilesOf(db, companyId, target) {
   const [rows] = target.kind === 'version'
     ? await db.query(
-      `SELECT mark_norm, length_mm, width_mm, area_mm2, cut_length_mm, holes, JSON_EXTRACT(geometry_json, '$.holeDiameters') AS dias
+      `SELECT mark_norm, length_mm, width_mm, area_mm2, cut_length_mm, holes, JSON_EXTRACT(geometry_json, '$.holeDiameters') AS dias, JSON_EXTRACT(geometry_json, '$.rings[0]') AS outline
          FROM cf_standard_drawing_files WHERE company_id = ? AND version_id = ? AND kind = 'part' AND deleted_at IS NULL AND geometry_json IS NOT NULL`, [companyId, target.id])
     : await db.query(
-      `SELECT mark_norm, length_mm, width_mm, area_mm2, cut_length_mm, holes, JSON_EXTRACT(geometry_json, '$.holeDiameters') AS dias
+      `SELECT mark_norm, length_mm, width_mm, area_mm2, cut_length_mm, holes, JSON_EXTRACT(geometry_json, '$.holeDiameters') AS dias, JSON_EXTRACT(geometry_json, '$.rings[0]') AS outline
          FROM cf_part_drawings WHERE company_id = ? AND order_line_id = ? AND file_kind = 'dxf' AND deleted_at IS NULL AND geometry_json IS NOT NULL`, [companyId, target.id]);
   const out = new Map();
   for (const f of rows) {
     if (!f.mark_norm || out.has(f.mark_norm)) continue;
-    const L = Number(f.length_mm); const W = Number(f.width_mm);
+    const real = realPlateSize(parseJson(f.outline));
+    const L = real?.kind === 'band' ? real.lengthMm : Number(f.length_mm); const W = real?.kind === 'band' ? real.widthMm : Number(f.width_mm);
     out.set(f.mark_norm, {
       lengthMm: Math.max(L, W), widthMm: Math.min(L, W), areaMm2: f.area_mm2 == null ? null : Number(f.area_mm2),
       cutLengthMm: f.cut_length_mm == null ? null : Number(f.cut_length_mm), holes: f.holes == null ? null : Number(f.holes),

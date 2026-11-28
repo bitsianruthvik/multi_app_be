@@ -51,6 +51,7 @@ import { cutFromOf } from '../lib/cutFrom.js';
 import { LOCKED_ORDER_STATUSES, DRAWING_FACT_SPECS, LIST_FACT_SPECS } from './records.js';
 import { holeSetOf, sameList } from '../lib/listSpec.js';
 import { normMark, NOT_ONE_PLATE } from './partDrawingService.js';
+import { realPlateSize } from '../lib/realSize.js';
 
 const FACTS = [...DRAWING_FACT_SPECS];
 const READ = ['LENGTH', 'WIDTH', 'DRAWING_MARK', ...FACTS];
@@ -89,8 +90,16 @@ export const SIZE_TOLERANCE = { pct: 0.02, minMm: 25 };
 /**
  * Pure: does drawing `d` fit row `p`'s typed size? → { ok, differs: { drawing: [L, W], row: [L, W] } | null }.
  * Either way round; a size not typed yet does not contradict the drawing.
+ * A drawing of a web cut to the camber or the slope (`d.real` [L, W], lib/realSize.js 'band') is its row's also when its
+ * REAL size is the row's (user, 2026-11-28: the row holds the real width, the blank is nesting's).
  */
 export function sizeFit(d, p) {
+  if (Array.isArray(d?.real)) {
+    const byReal = sizeFit({ lengthMm: d.real[0], widthMm: d.real[1] }, p);
+    if (byReal.ok && !byReal.differs) return byReal;
+    const byBox = sizeFit({ lengthMm: d.lengthMm, widthMm: d.widthMm }, p);
+    return byBox.ok ? byBox : byReal;
+  }
   const dl = Number(d.lengthMm); const dw = Number(d.widthMm);
   const rl = p.lengthMm == null ? null : Number(p.lengthMm); const rw = p.widthMm == null ? null : Number(p.widthMm);
   if (!(dl > 0 && dw > 0) || rl == null || rw == null || !(rl > 0) || !(rw > 0)) return { ok: true, differs: null };
@@ -169,7 +178,7 @@ export async function readFactInputs(db, companyId, lineId, specs = null) {
       [companyId, ids]),
     db.query(
       `SELECT id, drawing_id, mark_norm, length_mm, width_mm, area_mm2, cut_length_mm, holes,
-              JSON_EXTRACT(geometry_json, '$.holeDiameters') AS hole_dias, (geometry_json IS NOT NULL) AS shaped,
+              JSON_EXTRACT(geometry_json, '$.holeDiameters') AS hole_dias, JSON_EXTRACT(geometry_json, '$.rings[0]') AS outline, (geometry_json IS NOT NULL) AS shaped,
               (dxf_text IS NOT NULL) AS has_text, (warnings_json LIKE ?) AS not_one_plate
          FROM cf_part_drawings
         WHERE company_id = ? AND order_line_id = ? AND deleted_at IS NULL AND file_kind = 'dxf' ORDER BY mark_norm, id`,
@@ -195,11 +204,17 @@ export async function readFactInputs(db, companyId, lineId, specs = null) {
   const list = [...rows.values()];
   const matches = (p, f) => (!!p.markNorm && p.markNorm === f.mark_norm) || (f.drawing_id != null && p.drawingIds.includes(Number(f.drawing_id)));
   const drawings = files.filter((f) => Number(f.shaped)).map((f) => ({
-    id: Number(f.id), drawing_id: f.drawing_id, mark_norm: f.mark_norm, lengthMm: Number(f.length_mm), widthMm: Number(f.width_mm),
+    id: Number(f.id), drawing_id: f.drawing_id, mark_norm: f.mark_norm, lengthMm: Number(f.length_mm), widthMm: Number(f.width_mm), real: realOf(f.outline),
     areaMm2: f.area_mm2 == null ? null : Number(f.area_mm2), cutLengthMm: f.cut_length_mm == null ? null : Number(f.cut_length_mm), holes: f.holes == null ? null : Number(f.holes), holeDiameters: parseJson(f.hole_dias) ?? [],
   }));
   const bare = files.filter((f) => !Number(f.shaped) && Number(f.has_text) && !Number(f.not_one_plate) && list.some((p) => p.isPlatePart && matches(p, f)));
   return { rows: list, drawings, bare };
+}
+
+/** A drawing's real size [L, W] when its outline is a band (a web cut to the camber or the slope), else null. */
+function realOf(outline) {
+  const r = realPlateSize(parseJson(outline));
+  return r?.kind === 'band' ? [r.lengthMm, r.widthMm] : null;
 }
 
 let savepointNo = 0;

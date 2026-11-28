@@ -57,9 +57,10 @@ const bbox = (pts) => { const xs = pts.map((p) => p[0]); const ys = pts.map((p) 
   const f1 = M.get('BC1F1');
   ok(`RDSO BC1F1: ${a[0]} + ${b[0]} = 12115 × 150 × 12, 40 holes, 4 pieces`, near(a[0] + b[0], 12115) && f1.shape.lengthMm === 12115 && f1.shape.widthMm === 150 && f1.shape.t === 12 && f1.shape.holes === 40
     && rdso.parts.BC1F1.holes.length + rdso.parts['BC1F1#2'].holes.length === 40 && f1.pieces === 4, JSON.stringify(f1.shape));
-  // BC1W: one outline 12115.53 × 548, 12 thick, 145 holes.
+  // BC1W: one outline 12115.53 × 548 round a web 542 deep with a 6 mm step at its middle (a band, lib/realSize.js, 2026-11-28):
+  // its real size 542 × 12114.5 (its bottom edge), not the blank; 12 thick, 145 holes.
   const w = M.get('BC1W'); const wb = bbox(rdso.parts.BC1W.pts);
-  ok(`RDSO BC1W: ${wb[0].toFixed(2)} × ${wb[1]} × 12, ${rdso.parts.BC1W.holes.length} holes (bom.json 12115.5 × 548, 145)`, near(w.shape.lengthMm, 12115.53) && w.shape.widthMm === 548 && w.shape.holes === 145 && w.pieces === 4);
+  ok(`RDSO BC1W: blank ${wb[0].toFixed(2)} × ${wb[1]}, real 542 × 12114.5 × 12, ${rdso.parts.BC1W.holes.length} holes`, w.shape.how === 'band' && near(w.shape.lengthMm, 12114.5, 0.05) && w.shape.widthMm === 542 && w.shape.holes === 145 && w.pieces === 4, JSON.stringify(w.shape));
   // U1-G1 (the gusset of joint U1): outline x 0 … 1606.49, y 0 … 1412.25, t 16, 142 holes of 23.5.
   const g = M.get('U1-G1');
   ok('RDSO U1-G1: 1606.49 × 1412.25 × 16, 142 holes Ø23.5', g.shape.lengthMm === 1606.49 && g.shape.widthMm === 1412.25 && g.shape.t === 16 && g.shape.holes === 142 && rdso.parts['U1-G1'].holes.every((h) => h[2] === 23.5));
@@ -124,6 +125,19 @@ const bbox = (pts) => { const xs = pts.map((p) => p[0]); const ys = pts.map((p) 
   const v = valuesForRow({ shape: marksOfModel(m).get('P').shape, file: null, drill: d.get('P') }, new Set(['LENGTH', 'WIDTH', 'THICKNESS', 'HOLES', 'HOLE_DRILL_THICKNESS', 'TRUE_AREA', 'SURFACE_AREA']));
   ok('a row\'s values: 500 × 300 × 20, 1 hole, drilled through 32, area 150000 − π·11²', v.values.get('LENGTH').value === 500 && v.values.get('WIDTH').value === 300 && v.values.get('THICKNESS').value === 20 && v.values.get('HOLES').value === 1
     && v.values.get('HOLE_DRILL_THICKNESS').value === 32 && near(v.values.get('TRUE_AREA').value, 150000 - Math.PI * 121, 0.01));
+  // A web cut to the slope / the camber (NRE FOB WEB-S1, NECL WEB-1; user 2026-11-28 "show the real width. Let the blank size
+  // come from nesting"): its depth × its bottom edge developed, not the rectangle round it; a plate with clipped corners keeps its rectangle.
+  {
+    const web = pieceShape([{ pts: [[0, 0], [2210, 0], [8275, 175], [8275, 703], [2210, 528], [0, 528]], t: 12 }]);
+    ok('a web cut to a slope: 528 deep × 8277.5 along its bottom edge (how: band), not its blank 703 × 8275', web.how === 'band' && web.widthMm === 528 && near(web.lengthMm, 8277.5, 0.05) && web.blank?.widthMm === 703, JSON.stringify(web));
+    const camber = []; for (let k = 0; k <= 24; k++) { const x = k * 250; camber.push([x, 15 * Math.sin(Math.PI * x / 6000)]); }
+    const cw = pieceShape([{ pts: [...camber, ...camber.slice().reverse().map(([x, y]) => [x, y + 2150])], t: 16 }]);
+    ok('a web cut to the camber: 2150 deep, its bottom edge 6000.2 long (how: band)', cw.how === 'band' && cw.widthMm === 2150 && near(cw.lengthMm, 6000.2, 0.2), JSON.stringify(cw));
+    const clip = pieceShape([{ pts: [[30, 0], [498, 0], [528, 30], [528, 130], [0, 130], [0, 30]], t: 12 }]);
+    ok('a stiffener with clipped corners keeps its rectangle 528 × 130', clip.how === 'one' && clip.lengthMm === 528 && clip.widthMm === 130, JSON.stringify(clip));
+    const vb = valuesForRow({ shape: web, file: { lengthMm: 8277.5, widthMm: 528, holes: 0, holeDiameters: [], areaMm2: 4.4e6, cutLengthMm: 18000 }, drill: null }, new Set(['LENGTH', 'WIDTH']));
+    ok('…and its row takes 8277.5 × 528', near(vb.values.get('LENGTH').value, 8277.5, 0.05) && vb.values.get('WIDTH').value === 528);
+  }
   ok('equal is within 1 mm for a size, exact for a count', sameFor('LENGTH', 12115, 12115.5) && !sameFor('LENGTH', 12000, 12115) && !sameFor('HOLES', 40, 41));
 }
 
@@ -228,8 +242,10 @@ try {
   ok('a row whose mark the model does not have: listed, nothing written', r1.notDerivable.some((x) => x.mark === MARK.ODD && /not in the model/.test(x.why)) && (await stored(R.ODD, 'LENGTH')) === null);
   const weld = weldLengths(rdso).get('BC1').mm / 1000;
   ok(`the chord's weld: its T-joints in the model, ${weld.toFixed(3)} m`, near((await stored(R.CHORD, 'MIG_WELD_LENGTH'))?.n, weld, 0.001) && (await stored(R.CHORD, 'MIG_WELD_LENGTH')).source === 'model');
-  ok('the web\'s length a person typed (12000) is kept, and the model\'s 12115.53 is listed', (await stored(R.WEB, 'LENGTH'))?.n === 12000 && (await stored(R.WEB, 'LENGTH')).source === 'entered'
-    && r1.disagreements.some((d) => d.recordId === R.WEB && d.code === 'LENGTH' && d.held === 12000 && near(d.model, 12115.53) && d.acceptable), JSON.stringify(r1.disagreements));
+  // Rule 1 since 89058de (user 2026-11-08: "I want the calculated one, not the typed one"): the model's value replaces a typed or
+  // imported one, listed as replaced. The web BC1W is a band since 2026-11-28 (lib/realSize.js): 542 x 12114.5, not its blank.
+  ok('the web\'s length a person typed (12000) is replaced by the model\'s real 12114.5, and listed as replaced', near((await stored(R.WEB, 'LENGTH'))?.n, 12114.5, 0.05) && (await stored(R.WEB, 'LENGTH')).source === 'model'
+    && (r1.replaced ?? []).some((d) => d.recordId === R.WEB && d.code === 'LENGTH' && d.was === 12000 && near(d.model, 12114.5, 0.05)), JSON.stringify(r1.replaced));
   const wt = await stored(R.FL, 'WEIGHT');
   ok(`the weights are worked out after the sizes (flange ${wt?.n} kg = 12115 × 150 × 12 × 7.85e-6), and roll up`, wt && near(wt.n, 12115 * 150 * 12 * 7850 / 1e9, 0.01) && (await stored(R.CHORD, 'WEIGHT'))?.n > 0, JSON.stringify(wt));
   ok('piece counts against the BOM are reported, not written (the angle: model 128, this BOM 32)', r1.pieces.some((p) => p.mark === 'BCA' && p.model === 128 && p.bom === 32) && !r1.pieces.some((p) => p.mark === 'BC1F1'), JSON.stringify(r1.pieces));
@@ -238,12 +254,8 @@ try {
   ok('the design signature does not move (a model value is not a design choice)', (await lineStandard(db, COMPANY, LINE)).edited === sigBefore.edited);
 
   const v1 = await readLineValues(db, COMPANY, LINE);
-  ok('the Values screen: the model attached, a model value says so, the disagreement is listed', v1.model?.attached === true && cellOf(v1, R.FL, 'LENGTH')?.from === 'model' && !cellOf(v1, R.FL, 'LENGTH')?.waitingModel
-    && v1.model.disagreements.length === 1 && v1.model.disagreements[0].code === 'LENGTH', JSON.stringify({ m: v1.model, c: cellOf(v1, R.FL, 'LENGTH') }));
-  // Accept = the model's value written as the person's own.
-  const dis = v1.model.disagreements[0];
-  const acc = await writeLineValues(db, c, LINE, { writes: [{ recordId: dis.recordId, specCode: dis.code, value: dis.model }] });
-  ok('accepting it writes the model\'s value as typed, and the list empties', (await stored(R.WEB, 'LENGTH'))?.n === 12115.53 && (await stored(R.WEB, 'LENGTH')).source === 'entered' && acc.view.model.disagreements.length === 0);
+  ok('the Values screen: the model attached, a model value says so, nothing left to accept (the model replaced the typed one)', v1.model?.attached === true && cellOf(v1, R.FL, 'LENGTH')?.from === 'model' && !cellOf(v1, R.FL, 'LENGTH')?.waitingModel
+    && v1.model.disagreements.length === 0, JSON.stringify({ m: v1.model, c: cellOf(v1, R.FL, 'LENGTH') }));
 
   console.log('\n  4. again, a new model, a person, a lock');
   const r2 = await applyModel(db, c, { lineId: LINE, bom });
@@ -255,8 +267,8 @@ try {
   await attach(JSON.stringify(m2));
   const r3 = await applyModel(db, c, { lineId: LINE, bom });
   ok('a new model rewrites the model\'s own values (the flange now 14 thick)', (await stored(R.FL, 'THICKNESS'))?.n === 14 && (await stored(R.FL, 'THICKNESS')).source === 'model' && r3.written >= 1);
-  ok('…and leaves what a person typed (the gusset\'s 140 holes), listed against the model\'s 142', (await stored(R.GUS, 'HOLES'))?.n === 140 && (await stored(R.GUS, 'HOLES')).source === 'entered'
-    && r3.disagreements.some((d) => d.recordId === R.GUS && d.code === 'HOLES' && d.model === 142));
+  ok('…and replaces what a person typed (the gusset\'s 140 holes) by the model\'s 142, listed as replaced (rule 1)', (await stored(R.GUS, 'HOLES'))?.n === 142 && (await stored(R.GUS, 'HOLES')).source === 'model'
+    && (r3.replaced ?? []).some((d) => d.recordId === R.GUS && d.code === 'HOLES' && d.was === 140 && d.model === 142), JSON.stringify(r3.replaced));
   await db.query('UPDATE cf_sales_order_lines SET locked_at = NOW() WHERE id = ?', [LINE]);
   await attach(text);
   const r4 = await applyModel(db, c, { lineId: LINE, bom });
