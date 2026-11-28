@@ -14,6 +14,8 @@
  * (`bought`) and the standard's notes carry them.
  */
 
+import { exactBolt, exactStud, studOfName } from './fastenerItems.js';
+
 const r3 = (n) => Math.round(Number(n) * 1000) / 1000;
 
 /** A name as the comparison sees it. */
@@ -431,7 +433,10 @@ function familyTools(catalog) {
  *   specs       Map(CODE -> { id, data_type, default_uom })
  *   gradeOption Map(UPPER value or label -> option id)
  *   studs       [{ id, code, name }] — the Shear stud selection's catalog candidates
- * Returns { standard, rows, files, bought, newDefinitions, mappings, problems, totals }.
+ * Returns { standard, rows, files, bought, newDefinitions, newItems, mappings, problems, totals }.
+ *   newItems [{ kind: 'bolt' | 'stud', name, dia, length | height, grade?, weightKg, selection: { id, code, name }, for: [marks] }]
+ *            — catalog items of the exact size to create, add to the selection and choose (user, 2026-11-28: never the
+ *            nearest size, never the selection's default). A row's `make: { name }` names the one it takes.
  *   rows   [{ key, parentKey, kind: 'temp' | 'selection', depth, lineNo, position, role, quantity, notes, mark,
  *             def: { id, name, code } | { new: name }, classHint, values: [{ code, ... }], item, node, weightKg }]
  */
@@ -696,6 +701,15 @@ export function planImport(bom, catalog) {
     return rest;
   };
 
+  // Catalog items to make (one per name), each with the selection it joins and the marks that want it.
+  const newItems = new Map();
+  const planNewItem = (make, def, mark) => {
+    if (!newItems.has(make.name)) newItems.set(make.name, { ...make, selection: { id: def.id, code: def.code, name: def.name }, for: [] });
+    const n = newItems.get(make.name);
+    if (mark && !n.for.includes(mark)) n.for.push(mark);
+    return n;
+  };
+
   function walk(node, parentKey, depth, place) {
     const children = withStopper(node);
     const leaves = children.filter((c) => c.item != null);
@@ -743,15 +757,18 @@ export function planImport(bom, catalog) {
       // else left to choose, and said. A tenant without the "Bolt set" selection keeps the old way (listed, not a row).
       if (it.role === 'bolt' && boltDef) {
         const want = boltWanted(it);
-        const match = want.dia && want.length ? (catalog.bolts ?? []).find((b) => boltOf(b.name)?.dia === want.dia && boltOf(b.name)?.length === want.length && (!want.grade || boltOf(b.name)?.grade === want.grade)) : null;
+        // The catalog set of EXACTLY this size and class — else a new item, planned (user, 2026-11-28: never the nearest size).
+        const ex = exactBolt(want, catalog.bolts ?? [], { hsfg: !/\bblack\b|\bordinary\b/i.test(`${it.description} ${it.material ?? ''}`) });
+        const match = ex.match ?? null;
+        const make = ex.make ? planNewItem(ex.make, boltDef, it.mark) : null;
         rows.push({
           key: `n${++seq}`, parentKey: key, kind: 'selection', depth: depth + 1, lineNo, position: null,
           role: roleText(it.description), quantity: q, mark: it.mark,
-          notes: match ? (it.notes?.length ? it.notes.join(' ') : null)
-            : `Choose the bolt size: ${want.dia ? `M${want.dia}` : (it.profile ?? 'diameter not stated')}${want.length ? ` x ${want.length}` : ' — length by grip (plies + nut + 2 washers + 3 threads)'}${want.grade ? `, class ${want.grade}` : ''}.`,
-          def: boltDef, chosen: match ? { id: match.id, code: match.code, name: match.name } : null, values: [], item: it, weightKg: null, children: [],
+          notes: match || make ? (it.notes?.length ? it.notes.join(' ') : null)
+            : `Choose the bolt size: ${want.dia ? `M${want.dia}` : (it.profile ?? 'diameter not stated')}${want.length ? ` x ${want.length}` : ' — length by grip (plies + nut + 2 washers + 3 threads)'}${want.grade ? `, class ${want.grade}` : ''} (${ex.open}).`,
+          def: boltDef, chosen: match ? { id: match.id, code: match.code, name: match.name } : null, make: make ? { name: make.name } : null, values: [], item: it, weightKg: null, children: [],
         });
-        mappings.push({ what: what2Of(it), asked: ['Bolt set'], to: { id: boltDef.id, code: boltDef.code, name: boltDef.name }, fallback: false, chosen: match ? match.name : null });
+        mappings.push({ what: what2Of(it), asked: ['Bolt set'], to: { id: boltDef.id, code: boltDef.code, name: boltDef.name }, fallback: false, chosen: match ? match.name : make ? `NEW: ${make.name}` : null });
         continue;
       }
       if (BOUGHT_ROLES.has(it.role) || (it.category === 'bought' && it.role !== 'shear_stud')) {
@@ -764,16 +781,19 @@ export function planImport(bom, catalog) {
       if (it.role === 'shear_stud') {
         const sel = mapDef(partCandidates(it), 'selection', what2, null);
         if (!sel) continue;
-        // The catalog stud of this size if there is one; else the selection stays to be chosen, and says so.
-        const want = /(\d+)\s*dia\s*x\s*(\d+)/i.exec(String(it.profile ?? it.material ?? ''));
-        const match = want ? (catalog.studs ?? []).find((s) => new RegExp(`\\b${want[1]}\\b`).test(s.name) && new RegExp(`\\b${want[2]}\\b`).test(s.name)) : null;
+        // The catalog stud of EXACTLY this diameter and height; else a new one, planned (user, 2026-11-28: never the
+        // default "25 dia x 175" for a drawing's "100 mm height" studs).
+        const want = studOfName(it.profile) ?? studOfName(it.material) ?? studOfName(it.description);
+        const ex = exactStud(want, catalog.studs ?? []);
+        const match = ex.match ?? null;
+        const make = ex.make ? planNewItem(ex.make, sel, it.mark) : null;
         rows.push({
           key: `n${++seq}`, parentKey: key, kind: 'selection', depth: depth + 1, lineNo, position: null,
           role: roleText(it.description), quantity: q, mark: it.mark,
-          notes: match ? null : `Choose the stud: ${it.profile ?? it.material} — no catalog stud of this size yet.`,
-          def: sel, chosen: match ? { id: match.id, code: match.code, name: match.name } : null, values: [], item: it, weightKg: null, children: [],
+          notes: match || make ? null : `Choose the stud: ${it.profile ?? it.material} — ${ex.open}.`,
+          def: sel, chosen: match ? { id: match.id, code: match.code, name: match.name } : null, make: make ? { name: make.name } : null, values: [], item: it, weightKg: null, children: [],
         });
-        mappings[mappings.length - 1].chosen = match ? match.name : null;
+        mappings[mappings.length - 1].chosen = match ? match.name : make ? `NEW: ${make.name}` : null;
         continue;
       }
       // An angle written TOP/BOTTOM is two rows of the frame, one each — the catalog names them apart. An X-frame
@@ -849,6 +869,7 @@ export function planImport(bom, catalog) {
     files: [...files.values()],
     bought,
     newDefinitions: [...newDefs.values()],
+    newItems: [...newItems.values()],
     mappings,
     problems,
     info,

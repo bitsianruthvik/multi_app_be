@@ -184,6 +184,10 @@ function printReport(r, { host, co, trips }) {
   }
   if (r.newNotAllowed?.length && !APPLY) line(`  --apply refuses these unless allowed by name: --allow-new "${r.newNotAllowed.join(',')}"  (or map them in lib/standardImport.js)`);
   if (r.written?.newDefinitions?.length) for (const d of r.written.newDefinitions) line(`    created #${d.id} ${d.code ?? ''} ${d.name}${d.rules ? ` — ${d.rules} spec rules from #${d.rulesFrom}` : ''}`);
+  // User, 2026-11-28: a bolt or stud of a size the catalog lacks is MADE (never the nearest size), put in its selection, chosen.
+  line(`\nNew catalog items (exact size the drawing gives, none in the catalog): ${r.newItems?.length ? '' : 'none'}`);
+  for (const n of r.newItems ?? []) line(`  + ${n.name} — ${n.weightKg} kg, into selection "${n.selection}", for ${n.for.join(', ')}`);
+  if (r.written?.newItems?.length) for (const n of r.written.newItems) line(`    ${n.created ? 'created' : 'found'} #${n.id} ${n.code ?? ''} ${n.name}${n.addedToSelection ? ', added to the selection' : n.inBranch ? ', in the selection\'s branch' : ''}`);
   if (r.fallbacks.length) { line('\nMapped to a second choice (the first name is not in the catalog):'); for (const f of r.fallbacks) line(`  ${f.what}: wanted "${f.asked}", took "${f.took}"`); }
   line(`\nBought out, not in the BOM (listed on the standard's notes): ${r.bought.length ? '' : 'none'}`);
   for (const b of r.bought) line(`  ${b.quantity} × ${b.mark} ${b.description}${b.profile ? ` (${b.profile})` : ''}`);

@@ -34,6 +34,7 @@ import { readPartDrawing } from './partGeometry.js';
 import { normMark } from './partDrawingService.js';
 import { WORKED_OUT_SPECS, DRAWING_FACT_SPECS, AFTER_LOCK_SPECS, LIVE_WHEN_FROZEN, LOCKED_ORDER_STATUSES } from './records.js';
 import { planImport, normName } from '../lib/standardImport.js';
+import { ensureExactItem } from './exactItemService.js';
 import { modelLevelsOfStandard } from '../lib/modelLevels.js';
 import { together } from '../lib/together.js';
 
@@ -952,6 +953,13 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
   // ---- 1. the new definitions (rare: only what nothing in the catalog fits) ----
   const made = await createNewDefinitions(db, c, catalog, plan.newDefinitions);
   for (const r of plan.rows) if (r.def?.new) r.def = made.get(r.def.new);
+  // ---- 1a. catalog items of the exact size the drawing gives (user, 2026-11-28): made, put in their selection, chosen ----
+  const madeItems = [];
+  for (const ni of plan.newItems ?? []) {
+    const got = await ensureExactItem(db, c, ni.selection.id, ni);
+    madeItems.push({ ...got, kind: ni.kind, selection: ni.selection.name, for: ni.for });
+    for (const r of plan.rows) if (r.make?.name === ni.name) r.chosen = { id: got.id, code: got.code, name: got.name };
+  }
   const unresolved = new Set();
 
   // ---- 1b. values a DEFINITION holds itself (MATERIAL PB on the phosphor bronze plate: a fixed rule reads the
@@ -1105,7 +1113,7 @@ export async function importStandard(db, c, { bom, files = [], apply = false, so
     batch.push(row); bytes += f.text.length;
   }
   await flush();
-  return { plan, report: { ...report, written: { standardId, versionId, drawingId, rows: tempRows.length, files: okFiles.length, sheets: sheetsOut, newDefinitions: [...made.values()].map((d) => ({ id: d.id, code: d.code, name: d.name, classificationId: d.classification_id, rulesFrom: d.rulesFrom ?? null, rules: d.rules ?? 0 })) } }, standardId };
+  return { plan, report: { ...report, written: { standardId, versionId, drawingId, rows: tempRows.length, files: okFiles.length, sheets: sheetsOut, newItems: madeItems, newDefinitions: [...made.values()].map((d) => ({ id: d.id, code: d.code, name: d.name, classificationId: d.classification_id, rulesFrom: d.rulesFrom ?? null, rules: d.rules ?? 0 })) } }, standardId };
 }
 
 /** The mapping report a person reads before --apply: every row → definition, the new ones, the notes, the files. */
@@ -1113,7 +1121,7 @@ function reportOf(plan, fileRows, existingId) {
   const rows = plan.rows.map((r) => ({
     depth: r.depth, mark: r.mark ?? null, what: r.item ? `${r.item.mark} ${r.item.description}` : r.node?.name ?? null,
     role: r.role, quantity: r.quantity, to: r.def?.new ? `NEW: ${r.def.new}` : r.def ? `${r.def.name}${r.def.code ? ` (${r.def.code})` : ''}` : '(left out)',
-    chosen: r.kind === 'selection' ? (r.chosen?.name ?? 'to choose') : undefined, note: r.notes ?? null,
+    chosen: r.kind === 'selection' ? (r.chosen?.name ?? (r.make ? `NEW: ${r.make.name}` : 'to choose')) : undefined, note: r.notes ?? null,
     weightKg: r.weightKg ?? null, values: r.values.map((v) => `${v.code}=${v.display ?? v.number ?? v.text ?? v.optionId}`).join(' '),
   }));
   return {
@@ -1121,6 +1129,8 @@ function reportOf(plan, fileRows, existingId) {
     totals: plan.totals,
     rows,
     newDefinitions: plan.newDefinitions.map((d) => ({ name: d.name, kind: d.classHint, for: d.used, nearest: d.nearest ?? null })),
+    // Catalog items of the exact size the drawing gives that the catalog lacks: made on apply, added to the selection, chosen.
+    newItems: (plan.newItems ?? []).map((n) => ({ name: n.name, kind: n.kind, weightKg: n.weightKg, selection: n.selection.name, for: n.for })),
     fallbacks: plan.mappings.filter((m) => m.fallback).map((m) => ({ what: m.what, asked: m.asked[0], took: m.to.name ?? m.to.new })),
     // Rows that took a definition by a successor, a synonym or a like name (not their own name): a person reads them.
     matchedBy: [...new Map(plan.mappings.filter((m) => ['successor', 'synonym', 'similar'].includes(m.how))

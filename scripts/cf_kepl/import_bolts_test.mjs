@@ -10,6 +10,8 @@
  *      choose with "length by grip" said (the BOM gives no length)
  *   4. a bolt whose length the BOM gives (M24 x 95, class 10.9) is chosen: the catalog's bolt set of that size
  *   5. anchor bolts (holding down) stay bought — they are the bearing supplier's
+ *   6–9. exact sizes only (user, 2026-11-28): a size or class the catalog lacks is a NEW item planned (newItems), never
+ *      the nearest size or the selection's default; weights and grip lengths (lib/fastenerItems.js)
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -49,7 +51,9 @@ try {
   const rows = selRows(p1);
   const total = rows.reduce((a, r) => a + Number(r.quantity) * 1, 0);
   ok('3. the HSFG bolts are Bolt set rows now, not listed', rows.length > 0 && !p1.bought.some((b) => b.mark === hsfg.mark) && rows.every((r) => r.def.id === boltDef.id), J(rows.map((r) => [r.mark, r.quantity])));
-  ok('…left to choose (no length on the drawing), and it says so', rows.every((r) => r.chosen === null && /Choose the bolt size: M22 — length by grip/.test(r.notes ?? '')), J(rows.map((r) => r.notes)));
+  // The set now sizes its bolts (M22 x 90, x 125 … class 8.8, from the grip): each takes the catalog set of EXACTLY that size,
+  // else a new one is planned (2026-11-28) — never left open, never the nearest size (M22 x 95 is in this catalog).
+  ok('…each sized bolt is the exact catalog set or a NEW one planned, never the nearest', rows.every((r) => (r.chosen && r.chosen.name.includes(`M22 x ${SI.boltWanted(r.item).length},`)) || (r.chosen === null && r.make?.name === `HSFG bolt set M22 x ${SI.boltWanted(r.item).length}, class 8.8 (bolt + nut + 2 washers)`)), J(rows.map((r) => [r.mark, r.chosen?.name, r.make?.name])));
   ok('…the quantities are the BOM\'s', total > 0, String(total));
 
   // 4. A sized bolt is chosen.
@@ -59,6 +63,30 @@ try {
 
   // 5. Anchor bolts stay bought.
   ok('5. anchor (holding-down) bolts stay bought', p1.bought.some((b) => /AB$/.test(b.mark)), J(p1.bought.map((b) => b.mark)));
+
+  // 6–9. EXACT SIZES ONLY (user, 2026-11-28): no nearest size, no default — the item of the drawing's size is planned.
+  const FI = await imp('apps/cf_erp/lib/fastenerItems.js');
+  const longer = { ...bom, items: bom.items.map((i) => (i.role === 'bolt' ? { ...i, profile: 'M22 x 100', description: 'HSFG bolt, property class 8.8' } : i)) };
+  const p3 = SI.planImport(longer, withBolts);
+  ok('6. M22 x 100 class 8.8 with only M22 x 95 in the catalog: not chosen, a NEW item planned in the Bolt set selection',
+    selRows(p3).length > 0 && selRows(p3).every((r) => r.chosen === null && r.make?.name === 'HSFG bolt set M22 x 100, class 8.8 (bolt + nut + 2 washers)')
+      && p3.newItems.filter((n) => n.kind === 'bolt').length === 1 && p3.newItems.find((n) => n.kind === 'bolt').selection.id === boltDef.id && p3.newItems.find((n) => n.kind === 'bolt').weightKg === FI.boltSetKg(22, 100), J(p3.newItems));
+  const otherClass = { ...bom, items: bom.items.map((i) => (i.role === 'bolt' ? { ...i, profile: 'M24 x 95', description: 'HSFG bolt, property class 8.8' } : i)) };
+  ok('7. the right size in another class (M24 x 95 10.9 for 8.8) is not taken: a new 8.8 set is planned',
+    SI.planImport(otherClass, withBolts).newItems.filter((n) => n.kind === 'bolt').map((n) => n.name).join() === 'HSFG bolt set M24 x 95, class 8.8 (bolt + nut + 2 washers)');
+  ok('8. weights and lengths: M22 x 95 set 0.543 kg (as the catalog), stud 25 x 100 ≈ 0.457 kg, M22 grip 86 → 125, grip 32 → 70',
+    FI.boltSetKg(22, 95) === 0.543 && Math.abs(FI.studKg(25, 100) - 0.457) < 0.002 && FI.boltLengthFromGrip(22, 86, [60, 65, 130]) === 125 && FI.boltLengthFromGrip(22, 32) === 70,
+    J([FI.boltSetKg(22, 95), FI.studKg(25, 100), FI.boltLengthFromGrip(22, 86), FI.boltLengthFromGrip(22, 32)]));
+  const studDef = { id: 990002, code: 'SELST-001', name: 'Shear stud', short_name: null, status: 'active', classification_id: 1, default_flow_id: null, definition_type: 'selection', bom_id: null, bom_status: null };
+  const studCat = { ...withBolts, defs: [...withBolts.defs.filter((d) => d.name !== 'Shear stud'), studDef], studs: [{ id: 990021, code: 'STUD-001', name: 'Shear stud 25 dia x 175' }, { id: 990022, code: 'FS-1', name: 'STUDS M25 X 100 MM' }] };
+  const studBom = (h) => ({ ...bom, items: [...bom.items, { id: 'STUD', mark: 'STUD', role: 'shear_stud', category: 'bought', description: `Shear stud Ø25 × ${h}`, profile: `stud 25 dia x ${h}`, material: `shear stud 25 dia x ${h}` }],
+    assembly: { ...bom.assembly, children: [...(bom.assembly.children ?? []), { item: 'STUD', qtyPerParent: 10 }] } });
+  const p4 = SI.planImport(studBom(100), studCat);
+  const studRows = p4.rows.filter((r) => r.kind === 'selection' && r.mark === 'STUD');
+  ok('9. studs 25 x 100 with only 25 x 175 in the selection: NOT the default, a new "Shear stud 25 dia x 100" planned (a stores "STUDS M25 X 100" is not a shear stud)',
+    studRows.length === 1 && studRows[0].chosen === null && studRows[0].make?.name === 'Shear stud 25 dia x 100' && p4.newItems.some((n) => n.name === 'Shear stud 25 dia x 100' && n.kind === 'stud'), J([studRows.map((r) => [r.chosen, r.make]), p4.newItems]));
+  const p5 = SI.planImport(studBom(175), studCat);
+  ok('…and 25 x 175 studs take STUD-001, nothing new', p5.rows.filter((r) => r.mark === 'STUD').length === 1 && p5.rows.filter((r) => r.mark === 'STUD').every((r) => r.chosen?.id === 990021 && !r.make) && !p5.newItems.some((n) => n.name === 'Shear stud 25 dia x 175'));
 } catch (e) { failed += 1; fails.push(`crashed: ${e.message}`); console.log(e); } finally { await pool.end(); }
 console.log(`\n${passed} passed, ${failed} failed${fails.length ? `\n  ${fails.join('\n  ')}` : ''}`);
 process.exit(failed ? 1 : 0);
