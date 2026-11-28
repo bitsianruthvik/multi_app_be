@@ -36,7 +36,7 @@ import {
 import { registerFile } from '../services/partDrawingService.js';
 import { lineModel3d, placeAddedRow } from '../services/model3dService.js';
 import { linePhysicsInfo, linePhysicsPage } from '../services/physicsService.js';
-import { lineReviewInfo, lineReviewFile, sendReviewFile } from '../services/reviewService.js';
+import { lineReviewInfo, lineReviewFile, sendReviewFile, lineReviewMarks, saveLineReviewMarks } from '../services/reviewService.js';
 import { lineRowProgress, productionOrderLines } from '../services/rowProgressService.js';
 import { lineCurve, setLineCurve } from '../services/curveService.js';
 
@@ -64,6 +64,11 @@ router.get('/orders/:orderId/lines/:lineId/review', guard(PERM.ordersView),
 router.get('/orders/:orderId/lines/:lineId/review/file', guard(PERM.ordersView), handle(async (req, res) => {
   sendReviewFile(res, await lineReviewFile(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'), req.query?.name));
 }));
+// The signed-in person's decisions and comments on it, by part mark, kept with the line's standard (not with the review bundle).
+router.get('/orders/:orderId/lines/:lineId/review/marks', guard(PERM.ordersView),
+  handle((req) => lineReviewMarks(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'), ctx(req).userId)));
+router.put('/orders/:orderId/lines/:lineId/review/marks', guard(PERM.ordersView),
+  handle((req) => saveLineReviewMarks(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'), ctx(req).userId, req.body ?? {})));
 // WHERE EVERY ROW IS IN ITS FLOW, per unit, for the 3D progress view (rowProgressService); ?productionOrderId= marks what that order holds.
 router.get('/orders/:orderId/lines/:lineId/row-progress', guard(PERM.ordersView),
   handle((req) => lineRowProgress(pool, ctx(req).companyId, intParam(req.params.orderId, 'orderId'), intParam(req.params.lineId, 'lineId'),

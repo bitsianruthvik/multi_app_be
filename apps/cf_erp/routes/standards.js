@@ -32,7 +32,7 @@ import { standardModel3d } from '../services/model3dService.js';
 import { applyModel } from '../services/modelValueService.js';
 import { invalid } from '../lib/errors.js';
 import { standardPhysicsInfo, standardPhysicsPage } from '../services/physicsService.js';
-import { standardReviewInfo, standardReviewFile, sendReviewFile } from '../services/reviewService.js';
+import { standardReviewInfo, standardReviewFile, sendReviewFile, standardReviewMarks, saveStandardReviewMarks } from '../services/reviewService.js';
 
 const router = Router();
 const tx = (req, fn) => withTransaction((db) => fn(db, ctx(req)));
@@ -58,6 +58,9 @@ router.get('/standard-drawings/:id/physics/page', view, handle(async (req, res) 
 }));
 router.get('/standard-drawings/:id/review', view, handle((req) => standardReviewInfo(pool, company(req), id(req))));
 router.get('/standard-drawings/:id/review/file', view, handle(async (req, res) => { sendReviewFile(res, await standardReviewFile(pool, company(req), id(req), req.query?.name)); }));
+// The signed-in person's decisions and comments on the review, by part mark (kept across rebuilt reviews; reviewService).
+router.get('/standard-drawings/:id/review/marks', view, handle((req) => standardReviewMarks(pool, company(req), id(req), ctx(req).userId)));
+router.put('/standard-drawings/:id/review/marks', view, handle((req) => saveStandardReviewMarks(pool, company(req), id(req), ctx(req).userId, req.body ?? {})));
 router.get('/standard-drawings/:id', view, handle((req) => getStandard(pool, company(req), id(req), req.query)));
 router.post('/standard-drawings', manage, handle((req) => tx(req, (db, c) => createStandard(db, c, req.body ?? {}))));
 router.put('/standard-drawings/:id', manage, handle((req) => tx(req, (db, c) => updateStandard(db, c, id(req), req.body ?? {}))));

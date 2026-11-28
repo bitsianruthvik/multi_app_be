@@ -9319,3 +9319,23 @@ SELECT IF((SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 
           AND (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_step_events' AND COLUMN_NAME = 'source' AND COLUMN_TYPE LIKE '%''opening''%') = 1
           AND (SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cf_settings' AND COLUMN_NAME = 'value') >= 4000,
           'S121-OK', 'S121-MISSING') AS result;
+
+-- =====================================================================================================================
+-- §122 REVIEW MARKS (user, 2026-11-28: "Keep saving the reviews I have written so far, so that if I open it again I can see
+--      them"). The drawing review's accept / reject / maybe and comment per part, per company + standard drawing + person,
+--      keyed by the part's MARK — not by the review bundle (cf_standard_drawing_files kind 'review'), which a rebuild and
+--      re-attach replaces. reviewService readMarks / writeMarks; the person is the one signed in.
+-- =====================================================================================================================
+CREATE TABLE IF NOT EXISTS cf_review_marks (
+  id           INT            AUTO_INCREMENT PRIMARY KEY,
+  company_id   INT            NOT NULL,
+  standard_id  INT            NOT NULL,
+  user_id      INT            NOT NULL,
+  mark         VARCHAR(150)   NOT NULL,
+  decision     ENUM('ok','bad','q') NULL,
+  comment      TEXT           NULL,
+  created_at   TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_crm_mark (company_id, standard_id, user_id, mark),
+  KEY idx_crm_standard (company_id, standard_id)
+);

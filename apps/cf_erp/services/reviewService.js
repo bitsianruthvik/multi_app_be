@@ -14,7 +14,7 @@
  * sha differs), the review is said to be out of date.
  */
 import crypto from 'crypto';
-import { notFound } from '../lib/errors.js';
+import { invalid, notFound } from '../lib/errors.js';
 
 const parse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 const shaCache = new Map();
@@ -91,3 +91,65 @@ export function sendReviewFile(res, f) {
   res.setHeader('Content-Type', f.kind === 'json' ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8');
   res.send(f.text);
 }
+
+/*
+ * THE REVIEWER'S DECISIONS (user, 2026-11-28: "Keep saving the reviews I have written so far, so that if I open it again I
+ * can see them"). Accept / reject / maybe and a comment per part, kept on the server per company + standard drawing + person,
+ * keyed by the part's MARK — never by the review bundle, which is replaced each time a review is rebuilt and re-attached
+ * (cf_review_marks, init.sql §122). The person is the one signed in; the standard must be the company's own.
+ *   GET  …/review/marks → { parts: { [mark]: { d: 'ok' | 'bad' | 'q' | null, c: comment, at } } }
+ *   PUT  …/review/marks { parts: { [mark]: { d, c } } } → the marks given are saved (others are left as they are)
+ */
+const DECISIONS = new Set(['ok', 'bad', 'q']);
+const MAX_MARKS = 5000; const MAX_MARK = 150; const MAX_COMMENT = 4000;
+async function ownStandard(db, companyId, standardId) {
+  const [[s]] = await db.query('SELECT id FROM cf_standard_drawings WHERE company_id = ? AND id = ? AND deleted_at IS NULL', [companyId, Number(standardId)]);
+  if (!s) throw notFound('Standard drawing');
+  return Number(s.id);
+}
+const signedIn = (userId) => { if (!userId) throw invalid('NO_USER', 'Sign in to keep your review.'); return Number(userId); };
+async function readMarks(db, companyId, standardId, userId) {
+  const sid = await ownStandard(db, companyId, standardId);
+  const [rows] = await db.query(
+    'SELECT mark, decision, comment, updated_at FROM cf_review_marks WHERE company_id = ? AND standard_id = ? AND user_id = ? ORDER BY mark',
+    [companyId, sid, signedIn(userId)],
+  );
+  const parts = {};
+  for (const r of rows) if (r.decision || r.comment) parts[r.mark] = { d: r.decision ?? null, c: r.comment ?? '', at: r.updated_at };
+  return { parts };
+}
+async function writeMarks(db, companyId, standardId, userId, body) {
+  const sid = await ownStandard(db, companyId, standardId);
+  const uid = signedIn(userId);
+  const given = body?.parts;
+  if (!given || typeof given !== 'object' || Array.isArray(given)) throw invalid('INVALID', 'parts must be an object of mark → { d, c }.');
+  const entries = Object.entries(given);
+  if (entries.length > MAX_MARKS) throw invalid('INVALID', `At most ${MAX_MARKS} parts at a time.`);
+  const rows = [];
+  for (const [mark, p] of entries) {
+    const m = String(mark ?? '').trim();
+    if (!m || m.length > MAX_MARK) throw invalid('INVALID', `A part mark must be 1 to ${MAX_MARK} characters.`);
+    const d = p?.d == null || p.d === '' ? null : String(p.d);
+    if (d != null && !DECISIONS.has(d)) throw invalid('INVALID', `${m}: the decision must be ok, bad or q.`);
+    const c = p?.c == null ? '' : String(p.c);
+    if (c.length > MAX_COMMENT) throw invalid('INVALID', `${m}: a comment is at most ${MAX_COMMENT} characters.`);
+    rows.push([companyId, sid, uid, m, d, c || null]);
+  }
+  for (let i = 0; i < rows.length; i += 500) {
+    await db.query(
+      `INSERT INTO cf_review_marks (company_id, standard_id, user_id, mark, decision, comment) VALUES ?
+         ON DUPLICATE KEY UPDATE decision = VALUES(decision), comment = VALUES(comment), updated_at = CURRENT_TIMESTAMP`,
+      [rows.slice(i, i + 500)],
+    );
+  }
+  return { saved: rows.length };
+}
+async function lineStandardForMarks(db, companyId, orderId, lineId) {
+  const sid = await lineStandardId(db, companyId, orderId, lineId);
+  if (!sid) throw notFound('Drawing review');
+  return sid;
+}
+export async function standardReviewMarks(db, companyId, standardId, userId) { return readMarks(db, companyId, standardId, userId); }
+export async function saveStandardReviewMarks(db, companyId, standardId, userId, body) { return writeMarks(db, companyId, standardId, userId, body); }
+export async function lineReviewMarks(db, companyId, orderId, lineId, userId) { return readMarks(db, companyId, await lineStandardForMarks(db, companyId, orderId, lineId), userId); }
+export async function saveLineReviewMarks(db, companyId, orderId, lineId, userId, body) { return writeMarks(db, companyId, await lineStandardForMarks(db, companyId, orderId, lineId), userId, body); }
