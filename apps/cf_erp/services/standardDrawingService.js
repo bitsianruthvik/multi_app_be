@@ -798,7 +798,9 @@ function classFor(catalog, hint, nearest = null) {
 
 /** A short name for a new definition, free among the company's: its name's initials (never a drawing's mark — one order's code on a generic definition). */
 function shortNameFor(catalog, name, taken) {
-  const used = new Set([...catalog.defs.map((d) => String(d.short_name ?? '').toUpperCase()), ...taken]);
+  // Free among short names AND codes: a definition's code comes from its short name and must be unique too (2026-11-28:
+  // "Bracket angle" → BA clashed with Bearing assembly's code BA and refused the SLR import).
+  const used = new Set([...catalog.defs.flatMap((d) => [String(d.short_name ?? '').toUpperCase(), String(d.code ?? '').toUpperCase()]), ...[...taken].map((t) => String(t).toUpperCase())]);
   const words = String(name).split(/[\s–-]+/).filter(Boolean);
   const initials = words.map((w) => w[0]).join('').toUpperCase().replace(/[^A-Z0-9]/g, '');
   const longer = words.map((w) => w.slice(0, 2)).join('').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -879,7 +881,9 @@ export async function createNewDefinitions(db, c, catalog, newDefs) {
   const { companyId } = c;
   const { createDefinition, setStatus } = await import('./masterRecordService.js');
   const made = new Map();
-  const taken = new Set();
+  // Every code the company's master records already use (items too: the code is unique across them all).
+  const [codes] = await db.query('SELECT code FROM cf_master_records WHERE company_id = ? AND deleted_at IS NULL', [companyId]);
+  const taken = new Set(codes.map((r) => String(r.code ?? '').toUpperCase()).filter(Boolean));
   for (const nd of newDefs) {
     const classificationId = classFor(catalog, nd.classHint, nd.nearest);
     if (!classificationId) throw invalid('NO_CLASS', `No place to file the new definition ${nd.name}: the catalog has none of the usual ${nd.classHint} definitions.`);
