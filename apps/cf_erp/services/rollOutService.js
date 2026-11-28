@@ -436,7 +436,7 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null, froz
   // The line's own pieces carry on from the order's earlier lines of the same
   // design (user, 2026-10-03): span qty 2 then span qty 1 = SPAN1, SPAN2, SPAN3.
   const rootStart = line.id != null && line.order_id != null ? rootStartAmong(await siblingLines(db, companyId, line.id), line.id) : 1;
-  const laid = layOutPieces(root, { quantity: qty, lineRanges, sourceDef, rootAsMaterial: line.order_type !== 'stock', rootStart });
+  const laid = layOutPieces(root, { quantity: qty, lineRanges, sourceDef, rootAsMaterial: line.order_type !== 'stock', rootStart, maxNodes });
   problems.push(...laid.problems);
   return { problems, fromNothing, tree, all, detail, nodes: laid.nodes, reqs: laid.reqs, truncated: laid.truncated, openPlates };
 }
@@ -459,7 +459,7 @@ export async function rollOutPlan(db, companyId, line, { lockedBoth = null, froz
  *
  * Returns { nodes, reqs, problems, truncated } — the shapes rollOutPlan documents.
  */
-export function layOutPieces(root, { quantity, lineRanges = new Map(), sourceDef = new Map(), rootAsMaterial = true, rootStart = 1 }) {
+export function layOutPieces(root, { quantity, lineRanges = new Map(), sourceDef = new Map(), rootAsMaterial = true, rootStart = 1, maxNodes = MAX_NODES }) {
   const problems = [];
   const qty = Number(quantity);
   const nodes = [];
