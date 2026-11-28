@@ -79,10 +79,26 @@ export function boltOf(name) {
 }
 
 /** The definition names a part may take, best first — by its role (IMPORT_FORMAT.md `items[].role`). */
+/** A deck sheeting part's definition name, or null when the item is not one (roles as the SLR sets write them). */
+export function deckPartName(item, desc = String(item?.description ?? '').toUpperCase()) {
+  const role = String(item?.role ?? '');
+  if (['deck_sheet', 'deck_sheeting', 'deck_plate'].includes(role)) return 'Deck sheet';
+  if (role === 'deck_angle' || (role === 'angle' && /DECK\s+(SHEET\s+)?ANGLE|\bDSA/.test(desc))) return 'Deck angle';
+  if (role === 'runner_channel' || ((role === 'channel' || role === 'deck_channel') && /RUNNER/.test(desc))) return 'Cantilever runner';
+  if (role === 'deck_channel' || (role === 'channel' && /DECK|CROSS\s+MEMBER/.test(desc))) return 'Deck cross member';
+  if (role === 'bracket_angle' || (role === 'angle' && /BRACKET|\bANG-?[12]\b/.test(desc))) return 'Bracket angle';
+  if ((role === 'cleat' || role === 'cleat_plate') && /BRACKET|CLIT|CLEAT\s+PL|PL-?[12]\b/.test(desc)) return 'Bracket cleat';
+  if (role === 'gusset' && /BRACKET|PL-?3\b/.test(desc)) return 'Bracket gusset';
+  return null;
+}
+
 export function partCandidates(item, place = {}) {
   const holed = Number(item?.holes?.count ?? 0) > 0;
   const stiffener = (word) => (holed ? [`${word} stiffener (holed)`, `${word} stiffener`] : [`${word} stiffener (plain)`, `${word} stiffener`]);
   const desc = String(item?.description ?? '').toUpperCase();
+  // Deck sheeting / shuttering (SLR, 2026-11-28): one set of names for every set's words, so the three drawings share
+  // their definitions and each definition carries its default flow (DECK-SHEET, DECK-ANGLE, …).
+  const deck = place.deck ? deckPartName(item, desc) : null; if (deck) return [deck];
   switch (item?.role) {
     case 'top_flange': return ['Top flange'];
     case 'bottom_flange': return ['Bottom flange'];
@@ -281,6 +297,8 @@ export const SPAN_KINDS = [
   { re: /\bTRUSS\b|OPEN\s+WEB|THROUGH\s+TYPE|\bOWG\b/, name: 'Steel truss span' },
   { re: /BOW\s*STRING|\bARCH\b/, name: 'Bow string girder span' },
   { re: /\bTUB\b|\bTUBS\b|\bBOX\s+GIRDER/, name: 'Tub girder span' },
+  // Deck sheeting / shuttering is its own structure, never a girder span (SLR, 2026-11-28).
+  { re: /DECK\s*SHEET|SHUTTERING/, name: 'Deck sheeting span' },
 ];
 export function spanCandidates(text) {
   const name = String(text ?? '').toUpperCase();
@@ -305,6 +323,14 @@ export function nodeCandidates(node, items = null) {
     case 'girder': return ['Girder line'];
     case 'girder_segment': return ['Girder segment'];
     case 'splice_set': return ['Splice set'];
+    // Deck sheeting (SLR, 2026-11-28): one name per kind whatever each set calls it.
+    case 'deck_bay': return ['Deck sheeting bay'];
+    case 'deck_member': return ['Deck cross member pair'];
+    case 'deck_cantilever': case 'cantilever_deck': return ['Cantilever deck sheeting'];
+    case 'panel': return /CANTILEVER|SHEETING/.test(name) ? ['Cantilever sheeting panel'] : [plainName(nodeTitle(name))];
+    case 'bracket': return ['Cantilever bracket'];
+    case 'girder_line': if (/CANTILEVER|SHUTTERING|SHEETING/.test(name)) return ['Cantilever deck sheeting'];
+      return ['Girder line'];
     case 'assembly':
       // Bow string (the catalog's 2026-10-07 set) and tub girder (Khajaguda, 2026-11-02) assemblies by the catalog's names
       // (user, 2026-11-06: fit what exists; a drawing's title is not a definition name).
@@ -546,6 +572,8 @@ export function planImport(bom, catalog) {
   };
   // A bow string span: its splice plates are the catalog's bow string ones; "BLB" is its bottom long beam.
   const bowstring = /BOW\s*STRING|BOWSTRING|\bARCH\b/i.test(`${dw.title ?? ''} ${bom?.assembly?.name ?? ''}`);
+  // A deck sheeting set (SLR, 2026-11-28): its parts take the shared deck names (deckPartName) before any section name.
+  const deck = /DECK\s*SHEET|SHUTTERING/i.test(`${dw.title ?? ''} ${bom?.assembly?.name ?? ''}`);
   const has = (n) => !!(defsByNorm.get(normName(n)) ?? []).length;
   const newDefs = new Map();   // name -> { name, classHint, roles }
   const mappings = [];
@@ -806,7 +834,7 @@ export function planImport(bom, catalog) {
       const splitNote = horizontal ? `Top or bottom is not told apart on the drawing: the ${q} split evenly (${top} top, ${q - top} bottom).` : null;
       const parts = split
         ? [{ names: ['X-frame top angle'], quantity: top, role: 'Top angle' }, { names: ['X-frame bottom angle'], quantity: q - top, role: 'Bottom angle' }]
-        : [{ names: [...sectionNames(it), ...partCandidates(it, { endDiaphragm, single: q === 1, bowstring, has })], quantity: q, role: roleText(it.description) }];
+        : [{ names: [...(deck && deckPartName(it) ? [deckPartName(it)] : []), ...sectionNames(it), ...partCandidates(it, { endDiaphragm, single: q === 1, bowstring, deck, has })], quantity: q, role: roleText(it.description) }];
       for (const [i, p] of parts.entries()) {
         const d = mapDef(p.names, 'template', split ? `${what2} (${p.role.toLowerCase()})` : what2, it.category === 'section' ? 'profile' : 'plate');
         const { values: pv, kg, gradeNote, bronze } = partValues(it, it.mark);
